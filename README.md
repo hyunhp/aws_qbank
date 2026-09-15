@@ -20,4 +20,4 @@ claude.ai Artifact로 만든 원본 페이지(마스터 문제은행)는 실시�
 - **합계: 1,952문항, 12개 자격증 전체 커버** (자격증 간 공유 태깅된 문항은 두 개 이상의 카운트에 중복 포함됨)
 
 ## 참고
-- LINK: `https://hyunhp.github.io/aws-qbank/`
+- LINK: `https://hyunhp.github.io/aws_qbank/`

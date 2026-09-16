@@ -1,6 +1,6 @@
 # AWS Question Bank 
 - LINK: `https://hyunhp.github.io/aws_qbank/`
-- 
+  
 ## 현재 포함된 데이터 (2026-09-15 최종 완료 시점 스냅샷 — 12개 자격증 전부)
 - AIF-C01 (AI Practitioner): 142문항
 - AIB-C01 (AI Business Strategist): 129문항

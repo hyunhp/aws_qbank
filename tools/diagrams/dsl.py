@@ -56,7 +56,7 @@ ALIAS = {
     "firewall": "aws-network-firewall", "nfwep": "aws-network-firewall-endpoints", "fw": "aws-firewall-48-light",
     "nacl": "amazon-vpc-network-access-control-list", "peering": "amazon-vpc-peering-connection", "rt": "amazon-vpc-router",
     "ebsvol": "amazon-elastic-block-store-volume", "fms": "aws-firewall-manager", "firehose": "amazon-data-firehose",
-    "cloudwan": "aws-cloud-wan", "textract": "amazon-textract", "comprehend": "amazon-comprehend", "wavelength": "aws-wavelength",
+    "cloudwan": "aws-cloud-wan", "devopsguru": "amazon-devops-guru", "textract": "amazon-textract", "comprehend": "amazon-comprehend", "wavelength": "aws-wavelength",
     "outposts": "aws-outposts-family", "kb": "amazon-bedrock", "crawler": "aws-glue-crawler", "appflow": "amazon-appflow", "redshift": "amazon-redshift", "ddbstream": "amazon-dynamodb-stream",
     "catalog": "aws-glue-data-catalog", "databrew": "aws-glue-databrew", "mwaa": "amazon-managed-workflows-for-apache-airflow",
     "sagemaker": "amazon-sagemaker-ai", "bedrock": "amazon-bedrock", "msk": "amazon-managed-streaming-for-apache-kafka", "opensearch": "amazon-opensearch-service", "health": "aws-health-dashboard", "pipes": "amazon-eventbridge-pipes",

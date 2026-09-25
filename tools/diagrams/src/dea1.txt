@@ -1,0 +1,204 @@
+@Q000252 cols=2
+T DynamoDB Streams with NEW_AND_OLD_IMAGES captures every change in order per partition key, and a Lambda event source mapping processes it within seconds.
+N app app "Order writes" 0 0
+N ddb dynamodb "Orders table" 0 1
+N st ddbstream "Stream\n(old + new images)" 1 1
+N lam lambda "Lambda consumer" 1 0
+E app>ddb
+E ddb>st
+E st>lam "in order per\norder ID"
+
+@Q000253 cols=2
+T DMS performs the full load and then applies ongoing changes from the Oracle logs, writing them continuously to S3 with minutes of latency.
+G dc onprem "On-premises" 0 0-1
+N ora server "Oracle database" 0 0.5
+G reg region "AWS Region" 1-2 0-1
+N dms dms "DMS task\n(full load + CDC)" 1 0.5
+N s3 s3 "S3 target" 2 0.5
+E ora>dms "logs"
+E dms>s3 "changes"
+
+@Q000254 cols=2
+T AppFlow pulls only changed Salesforce records every hour, applies field mapping and filters, and writes them to S3 with no code or servers.
+N sf app "Salesforce" 0 0
+N af appflow "AppFlow\n(incremental, hourly)" 0 1
+N s3 s3 "Amazon S3" 1 1
+E sf>af "changed records"
+E af>s3 "mapped, filtered"
+
+@Q000255 cols=2
+T S3 sends object events to EventBridge, a rule filters on the orders/ prefix and .csv suffix to start the Glue job, and job bookmarks prevent reprocessing.
+N s3 s3 "s3://raw/orders/" 0 0
+N eb eventbridge "Rule: prefix +\n.csv suffix" 0 1
+N gl glue "Glue job\n(bookmarks)" 1 1
+E s3>eb "object created"
+E eb>gl "start"
+
+@Q000260 cols=3
+T Enhanced fan-out gives each registered consumer its own 2 MB/s per shard, so consumers no longer share read throughput.
+N ks kinesis "Kinesis stream" 0 1
+N c1 lambda "Consumer A\n2 MB/s/shard" 1 0 ! consumers drawn as Lambda
+N c2 app "Consumer B\n2 MB/s/shard" 1 1
+N c3 app "Consumer C\n2 MB/s/shard" 1 2
+E ks>c1 "enhanced\nfan-out"
+E ks>c2
+E ks>c3
+
+@Q000261 cols=3
+T Many gateways writing to one stream is fan-in; independent consumers each reading the whole stream is fan-out.
+N g1 app "IoT gateway" 0 0
+N g2 app "IoT gateway" 0 1
+N g3 app "... hundreds" 0 2
+N ks kinesis "Kinesis stream" 1 1
+N c1 app "Analytics" 2 0
+N c2 app "Alerting" 2 1
+N c3 s3 "Archive" 2 2 ! archives typically land in S3
+E g1>ks
+E g2>ks "fan-in"
+E g3>ks
+E ks>c1
+E ks>c2 "fan-out"
+E ks>c3
+
+@Q000264 cols=2
+T The DMS replication instance keeps a fixed private IP in the VPC, so the on-premises firewall can allow exactly that address over the VPN.
+G vpc vpc "VPC" 0 0-1
+N dms dms "DMS replication\ninstance (fixed IP)" 0 0.5
+N vpn vpn "Site-to-Site VPN" 1 0.5
+G dc onprem "On-premises" 2 0-1
+N fw fw "Firewall\n(allow that IP)" 2 0
+N sql server "SQL Server" 2 1
+E dms>vpn
+E vpn>fw
+E fw>sql
+
+@Q000271 cols=2
+T The Glue connection places the job's network interfaces in your VPC subnet, so it reaches the on-premises SQL Server over Direct Connect with no internet path.
+G vpc vpc "VPC subnet" 0 0-1
+N gl glue "Glue job\n(JDBC connection)" 0 0.5
+N dx dx "Direct Connect" 1 0.5
+G dc onprem "On-premises" 2 0-1
+N sql server "SQL Server" 2 0.5
+E gl>dx "ENIs in subnet"
+E dx>sql
+
+@Q000273 cols=2
+T One Glue job defines connections to Redshift and S3, creates a DynamicFrame from each, and joins them in a single transformation.
+N rs redshift "Redshift orders" 0 0
+N s3 s3 "S3 Parquet\nprofiles" 0 1
+N gl glue "Glue Spark job\n(join DynamicFrames)" 1 0.5
+N out s3 "Joined output" 2 0.5 ! results are typically written to S3
+E rs>gl
+E s3>gl
+E gl>out
+
+@Q000277 cols=2
+T API Gateway gives internal apps a REST endpoint with IAM auth and per-app throttling; Lambda reads the curated aggregates from S3 (for example through Athena).
+N apps app "Internal apps" 0 0.5
+N api apigw "API Gateway\n(IAM auth, usage plans)" 1 0.5
+N lam lambda "Lambda" 2 0.5
+N ath athena "Athena" 3 0
+N s3 s3 "Curated data" 3 1
+E apps>api
+E api>lam
+E lam>ath
+E ath>s3
+
+@Q000289 cols=3
+T An EventBridge rule matching the custom event starts the Step Functions state machine, and other rules or targets receive the same event for auditing.
+N app app "Application event" 0 1
+N eb eventbridge "EventBridge" 1 1
+N sf stepfn "Step Functions" 2 0
+N a1 app "Audit target" 2 1
+N a2 app "Other target" 2 2
+E app>eb
+E eb>sf "start"
+E eb>a1
+E eb>a2
+
+@Q000293 cols=2
+T One SNS message fans out to both subscribers: the email to on-call and the remediation Lambda, each independently.
+N p app "Pipeline failure" 0 0.5
+N sns sns "SNS topic" 1 0.5
+N em users "Email to on-call" 2 0
+N lam lambda "Remediation Lambda" 2 1
+E p>sns
+E sns>em
+E sns>lam
+
+@Q000294 cols=2
+T SQS stores every task durably, Lambda polls at a controlled concurrency, and messages that keep failing go to a dead-letter queue.
+N p app "Producer" 0 0
+N q sqs "SQS queue" 0 1
+N lam lambda "Lambda transformer" 1 1
+N dlq sqs "Dead-letter queue" 1 0
+E p>q "fast"
+E q>lam "as capacity allows"
+E q>dlq -- "repeated failures"
+
+@Q000295 cols=2
+T A conditional trigger with AND logic starts the downstream job only after both crawlers finish successfully.
+N c1 crawler "Crawler A" 0 0
+N c2 crawler "Crawler B" 0 1
+N tr glue "Conditional trigger\n(AND)" 1 0.5
+N job glue "Downstream job" 2 0.5
+E c1>tr "succeeded"
+E c2>tr "succeeded"
+E tr>job
+
+@Q000311 cols=2
+T Lambda mounts an EFS file system, giving every invocation shared, persistent read-write access to the multi-GB reference data.
+G vpc vpc "VPC" 0-1 0-1
+N lam lambda "Lambda function" 0 0
+N efs efs "EFS (reference data)" 0 1
+E lam>efs <> "file system config"
+
+@Q000322 cols=2
+T Transfer Family SFTP maps each partner's key to a scoped role and home folder, so each lands files only in its own S3 prefix.
+N p1 users "Partner A" 0 0
+N p2 users "Partner B" 0 1
+N tf transfer "Transfer Family SFTP" 1 0.5
+N s3 s3 "S3: /partnerA/, /partnerB/" 2 0.5
+E p1>tf "SFTP key"
+E p2>tf
+E tf>s3 "scoped home\nfolders"
+
+@Q000325 cols=2
+T Redshift Spectrum queries the historical Parquet in S3 through external tables and joins it with local tables, with no loading.
+N u users "Analysts (SQL)" 0 0.5
+N rs redshift "Redshift\n(local tables)" 1 0
+N sp redshift "Spectrum\nexternal tables" 1 1 ! Spectrum is part of Redshift
+N s3 s3 "Parquet in S3" 2 1
+E u>rs
+E rs>sp "join"
+E sp>s3 "scan in place"
+
+@Q000332 cols=2
+T EMR uses the Glue Data Catalog as its Hive metastore, so metadata persists outside the clusters and is shared with other services.
+N e1 emr "EMR cluster\n(Hive, Spark)" 0 0
+N e2 emr "Another cluster" 0 1
+N cat catalog "Glue Data Catalog\n(Hive metastore)" 1 0.5
+N ath athena "Athena" 2 0.5 ! other services share the same catalog
+E e1>cat
+E e2>cat
+E ath>cat
+
+@Q000333 cols=2
+T A scheduled crawler infers the evolving JSON schema and adds new columns per its schema change policy, so tables appear in Athena automatically.
+N s3 s3 "Raw JSON (daily)" 0 0 ! raw data lands in S3
+N cr crawler "Scheduled crawler" 0 1
+N cat catalog "Data Catalog tables" 1 1 ! crawlers write tables to the Glue Data Catalog
+N ath athena "Athena" 1 0
+E cr>s3 -- x "infer schema"
+E cr>cat "update policy"
+E ath>cat
+
+@Q000342 cols=2
+T TTL deletes sessions after 24 hours without using write capacity, and those deletions flow through Streams to a Lambda that archives them to S3.
+N ddb dynamodb "Sessions table\n(TTL 24 h)" 0 0
+N st ddbstream "DynamoDB Streams" 0 1
+N lam lambda "Archive Lambda" 1 1
+N s3 s3 "S3 archive" 1 0
+E ddb>st "TTL deletions"
+E st>lam
+E lam>s3

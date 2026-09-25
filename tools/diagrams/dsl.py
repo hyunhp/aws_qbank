@@ -56,7 +56,8 @@ ALIAS = {
     "firewall": "aws-network-firewall", "nfwep": "aws-network-firewall-endpoints", "fw": "aws-firewall-48-light",
     "nacl": "amazon-vpc-network-access-control-list", "peering": "amazon-vpc-peering-connection", "rt": "amazon-vpc-router",
     "ebsvol": "amazon-elastic-block-store-volume", "fms": "aws-firewall-manager", "firehose": "amazon-data-firehose",
-    "cloudwan": "aws-cloud-wan", "lattice": "amazon-vpc-lattice", "pca": "aws-certificate-manager-certificate-authority", "flowlogs": "amazon-vpc-flow-logs", "tgwatt": "aws-transit-gateway-attachment", "ap": "amazon-simple-storage-service-general-access-points", "dnsfw": "amazon-route-53-resolver-dns-firewall",
+    "cloudwan": "aws-cloud-wan", "signer": "aws-signer", "hsm": "aws-cloudhsm", "objlock": "amazon-simple-storage-service-s3-object-lock", "codebuild": "aws-codebuild", "chatbot": "aws-chatbot", "detective": "amazon-detective", "macie": "amazon-macie",
+    "inspector": "amazon-inspector", "seclake": "amazon-security-lake", "controltower": "aws-control-tower", "lattice": "amazon-vpc-lattice", "pca": "aws-certificate-manager-certificate-authority", "flowlogs": "amazon-vpc-flow-logs", "tgwatt": "aws-transit-gateway-attachment", "ap": "amazon-simple-storage-service-general-access-points", "dnsfw": "amazon-route-53-resolver-dns-firewall",
 }
 
 

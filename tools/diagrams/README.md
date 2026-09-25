@@ -13,6 +13,7 @@ They are rendered in the browser by `js/diagram.js` from small grid specs in `di
 | `tools/diagrams/src/*.txt` + `dsl.py` | Compact batch sources (one file per category) compiled into `diagrams/<QID>.json`. |
 | `tools/diagrams/build_assets.py` | Regenerates the sprite and manifest. Run after any spec or module change. |
 | `tools/diagrams/check.py` | Consistency + layout lint in a real browser, optional screenshots. |
+| `tools/diagrams/rejected.txt` | Candidates reviewed and deliberately left without a diagram. |
 | `tools/diagrams/preview.html` | Renders every diagram with lint results (serve the repo root over HTTP). |
 | `tools/diagrams/selection.json` | Which SAA/SAP questions get a diagram and why. |
 
@@ -37,11 +38,22 @@ They are rendered in the browser by `js/diagram.js` from small grid specs in `di
 - Draw only the correct architecture from the explanation. Every service icon must be named in the
   stem, correct option, explanation or services field, or carry an `implied` reason (checked by `check.py`).
 
+## What `check.py` verifies
+- Every service icon is named in the question (stem, correct option, explanation, services) or has an `implied` reason.
+- Nothing is drawn outside the canvas; labels don't overlap each other or icons.
+- Edges don't run through other icons, node labels or group titles, don't sit on top of each other,
+  and aren't hidden by their own label; edge labels don't cover other edges.
+- Icons don't straddle a group border and node labels stay inside their group.
+
+The renderer places edge labels itself: on the longest segment when there is room, otherwise beside the
+line (right/left for vertical lines, above/below for horizontal ones), avoiding icons, labels and other edges.
+
 ## Workflow
 ```bash
 python3 tools/diagrams/dsl.py                                     # src/*.txt -> diagrams/*.json
 python3 tools/diagrams/build_assets.py /path/to/aws-icons/svg   # sprite + manifest
 python3 tools/diagrams/check.py --shots /tmp/diagram-shots        # must print OK
+python3 tools/diagrams/site_test.py                               # must print FAILS: []
 ```
 Icons: official [AWS Architecture Icons](https://aws.amazon.com/architecture/icons/), taken from the
 `svg/` folder of github.com/harmalh/aws-mermaid-icons.

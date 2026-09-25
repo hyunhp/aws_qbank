@@ -5,7 +5,8 @@
 1. Consistency: every service icon in a diagram must be named in the question's stem, correct
    option(s), explanation or services field. Nodes marked "implied" are listed for manual review.
 2. Layout lint (real browser, same module the site uses): canvas overflow, overlapping labels,
-   edge labels over icons, edges crossing other icons or group titles, labels spilling out of groups.
+   edge labels over icons or other edges, edges crossing icons, node labels or group titles,
+   overlapping edges, edges hidden by their own label, icons straddling or labels spilling out of groups.
 3. Screenshots of each rendered diagram (for visual review) when --shots is given.
 Exit code 1 if any consistency or layout error is found.
 """

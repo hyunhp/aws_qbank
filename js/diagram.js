@@ -186,7 +186,8 @@ export function buildSvg(spec) {
 
   for (const n of spec.nodes || []) {
     const g = el("g", { class: "qb-node", "data-id": n.id }, gNodes);
-    el("use", { href: `#i-${n.icon}`, x: n._x - ICON / 2, y: n._y - ICON / 2, width: ICON, height: ICON }, g);
+    const u = el("use", { href: `#i-${n.icon}`, x: n._x - ICON / 2, y: n._y - ICON / 2, width: ICON, height: ICON }, g);
+    u.setAttributeNS("http://www.w3.org/1999/xlink", "xlink:href", `#i-${n.icon}`); // older Safari
     (n.label ? String(n.label).split("\n") : []).forEach((line, i) => {
       const t = el("text", { class: "qb-node-label", x: n._x, y: n._y + ICON / 2 + 16 + i * LINE, "text-anchor": "middle", "font-size": 13, fill: INK }, g);
       t.textContent = line;
@@ -222,7 +223,8 @@ function drawEdges(svg, spec) {
   };
   const pt = ([r, c]) => [L.colX(c), Number.isInteger(r) ? L.rowY(r) : L.gapY(r)];
 
-  for (const e of spec.edges || []) {
+  // Pass 1: draw every edge line.
+  const drawn = (spec.edges || []).map((e, ei) => {
     const a = boxOf(e.from), b = boxOf(e.to);
     let mids = (e.via || []).map(pt);
     if (e.route === "hv") mids = [[b.c[0], a.c[1]]];
@@ -232,37 +234,71 @@ function drawEdges(svg, spec) {
     pts[pts.length - 1] = clip(pts[pts.length - 1], pts[pts.length - 2], b.box);
     const d = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(" ");
     el("path", {
-      class: "qb-edge", "data-from": e.from, "data-to": e.to, d, fill: "none", stroke: EDGE, "stroke-width": 1.6,
+      class: "qb-edge", "data-from": e.from, "data-to": e.to, "data-i": ei, d, fill: "none", stroke: EDGE, "stroke-width": 1.6,
       "stroke-dasharray": e.style === "dashed" ? "6 4" : null,
       "marker-end": e.noarrow ? null : `url(#qbA${id})`,
       "marker-start": e.both ? `url(#qbS${id})` : null,
     }, gEdges);
-
-    if (e.label) {
-      let mx, my;
-      if (e.labelAt) [mx, my] = pt(e.labelAt);
-      else {
-        let best = null;
-        for (let i = 0; i < pts.length - 1; i++) {
-          const len = Math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]);
-          if (!best || len > best.len) best = { len, x: (pts[i][0] + pts[i + 1][0]) / 2, y: (pts[i][1] + pts[i + 1][1]) / 2 };
-        }
-        mx = best.x; my = best.y;
-      }
-      const lines = String(e.label).split("\n");
-      const lg = el("g", { class: "qb-edge-label" }, gLabels);
-      const bg = el("rect", { rx: 3, fill: "#FFFFFF", stroke: "#D5DBDB", "stroke-width": 1 }, lg);
-      const h = lines.length * 14 + 6;
-      let w = 0;
-      lines.forEach((line, i) => {
-        const t = el("text", { x: mx, y: my - h / 2 + 14 + i * 14, "text-anchor": "middle", "font-size": 11.5, fill: "#414D5C" }, lg);
-        t.textContent = line;
-        w = Math.max(w, t.getBBox().width);
-      });
-      w += 10;
-      bg.setAttribute("x", (mx - w / 2).toFixed(1)); bg.setAttribute("y", (my - h / 2).toFixed(1));
-      bg.setAttribute("width", w.toFixed(1)); bg.setAttribute("height", h);
+    // sample points along the line, used to keep other edges' labels off it
+    const samples = [];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const [x0, y0] = pts[i], [x1, y1] = pts[i + 1];
+      const n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / 4));
+      for (let k = 0; k <= n; k++) samples.push([x0 + (x1 - x0) * k / n, y0 + (y1 - y0) * k / n]);
     }
+    return { e, ei, pts, samples };
+  });
+
+  // Pass 2: place labels. Try the middle of the longest segment first; if that hides most of a short
+  // line or covers another edge, icon, label or group title, try spots beside the line.
+  const nodeBoxes = [...svg.querySelectorAll(".qb-node use, .qb-node text, .qb-group-label")].map(n => n.getBBox());
+  const placed = [];
+  for (const { e, ei, pts } of drawn) {
+    if (!e.label) continue;
+    let mx, my, seg = null;
+    if (e.labelAt) [mx, my] = pt(e.labelAt);
+    else {
+      for (let i = 0; i < pts.length - 1; i++) {
+        const len = Math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]);
+        if (!seg || len > seg.len) seg = { len, p: pts[i], q: pts[i + 1] };
+      }
+      mx = (seg.p[0] + seg.q[0]) / 2; my = (seg.p[1] + seg.q[1]) / 2;
+    }
+    const lines = String(e.label).split("\n");
+    const lg = el("g", { class: "qb-edge-label", "data-i": ei }, gLabels);
+    const bg = el("rect", { rx: 3, fill: "#FFFFFF", stroke: "#D5DBDB", "stroke-width": 1 }, lg);
+    const h = lines.length * 14 + 6;
+    const texts = lines.map(line => {
+      const t = el("text", { "text-anchor": "middle", "font-size": 11.5, fill: "#414D5C" }, lg);
+      t.textContent = line;
+      return t;
+    });
+    const w = Math.max(...texts.map(t => t.getBBox().width)) + 10;
+
+    if (seg) {
+      const hit = (x, y) => {
+        const r = { x: x - w / 2, y: y - h / 2 };
+        if (r.x < 2 || r.y < 2 || r.x + w > L.W - 2 || r.y + h > L.H - 2) return true;
+        const ov = bb => r.x < bb.x + bb.width && bb.x < r.x + w && r.y < bb.y + bb.height && bb.y < r.y + h;
+        if (nodeBoxes.some(ov) || placed.some(ov)) return true;
+        return drawn.some(o => o.ei !== ei && o.samples.some(([sx, sy]) => sx > r.x + 1 && sx < r.x + w - 1 && sy > r.y + 1 && sy < r.y + h - 1));
+      };
+      const dx = seg.q[0] - seg.p[0], dy = seg.q[1] - seg.p[1];
+      const vertical = Math.abs(dx) < 1, horizontal = Math.abs(dy) < 1;
+      const covered = vertical ? h : horizontal ? w : Math.min(seg.len, Math.hypot(w, h));
+      const onLineOk = seg.len - covered >= 28 && !hit(mx, my);
+      if (!onLineOk) {
+        const side = [[mx + w / 2 + 6, my], [mx - w / 2 - 6, my], [mx, my - h / 2 - 4], [mx, my + h / 2 + 4]];
+        const along = [0.3, 0.7].map(t => [seg.p[0] + dx * t, seg.p[1] + dy * t]);
+        const cands = vertical ? [side[0], side[1]] : horizontal ? [side[2], side[3]] : side;
+        const pick = cands.find(([x, y]) => !hit(x, y)) || along.find(([x, y]) => !hit(x, y));
+        if (pick) [mx, my] = pick;
+      }
+    }
+    texts.forEach((t, i) => { t.setAttribute("x", mx); t.setAttribute("y", my - h / 2 + 14 + i * 14); });
+    bg.setAttribute("x", (mx - w / 2).toFixed(1)); bg.setAttribute("y", (my - h / 2).toFixed(1));
+    bg.setAttribute("width", w.toFixed(1)); bg.setAttribute("height", h);
+    placed.push({ x: mx - w / 2, y: my - h / 2, width: w, height: h });
   }
 }
 

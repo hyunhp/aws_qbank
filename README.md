@@ -19,11 +19,26 @@
 
 ## 해설 아키텍처 다이어그램 (2026-09-25)
 
-- SAA-C03 / SAP-C02 중 구조가 핵심인 185문항(SAA 83, SAP 102)의 해설에 정답 아키텍처 다이어그램을 표시 (정답 확인 후에만 보임). 대상 목록과 사유: `tools/diagrams/selection.json`
-- 설계도 원본은 유형별 DSL 파일(`tools/diagrams/src/*.txt`)이며 `tools/diagrams/dsl.py`로 JSON을 생성.
+- 구조가 핵심인 473개 고유 문항의 해설에 정답 아키텍처 다이어그램을 표시 (정답 확인 후에만 보임).
+- 선별: SAA/SAP는 전 문항 수작업 검토, 나머지 자격증은 SAA/SAP 결정으로 학습한 분류기가 후보를 올리고 문항별로 직접 검토. 대상과 사유는 `tools/diagrams/selection.json`, 검토 후 제외한 후보는 `tools/diagrams/rejected.txt`.
 - 브라우저에서 `js/diagram.js`가 `diagrams/<문항ID>.json` 설계도를 그려서 표시하고, 해설을 처음 열 때만 불러옴. 실패해도 해설 텍스트와 퀴즈 기능에는 영향 없음.
-- 도구·형식 설명: `tools/diagrams/README.md`
+- 설계도 원본은 유형·자격증별 DSL 파일(`tools/diagrams/src/*.txt`)이며 `tools/diagrams/dsl.py`로 JSON을 생성. 도구·형식 설명: `tools/diagrams/README.md`
 - 아이콘: [AWS Architecture Icons](https://aws.amazon.com/architecture/icons/) (AWS 제공, 아키텍처 다이어그램 용도)
+
+| 자격증 | 다이어그램 / 문항 (공유 문항 중복 집계) |
+|---|---|
+| AIB-C01 | 3 / 148 |
+| AIF-C01 | 5 / 142 |
+| AIP-C01 | 37 / 208 |
+| ANS-C01 | 82 / 208 |
+| DEA-C01 | 33 / 199 |
+| DOP-C02 | 58 / 244 |
+| DVA-C02 | 19 / 184 |
+| MLA-C01 | 16 / 197 |
+| SAA-C03 | 83 / 182 |
+| SAP-C02 | 102 / 216 |
+| SCS-C03 | 45 / 211 |
+| SOA-C03 | 29 / 157 |
 
 ## 정답 위치 재배치 (2026-09-24)
 - 기존 문항은 정답이 A/B에 몰려 있어(A 61%, B 35%) 문항 ID 기반 시드로 보기 순서를 섞음. 해설 속 보기 문자 참조("Option B", "(A, D)" 등)도 새 위치로 함께 변환.

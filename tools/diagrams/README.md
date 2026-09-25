@@ -10,6 +10,7 @@ They are rendered in the browser by `js/diagram.js` from small grid specs in `di
 | `diagrams/<QID>.json` | One spec per question. |
 | `diagrams/index.json` | Manifest: question ids with a diagram + content-hash `version` (cache busting). Generated. |
 | `assets/aws-icons.svg` | Sprite of the AWS Architecture Icons used by the specs. Generated. |
+| `tools/diagrams/src/*.txt` + `dsl.py` | Compact batch sources (one file per category) compiled into `diagrams/<QID>.json`. |
 | `tools/diagrams/build_assets.py` | Regenerates the sprite and manifest. Run after any spec or module change. |
 | `tools/diagrams/check.py` | Consistency + layout lint in a real browser, optional screenshots. |
 | `tools/diagrams/preview.html` | Renders every diagram with lint results (serve the repo root over HTTP). |
@@ -38,6 +39,7 @@ They are rendered in the browser by `js/diagram.js` from small grid specs in `di
 
 ## Workflow
 ```bash
+python3 tools/diagrams/dsl.py                                     # src/*.txt -> diagrams/*.json
 python3 tools/diagrams/build_assets.py /path/to/aws-icons/svg   # sprite + manifest
 python3 tools/diagrams/check.py --shots /tmp/diagram-shots        # must print OK
 ```

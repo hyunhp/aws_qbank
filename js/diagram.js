@@ -178,7 +178,8 @@ export function buildSvg(spec) {
       fill: st.fill, stroke: st.stroke, "stroke-width": 1.5, "stroke-dasharray": st.dash,
     }, gGroups);
     if (g.label) {
-      const t = el("text", { class: "qb-group-label", x: g._x0 + 8, y: g._y0 + 17, fill: st.text, "font-size": 12, "font-weight": 600 }, gGroups);
+      const t = el("text", { class: "qb-group-label", x: g._x0 + 8, y: g._y0 + 17, fill: st.text, "font-size": 12, "font-weight": 600,
+        "data-x1": g._x1 - 8 }, gGroups);
       t.textContent = g.label;
     }
   }
@@ -265,6 +266,26 @@ function drawEdges(svg, spec) {
   }
 }
 
+// Move a group title to the right edge of its group if an edge line runs through it.
+function avoidTitleCrossings(svg) {
+  const paths = [...svg.querySelectorAll(".qb-edge")].map(p => {
+    const len = p.getTotalLength(), pts = [];
+    for (let s = 0; s <= len; s += 3) pts.push(p.getPointAtLength(s));
+    return pts;
+  });
+  const crossed = t => {
+    const b = t.getBBox();
+    return paths.some(pts => pts.some(q => q.x > b.x - 4 && q.x < b.x + b.width + 4 && q.y > b.y - 2 && q.y < b.y + b.height + 2));
+  };
+  for (const t of svg.querySelectorAll(".qb-group-label")) {
+    if (!crossed(t)) continue;
+    const x0 = t.getAttribute("x");
+    t.setAttribute("x", t.getAttribute("data-x1"));
+    t.setAttribute("text-anchor", "end");
+    if (crossed(t)) { t.setAttribute("x", x0); t.removeAttribute("text-anchor"); }
+  }
+}
+
 function openZoom(svg, title) {
   const overlay = document.createElement("div");
   overlay.className = "qb-zoom";
@@ -321,6 +342,7 @@ export async function renderDiagram(spec, container, opts = {}) {
   if (opts.beforeAppend && opts.beforeAppend() === false) return null;
   container.appendChild(fig);
   drawEdges(svg, spec);  // needs layout for text measurement
+  avoidTitleCrossings(svg);
   if (opts.zoom !== false) {
     fig.tabIndex = 0;
     fig.setAttribute("aria-label", "Open larger diagram");

@@ -17,9 +17,10 @@
 - **12개 자격증 노출** (자격증 간 공유 태깅된 문항은 두 개 이상의 카운트에 중복 포함됨)
 
 
-## 해설 아키텍처 다이어그램 (2026-09 진행 중)
+## 해설 아키텍처 다이어그램 (2026-09-25)
 
-- SAA-C03 / SAP-C02 문항 중 구조가 핵심인 문항의 해설에 정답 아키텍처 다이어그램을 표시 (정답 확인 후에만 보임).
+- SAA-C03 / SAP-C02 중 구조가 핵심인 185문항(SAA 83, SAP 102)의 해설에 정답 아키텍처 다이어그램을 표시 (정답 확인 후에만 보임). 대상 목록과 사유: `tools/diagrams/selection.json`
+- 설계도 원본은 유형별 DSL 파일(`tools/diagrams/src/*.txt`)이며 `tools/diagrams/dsl.py`로 JSON을 생성.
 - 브라우저에서 `js/diagram.js`가 `diagrams/<문항ID>.json` 설계도를 그려서 표시하고, 해설을 처음 열 때만 불러옴. 실패해도 해설 텍스트와 퀴즈 기능에는 영향 없음.
 - 도구·형식 설명: `tools/diagrams/README.md`
 - 아이콘: [AWS Architecture Icons](https://aws.amazon.com/architecture/icons/) (AWS 제공, 아키텍처 다이어그램 용도)

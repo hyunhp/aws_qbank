@@ -176,11 +176,39 @@ export async function open(opts) {
   qb = opts.qb; root = opts.root; onExit = opts.onExit;
   injectStyles();
   await ensureData();
-  const active = load(KEY_ACTIVE, null);
+  const active = await validActive(load(KEY_ACTIVE, null));
   setupExam = (opts.exam && specs[opts.exam]) ? opts.exam : (active && active.exam) || "SAA-C03";
-  if (active && !active.submitted) { state = active; view = "exam"; await startTicking(); }
+  if (active) { state = active; view = "exam"; await startTicking(); }
   else { state = null; view = "setup"; }
   render();
+}
+
+// A saved in-progress exam can go stale (question bank updated, storage edited, older app version).
+// Keep whatever still matches the current pool; discard it only if nothing usable is left.
+async function validActive(active) {
+  if (!active || active.submitted || typeof active !== "object") return null;
+  if (!specs[active.exam] || !Array.isArray(active.ids)) { drop(KEY_ACTIVE); return null; }
+  const docs = await docsFor(active.exam);
+  const byId = new Map(docs.map(q => [q.id, q]));
+  const ids = active.ids.filter(id => byId.has(id));
+  if (!ids.length) { drop(KEY_ACTIVE); return null; }
+  if (ids.length !== active.ids.length) {
+    const keep = new Set(ids);
+    active.ids = ids;
+    active.answers = Object.fromEntries(Object.entries(active.answers || {}).filter(([k]) => keep.has(k)));
+    active.flags = (active.flags || []).filter(k => keep.has(k));
+  }
+  active.order = active.order || {};
+  ids.forEach(id => {
+    const keys = (byId.get(id).choices || []).map(c => c.key);
+    const o = active.order[id];
+    if (!Array.isArray(o) || o.length !== keys.length || !o.every(k => keys.includes(k))) active.order[id] = shuffle(keys);
+  });
+  active.answers = active.answers || {};
+  active.flags = active.flags || [];
+  active.cur = Math.min(Math.max(0, active.cur | 0), ids.length - 1);
+  save(KEY_ACTIVE, active);
+  return active;
 }
 
 function exit() {
@@ -326,6 +354,11 @@ async function renderExam() {
   const byId = new Map(docs.map(q => [q.id, q]));
   const id = state.ids[state.cur];
   const q = byId.get(id);
+  if (!q) {  // should not happen after validActive(), but never leave a blank screen
+    state.ids = state.ids.filter(x => byId.has(x));
+    if (!state.ids.length) { drop(KEY_ACTIVE); state = null; view = "setup"; return render(); }
+    state.cur = Math.min(state.cur, state.ids.length - 1); persist(); return renderExam();
+  }
   const n = state.ids.length;
   const answered = Object.keys(state.answers).filter(k => (state.answers[k] || []).length).length;
   const multi = (q.correctKeys || []).length > 1;

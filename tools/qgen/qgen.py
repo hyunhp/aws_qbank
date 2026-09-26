@@ -278,13 +278,29 @@ def check(path, write=False):
             warns.append(f"{i['where']}: correct answer is much longer than every distractor")
     if items and longest / len(items) > 0.25:
         errors.append(f"length bias: correct answer is clearly longest in {longest}/{len(items)} questions (max 25%)")
-    strict = sum(1 for i in items if max(i["choices"], key=lambda k: len(i["choices"][k])) in i["keys"])
+    def stands_out(i, longest):
+        """correct answer is the longest (or shortest) option by a visible margin (8%), not a near-tie"""
+        lens = {k: len(t) for k, t in i["choices"].items()}
+        wrong = [l for k, l in lens.items() if k not in i["keys"]]
+        if longest:
+            return min(lens[k] for k in i["keys"]) > max(wrong) * 1.08
+        return max(lens[k] for k in i["keys"]) < min(wrong) * 0.92
+    strict = sum(1 for i in items if stands_out(i, True))
     # single-answer baseline is 25% (1 of 4); multi-answer questions raise it, so allow some headroom
-    limit = 0.25 + 0.4 * sum(1 for i in items if len(i["keys"]) > 1) / max(1, len(items)) + 0.08
+    limit = 0.25 + 0.3 * sum(1 for i in items if len(i["keys"]) > 1) / max(1, len(items))
     if items and strict / len(items) > limit:
-        errors.append(f"length bias: correct answer is the longest option in {strict}/{len(items)} questions (limit {limit:.0%})")
+        errors.append(f"length bias: correct answer is clearly the longest option in {strict}/{len(items)} questions (limit {limit:.0%})")
     elif items:
-        print(f"  correct answer is the longest option in {strict}/{len(items)} ({strict / len(items):.0%}, limit {limit:.0%})")
+        print(f"  correct answer clearly longest in {strict}/{len(items)} ({strict / len(items):.0%}, limit {limit:.0%})")
+    singles = [i for i in items if len(i["keys"]) == 1]
+    short = sum(1 for i in singles if stands_out(i, False))
+    if singles and short / len(singles) > 0.30:
+        errors.append(f"length bias: correct answer is clearly the shortest option in {short}/{len(singles)} single-answer questions (max 30%)")
+    for i in singles:
+        lens = {k: len(t) for k, t in i["choices"].items()}
+        c = lens[i["keys"][0]]
+        if c * 2 < min(l for k, l in lens.items() if k not in i["keys"]):
+            warns.append(f"{i['where']}: correct answer is less than half the length of every distractor")
 
     multi = sum(1 for i in items if len(i["keys"]) > 1)
     print(f"{path}: {len(items)} questions, {multi} multi-answer, {len(errors)} errors, {len(warns)} warnings")

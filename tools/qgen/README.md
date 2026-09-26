@@ -23,7 +23,7 @@ Checks that reject a batch:
 
 On ingest the correct answer is placed in the least-used position for that exam, the explanation is
 assembled in the site's three-part format, shared questions (`+SOA-C03:D2`) are written to every exam
-file and to `data/_exam_domains.json`.
+file and to `data/exam-domains.json`.
 
 After ingesting: run `node tools/mock_unit_test.mjs`, `python3 tools/mock_e2e_test.py`, and for
 structural questions consider a diagram (`tools/diagrams/`).

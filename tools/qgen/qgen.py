@@ -30,7 +30,7 @@ import collections, hashlib, json, pathlib, random, re, sys
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DATA = ROOT / "data"
 STATE = ROOT / "tools/qgen/ingested.json"          # block hash -> question id
-SPECS = json.loads((DATA / "_exam_specs.json").read_text())
+SPECS = json.loads((DATA / "exam-specs.json").read_text())
 TASKS = json.loads((ROOT / "tools/qgen/tasks.json").read_text())
 EXAMS = [k for k in SPECS if not k.startswith("_")]
 TARGET_MULT = 5                                   # pool target = 5 full exams
@@ -48,7 +48,7 @@ def save_exam(code, qs):
 
 
 def domain_map():
-    p = DATA / "_exam_domains.json"
+    p = DATA / "exam-domains.json"
     return json.loads(p.read_text()) if p.exists() else {}
 
 
@@ -390,7 +390,7 @@ def ingest(items, state):
     for e in EXAMS:
         files[e].sort(key=lambda x: x["id"])
         save_exam(e, files[e])
-    (DATA / "_exam_domains.json").write_text(json.dumps(dict(sorted(dmap.items())), indent=1) + "\n")
+    (DATA / "exam-domains.json").write_text(json.dumps(dict(sorted(dmap.items())), indent=1) + "\n")
     STATE.write_text(json.dumps(state, indent=1, sort_keys=True) + "\n")
     print(f"ingested: {added} new, {updated} updated")
 

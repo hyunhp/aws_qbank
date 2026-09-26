@@ -1,5 +1,5 @@
 """Regression tests for opening mock exams by link, including stale saved exam state."""
-import subprocess, time, json, sys
+import subprocess, time, json, sys, re
 from playwright.sync_api import sync_playwright
 PORT = 8768
 srv = subprocess.Popen(["python3", "-m", "http.server", str(PORT)], cwd="/home/claude/aws_qbank",
@@ -37,8 +37,11 @@ try:
             "expired + history object": {"aws_qbank_mock_active_v1": active(real, timed=True, deadline=1),
                                           "aws_qbank_mock_history_v1": json.dumps({"a": 1})},
         }
+        def jekyll_like(ctx):
+            # GitHub Pages (legacy Jekyll build) does not publish files or folders starting with "_".
+            ctx.route(re.compile(r".*/_[^/]*$"), lambda r: r.fulfill(status=404, content_type="text/html", body="<!DOCTYPE html><p>404</p>"))
         for label, saved, expect in cases:
-            ctx = b.new_context(); pg = ctx.new_page(); errs = []
+            ctx = b.new_context(); jekyll_like(ctx); pg = ctx.new_page(); errs = []
             pg.on("pageerror", lambda e: errs.append(str(e)[:120]))
             pg.goto(BASE + "#exam=SAA-C03"); pg.wait_for_selector(".qcard")
             if saved is not None: pg.evaluate(f"localStorage.setItem('aws_qbank_mock_active_v1', {json.dumps(saved)})")
@@ -68,11 +71,11 @@ try:
         # forced failure: error screen offers a reset that actually recovers
         ctx = b.new_context(); pg = ctx.new_page(); errs = []
         pg.on("pageerror", lambda e: errs.append(str(e)[:120]))
-        pg.route("**/data/_exam_specs.json", lambda r: r.fulfill(status=500, body="x"))
+        pg.route("**/data/exam-specs.json", lambda r: r.fulfill(status=500, body="x"))
         pg.goto(BASE + "#mock=SOA-C03"); pg.wait_for_timeout(2000)
         txt = pg.inner_text("#mockRoot")
         check("spec failure shows error screen", "could not" in txt.lower(), txt[:100])
-        pg.unroute("**/data/_exam_specs.json")
+        pg.unroute("**/data/exam-specs.json")
         btn = pg.query_selector("#mockReset") or pg.query_selector("[data-act=resetall]")
         check("reset button present", btn is not None)
         if btn: btn.click(); pg.wait_for_timeout(2000)

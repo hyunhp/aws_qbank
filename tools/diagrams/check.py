@@ -75,7 +75,7 @@ def terms_for(icon):
 def load_questions():
     qs = {}
     for f in (ROOT / "data").glob("*.json"):
-        if f.name.startswith("_"):
+        if f.name.startswith("_") or f.name.startswith("exam-"):
             continue
         for q in json.loads(f.read_text()):
             qs[q["id"]] = q

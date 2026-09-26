@@ -23,7 +23,7 @@
 - 실제 시험 길이(문항 수·시간) 또는 짧은 모드(20문항, 시간은 비례)를 선택. 공식 도메인 가중치대로 층화 추출하고, 이전 모의고사에서 안 본 문항을 먼저 뽑음. 보기 순서도 매번 섞음.
 - 시험 중에는 정답·해설 비공개, 플래그·현황판·타이머(0:00에 자동 제출), 새로고침해도 이어서 진행.
 - 결과: 정답률, 도메인별 정답률, 합격권 판정(Foundational·Associate 80%, Professional·Specialty 85% 기준 — AWS 환산 점수가 아님), 틀린/플래그 문항 리뷰(해설·다이어그램), 응시 기록.
-- 데이터: `data/_exam_specs.json`(문항 수·시간·도메인 가중치), `data/_exam_domains.json`(여러 자격증에 걸친 문항의 자격증별 도메인).
+- 데이터: `data/exam-specs.json`(문항 수·시간·도메인 가중치), `data/exam-domains.json`(여러 자격증에 걸친 문항의 자격증별 도메인).
 - 코드: `js/mock.js`(수정 후 `python3 tools/stamp_version.py`로 캐시 버전 갱신). 테스트: `node tools/mock_unit_test.mjs`, `python3 tools/mock_e2e_test.py`.
 
 ## 해설 아키텍처 다이어그램 (2026-09-25)

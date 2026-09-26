@@ -1,8 +1,8 @@
 // Unit tests for mock exam drawing: node tools/mock_unit_test.mjs
 import { draw, allocate, domainOf } from "../js/mock.js";
 import fs from "fs";
-const specs = JSON.parse(fs.readFileSync("data/_exam_specs.json"));
-const map = JSON.parse(fs.readFileSync("data/_exam_domains.json"));
+const specs = JSON.parse(fs.readFileSync("data/exam-specs.json"));
+const map = JSON.parse(fs.readFileSync("data/exam-domains.json"));
 let fails = 0;
 const ok = (name, cond, info = "") => { if (!cond) { fails++; console.log("FAIL", name, info); } };
 for (const exam of Object.keys(specs).filter(k => !k.startsWith("_"))) {

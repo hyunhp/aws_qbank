@@ -9,7 +9,7 @@ class Q(http.server.SimpleHTTPRequestHandler):
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Q, directory=ROOT))
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 BASE = f"http://127.0.0.1:{srv.server_address[1]}/"
-data = {p.stem: {q["id"]: q for q in json.load(open(p))} for p in pathlib.Path(ROOT, "data").glob("*.json") if not p.stem.startswith("_")}
+data = {p.stem: {q["id"]: q for q in json.load(open(p))} for p in pathlib.Path(ROOT, "data").glob("*.json") if not p.stem.startswith("_") and not p.stem.startswith("exam-")}
 res = []
 def ok(n, c, info=""): res.append((n, bool(c))); print(("PASS " if c else "FAIL ") + n + (f"  [{info}]" if info and not c else ""))
 

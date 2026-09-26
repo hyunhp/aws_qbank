@@ -12,8 +12,8 @@ const HISTORY_MAX = 200;
 let qb = null;           // helpers passed from index.html
 let root = null;
 let onExit = null;
-let specs = null;        // data/_exam_specs.json
-let domainMap = null;    // data/_exam_domains.json
+let specs = null;        // data/exam-specs.json
+let domainMap = null;    // data/exam-domains.json
 let state = null;        // running or finished exam
 let view = "setup";
 let setupExam = null;
@@ -178,8 +178,8 @@ function injectStyles() {
 async function ensureData() {
   if (!specs) {
     const [s, m] = await Promise.all([
-      fetch("./data/_exam_specs.json", { cache: "no-cache" }).then(r => r.json()),
-      fetch("./data/_exam_domains.json", { cache: "no-cache" }).then(r => r.ok ? r.json() : {}).catch(() => ({})),
+      fetch("./data/exam-specs.json", { cache: "no-cache" }).then(r => r.json()),
+      fetch("./data/exam-domains.json", { cache: "no-cache" }).then(r => r.ok ? r.json() : {}).catch(() => ({})),
     ]);
     specs = s; domainMap = m;
   }

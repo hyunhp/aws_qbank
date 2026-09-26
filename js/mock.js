@@ -19,11 +19,26 @@ let view = "setup";
 let setupExam = null;
 let tick = null;
 let reviewFilter = "incorrect";
+let lastOpts = null;     // remembered so the error screen can retry a full open
 
 // ---------- storage ----------
 const load = (k, d) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } };
 const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* quota or private mode */ } };
 const drop = (k) => { try { localStorage.removeItem(k); } catch (e) {} };
+// Stored values can be missing, from an older version, or hand-edited; never trust their shape.
+const isObj = (v) => v && typeof v === "object" && !Array.isArray(v);
+function loadHistory() {
+  const v = load(KEY_HISTORY, []);
+  return Array.isArray(v) ? v.filter(h => isObj(h) && typeof h.exam === "string" && Number.isFinite(h.correct) && Number.isFinite(h.total) && h.total > 0) : [];
+}
+function loadSeen() {
+  const v = load(KEY_SEEN, {});
+  if (!isObj(v)) return {};
+  const out = {};
+  Object.entries(v).forEach(([k, arr]) => { if (Array.isArray(arr)) out[k] = arr.filter(x => typeof x === "string"); });
+  return out;
+}
+export function resetAllMockData() { [KEY_ACTIVE, KEY_HISTORY, KEY_SEEN].forEach(drop); }
 
 // ---------- helpers ----------
 const esc = (s) => (s == null ? "" : String(s)).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -173,14 +188,21 @@ async function docsFor(exam) { return (await qb.loadExam(exam)) || []; }
 
 // ---------- lifecycle ----------
 export async function open(opts) {
+  lastOpts = opts;
   qb = opts.qb; root = opts.root; onExit = opts.onExit;
   injectStyles();
-  await ensureData();
-  const active = await validActive(load(KEY_ACTIVE, null));
-  setupExam = (opts.exam && specs[opts.exam]) ? opts.exam : (active && active.exam) || "SAA-C03";
-  if (active) { state = active; view = "exam"; await startTicking(); }
-  else { state = null; view = "setup"; }
-  render();
+  state = null; view = "setup";
+  try {
+    await ensureData();
+    const active = await validActive(load(KEY_ACTIVE, null));
+    setupExam = (opts.exam && specs[opts.exam]) ? opts.exam : (active && active.exam) || "SAA-C03";
+    if (active) { state = active; view = "exam"; await startTicking(); }
+  } catch (err) {
+    if (!specs) { showError(new Error("Could not load exam settings. Check your connection and reload. (" + (err && err.message) + ")")); return; }
+    drop(KEY_ACTIVE); state = null; view = "setup";
+    setupExam = (opts.exam && specs[opts.exam]) ? opts.exam : "SAA-C03";
+  }
+  await render();
 }
 
 // A saved in-progress exam can go stale (question bank updated, storage edited, older app version).
@@ -223,7 +245,7 @@ async function startExam(mode, timed) {
   const spec = specs[setupExam];
   const docs = await docsFor(setupExam);
   const n = mode === "short" ? Math.min(SHORT_N, docs.length) : Math.min(spec.questions, docs.length);
-  const seenAll = load(KEY_SEEN, {});
+  const seenAll = loadSeen();
   const ids = draw(setupExam, n, docs, spec, domainMap, seenAll[setupExam]);
   const byId = new Map(docs.map(q => [q.id, q]));
   const order = {};
@@ -281,10 +303,10 @@ async function submit(auto) {
   state.results = results;
   state.summary = { correct, total: state.ids.length, dom, used };
   // history + seen
-  const hist = load(KEY_HISTORY, []);
+  const hist = loadHistory();
   hist.push({ exam: state.exam, mode: state.mode, at: Date.now(), correct, total: state.ids.length, dom, used, timed: state.timed, auto: state.auto });
   save(KEY_HISTORY, hist.slice(-HISTORY_MAX));
-  const seen = load(KEY_SEEN, {});
+  const seen = loadSeen();
   seen[state.exam] = Array.from(new Set((seen[state.exam] || []).concat(state.ids)));
   save(KEY_SEEN, seen);
   drop(KEY_ACTIVE);
@@ -296,22 +318,38 @@ async function submit(auto) {
 
 // ---------- rendering ----------
 function render() {
-  if (!root) return;
-  if (view === "setup") return renderSetup();
-  if (view === "exam") return renderExam();
-  if (view === "grid") return renderGrid();
-  if (view === "results") return renderResults();
-  if (view === "review") return renderReview();
+  if (!root) return Promise.resolve();
+  const fn = { setup: renderSetup, exam: renderExam, grid: renderGrid, results: renderResults, review: renderReview }[view];
+  return Promise.resolve().then(() => fn && fn()).catch(showError);
+}
+
+// Shown instead of a blank screen when anything goes wrong; works without help from index.html.
+function showError(err) {
+  stopTicking();
+  console.warn("Mock exam error", err);
+  const msg = (err && (err.message || String(err))) || "unknown error";
+  root.innerHTML = `<div class="mk"><button class="linkbtn" data-act="exit">← Question bank</button>
+    <h2>Mock exam could not be displayed</h2>
+    <div class="panel"><p>Saved mock exam data in this browser seems to be damaged or from an older version.</p>
+    <p>Resetting clears this browser's mock exam progress, history, and seen-question list. Bookmarks are not affected.</p>
+    <div class="btnrow"><button class="btn" data-act="resetall">Reset mock exam data</button></div>
+    <div class="meta">Details: ${esc(msg)}</div></div></div>`;
+  root.onclick = (e) => {
+    const t = e.target.closest("[data-act]");
+    if (!t) return;
+    if (t.dataset.act === "exit") { state = null; view = "setup"; exit(); }
+    else if (t.dataset.act === "resetall") { resetAllMockData(); state = null; view = "setup"; if (lastOpts) open(lastOpts); }
+  };
 }
 
 async function renderSetup(extra) {
   const spec = specs[setupExam];
   const docs = await docsFor(setupExam);
-  const seen = new Set((load(KEY_SEEN, {})[setupExam]) || []);
+  const seen = new Set(loadSeen()[setupExam] || []);
   const unseen = docs.filter(q => !seen.has(q.id)).length;
   const fullN = Math.min(spec.questions, docs.length);
   const shortN = Math.min(SHORT_N, docs.length);
-  const hist = load(KEY_HISTORY, []).filter(h => h.exam === setupExam).slice(-10).reverse();
+  const hist = loadHistory().filter(h => h.exam === setupExam).slice(-10).reverse();
   const opts = (qb.EXAMS || []).filter(([c]) => specs[c]).map(([c, n]) => `<option value="${c}"${c === setupExam ? " selected" : ""}>${c} · ${esc(n)}</option>`).join("");
   const mode = (extra && extra.mode) || root.dataset.mode || "full";
   root.dataset.mode = mode;
@@ -344,7 +382,7 @@ async function renderSetup(extra) {
     const act = t.dataset.act;
     if (act === "exit") exit();
     else if (act === "start") startExam(root.dataset.mode, root.querySelector("#mkTimed").checked);
-    else if (act === "resetseen") { const s = load(KEY_SEEN, {}); delete s[setupExam]; save(KEY_SEEN, s); renderSetup(); }
+    else if (act === "resetseen") { const s = loadSeen(); delete s[setupExam]; save(KEY_SEEN, s); renderSetup(); }
   };
   root.querySelector("#mkExam").onchange = (e) => { setupExam = e.target.value; renderSetup(); };
 }

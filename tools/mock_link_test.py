@@ -27,7 +27,16 @@ try:
             ("bad order", active(real[:2], order={real[0]: ["Z"]}), "exam"),
             ("unknown exam", active(real[:2], exam="XYZ-C01"), "setup"),
             ("corrupt json", "{bad", "setup"),
+            ("expired timed exam", active(real, timed=True, deadline=1), "results"),
         ]
+        extra = {
+            "history is object": {"aws_qbank_mock_history_v1": json.dumps({"a": 1})},
+            "history bad entries": {"aws_qbank_mock_history_v1": json.dumps([None, {"exam": "SOA-C03"}, 5])},
+            "history is number": {"aws_qbank_mock_history_v1": "5"},
+            "seen not arrays": {"aws_qbank_mock_seen_v1": json.dumps({"SOA-C03": {"x": 1}, "SAA-C03": "abc"})},
+            "expired + history object": {"aws_qbank_mock_active_v1": active(real, timed=True, deadline=1),
+                                          "aws_qbank_mock_history_v1": json.dumps({"a": 1})},
+        }
         for label, saved, expect in cases:
             ctx = b.new_context(); pg = ctx.new_page(); errs = []
             pg.on("pageerror", lambda e: errs.append(str(e)[:120]))
@@ -37,6 +46,7 @@ try:
             txt = pg.inner_text("#mockRoot")
             check(f"{label}: not blank", len(txt) > 50, txt[:80])
             if expect == "setup": check(f"{label}: setup shown", "Start exam" in txt, txt[:80])
+            elif expect == "results": check(f"{label}: results shown", "Review" in txt or "Score" in txt or "%" in txt, txt[:80])
             else: check(f"{label}: exam resumed", "answered" in txt and "SOA-C03" in txt, txt[:80])
             if label == "some ids stale":
                 st = json.loads(pg.evaluate("localStorage.getItem('aws_qbank_mock_active_v1')"))
@@ -45,6 +55,31 @@ try:
                 check("stale answer pruned", "Q999999" not in st["answers"], st["answers"])
             check(f"{label}: no page errors", not errs, errs)
             ctx.close()
+        for label, stores in extra.items():
+            ctx = b.new_context(); pg = ctx.new_page(); errs = []
+            pg.on("pageerror", lambda e: errs.append(str(e)[:120]))
+            pg.goto(BASE + "#exam=SAA-C03"); pg.wait_for_selector(".qcard")
+            for k, v in stores.items(): pg.evaluate(f"localStorage.setItem({json.dumps(k)}, {json.dumps(v)})")
+            pg.goto(BASE + "#mock=SOA-C03"); pg.reload(); pg.wait_for_timeout(2000)
+            txt = pg.inner_text("#mockRoot")
+            check(f"{label}: usable screen", len(txt) > 50 and "could not" not in txt.lower(), txt[:100])
+            check(f"{label}: no page errors", not errs, errs)
+            ctx.close()
+        # forced failure: error screen offers a reset that actually recovers
+        ctx = b.new_context(); pg = ctx.new_page(); errs = []
+        pg.on("pageerror", lambda e: errs.append(str(e)[:120]))
+        pg.route("**/data/_exam_specs.json", lambda r: r.fulfill(status=500, body="x"))
+        pg.goto(BASE + "#mock=SOA-C03"); pg.wait_for_timeout(2000)
+        txt = pg.inner_text("#mockRoot")
+        check("spec failure shows error screen", "could not" in txt.lower(), txt[:100])
+        pg.unroute("**/data/_exam_specs.json")
+        btn = pg.query_selector("#mockReset") or pg.query_selector("[data-act=resetall]")
+        check("reset button present", btn is not None)
+        if btn: btn.click(); pg.wait_for_timeout(2000)
+        txt = pg.inner_text("#mockRoot")
+        check("reset recovers to setup", "Start exam" in txt, txt[:100])
+        check("no page errors on reset path", not errs, errs)
+        ctx.close()
         # hash navigation from an open page opens the mock exam
         ctx = b.new_context(); pg = ctx.new_page()
         pg.goto(BASE + "#exam=SAA-C03"); pg.wait_for_selector(".qcard")

@@ -397,7 +397,7 @@ def ingest(items, state):
 
 def report():
     dmap = domain_map()
-    print(f"{'exam':9} {'pool':>5} {'target':>6} {'need':>5} {'multi%':>6}  answer positions   longest-correct%")
+    print(f"{'exam':9} {'pool':>5} {'target':>6} {'need':>5} {'multi%':>6}  answer positions   correct-clearly-longest%")
     for e in EXAMS:
         qs = load_exam(e)
         multi = sum(1 for q in qs if len(q["correctKeys"]) > 1)
@@ -405,7 +405,8 @@ def report():
         longest = 0
         for q in qs:
             lens = {c["key"]: len(c["text"]) for c in q["choices"]}
-            if max(lens, key=lens.get) in q["correctKeys"]:
+            wrong = [l for k, l in lens.items() if k not in q["correctKeys"]]
+            if min(lens[k] for k in q["correctKeys"]) > max(wrong) * 1.08:   # clearly longest, ignoring near-ties
                 longest += 1
         print(f"{e:9} {len(qs):5} {target(e):6} {max(0, target(e) - len(qs)):5} {multi * 100 / len(qs):6.1f}  "
               f"{' '.join(f'{k}{pos[k]}' for k in 'ABCDE')}   {longest * 100 / len(qs):.0f}%")

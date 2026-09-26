@@ -13,7 +13,7 @@ threading.Thread(target=srv.serve_forever,daemon=True).start()
 BASE=f"http://127.0.0.1:{srv.server_address[1]}/"
 ids=set(json.load(open(f"{ROOT}/diagrams/index.json"))["ids"])
 exams={}
-for f in sorted(glob.glob(f"{ROOT}/data/*.json")):
+for f in sorted(g for g in glob.glob(f"{ROOT}/data/*.json") if not pathlib.Path(g).name.startswith("_")):
     if f.endswith("_manifest.json"): continue
     code=f.split("/")[-1][:-5]
     qs=json.load(open(f))

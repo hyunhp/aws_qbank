@@ -1,0 +1,313 @@
+# SAP-C02 detailed explanations, e15 (explanation-only rewrites; letters are the published ones)
+
+@ Q003123 explain
+G: ## How Session Manager replaces SSH
+**AWS Systems Manager Session Manager** opens an interactive shell on an instance through the Systems Manager service instead of through port 22.
+- The **SSM Agent** on the instance makes an outbound HTTPS (443) connection to the Systems Manager endpoints, or to VPC interface endpoints such as `ssm` and `ssmmessages` in private subnets. No inbound rule, public IP or bastion host is needed.
+- Who may start a session is controlled by IAM, for example allowing `ssm:StartSession` only on instances tagged `Env=prod` for a given role.
+- Session activity can be logged to Amazon S3 or CloudWatch Logs, and session starts are recorded by CloudTrail.
+## Example
+An administrator signs in through IAM Identity Center, runs `aws ssm start-session --target i-0abc123` and gets a shell. There is no key file to lose or rotate, and the whole session is recorded.
+W: Session Manager with IAM and logging: access is granted and revoked through IAM identities, not key files, the instances need no open inbound ports or bastion, and every session can be audited.
+X: B=Public IPs with SSH from the office: the instances are still internet-facing on port 22 and access still depends on long-lived SSH keys, which is exactly what the company wants to remove.
+C=Shared key in team chat: a shared key cannot be tied to one person, cannot be revoked for one user, and posting it in chat exposes it to everyone with access to the channel and its history.
+D=Bastion with yearly key rotation: it keeps both things the company wants to eliminate, a bastion host to patch and expose, and long-lived keys that stay valid for up to a year.
+T: Session Manager gives IAM-controlled, logged shell access with no SSH keys, bastions or inbound ports; tightening SSH still leaves keys and exposure.
+
+@ Q003124 explain
+G: ## WORM storage with S3 Object Lock
+**S3 Object Lock** stores objects in a write-once-read-many model: while an object version is under retention, it cannot be overwritten or deleted. Versioning must be on for the bucket.
+- **Governance mode**: users with the special `s3:BypassGovernanceRetention` permission can still remove the lock.
+- **Compliance mode**: nobody, including the account root user, can shorten the retention period or delete the object version until retention expires.
+- A default retention, for example 3 years, can be set on the bucket so every new log object is protected automatically.
+## Why a separate account
+If logs sit in the same account as the application, an attacker or insider with broad rights there can tamper with the pipeline. A dedicated log-archive account, with the application accounts only allowed to write, separates the people who produce logs from the place logs are kept.
+W: Object Lock compliance mode in a separate account: compliance mode makes each log object immutable for the full three years with no bypass, and the separate account keeps application administrators away from the stored evidence.
+X: B=Daily email to a shared mailbox: anyone with mailbox access can delete or edit messages, and email offers no retention lock, so it proves nothing about tampering.
+C=Local disks with limited SSH: administrators with SSH can still edit or delete the files, and instance disks can be lost when an instance is replaced, so there is neither immutability nor durability.
+D=CloudWatch Logs with a "please don't delete" policy: a written request is not a control; anyone with delete permissions on the log group can still remove the data.
+T: Auditor-grade immutability needs a technical lock that no one can bypass, S3 Object Lock in compliance mode, ideally in an isolated log account.
+
+@ Q003125 explain
+G: ## Choosing the right scaling signal
+Target tracking scaling keeps a metric near a target value by adding or removing instances. The metric decides how fast scaling reacts.
+- **CPU utilization** rises only after instances are already busy, so for a web tier it often lags the real load.
+- **`ALBRequestCountPerTarget`** measures how many requests each target receives. It rises as soon as traffic grows, before CPU saturates.
+- A **lower target value**, for example 500 instead of 1,000 requests per target, keeps more headroom per instance.
+- **Instance warm-up** tells Auto Scaling how long a new instance takes before its metrics count. If it is set longer than the real boot time, further scale-out is held back.
+## Example
+Traffic doubles in five minutes. With request-count tracking at a lower target and a warm-up that matches the actual boot time, new instances launch early and start taking traffic before the existing ones hit 90% CPU.
+W: Request count per target with lower target and shorter warm-up: the policy reacts directly to traffic, adds capacity sooner, and counts new instances as ready as soon as they really are.
+X: A=Longer ALB idle timeout: the idle timeout only controls how long an idle connection stays open; it adds no capacity, so saturated targets stay just as slow.
+C=Fixed large instances without Auto Scaling: capacity is fixed, so it either wastes money at low traffic or still runs out as traffic keeps growing, and failed instances are no longer replaced automatically.
+D=Disable health checks: unhealthy instances would keep receiving traffic, which worsens latency and errors; health checks do not slow scaling down.
+T: Scale web tiers on a leading load signal such as requests per target with realistic warm-up, not by tuning timeouts or removing safety checks.
+
+@ Q003126 explain
+G: ## Caching data that changes slowly
+If a result only changes once an hour, running the same expensive query for every request wastes time and database capacity. A cache stores the result once and serves it until it expires.
+- **TTL (time to live)** controls expiry. Setting it to about one hour matches how often the data changes.
+- **Amazon API Gateway caching** (REST APIs) caches whole responses at the API stage, keyed by path and chosen parameters; the TTL can be set up to 3,600 seconds.
+- **Amazon ElastiCache** (Redis OSS, Valkey or Memcached) lets the application cache query results itself, for example under the key `report:region=eu:hour=14`.
+## Example
+The first request after the hour runs the slow query (a cache miss) and stores the result. Every later request in that hour is a cache hit that returns in milliseconds, and the analytics database sees one query per hour per key instead of thousands.
+W: Cache results with a one-hour TTL: responses become fast, the downstream query load drops sharply, and the one-hour expiry keeps results as fresh as the data itself.
+X: A=Run the query twice and take the faster: it doubles the load on an already slow system and makes latency worse under traffic.
+B=Longer API timeout: fewer requests time out, but every response is still just as slow and the query still runs on every call.
+D=Larger database instance: it costs more and may shave some time, but the same redundant query still runs for every request, when the result could be reused for an hour.
+T: When data changes on a known schedule, cache it with a matching TTL instead of recomputing it on every request.
+
+@ Q003127 explain
+G: ## Making S3 dependencies multi-Region
+An S3 bucket is stored redundantly across Availability Zones in one Region, but it still lives in that single Region. If S3 in that Region is impaired, every application that reads its configuration from the bucket is affected.
+## S3 Cross-Region Replication
+- **Cross-Region Replication (CRR)** asynchronously copies new objects from a source bucket to a bucket in another Region. Versioning must be enabled on both buckets.
+- **S3 Replication Time Control** adds a predictable replication time with metrics, if a replication SLA is needed.
+- The application needs a **fallback path**: try the primary bucket, and on failure read from the replica. S3 Multi-Region Access Points can also route requests to a replica bucket.
+## Example
+Config files in `s3://app-config-use1` replicate to `s3://app-config-usw2`. The client reads from the first bucket and switches to the second after errors or timeouts.
+W: Replicate to a second Region with fallback: a copy of the configuration exists outside the primary Region, and the application knows how to use it, which removes the single-Region dependency.
+X: A=Transfer Acceleration: it speeds up long-distance uploads and downloads through edge locations, but the data still lives in one bucket in one Region, so an outage there still breaks the application.
+B=Combine files into one large object: object size has nothing to do with availability; one big object is still in the same single bucket and is harder to update safely.
+C=Root volume only: each instance holds its own copy with no central source of truth, so updates are hard to distribute consistently and a replaced instance loses its files.
+T: Resilience against a Regional S3 problem needs a replicated copy in another Region plus a fallback in the application, not a faster or bigger single bucket.
+
+@ Q003128 explain
+G: ## Poison messages in Amazon SQS
+When a consumer receives a message, SQS hides it for the **visibility timeout**. If the consumer crashes before deleting it, the message becomes visible again and is retried. A malformed "poison" message can crash consumers over and over.
+## Dead-letter queues
+- A **redrive policy** on the source queue names a **dead-letter queue (DLQ)** and a `maxReceiveCount`, for example 5.
+- After a message has been received 5 times without being deleted, SQS moves it to the DLQ automatically.
+- Normal messages keep flowing, and engineers can inspect the bad message later, fix the code, and use **DLQ redrive** to send messages back to the source queue.
+- For FIFO queues this matters even more, because a stuck message blocks the rest of its message group.
+W: DLQ with maximum receive count: repeatedly failing messages are moved aside automatically after a bounded number of attempts, so processing continues and the bad messages are kept for analysis.
+X: B=Only one consumer: throughput drops, and the single consumer still crashes on the same malformed message and keeps retrying it.
+C=Twelve-hour visibility timeout: the bad message is hidden longer but comes back and fails again, and legitimate messages whose consumer crashes are also delayed for up to twelve hours.
+D=Delete and recreate the queue: all pending valid messages are lost, the queue URL consumers use is disrupted, and the problem returns with the next malformed message.
+T: Bound retries with a dead-letter queue and maxReceiveCount so poison messages are isolated instead of blocking the whole queue.
+
+@ Q003129 explain
+G: ## How EBS volume types are billed
+- **io2** (Provisioned IOPS SSD) charges for storage plus every IOPS you provision, whether you use it or not. It is meant for workloads that need very high, consistent IOPS and very high durability.
+- **gp3** (General Purpose SSD) includes a baseline of 3,000 IOPS and 125 MiB/s with the storage price. More IOPS and throughput can be provisioned separately and much more cheaply, independent of volume size.
+## Right-sizing with metrics
+CloudWatch metrics such as `VolumeReadOps` and `VolumeWriteOps` show the real IOPS a volume uses. If a volume is provisioned for 20,000 IOPS but peaks at 1,500, the company is paying for more than 90% unused capacity. Moving to gp3 with IOPS set a little above the measured peak keeps performance and cuts cost. EBS Elastic Volumes can change the volume type without detaching it.
+W: gp3 matched to measured usage: gp3 covers the observed IOPS, often within its included baseline, at a far lower price than paying for unused provisioned io2 IOPS.
+X: A=Increase provisioned IOPS: usage is already under 10% of what is provisioned, so adding more IOPS raises the bill for capacity that is never used.
+C=Keep it because IOPS are free: provisioned IOPS on io2 are billed per IOPS-month, so idle provisioned IOPS are a direct, recurring cost.
+D=More io2 volumes striped: striping adds more provisioned IOPS and storage to pay for, while the problem is that the existing IOPS are already mostly unused.
+T: Pay for measured performance: move over-provisioned io2 volumes to gp3 sized to actual IOPS instead of buying even more provisioned capacity.
+
+@ Q003130 explain
+G: ## Provisioned clusters versus Redshift Serverless
+- A **provisioned Redshift cluster** bills for its nodes every hour they run, whether queries are running or not. Idle nights and weekends are paid in full unless someone pauses and resumes the cluster.
+- **Amazon Redshift Serverless** has no nodes to manage. Compute is measured in **RPUs** and billed per second (with a 60-second minimum) only while queries run; storage is billed separately. When no queries run, compute cost stops.
+- Capacity scales automatically for busy daytime periods, and a base capacity and usage limits can be set to control spending.
+## Example
+A cluster runs 168 hours a week but is used about 50. With Serverless, the company pays compute for roughly those 50 busy hours, with no scheduling scripts and no cluster resizing to maintain.
+W: Redshift Serverless: it charges only for compute actually used, so idle nights and weekends cost almost nothing for compute, and there is no cluster to pause, resume or size.
+X: A=Three-year reserved nodes: reservations lower the hourly rate, but the company still pays for every idle hour, and commits to that capacity for three years.
+B=Weekly CSV export: exporting data does not stop the cluster from billing, adds manual work, and leaves the data in a form that cannot be queried like the warehouse.
+D=More nodes: more nodes raise the hourly cost of the cluster, including all the idle hours, and do nothing about paying for idle time.
+T: For warehouses that sit idle much of the week, pay-per-use Redshift Serverless beats reserving or enlarging an always-on cluster.
+
+@ Q003131 explain
+G: ## The operational excellence pillar
+The Well-Architected **operational excellence** pillar is about running workloads well and improving over time. Key practices include:
+- **Operations as code**: changes go through pipelines and infrastructure as code, not manual console edits.
+- **Frequent, small, reversible changes**, deployed when the team is available to watch and roll back.
+- **Runbooks and playbooks**: documented, ideally automated steps for known events, such as rotating a certificate or recovering a failed queue consumer.
+- **Observability**: dashboards and alarms on technical and business metrics, for example orders per minute or checkout success rate, so problems are seen as customers feel them.
+- Learning from failures through post-incident reviews.
+W: D=Runbooks: documented procedures make responses to common events consistent and fast, reduce reliance on individual memory, and are the first step toward automating those responses.
+E=Business-metric dashboards: tracking metrics like orders or sign-ups shows whether the workload is actually delivering value, and reveals problems that pure infrastructure metrics can miss.
+X: A=Friday-evening deployments: releasing right before a weekend, when fewer people are available to notice and fix problems, increases the impact of failed changes.
+B=No documentation: undocumented systems make incidents slower to resolve and onboarding harder; the time saved is lost many times over during operations.
+C=Direct console changes in production: manual changes are not reviewed, repeatable or easily reversible, and they cause drift from the defined infrastructure.
+T: Operational excellence means documented, repeatable responses and visibility into business outcomes, not risky timing, manual changes or missing documentation.
+
+@ Q003132 explain
+G: ## Finding unused access with IAM Access Analyzer
+Over time, roles and users collect permissions they never use. Each unused permission is extra risk if credentials leak. **IAM Access Analyzer** offers an **unused access analyzer** that continuously reviews IAM roles and users in an account or across a whole AWS Organization.
+- It reports **unused roles**, **unused access keys and passwords**, and **unused permissions**, down to services and actions not used during a tracking period you choose, such as 90 days.
+- Findings appear in one dashboard and can also be sent to AWS Security Hub or Amazon EventBridge for automated handling.
+- Together with policy generation from CloudTrail activity, this supports moving roles toward least privilege.
+## Example
+A role `legacy-etl-role` has not been assumed for 120 days, and another role has `s3:*` but only ever uses `s3:GetObject`. Access Analyzer flags both, and the team deletes the first and narrows the second.
+W: Access Analyzer unused access findings: it is built specifically to find unused roles, credentials and permissions across accounts, which is exactly the least-privilege clean-up requested.
+X: A=Trusted Advisor cost checks: cost optimization checks look for idle or underused resources that cost money, such as low-utilization instances; they do not analyze IAM permissions.
+C=AWS Backup job reports: AWS Backup reports on backup and restore jobs for protected resources; IAM roles are not backed up and the reports say nothing about permission use.
+D=CloudFront access logs: these record viewer requests to a CloudFront distribution; they contain no information about which IAM roles or permissions are used.
+T: To find unused IAM roles and permissions, use IAM Access Analyzer's unused access findings, not cost, backup or CDN reports.
+
+@ Q003133 explain
+G: ## Single-threaded workloads and CPU choice
+A single-threaded program runs on one core at a time. Once that core is at 100%, it cannot go faster no matter how many other cores are idle; you will often see total CPU at, for example, 25% on a 4-vCPU instance while the app is saturated.
+- The only way to speed it up without code changes is **faster per-core performance**: a newer processor generation, higher clock speeds, or better instructions per clock.
+- AWS offers instance families aimed at this, such as newer-generation compute-optimized instances and high-frequency families like `z1d`, which offers sustained all-core frequencies up to 4.0 GHz.
+- Scaling out or adding cores helps only if the work can be split, which here requires code changes.
+W: Higher per-core performance: a faster core directly speeds up the one thread doing the work, which is the only lever available when the app cannot be parallelized.
+X: B=More vCPUs of the same generation: extra cores sit idle because the application uses only one thread, and each core is no faster than before.
+C=Detailed monitoring: it sends metrics every minute instead of every five minutes, which helps observation but adds no compute capacity.
+D=Bigger EBS volume: the bottleneck is CPU, not storage; a larger volume may raise gp2 baseline IOPS but does nothing for a CPU-bound thread.
+T: A CPU-bound single thread needs a faster core, not more cores, more monitoring or more storage.
+
+@ Q003134 explain
+G: ## Near-zero-downtime database migration with AWS DMS
+**AWS Database Migration Service (DMS)** copies data from a source database to a target while the source stays online.
+- **Full load** copies existing tables into the target, here Amazon RDS for SQL Server.
+- **Change data capture (CDC)** then reads ongoing changes from the source (for SQL Server, using MS-CDC or MS-Replication) and applies them to the target, so it keeps catching up.
+- When lag is near zero, the team stops writes briefly, lets the last changes apply, and points the application to the RDS endpoint. Downtime is minutes, not hours.
+- For a homogeneous SQL Server to SQL Server move, no schema conversion is needed; DMS Schema Conversion is used for engine changes.
+## Example
+Full load runs for two days while users keep working. CDC keeps RDS within seconds of production, and cutover happens in a 10-minute window on a weeknight.
+W: DMS full load plus ongoing replication: the source keeps serving users during the long copy, and CDC keeps RDS in sync so the final cutover needs only a short pause.
+X: A=Weekend-long offline backup copy: the application is down for the entire copy and restore, which is the opposite of minimal downtime.
+B=Application Migration Service only: it rehosts whole servers onto EC2, so the result is SQL Server on an EC2 instance that the company still manages, not an RDS for SQL Server database.
+D=Export to spreadsheets: it is manual, loses data types, constraints and indexes, cannot handle large tables reliably and needs the source frozen for the whole process.
+T: Minimal-downtime moves into RDS use DMS full load plus CDC and a short cutover, not offline copies or server rehosting.
+
+@ Q003135 explain
+G: ## Managed load balancing and TLS on AWS
+On premises, a hardware load balancer often spreads traffic and terminates SSL/TLS. On AWS, the managed equivalent for web applications is the **Application Load Balancer (ALB)**.
+- An ALB is deployed across subnets in **multiple Availability Zones**, and AWS scales and patches it.
+- **HTTPS listeners** terminate TLS using certificates from **AWS Certificate Manager (ACM)**. Public ACM certificates used with an ALB are free and renew automatically.
+- **Health checks** stop routing to failed targets, and rules can route by path or host, for example `/api/*` to one target group.
+## Example
+The listener on port 443 uses the ACM certificate for `www.example.com`, forwards to an Auto Scaling group in two AZs, and a Route 53 alias record points the domain to the ALB.
+W: ALB with ACM across multiple AZs: it replaces both the load balancer and SSL termination with managed, highly available services, with no certificate renewals or load balancer servers to maintain.
+X: A=Route 53 simple routing to one instance: DNS pointing at one public IP spreads nothing and has no failover; if that instance fails, the site is down, and TLS still has to be handled on the instance.
+B=Self-run load balancer on EC2 in one AZ: it is not a managed service, has to be patched and scaled by the company, and a single instance in one AZ is a single point of failure.
+C=NAT gateway balancing traffic: a NAT gateway only lets private resources start outbound connections; it cannot accept inbound client traffic or distribute requests.
+T: Replace on-premises load balancers and SSL offload with a multi-AZ ALB using ACM certificates, not DNS to one host or self-managed instances.
+
+@ Q003136 explain
+G: ## Moving cron jobs off a server
+A cron server is a single instance that must be patched, monitored and kept running just to start jobs at set times. If it fails, jobs silently stop.
+## Amazon EventBridge Scheduler
+**EventBridge Scheduler** is a serverless scheduler that invokes targets on a schedule.
+- Schedules use cron or rate expressions, for example `cron(0 2 * * ? *)` for 02:00 daily, with time zone support.
+- Targets include AWS Lambda functions, Amazon ECS tasks and many other AWS APIs.
+- It has built-in retries and can send failed invocations to a dead-letter queue.
+## Minimal code changes
+Short scripts can be wrapped in Lambda functions. Longer or heavier jobs can be packaged into a container image and run as ECS tasks on Fargate with little change to the script itself.
+W: EventBridge Scheduler with Lambda or ECS: it keeps the existing cron timing, removes the dedicated server, and runs the existing job logic with small packaging changes and built-in retries.
+X: B=Manual execution: people forget, run jobs at the wrong time and cannot scale; it replaces automation with a less reliable process.
+C=Larger EC2 instance: it keeps the same single server with the same maintenance and failure risk, and only raises cost.
+D=Second instance with duplicate cron jobs: both servers would run every job, causing duplicate processing, and there are now two servers to maintain.
+T: Modernize cron by moving schedules to EventBridge Scheduler and jobs to Lambda or ECS, not by resizing or duplicating the cron server.
+
+@ Q003137 explain
+G: ## Rehost versus refactor
+In the migration strategies (the "7 Rs"), **rehost** moves an application as-is, usually to EC2, while **refactor** redesigns it to use cloud-native services such as containers, serverless and managed databases.
+- Refactoring is the most expensive and slowest strategy, so it must pay off.
+- It pays off when the application is **high business value** and changes often, because faster delivery and scaling bring ongoing benefits.
+- It also pays off when the **current architecture limits** scaling, availability or team agility, such as a monolith that must be scaled as one unit.
+- Applications that will be retired, rarely change, or cannot be modified are better candidates for retire, retain, rehost or repurchase.
+W: C=Architecture limits scaling or agility: refactoring directly removes those limits, for example by splitting a monolith so parts scale and deploy independently.
+E=High value with frequent changes: the investment is recovered through faster, safer feature delivery on a business-critical application.
+X: A=Unmodifiable vendor software: the company cannot change the code, so refactoring is impossible; rehost, replatform or repurchase are the realistic options.
+B=Stable apps with no planned changes: little would be gained from re-architecting, so rehosting is cheaper and faster.
+D=Retiring next quarter: any refactoring effort would be thrown away almost immediately; retire or a quick rehost is appropriate.
+T: Refactor where business value and architectural constraints justify the cost; rehost, retain or retire everything else.
+
+@ Q003138 explain
+G: ## Separating storage from compute for Hadoop workloads
+In a classic Hadoop cluster, data lives in **HDFS** on the same nodes that run the jobs, so storage and compute must be scaled together. On AWS, the common pattern is to keep data in **Amazon S3** and run processing on **Amazon EMR**.
+- **Moving the data**: AWS DataSync can use HDFS as a source location and copy it to S3 with scheduling and verification. Alternatively, Hadoop `DistCp` (or `S3DistCp` on EMR) copies data in parallel using the cluster itself.
+- **Running Spark**: EMR provides managed Spark that reads S3 directly, for example `spark.read.parquet("s3://datalake/events/")`.
+- Clusters can be sized per job or shut down when idle, because the data stays in S3.
+W: DataSync or DistCp, then Spark on EMR: both tools are built for bulk HDFS-to-S3 copies, and EMR runs Spark natively against S3, giving durable storage and elastic compute.
+X: A=Self-managed HDFS on EC2 with weekly manual copies: the company still runs and scales HDFS itself, and weekly hand copies are slow, error-prone and leave data stale.
+B=Load into RDS tables: a relational database is not designed to hold a large HDFS data lake, and Spark would not run efficiently against it; it adds cost and a bottleneck.
+C=Convert to spreadsheets: spreadsheet formats cannot hold big-data volumes efficiently, lose schema and partitioning, and are poorly suited to Spark compared with Parquet or ORC.
+T: Hadoop migrations move HDFS data to S3 with DataSync or DistCp and run Spark on EMR, decoupling storage from compute.
+
+@ Q003139 explain
+G: ## Purpose-built databases
+AWS offers databases shaped around different data models:
+- **Amazon DocumentDB (with MongoDB compatibility)**: a managed **document** database that stores JSON-like documents and supports MongoDB APIs and drivers, so existing MongoDB code and tools usually work with little change.
+- **Amazon Neptune**: a **graph** database queried with Gremlin, openCypher or SPARQL.
+- **Amazon Timestream**: a **time-series** database for measurements over time, such as IoT readings.
+- **Amazon Keyspaces**: a managed **wide-column** database compatible with Apache **Cassandra** and CQL.
+## Example
+An application stores an order as `{ "orderId": 42, "items": [ ... ] }` and queries it with the MongoDB driver's `find()`. Pointing the connection string to a DocumentDB cluster keeps that code working, while AWS handles replication, backups and patching.
+W: Amazon DocumentDB: it is the fully managed document database built for MongoDB API compatibility, which is exactly the requirement.
+X: A=Neptune: it models data as nodes and relationships and uses graph query languages, not the MongoDB API.
+C=Timestream: it is optimized for timestamped measurements such as metrics and IoT readings; it is not a document database and does not support the MongoDB API.
+D=Keyspaces: it is compatible with Apache Cassandra and CQL, a wide-column model, not MongoDB.
+T: MongoDB-compatible managed documents mean DocumentDB; graph is Neptune, time series is Timestream, Cassandra is Keyspaces.
+
+@ Q003140 explain
+G: ## Why IPv6 needs a different egress component
+IPv6 addresses assigned to VPCs are globally unique and publicly routable. There is no private IPv6 range that needs NAT, so a NAT gateway is not how private IPv6 subnets reach the internet.
+## Egress-only internet gateway
+An **egress-only internet gateway** is a stateful, horizontally scaled VPC component for IPv6 only.
+- It lets instances start **outbound** IPv6 connections to the internet and receive the responses.
+- It **blocks connections initiated from the internet** to those instances.
+- The private subnet's route table gets `::/0` pointing to the gateway, for example `::/0 -> eigw-0abc123`, while IPv4 traffic keeps using a NAT gateway if needed.
+It is created per VPC, so each of the many VPCs gets its own.
+W: Egress-only internet gateway: it gives private IPv6 subnets outbound-only internet access, which is its exact purpose.
+X: B=Standard internet gateway on private subnets: routing `::/0` to an internet gateway allows two-way IPv6 traffic, so instances become reachable from the internet and the subnet is no longer private.
+C=Virtual private gateway: it terminates Site-to-Site VPN connections toward on-premises networks; it is not a path to the internet.
+D=NAT gateway with IPv6 only: NAT gateways translate IPv4 (and support NAT64 for IPv6 hosts reaching IPv4 destinations), but they are not the component for IPv6-to-IPv6 internet egress.
+T: Outbound-only IPv6 uses an egress-only internet gateway; NAT gateways are for IPv4 and internet gateways allow inbound traffic.
+
+@ Q003141 explain
+G: ## A reliable log pipeline
+A central logging pipeline must keep accepting logs even when parts of it are slow or failing, and store them durably.
+- **Amazon Data Firehose** receives records, **buffers** them by size or time, retries on errors, and delivers them to Amazon S3. It can back up failed records to S3 too.
+- **Amazon Kinesis Data Streams** can sit in front as a durable buffer that retains records for 24 hours by default and up to 365 days, so consumers can catch up after an outage.
+- Source accounts typically send CloudWatch Logs through **subscription filters** to a destination in the logging account.
+- In **Amazon S3**, objects are stored across multiple Availability Zones; **Cross-Region Replication** can add a copy in a second Region.
+## Example
+Each account's log groups stream to a Kinesis stream in the security account, Firehose delivers batches to `s3://org-security-logs`, and that bucket replicates to another Region.
+W: Firehose or Kinesis buffering with replicated S3: managed buffering and retries absorb spikes and failures, and replicated S3 storage keeps logs durable even if one Region has problems.
+X: A=Email from each account: email has no delivery guarantees, size limits, or structured storage, and messages can be lost, delayed or deleted.
+B=Single EC2 local disk in one AZ: one instance and one AZ are single points of failure, and logs on that disk are lost if the instance fails.
+C=Keep logs only in source accounts: there is no central pipeline at all, and an attacker who controls a source account can delete that account's logs.
+T: Reliable central logging combines managed streaming buffers with durable, replicated S3 storage, not email, single instances or scattered local copies.
+
+@ Q003142 explain
+G: ## Moving accounts between AWS Organizations
+An AWS account can belong to **only one organization at a time**, and organizations cannot be merged or nested.
+- Each member account of the acquired organization must first **leave** its current organization (or be removed by that organization's management account).
+- The acquiring organization's management account then **invites** the account, and the account accepts.
+- The acquired **management account** cannot leave its own organization; to join the new one, its organization must be deleted after all members are removed.
+- Once inside, accounts are moved into the right **OUs**, where service control policies and, if used, AWS Control Tower controls apply. Control Tower can then enroll them.
+## Example
+Account `111122223333` leaves the acquired organization, accepts an invitation from the parent company, and is moved into the `Workloads/Prod` OU with its guardrails.
+W: Leave, then invite and move into governed OUs: this is the supported way to transfer accounts between organizations, and placing them in OUs applies central governance immediately.
+X: A=Attach the other organization as an OU: Organizations has no feature to nest one organization inside another; accounts must move individually.
+B=Manually copy resources into new accounts: this is a slow, risky rebuild that changes account IDs and ARNs, when the existing accounts can simply be moved.
+D=Merge management accounts: there is no merge feature for management accounts or organizations in the Organizations console or API.
+T: Accounts move between organizations one by one (leave, then accept an invitation), after which OUs and SCPs bring them under central governance.
+
+@ Q003143 explain
+G: ## Just-in-time access instead of standing admin rights
+Standing administrator permissions mean every compromised engineer credential is a production admin credential. **Just-in-time (JIT) elevated access** grants higher permissions only when needed, only after approval, and removes them automatically.
+## Building it on IAM Identity Center
+- **IAM Identity Center** assigns **permission sets** (for example `ProdChangeAdmin`) to users or groups for specific accounts; these become short-lived role credentials.
+- A JIT layer creates that assignment on request and deletes it after a set duration. AWS publishes the open-source **Temporary Elevated Access Management (TEAM)** solution for this, and AWS partner products offer the same pattern.
+- Requests carry a justification, go to an approver, and the grant expires on time, for example after 2 hours. Activity is recorded in CloudTrail.
+W: Temporary elevated access with approvals and time limits: engineers get production rights only for an approved window, credentials are short-lived, and removal happens automatically without anyone remembering to do it.
+X: A=Emailed shared break-glass password: a shared password cannot be traced to one person, spreads through mailboxes, and has no approval or expiry built in.
+C=Create IAM users per change and delete manually: IAM users have long-lived credentials, and manual deletion is easily forgotten, leaving elevated users behind.
+D=Permanent admin for all engineers: this is standing privilege, the opposite of just-in-time, and maximizes the damage any leaked credential can do.
+T: Just-in-time access means approved, time-limited Identity Center assignments that expire automatically, not shared passwords, leftover IAM users or permanent admin.
+
+@ Q003144 explain
+G: ## Why Multi-AZ failover can look long to clients
+In RDS Multi-AZ, the database endpoint is a DNS name. During failover, RDS promotes the standby and updates the DNS record to point to the new primary. The database side usually recovers in a minute or two, but a client that **caches DNS** longer than the record's short TTL keeps connecting to the old, unavailable address.
+## Amazon RDS Proxy
+**RDS Proxy** is a managed, highly available proxy between the application and the database.
+- The application connects to the **proxy endpoint**, which stays the same during failover.
+- The proxy monitors the database and routes to the new primary itself, without waiting for client DNS to update.
+- It keeps client connections open where possible and pools database connections, which reduces failover time as seen by the application.
+## Example
+A Java app with a long JVM DNS cache connects to `myapp-proxy.proxy-abc123.us-east-1.rds.amazonaws.com`. During failover, the proxy redirects to the new primary and the app sees a brief pause rather than minutes of errors.
+W: RDS Proxy: clients keep a stable endpoint and the proxy handles the switch to the new primary, so failover no longer depends on how long clients cache DNS.
+X: A=Larger instance size: instance size does not change how long clients keep using a cached DNS answer, so the connection failures remain.
+C=Disable Multi-AZ: there would be no standby to fail over to, so an instance or AZ failure would cause a much longer outage.
+D=Hard-code the primary IP: the IP changes after failover, so the application would keep connecting to the failed instance until someone edits the configuration.
+T: DNS-caching clients make RDS failover look slow; put RDS Proxy in front so the endpoint never changes, rather than resizing, disabling Multi-AZ or pinning IPs.

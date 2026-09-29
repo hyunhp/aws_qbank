@@ -1,0 +1,353 @@
+# SAP-C02 detailed explanations, chunk e14 (explanation-only rewrites; letters are the published ones)
+
+@ Q003098 explain
+G: ## Why one failing dependency can take a whole system down
+In a microservice system, a request often passes through several services. If one downstream service becomes slow instead of failing fast, callers keep waiting, their threads and connections fill up, and soon the callers fail too. This is called a **cascading failure**.
+## Patterns that contain the damage
+- **Timeouts**: every remote call gets a deadline (for example 300 ms), so a slow dependency returns an error quickly instead of holding resources forever.
+- **Bulkheads**: separate connection pools, thread pools or concurrency limits per dependency, so a problem with the payments service cannot use up the capacity needed to call the catalog service.
+- **Retries with exponential backoff and jitter**, plus **circuit breakers** that stop calling a dependency that keeps failing.
+- **Asynchronous messaging** through queues or event buses such as `Amazon SQS` or `Amazon EventBridge`: the producer hands off work and moves on, and the consumer processes it when it is healthy again.
+Example: an order service writes an "order placed" message to a queue instead of calling the email service directly. If the email service is down, orders still succeed and emails go out later.
+W: A=Timeouts and bulkheads: they limit how long and how much capacity any single dependency can consume, so a failing service is isolated instead of exhausting the caller's threads and connections.
+E=Asynchronous messaging: a queue decouples producer and consumer in time, so work is buffered while a dependency is unavailable and processed once it recovers.
+X: B=Long synchronous chains: five synchronous calls per request multiply latency and make availability the product of all five services, so any one failure breaks the whole request.
+C=Shared database: every service depends on the same database, so one bad query, lock or outage affects all services at once and removes the isolation microservices are meant to give.
+D=No retries: many failures are transient (a throttled call, a brief network blip), and a well-bounded retry with backoff hides them; sending every transient error straight to users lowers availability.
+T: Resilience comes from isolating dependencies (timeouts, bulkheads) and decoupling them in time (queues), not from long synchronous chains or shared databases.
+
+@ Q003099 explain
+G: ## What blue/green deployment means
+In a blue/green deployment you run two environments: **blue** is the current version serving users, **green** is the new version. You deploy and test green while blue keeps working, then move traffic to green. If something goes wrong, you move traffic back to blue, which is still running.
+## How CodeDeploy does it for EC2
+`AWS CodeDeploy` supports a blue/green deployment type for the EC2/On-Premises compute platform:
+- It can copy the existing Auto Scaling group to create the green instances, or use instances you specify.
+- It installs the new revision on the green instances and registers them behind the load balancer (Application Load Balancer or Network Load Balancer target group, or Classic Load Balancer).
+- Traffic is rerouted to green, and the original instances are kept for a period you configure before termination.
+- Rollback reroutes traffic back to the original instances, which is fast because nothing has to be rebuilt; automatic rollback can be triggered by a failed deployment or a CloudWatch alarm.
+W: B=CodeDeploy blue/green with a load balancer: the old fleet stays intact while the load balancer points at the new one, so rollback is a traffic switch back to known-good instances rather than a redeploy.
+X: A=Delete and recreate the Auto Scaling group: there is a window with no capacity at all, and rolling back means rebuilding the old group from scratch, which is the opposite of instant.
+C=Manual SSH updates: slow, error-prone and not repeatable, and there is no second environment to fall back to; rollback means copying the old code back by hand.
+D=In-place update of all instances at once: every instance runs the new version at the same time, so a bad release affects all users and rollback requires another full deployment.
+T: Instant rollback needs the old environment still running behind a switchable load balancer, which is what CodeDeploy blue/green provides; in-place or rebuild approaches have nothing to switch back to.
+
+@ Q003100 explain
+G: ## How ElastiCache keeps data available
+Amazon ElastiCache offers several engines. **Valkey** and **Redis OSS** support replication; **Memcached** does not.
+- A **replication group** has one primary node that accepts writes and up to five read replicas that copy its data asynchronously.
+- With **Multi-AZ** enabled, the replicas are placed in different Availability Zones from the primary.
+- With **automatic failover**, if the primary fails, ElastiCache promotes a replica to primary and updates the primary endpoint's DNS, so the application reconnects to the same endpoint name.
+Example: a session store with the primary in `us-east-1a` and a replica in `us-east-1b`. If the `us-east-1a` node fails, the replica is promoted and the sessions it had already replicated are still there.
+Note that replication is asynchronous, so the last few writes before a failure can be lost, which is usually acceptable for session data.
+W: A=Replication group with Multi-AZ and automatic failover: session data is already copied to a replica in another AZ, and failover promotes it automatically, so sessions survive the loss of the primary node.
+X: B=Single node with daily snapshots: when the node fails, restoring from a snapshot takes time and loses up to a day of sessions, so users are logged out in the meantime.
+C=Memcached across AZs: Memcached does not replicate data between nodes; each key lives on one node, so the sessions stored on the failed node are simply gone.
+D=Larger single node: more memory does not add redundancy; the single node is still a single point of failure and all sessions are lost when it fails.
+T: Surviving a node failure requires a replica that already holds the data, which means a Valkey or Redis OSS replication group with Multi-AZ failover, not snapshots, bigger nodes or Memcached.
+
+@ Q003101 explain
+G: ## Who controls the hardware that holds your keys
+- **AWS KMS** stores keys in HSMs that AWS operates and that are shared by many customers (with strong isolation). You control key policies and usage, but not the hardware.
+- **AWS CloudHSM** gives you dedicated, single-tenant HSMs in your VPC. They are FIPS-validated, and you create and manage the crypto users; AWS manages the appliance but cannot use your keys.
+- A **KMS custom key store** backed by CloudHSM (a CloudHSM key store) lets you keep the KMS API and its integrations with S3, EBS, RDS and other services, while the key material is generated and used inside your own CloudHSM cluster.
+Example: a bank must show auditors that its master keys only ever exist in HSMs it exclusively controls. It creates a CloudHSM cluster with HSMs in two AZs, connects it to KMS as a custom key store, and uses those KMS keys for S3 and EBS encryption.
+W: C=CloudHSM or a KMS custom key store: the key material lives only in single-tenant HSMs that the company controls, which is exactly the "exclusive control" requirement, and the custom key store keeps KMS service integrations working.
+X: A=SSE-S3: Amazon S3 creates and manages these keys entirely; the customer has no control over or visibility into the hardware.
+B=AWS managed KMS keys: these are created and managed by AWS services in the multi-tenant KMS HSMs; you cannot even manage their key policies or rotation settings.
+D=Parameter Store String parameters: a String parameter holds its value as plain text rather than as a SecureString encrypted with a KMS key, and Parameter Store is not dedicated hardware under the company's control.
+T: "Hardware under our exclusive control" means dedicated HSMs, so CloudHSM directly or through a KMS custom key store; standard KMS and SSE-S3 run on AWS-controlled shared infrastructure.
+
+@ Q003102 explain
+G: ## Where data transfer costs come from
+AWS charges for data transferred **out to the internet**. Serving large files directly from EC2 incurs EC2 data-transfer-out rates for every byte sent to every user, and every request also uses instance capacity.
+## How CloudFront changes the bill
+- **Data transferred from AWS origins** (EC2, ALB, S3) **to CloudFront is not charged**.
+- CloudFront has its own data-transfer-out pricing, which is generally lower than EC2 internet rates, especially at higher volume tiers.
+- **Caching** at edge locations means repeated requests for the same object are served from the edge, so the origin sends it once instead of thousands of times.
+Example: a 50 MB installer downloaded 100,000 times. From EC2, every download leaves the Region. Through CloudFront, the origin sends the file to each edge location a few times and the edges serve the rest, reducing origin load and transfer cost while also lowering latency for users.
+W: B=CloudFront: origin-to-CloudFront transfer is free, CloudFront edge transfer rates are lower, and cached content is served without going back to EC2, which cuts both transfer cost and origin load.
+X: A=Larger EC2 instances: more network bandwidth lets the instance send faster, but every byte is still billed at EC2 data-transfer-out rates and there is no caching, so cost goes up, not down.
+C=EC2 in every Region without caching: users get closer servers, but each Region still pays internet transfer for every byte, and running full fleets everywhere adds large compute and replication costs.
+D=Serve directly from one Region: this is the current costly pattern; every request pays EC2 transfer rates and far-away users also see high latency.
+T: For large, repeated downloads, put CloudFront in front of the origin: free origin fetch plus edge caching lowers transfer cost, while bigger or more EC2 fleets only add cost.
+
+@ Q003103 explain
+G: ## A gated release pipeline
+`AWS CodePipeline` models a release as ordered **stages**, each containing **actions** (source, build, test, deploy, approval, invoke). A change moves to the next stage only if the current one succeeds.
+- **Build** stage: compile and package with `CodeBuild`.
+- **Security scan** stage: static analysis, dependency and container image scanning (for example with CodeBuild running a scanner, or Amazon Inspector for images).
+- **Test** stage: deploy to a staging environment and run integration tests.
+- **Manual approval** action: the pipeline pauses and can notify approvers through Amazon SNS. An authorized IAM principal approves or rejects with an optional comment.
+- **Production** deploy stage runs only after approval.
+The approval (who, when, comment) is recorded in the pipeline execution history, and the API call is logged in AWS CloudTrail, giving an audit trail.
+W: D=CodePipeline stages with manual approval: scans and tests are enforced gates before production, and the approval action records who approved each release, satisfying the audit requirement.
+X: A=Deploy first, test later: untested and unscanned code reaches production, which is exactly what the requirement is meant to prevent; tests afterward only detect problems users already hit.
+B=Local scans and emailed results: nothing enforces that scans actually ran on the code being released, and email approvals are easy to lose or forge, so there is no reliable audit trail.
+C=Single step deploying on any push: there are no scan, test or approval gates, and pushes to any branch reach production, so unreviewed code can ship.
+T: Enforce quality with pipeline stages that must pass and a manual approval action that is logged, rather than relying on developers' local checks or email.
+
+@ Q003104 explain
+G: ## Ordering versus parallelism in SQS
+- An **SQS standard queue** offers nearly unlimited throughput but only best-effort ordering and at-least-once delivery, so messages can arrive out of order or twice.
+- An **SQS FIFO queue** guarantees order and exactly-once processing within a **message group**. Each message carries a `MessageGroupId`.
+## How message groups give both
+Messages with the same `MessageGroupId` are delivered strictly in order, one batch at a time. Messages with different group IDs can be processed in parallel by different consumers.
+Example: use the customer ID as the group ID. Customer `C-17`'s files are processed in the order they arrived, while customer `C-42`'s files are processed at the same time by another consumer. With many customers, you get high parallelism without breaking per-customer order. FIFO queues also have a high-throughput mode for large volumes.
+W: B=SQS FIFO with a group ID per customer: ordering is guaranteed within each customer's group, while different groups are consumed in parallel, which is exactly per-customer order with cross-customer parallelism.
+X: A=SNS standard topic: a standard topic pushes each message to subscribers with no ordering guarantee and does not buffer work for later processing the way a queue does.
+C=SQS standard queue with many consumers: best-effort ordering means a customer's later file can be processed before an earlier one, especially with many consumers pulling at once.
+D=EventBridge with one rule: EventBridge routes events to targets but does not guarantee ordering per customer, and a single rule and target gives no controlled per-customer parallelism.
+T: Per-key order with parallelism across keys is the definition of SQS FIFO message groups; standard queues and topics give throughput but not order.
+
+@ Q003105 explain
+G: ## What makes time-series data special
+Sensor readings are small records with a timestamp, a device ID and a measurement, arriving continuously and in huge numbers. Queries usually ask about recent data ("average temperature per device over the last hour"), while old data is kept for trend analysis and queried less often.
+## Amazon Timestream
+Amazon Timestream is a purpose-built time-series database.
+- The **Timestream for LiveAnalytics** engine stores data in a **memory store** for recent, fast queries and automatically moves it to a lower-cost **magnetic store** based on retention periods you set on the table (for example 24 hours in memory, 5 years in magnetic).
+- It is serverless and scales for large ingestion volumes, and offers built-in time-series functions such as interpolation and time binning.
+- Timestream also offers **Timestream for InfluxDB**, a managed InfluxDB engine for workloads that need InfluxDB APIs.
+Availability note: Timestream for LiveAnalytics stopped accepting new customers on June 20, 2025 (existing customers can keep using it), and AWS points new workloads to Timestream for InfluxDB. Among the options here, Timestream is still the only purpose-built time-series database.
+W: D=Amazon Timestream: it is AWS's purpose-built time-series database for IoT-scale data, and its LiveAnalytics engine tiers data automatically from memory to magnetic storage based on retention and provides time-series query functions.
+X: A=Amazon Keyspaces: a managed Apache Cassandra-compatible wide-column database; it can store time-stamped rows but has no automatic hot/cold tiering or time-series functions.
+B=Amazon Neptune: a graph database for relationships between entities (social graphs, fraud rings, knowledge graphs), not for storing and aggregating billions of measurements over time.
+C=Amazon QLDB: a ledger database for an immutable, verifiable history of changes; it was not designed for high-volume sensor ingestion, and it reached end of support on July 31, 2025.
+T: Time-stamped sensor data with hot and cold tiers points to Timestream; graph, ledger and Cassandra-style databases solve different problems.
+
+@ Q003106 explain
+G: ## Centralized inspection with a transit gateway
+In a hub-and-spoke network, every VPC attaches to a transit gateway. To inspect traffic in one place, you add an **inspection VPC** and use transit gateway route tables so that:
+- Spoke VPC subnets route traffic to the transit gateway, and the transit gateway route table associated with the spoke attachments sends all traffic (`0.0.0.0/0` and other VPC CIDRs) to the inspection VPC attachment.
+- The inspection VPC sends traffic through **AWS Network Firewall** endpoints, then back to the transit gateway or out through an egress NAT gateway.
+## What AWS Network Firewall provides
+- **Stateful rules** that track connections and match on domains, protocols and 5-tuples.
+- **Intrusion prevention** using Suricata-compatible rules, including AWS managed threat signature rule groups.
+- Central policy management across accounts with **AWS Firewall Manager**.
+Enable **appliance mode** on the inspection VPC's transit gateway attachment so both directions of a flow go through the same AZ's firewall endpoint, keeping stateful inspection symmetric.
+W: A=Inspection VPC with Network Firewall through a transit gateway: all east-west and internet-bound traffic is routed through one managed, stateful, IPS-capable firewall that scales and can be deployed across AZs.
+X: B=Single EC2 proxy: one instance is a single point of failure and a throughput bottleneck, and a proxy only handles traffic explicitly sent to it, not all VPC-to-VPC flows.
+C=Security groups with broad allows: security groups are stateful but only allow or deny by port, protocol and source; they have no intrusion prevention, and broad allow rules plus per-instance management are the opposite of central control.
+D=Network ACLs everywhere: NACLs are stateless allow and deny lists by IP and port with no payload inspection or IPS, and they are managed per subnet rather than centrally.
+T: Central stateful inspection with IPS means routing traffic through Network Firewall in an inspection VPC; security groups and NACLs filter by address and port and are managed per resource.
+
+@ Q003107 explain
+G: ## The problem with overlapping IP ranges
+Routing-based connectivity (VPC peering, transit gateway, VPN) requires that each destination IP be unique. If both companies use `10.0.0.0/16`, a router cannot tell which network `10.0.1.10` belongs to. Fixing that normally means re-addressing one side, which is slow and risky.
+## Why PrivateLink sidesteps it
+With **AWS PrivateLink**, the provider puts a service behind a Network Load Balancer and publishes it as a **VPC endpoint service**, allowing specific AWS accounts (principals) to connect. The consumer creates an **interface endpoint**: network interfaces with IPs from the consumer's own subnets.
+- Consumers connect to that local IP; AWS delivers the traffic to the provider's NLB.
+- No routes between the VPCs exist, so overlapping CIDRs do not matter.
+- Only the published service is exposed, not the whole network.
+Example: company A publishes its inventory API as an endpoint service and allows company B's account; B creates an endpoint in its VPC and calls the API through a private DNS name.
+W: C=PrivateLink endpoint services: they share specific services across accounts without any routing between the VPCs, so overlapping IP ranges are irrelevant, and setup is quick.
+X: A=Edit CIDRs on running subnets: you cannot change a subnet's existing CIDR block; re-addressing means creating new subnets and migrating workloads, which is slow and risky for production.
+B=Public internet with allow lists: internal services would have to be exposed publicly, increasing attack surface and requiring public IPs, TLS and access controls for something meant to stay private.
+D=VPC peering between overlapping VPCs: AWS does not allow peering between VPCs with matching or overlapping IPv4 CIDR blocks, so the connection cannot even be created.
+T: When CIDRs overlap and only a few services need to be shared, PrivateLink works immediately because it exposes services, not networks; peering needs unique ranges.
+
+@ Q003108 explain
+G: ## Service control policies as guardrails
+A **service control policy (SCP)** in AWS Organizations sets the maximum permissions for IAM users and roles in member accounts. Even an account administrator cannot do something an SCP denies. SCPs do not apply to the management account.
+## Typical Region and service guardrail
+- Deny all actions where `aws:RequestedRegion` is not in the approved list, using `NotAction` to exempt global services such as IAM, Organizations, Route 53 and CloudFront.
+- Deny unapproved services explicitly, or use an allow-list SCP that allows only approved services.
+- Add a condition such as `ArnNotLike` on `aws:PrincipalARN` with `arn:aws:iam::*:role/BreakGlass` so the emergency role is not affected by the deny.
+Attach the SCP to the root or OUs so it applies to every current and future member account automatically.
+W: A=SCPs with a break-glass exemption: SCPs are centrally enforced preventive controls that local administrators cannot override, and a principal-ARN condition cleanly exempts the emergency role.
+X: B=Training course: education does not prevent anyone from launching resources in an unapproved Region; it is not an enforceable control.
+C=CloudTrail alerts: alerts are detective, not preventive; the resource is already running in the unapproved Region when the alert fires.
+D=Per-account IAM policies maintained locally: each team can change or remove its own policies, coverage becomes inconsistent across accounts, and administrators in the account are not reliably restricted.
+T: "Prevent across all accounts" means SCPs at the organization level; alerts detect after the fact and per-account IAM policies can be changed by the teams they are meant to restrict.
+
+@ Q003109 explain
+G: ## Delegated administrators for security services
+AWS security services integrate with AWS Organizations. From the management account you designate a **delegated administrator** account (usually a dedicated security tooling account) for each service.
+- **Amazon GuardDuty**, **Amazon Macie** and **AWS Security Hub** each support a delegated administrator that can enable the service in member accounts, auto-enable it for new accounts, and view all members' findings.
+- Security Hub also aggregates findings from GuardDuty, Macie, Inspector and other sources, and can aggregate across Regions into one home Region.
+Why not use the management account: AWS recommends keeping the management account for organization and billing tasks only, because it is not restricted by SCPs and a compromise there affects the whole organization.
+Example: the management account runs `aws guardduty enable-organization-admin-account --admin-account-id 111122223333`, and similar calls for Macie and Security Hub; the security team then works entirely in account `111122223333`.
+W: C=Delegated administrator per service: the security account gets organization-wide visibility and management of findings through native integration, with automatic coverage of new accounts.
+X: A=Cross-account IAM users: long-lived IAM users in every account are hard to manage and audit, and the team would still have to log in account by account instead of seeing aggregated findings.
+B=Daily emailed exports: findings arrive up to a day late, cannot be triaged or updated centrally, and email is neither secure nor auditable for security data.
+D=Use the management account daily: it concentrates risk in the most privileged account, which SCPs cannot restrict, against AWS best practice of minimizing its use.
+T: Centralize security findings by delegating administration of GuardDuty, Macie and Security Hub to a security account, not by using the management account or manual exports.
+
+@ Q003110 explain
+G: ## Two layers: default and enforcement
+- **Default bucket encryption** set to `SSE-KMS` makes S3 encrypt new objects with a KMS key when the request does not specify encryption. Since 2023, S3 encrypts all new objects with at least SSE-S3 by default, so enforcing **KMS** specifically needs configuration.
+- A **bucket policy** can deny `s3:PutObject` when `s3:x-amz-server-side-encryption` is not `aws:kms`, or when the header is missing (a `Null` condition), so non-KMS or header-less requests are rejected.
+- At organization scale, an **SCP** can deny `s3:PutObject` with the same condition for every principal in member accounts, and **resource control policies (RCPs)** can apply guardrails to S3 resources across the organization.
+Example deny statement: Effect `Deny`, Action `s3:PutObject`, Condition `StringNotEquals` `s3:x-amz-server-side-encryption` = `aws:kms`.
+W: D=Default SSE-KMS plus deny policies: default encryption ensures objects are KMS-encrypted, and bucket policies or SCPs actively reject uploads that do not request KMS encryption, meeting both parts of the requirement.
+X: A=Weekly re-encryption scan: unencrypted objects exist for up to a week, and nothing rejects the non-compliant requests, which the requirement explicitly demands.
+B=Client-side encryption with a shared embedded key: a key embedded in every application is easy to leak and hard to rotate, and it does not use KMS or cause S3 to reject requests.
+C=Written policy document: developers can forget or ignore it; guidance without technical enforcement does not reject anything.
+T: Enforce encryption preventively with default SSE-KMS plus deny statements on the upload API; scans and written guidance only detect or hope.
+
+@ Q003111 explain
+G: ## Shared services as a hidden single point of failure
+Many landing zones put DNS resolution (Route 53 Resolver endpoints, private hosted zones), directory services (AWS Managed Microsoft AD) and other identity components in a **shared services account**. If those components run in only one Region, a Regional outage breaks name resolution and sign-in for every workload, even workloads designed to fail over to another Region.
+## Making shared services multi-Region
+- Deploy Route 53 Resolver inbound and outbound endpoints and forwarding rules in the second Region, and associate private hosted zones with VPCs there.
+- Use multi-Region replication for directory services, for example AWS Managed Microsoft AD Enterprise Edition supports adding Regions.
+- Keep configuration in infrastructure as code (CloudFormation StackSets, Terraform) so both Regions stay consistent.
+- Test failover regularly.
+W: B=Second Region with replicated configuration: the dependency now exists in two independent Regions, so workloads failing over still have DNS and identity available.
+X: A=Move everything into one AZ: this reduces redundancy even further; one AZ failure would take down all shared services.
+C=Larger instances: bigger instances handle more load but do nothing when the Region, AZ or instance itself fails; they are still a single deployment.
+D=Documented manual recovery only: without a standby deployment, recovery means building everything during the outage, which is slow and error-prone when every workload is already down.
+T: A single-Region dependency limits the resilience of everything that uses it; replicate shared DNS and identity services to a second Region rather than scaling up or writing runbooks.
+
+@ Q003112 explain
+G: ## Transit gateways are Regional
+A transit gateway connects VPCs, VPNs and Direct Connect gateways **within one Region**. To connect networks in two Regions, you create a transit gateway in each Region and link them with a **transit gateway peering attachment**.
+- Inter-Region peering traffic stays on the AWS global backbone and is encrypted.
+- Peering attachments use **static routes**: you add routes in each transit gateway route table pointing the other Region's CIDRs to the peering attachment.
+- In the DR Region, recovery VPCs attach to the local transit gateway, so a small number of connections serves many VPCs.
+Example: Region one's `tgw-a` peers with Region two's `tgw-b`; a static route `10.200.0.0/16` in `tgw-a` points to the peering attachment, and `10.0.0.0/12` in `tgw-b` points back.
+AWS Cloud WAN is another option when you need a global, policy-driven network across many Regions.
+W: C=Second transit gateway with inter-Region peering: it gives one scalable, managed link between the Regions' hubs, and every VPC attached to either hub can use it with simple static routes.
+X: A=Move all VPCs permanently: that is a migration, not DR; it removes the primary Region instead of adding recovery capability and is far too disruptive.
+B=A single VPN to an internet gateway: an internet gateway does not terminate VPN connections, and one VPN from one VPC would not give the other 49 VPCs connectivity.
+D=Full mesh of VPC peering: 50 VPCs times the DR VPCs means a huge number of peering connections and route entries to manage, which does not scale and ignores the transit gateway already in place.
+T: Connect Regions hub to hub with transit gateway inter-Region peering; per-VPC peering meshes and single VPNs do not scale.
+
+@ Q003113 explain
+G: ## Self-service sandbox accounts
+Giving each developer or team their own **sandbox account** isolates experiments: a mistake or cost spike stays in that account. The challenge is creating, limiting and cleaning up many accounts.
+## Building blocks
+- **AWS Control Tower Account Factory** provisions new accounts that are enrolled in the landing zone with baseline guardrails. It can be exposed through AWS Service Catalog, or automated with Account Factory for Terraform (AFT) and account customizations.
+- **AWS Budgets** in each account alerts owners (and can trigger budget actions) when spend nears a limit.
+- **Automated decommissioning**: a workflow (for example Step Functions and Lambda triggered by a lease expiry) removes resources and then closes or recycles the account; AWS also publishes the Innovation Sandbox on AWS solution for this pattern.
+- A sandbox OU with SCPs restricts expensive or risky actions.
+W: B=Control Tower Account Factory with budgets and automated cleanup: developers get governed accounts on demand, spend is capped by alerts, and accounts are cleaned up automatically instead of accumulating cost.
+X: A=Shared sandbox with admin access: everyone's experiments interfere with each other, costs cannot be attributed, and full admin access in a shared account is a security risk.
+C=Experiment in a production VPC: experiments can break or expose production systems; this defeats the purpose of isolation.
+D=Personal accounts on company cards: accounts are outside the organization, so there are no guardrails, no central billing or visibility, and no controlled cleanup.
+T: Scalable sandboxes are governed, vended accounts with budgets and automatic cleanup, not shared accounts, production VPCs or unmanaged personal accounts.
+
+@ Q003114 explain
+G: ## OUs and policy inheritance
+In AWS Organizations, accounts are grouped into **organizational units (OUs)**. Policies attached to an OU, such as **service control policies (SCPs)**, apply to every account in it and to nested OUs.
+- An account's effective permissions are limited by the SCPs on the root, every parent OU and the account itself.
+- So you place accounts with similar guardrail needs in the same OU.
+Example structure:
+- `Workloads/Prod` OU: SCPs deny disabling CloudTrail, deny deleting backups, restrict Regions and instance types.
+- `Workloads/NonProd` OU: fewer restrictions so developers can experiment, but still baseline security SCPs inherited from the parent `Workloads` OU.
+Moving an account from one OU to the other changes its guardrails immediately, with no per-account policy editing.
+W: A=Separate OUs with different SCPs: guardrails follow OU membership, so production and non-production accounts automatically get different, centrally managed controls.
+X: B=No OUs, each account on its own: guardrails become inconsistent and depend on each account's administrators, and nothing is centrally enforced.
+C=Separate organizations: you lose single consolidated billing, shared organization-wide policies and delegated administration, and must duplicate governance in two places.
+D=One OU with the strictest SCP everywhere: non-production gets production restrictions, which blocks legitimate development work; the requirement is different guardrails, not the same ones.
+T: Different guardrails for different environments come from separate OUs with their own SCPs within one organization.
+
+@ Q003115 explain
+G: ## Tag policies in AWS Organizations
+A **tag policy** is an Organizations policy type that standardizes tags across accounts.
+- It defines tag keys and their capitalization (for example `CostCenter`, not `costcenter`), and optionally the allowed values (`CostCenter` must be one of `CC-100`, `CC-200`).
+- Attached to the root, an OU or an account, it is inherited like other Organizations policies.
+- **Compliance reporting**: you can view noncompliant resources per account, and from the management account generate an organization-wide compliance report.
+- **Optional enforcement**: for specified resource types, noncompliant tagging operations can be blocked.
+To make sure a tag is present on every new resource, organizations commonly add SCPs that deny creation without the required tags, or AWS Config rules such as `required-tags`.
+W: D=Tag policies: they define the tagging standard once for all accounts and report noncompliant tags, exactly matching both requirements.
+X: A=Resource groups: they group resources by tags or CloudFormation stacks for viewing and operations in one account; they do not define a tagging standard or report compliance.
+B=SCPs only: SCPs can deny API calls based on tag conditions, but they do not define a standard of keys and values or produce compliance reports of existing resources.
+C=Permission boundaries only: a boundary limits what an IAM principal can do; it does not check how resources are tagged or report noncompliance.
+T: Standardize and report on tags across the organization with tag policies; SCPs, boundaries and resource groups solve different problems.
+
+@ Q003116 explain
+G: ## The most detailed billing data AWS offers
+**AWS Cost and Usage Reports**, now delivered through **Data Exports** as **CUR 2.0**, contain line items for every service, usage type, resource ID, pricing and discount, and cost allocation tag.
+- Granularity can be **hourly**, daily or monthly.
+- Exports are delivered to an Amazon S3 bucket in `Parquet` or CSV format and refreshed several times a day.
+- Created in the management (payer) account, they include usage for all member accounts.
+- The data can be queried with **Amazon Athena** (for example by creating a table over the Parquet files) and visualized in Amazon QuickSight.
+Example: an Athena query that sums `line_item_unblended_cost` grouped by `line_item_usage_account_id` for one billing period gives spend per account for that month.
+W: C=Cost and Usage Reports (CUR 2.0) to S3: it is the only option providing hourly, resource-level cost and usage for every account in a format Athena can query directly.
+X: A=Health Dashboard event history: it lists service events and scheduled maintenance affecting your resources; it contains no cost or usage data.
+B=Free Tier usage alerts: they only warn when free tier usage approaches its limit in one account; they give no detailed, organization-wide cost data.
+D=Monthly invoice PDF: it is a summary for the whole month, not hourly line items, and a PDF cannot be queried with Athena.
+T: For hourly, line-item cost analysis across accounts, export CUR 2.0 to S3 and query it with Athena; invoices and alerts are summaries.
+
+@ Q003117 explain
+G: ## Preventive and responsive cost controls
+Sandbox accounts give freedom to experiment, but expensive resources (for example GPU instance families such as `p5` or `g6`) can quietly run for weeks. Two kinds of control work together:
+- **Preventive**: an **SCP** on the sandbox OU denies `ec2:RunInstances` when `ec2:InstanceType` matches expensive types (for example `p*.*`). The launch fails no matter what IAM permissions the user has.
+- **Responsive**: **AWS Budgets** sends alerts at thresholds (for example 80% and 100% of a monthly limit), and **budget actions** can automatically or after approval apply an IAM policy or SCP that blocks further provisioning, or stop specific EC2 or RDS instances.
+Combined with a cleanup process, these keep sandbox spend bounded while still allowing normal experiments.
+W: D=Budgets with actions: they notify owners when spend approaches the limit and can automatically restrict further provisioning or stop instances, catching forgotten resources.
+E=SCPs denying expensive instance types: they prevent the costly GPU instances from being launched in sandbox OUs at all, regardless of local permissions.
+X: A=Full administrator for everyone: this removes restrictions and makes the problem worse, since anyone can launch any instance type.
+B=Disable Cost Explorer: turning off visibility does not reduce spend; teams just lose the ability to see what they are paying for.
+C=Remove all budgets: without budgets there are no alerts or automatic actions, so forgotten instances run until someone notices the bill.
+T: Stop waste with a preventive SCP on instance types plus budgets that alert and act; removing visibility or limits only hides the cost.
+
+@ Q003118 explain
+G: ## Centralized VPC interface endpoints
+An **interface VPC endpoint** (for example for `ssm`, `sts` or `ecr.api`) places network interfaces in a VPC so resources reach AWS services privately. Each endpoint is billed per hour per AZ, so deploying dozens of endpoints in every VPC gets expensive.
+## The shared-endpoint pattern
+- Create the interface endpoints once in a **shared services VPC** connected to spokes through a transit gateway, with private DNS disabled on the endpoints.
+- For each service, create a **Route 53 private hosted zone** with the service's name (for example `ssm.us-east-1.amazonaws.com`) and an alias record pointing to the endpoint's DNS name.
+- **Associate** those private hosted zones with the spoke VPCs (cross-account associations require an authorization step), or forward queries with Route 53 Resolver rules.
+Spoke instances resolve `ssm.us-east-1.amazonaws.com` to the central endpoint's private IPs and reach it over the transit gateway.
+W: B=Central endpoints plus shared private hosted zones: endpoints are created once, and DNS in every spoke resolves service names to them, so spokes get private access without their own endpoints.
+X: A=NAT gateways in every spoke: traffic goes to public service endpoints instead of private endpoints, and every spoke pays NAT gateway hourly and data processing charges.
+C=Internet gateways with public IPs: instances become directly internet-reachable, which weakens security, and traffic still does not use private endpoints.
+D=Endpoints in every spoke: this works but is exactly what the requirement wants to avoid, multiplying endpoint cost and management by the number of VPCs.
+T: Share interface endpoints by centralizing them and sharing DNS through private hosted zones; per-VPC endpoints or internet paths are costlier or less secure.
+
+@ Q003119 explain
+G: ## What IAM Access Analyzer checks
+**IAM Access Analyzer** external access analyzers use automated reasoning on resource-based policies, including **IAM role trust policies**, to find resources that can be accessed by principals outside a **zone of trust**.
+- The zone of trust is either the current account or the whole **organization**.
+- With the organization as the zone of trust, a role that trusts, for example, `arn:aws:iam::999988887777:root` (an account outside the organization) produces an active finding; trusts between member accounts do not.
+- Supported resources also include S3 buckets, KMS keys, Lambda functions, SQS queues, Secrets Manager secrets and others.
+- Create the organization analyzer in the management account or a delegated administrator account; findings can be sent to Security Hub and EventBridge for alerting.
+W: A=Access Analyzer with the organization as zone of trust: it evaluates every role trust policy in all member accounts and reports exactly those that grant access to accounts outside the organization.
+X: B=Amazon Detective: it builds behavior graphs from logs to help investigate security findings after the fact; it does not analyze trust policies for external access.
+C=Inspector Lambda scanning: Amazon Inspector scans Lambda code and dependencies for vulnerabilities; it does not evaluate IAM role trust relationships.
+D=Config recorder for S3 only: recording only S3 bucket configuration ignores IAM roles entirely, and a recorder alone does not evaluate who is trusted.
+T: To find cross-account trust to outsiders, use Access Analyzer with the organization as the zone of trust; Detective and Inspector solve investigation and vulnerability problems.
+
+@ Q003120 explain
+G: ## How transit gateway attachments use AZs
+When you attach a VPC to a transit gateway, you choose **one subnet per Availability Zone**. The transit gateway puts a network interface in each chosen subnet.
+- Traffic from an AZ goes to the transit gateway interface in that same AZ.
+- Resources in an AZ where the attachment has no subnet cannot reach the transit gateway.
+- If the attachment uses only one AZ and that AZ fails, the whole VPC loses connectivity.
+## Appliances in the path
+Centralized inspection or egress VPCs usually run firewalls or NAT gateways. If they exist in only one AZ, that AZ becomes a single point of failure for all spokes. Deploy them in every AZ (for example Network Firewall endpoints and NAT gateways per AZ), and enable **appliance mode** on the inspection attachment so flows stay symmetric.
+W: D=Attach VPCs using subnets in multiple AZs: each AZ has its own transit gateway interface, so losing one AZ leaves the other AZs connected.
+E=Appliances in every AZ: inspection and egress keep working in the surviving AZs instead of depending on a single AZ's appliance.
+X: A=One firewall in one AZ: all traffic depends on one instance in one AZ, so an instance or AZ failure stops inspection and connectivity for every spoke.
+B=Remove route table associations: without associations, attachments have no route table to look up destinations, so traffic cannot be routed; it breaks connectivity rather than improving resilience.
+C=All attachments in one AZ: this is the single-AZ design that fails when that AZ fails.
+T: AZ resilience for a transit gateway network means multi-AZ attachment subnets and per-AZ appliances; anything pinned to one AZ is a single point of failure.
+
+@ Q003121 explain
+G: ## What makes postmortems effective
+A **postmortem** (post-incident review) documents what happened, why, and what will prevent recurrence. It only improves reliability if its output changes the system.
+- **Blameless**: focus on why the system allowed the mistake (missing guardrails, unclear runbooks, missing alarms), so people share details openly.
+- **Root cause analysis**, for example "five whys", to find underlying causes instead of symptoms.
+- **Action items** with an owner, a due date and a priority, tracked in the team's normal work backlog and reviewed until closed.
+- **Trend review**: look across postmortems for repeated causes, which reveals systemic gaps.
+Example: three incidents are traced to expired TLS certificates. The action item "move certificates to ACM with automatic renewal and add an expiry alarm", owned by the platform team and due in two weeks, prevents the fourth.
+The AWS Well-Architected Operational Excellence pillar recommends learning from operational events and sharing lessons across teams.
+W: B=Track action items to completion: repeated root causes mean fixes were identified but not implemented; owners, deadlines and follow-up ensure the fixes actually happen.
+X: A=Assign blame: blame makes people hide information, which hides the real systemic causes and leads to more repeated incidents.
+C=Only public complaints: many serious incidents never become public, and skipping their reviews loses exactly the lessons that could prevent larger outages.
+D=Stop postmortems: without reviews, root causes are never analyzed or fixed, so the same incidents keep consuming time that could go to feature work.
+T: Postmortems prevent repeats only when their action items are owned, scheduled and completed in a blameless culture.
+
+@ Q003122 explain
+G: ## Scaling for predictable load
+Amazon EC2 Auto Scaling offers several ways to change capacity:
+- **Dynamic scaling** (target tracking, step scaling) reacts to metrics such as CPU. It can lag behind a sudden surge while new instances boot.
+- **Scheduled scaling** changes minimum, maximum and desired capacity at specific times with a cron-like recurrence. Example: set desired capacity to 40 every Monday at 07:30 and back to 10 at 12:00.
+- **Predictive scaling** analyzes historical load (it needs at least 24 hours of data and uses up to 14 days) to forecast the next 48 hours and launches capacity ahead of forecast peaks. It can run in forecast-only mode first so you can evaluate its accuracy.
+Combining predictive or scheduled scaling with target tracking handles both the known Monday surge and unexpected spikes, without anyone doing it by hand.
+W: C=Scheduled or predictive scaling: the recurring Monday surge is known in advance, so capacity is added automatically before it starts, removing manual work and the risk of forgetting.
+X: A=Reminder email: the scaling is still manual and depends on someone reading the email and acting correctly on time.
+B=Monday peak capacity all week: this avoids manual work but pays for peak capacity during all the hours when it is not needed.
+D=Ask customers to avoid Mondays: it shifts the problem to customers and harms the business instead of fixing the operational process.
+T: Known recurring load calls for scheduled or predictive scaling, which is automatic and pays for peak capacity only when the peak is expected.

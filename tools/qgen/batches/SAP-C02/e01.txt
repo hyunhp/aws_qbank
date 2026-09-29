@@ -1,0 +1,330 @@
+# SAP-C02 detailed explanations, e01 (explanation-only rewrites; letters are the published ones)
+
+@ Q001023 explain
+G: ## Availability Zones versus Regions
+A **Region** is a geographic area, such as `us-east-1`. Each Region contains several **Availability Zones (AZs)**. An AZ is one or more data centers with independent power, cooling and networking, and AZs are kilometers apart but joined by high-bandwidth, low-latency private links.
+## Why distance decides the replication mode
+- **Synchronous** replication waits for the second copy to confirm every write. It gives zero data loss (RPO 0), but every write pays the round trip, so it only works over short distances such as between AZs.
+- **Asynchronous** replication ships changes after the write commits. Writes stay fast over long distances, but a small amount of recent data can be lost (RPO of seconds).
+Example: Aurora or RDS Multi-AZ writes synchronously within a Region, while Aurora Global Database or cross-Region read replicas copy asynchronously to another Region.
+W: Sync across AZs, async to a second Region: synchronous AZ replication survives the loss of a data center with no data loss at low-millisecond latency, and the asynchronous copy in another Region can be promoted within an hour if the whole Region fails.
+X: A=Sync across Regions: Regions are hundreds of kilometers apart, so each synchronous write would wait tens of milliseconds, far above the low-millisecond latency target.
+C=Racks in one AZ plus nightly snapshots: an AZ-wide event takes out every rack at once, and nightly snapshots can lose up to a day of orders and take longer than an hour to restore.
+D=Async across AZs, sync across Regions: this is backwards. Async between AZs can lose data when an AZ fails, and sync between Regions adds the long-distance write latency.
+T: Replicate synchronously where distance is short (between AZs) for zero data loss, and asynchronously where it is long (between Regions) for disaster recovery.
+
+@ Q001024 explain
+G: ## VPC peering is one-to-one
+A VPC peering connection links exactly two VPCs. Each side adds routes such as `10.2.0.0/16 -> pcx-1234` and allows the traffic in its security groups.
+## Why A cannot reach C through B
+Peering is **not transitive**. A packet from VPC-A that arrives in VPC-B over one peering is never forwarded out over another peering to VPC-C, even if route tables in every VPC point the right way. AWS drops it because VPC-B is not the source or destination.
+- Example: A (`10.1.0.0/16`) peers with B (`10.2.0.0/16`), and B peers with C (`10.3.0.0/16`). A route in A for `10.3.0.0/16` pointing at the A-B peering does nothing useful.
+- The same rule blocks "edge to edge" routing: A cannot use B's internet gateway, NAT gateway or VPN through peering.
+Fixes: create a direct A-C peering, or attach all VPCs to a Transit Gateway, which is a real router that forwards between attachments.
+W: Non-transitive peering: AWS does not forward traffic through an intermediate VPC, so A needs its own peering with C or a Transit Gateway that routes between all three VPCs.
+X: A=Security groups in VPC-C: security groups would matter only if packets reached VPC-C. Here they never leave VPC-B, so no security group change can fix it.
+B=Overlapping CIDRs: nothing points to an overlap, the stem says the routes are already in place, and even with unique CIDRs the traffic would still fail because VPC-B will not forward it between peerings.
+D=Different Organizations: peering works across accounts, across Regions and between unrelated organizations once the owner accepts the request; ownership does not affect forwarding.
+T: Peering links only the two VPCs it names; for traffic that must pass through a middle VPC, use a direct peering or a Transit Gateway.
+
+@ Q001025 explain
+G: ## Direct Connect resiliency models
+AWS Direct Connect (DX) is a private physical link from your network to AWS at a **DX location** (a colocation facility). Each connection terminates on one AWS device at one location, so three things can fail: the connection, the device, or the whole location.
+The DX Resiliency Toolkit describes the models:
+- **Development and test**: one connection at one location, no redundancy.
+- **High resiliency**: one connection at each of two locations, surviving a location failure.
+- **Maximum resiliency**: two connections on separate devices at each of two locations, which is the model AWS uses for its highest availability targets.
+BGP runs over every virtual interface, so when one path fails, routes are withdrawn and traffic moves to the surviving path automatically. A Site-to-Site VPN can act as a lower-cost extra path over the internet.
+W: Two DX locations plus VPN backup: of the choices, this is the only Direct Connect design that does not depend on a single DX location. Connections at two separate locations, joined through a DX gateway, fail over automatically with BGP, and the VPN adds a further independent path at low cost. It follows the high resiliency model; AWS ties its highest availability targets to the maximum resiliency model, which adds a second connection on a separate device at each location.
+X: A=One DX plus VPN: the single connection and single location remain points of failure, and failing over to an internet VPN gives lower, variable bandwidth and performance.
+B=Two connections at one location: separate customer routers help, but a fire, power or fiber problem at that one facility takes both connections down together.
+D=VPN only: every path depends on the public internet, whose latency and throughput AWS does not control, so it cannot give the consistent performance or availability required.
+T: For high availability on Direct Connect, spread connections across more than one DX location; redundancy inside a single location still fails with that location.
+
+@ Q001026 explain
+G: ## Why full mesh does not scale
+Connecting every VPC to every other VPC with peering needs n(n-1)/2 connections: 40 VPCs means 780 peerings, each with routes in both VPCs, and each new VPC adds 40 more.
+## Hub and spoke with Transit Gateway
+A **Transit Gateway (TGW)** is a Regional router. Each VPC gets one attachment, and TGW route tables decide which attachments can reach each other.
+- VPCs in other accounts attach after the TGW is shared with AWS Resource Access Manager (RAM).
+- On-premises traffic arrives over Direct Connect through a **transit virtual interface** to a **Direct Connect gateway**, which is associated with the TGW.
+- Adding VPC number 41 means one attachment and one route table association, not 40 new peerings.
+W: One Transit Gateway with a DX gateway: each VPC needs a single attachment, routing is managed centrally in TGW route tables, and the shared DX link reaches every VPC through one transit VIF and DX gateway association.
+X: A=Full-mesh peering: 780 peering connections and their routes must be created and maintained, and each new VPC needs peerings to all the others; peering also cannot carry traffic transitively between VPCs.
+C=VPN between every pair: hundreds of IPsec tunnels, each with its own gateways, keys and routing, is far more work than peering and adds per-connection cost and bandwidth limits.
+D=One large VPC: it removes the account boundaries that separate teams, permissions, quotas and billing, and a single VPC's address space and blast radius become shared by everything.
+T: Many VPCs plus on-premises: attach each VPC once to a Transit Gateway and connect it to Direct Connect through a DX gateway, instead of building point-to-point links.
+
+@ Q001027 explain
+G: ## Route 53 Resolver in hybrid DNS
+Every VPC has the **Route 53 Resolver** at the VPC base address plus two (for example `10.0.0.2`). It answers for private hosted zones associated with the VPC and for public names. By itself it cannot be reached from on-premises and does not know on-premises domains.
+## Two kinds of Resolver endpoints
+- **Inbound endpoint**: network interfaces with IPs in your VPC. On-premises DNS servers forward queries (for example for `aws.corp.example`) to those IPs, so on-premises can resolve private hosted zone records.
+- **Outbound endpoint** plus **forwarding rules**: a rule such as "forward `corp.example` to `192.168.1.10`" sends VPC queries for on-premises domains out through the endpoint to on-premises DNS, such as Active Directory DNS servers.
+Traffic flows over Direct Connect or VPN in both cases.
+W: Inbound and outbound endpoints: the inbound endpoint lets on-premises servers query the private hosted zone, and the outbound endpoint with forwarding rules lets EC2 instances resolve on-premises Active Directory names, covering both directions.
+X: B=Outbound endpoint only: it handles queries leaving the VPC toward on-premises, but gives on-premises servers no IP address to send queries into the VPC, so the private hosted zone stays unreachable from on-premises.
+C=EC2 DNS forwarders replacing Resolver: you would have to build, patch, scale and make highly available your own DNS servers, and they still need the Resolver to answer private hosted zones, so the managed endpoints are simpler.
+D=Public hosted zone: it publishes internal names on the internet for anyone to query, and it does not help EC2 instances resolve on-premises hostnames.
+T: Inbound endpoints bring on-premises queries into AWS; outbound endpoints with forwarding rules send AWS queries to on-premises, and two-way hybrid DNS needs both.
+
+@ Q001028 explain
+G: ## Two kinds of VPC endpoints
+- **Gateway endpoint**: a target you add to route tables, that points to the service's AWS-managed prefix list (a `pl-` ID). Traffic to the service follows that route and stays on the AWS network. It exists only for **Amazon S3** and **DynamoDB** and has no hourly or data charge.
+- **Interface endpoint** (AWS PrivateLink): a network interface with a private IP in your subnet. You reach the service at that IP. It works for most AWS services, for S3 as well, and for services published by other accounts, such as a SaaS provider's **endpoint service** behind a Network Load Balancer. It is billed per hour and per GB.
+Example: route table entry `pl-xxxx -> vpce-gw123` for S3, and the SaaS API at a private DNS name that resolves to `10.0.3.25` in your subnet.
+W: Gateway endpoint for S3, interface endpoint for SaaS: S3 is one of the two services with gateway endpoints and they are free, while a third-party API in another VPC is reached privately, without joining the two networks, as a PrivateLink endpoint service through an interface endpoint.
+X: A=Gateway endpoints for both: gateway endpoints are only offered for S3 and DynamoDB, so there is no gateway endpoint type for a SaaS provider's API.
+B=Interface endpoints for both: this would work, but the S3 interface endpoint adds hourly and per-GB charges that the free gateway endpoint avoids, so it is not the best fit.
+D=Interface for S3, gateway for SaaS: the SaaS half cannot be built, because gateway endpoints do not exist for customer or partner services.
+T: S3 and DynamoDB can use free gateway endpoints; any other private service, including SaaS in another VPC, is reached through a PrivateLink interface endpoint.
+
+@ Q001029 explain
+G: ## Why IP planning matters early
+VPCs, Transit Gateway routes, peering and Direct Connect all need **non-overlapping CIDRs**. If two VPCs both use `10.1.0.0/16`, they can never be routed to each other without renumbering or NAT. With 200 VPCs and an on-premises network already using `10.0.0.0/8`, the new ranges must be planned centrally.
+## Amazon VPC IP Address Manager (IPAM)
+- You create a top-level **pool**, for example `172.16.0.0/12`, and split it into Regional and environment pools such as prod, staging and dev.
+- IPAM integrates with AWS Organizations (with a delegated administrator account), and pools are shared to accounts with AWS RAM; teams create VPCs by requesting a CIDR from a pool, and IPAM hands out a non-overlapping block.
+- Allocation rules (such as required netmask length) and monitoring show usage and flag overlapping or non-compliant CIDRs.
+W: VPC IPAM: it allocates each new VPC a block from centrally managed pools across all accounts and Regions, so the 200 VPCs cannot overlap each other or the on-premises range.
+X: B=Independent choice by each team: IAM policies control who can call APIs, not which CIDR values are unique, so teams working separately will eventually pick overlapping ranges.
+C=Same /16 everywhere: identical ranges mean no two VPCs can be peered or routed through a Transit Gateway, and the landing zone could never interconnect.
+D=Public IP ranges: you cannot use public addresses you do not own without breaking reachability to those internet hosts, and owned public space is scarce and costly to spend on private networks.
+T: Plan CIDRs for many VPCs from central IPAM pools so every allocation is unique, instead of relying on teams or permissions to avoid overlap.
+
+@ Q001030 explain
+G: ## What can fail on a Direct Connect path
+A DX connection is a physical cross-connect at a **DX location**, ending on one AWS device. Three things can fail on their own:
+- the **connection** (fiber, optics, a port);
+- the **AWS device** it terminates on;
+- the whole **location** (power, fire, carrier outage).
+## The maximum resiliency model
+To survive any one of these failures, AWS recommends **two DX locations** with **two connections at each**, each connection on a separate AWS device. That is four connections in total. With BGP on every virtual interface, if one connection, one device, or an entire location fails, the remaining paths keep carrying traffic.
+Compare: high resiliency uses one connection at each of two locations, which survives a location loss but leaves only one path while it is down.
+W: Four connections across two locations: separate connections on separate devices at two locations mean no single connection, device or site can cut connectivity, which is AWS's maximum resiliency model.
+X: B=Two connections on one AWS device: the shared device and shared location are both single points of failure, so one hardware or site failure takes down both links.
+C=Dedicated plus hosted at one location: both paths still sit in the same facility, so a location outage disconnects them together.
+D=Dedicated connection plus VPN in the same location: the Direct Connect side has one connection and one location, and falling back to an internet VPN is not part of the maximum resiliency model.
+T: Surviving a device, connection or location failure requires redundancy at every level: two DX locations with two connections on separate devices in each.
+
+@ Q001031 explain
+G: ## Transit Gateway route tables
+A Transit Gateway can have several route tables. Two settings control routing for each attachment:
+- **Association**: which route table is used to look up where the attachment's traffic goes. Each attachment can be associated with only one table.
+- **Propagation**: which route tables automatically learn the attachment's CIDR.
+## Building "spokes see only the hub"
+- **Spoke table**: associate all spoke attachments; propagate only the shared services VPC into it. Spokes can reach shared services but have no route to each other.
+- **Shared services table**: associate the shared services attachment; propagate every spoke into it, so it can reach all spokes.
+Example: spoke `10.1.0.0/16` sends traffic to `10.2.0.0/16`; the spoke table has no route for it, so the TGW drops it.
+W: Separate route tables: associating spokes with a table that only knows the shared services route, and shared services with a table that knows all spokes, gives central, one-way isolation on a single TGW.
+X: A=One table with default association and propagation: every attachment learns every other attachment's routes, so spokes can talk to each other directly, which is the opposite of the requirement.
+C=Peering with each spoke: it abandons the single Transit Gateway, needs one peering per spoke with routes in both VPCs, and spreads control across many connections instead of one place.
+D=NACLs in every spoke: each spoke must list every other spoke's CIDR and be updated whenever a VPC is added, and NACL rule limits and mistakes make this fragile compared with not having the route at all.
+T: Segment traffic on a Transit Gateway with route table association and propagation, so unwanted paths simply have no route.
+
+@ Q001032 explain
+G: ## What VPC Flow Logs capture
+VPC Flow Logs record metadata about IP traffic on network interfaces (ENIs), subnets or whole VPCs. Each record includes source and destination IP and port, protocol, packets, bytes, start and end time and the **action**: `ACCEPT` or `REJECT`. Logs go to CloudWatch Logs, S3 or Amazon Data Firehose.
+Example record: `10.0.1.15 10.0.2.40 49152 3306 6 ... REJECT` shows a MySQL connection from the app to the database that a security group or network ACL refused.
+## Using them for intermittent failures
+Enable flow logs on the EC2 and RDS network interfaces, then filter by time window: rejected flows point to a security group or NACL problem, while accepted flows with no reply suggest the database or application side.
+Flow logs show packet metadata, not payloads; for full packet capture, VPC Traffic Mirroring is the tool.
+W: Flow Logs on the ENIs: they record every flow's accept or reject decision with timestamps, so the team can see exactly what happened to the traffic during the failure windows.
+X: A=X-Ray tracing: X-Ray follows requests through application code and shows that a database call failed or was slow, but not whether the network accepted or dropped the packets.
+B=Inspector network reachability: Inspector analyzes configuration to show which ports could be reachable; it does not record what actually happened to traffic at a given moment.
+C=Config history: Config shows when security group rules changed, which may be a useful clue, but it does not log any traffic or its outcome.
+T: To see what really happened to network traffic at a point in time, use VPC Flow Logs; configuration and tracing tools show settings or code, not packets.
+
+@ Q001033 explain
+G: ## Publishing one service to many VPCs
+**AWS PrivateLink** lets a provider publish a service without connecting networks:
+- The provider puts the API behind a **Network Load Balancer** and creates a **VPC endpoint service**, allowing specific AWS account principals to connect (and optionally requiring acceptance).
+- Each customer creates an **interface endpoint** in their own VPC. It is a network interface with an IP from the customer's CIDR, for example `172.31.5.20`.
+- Connections can only be opened from the customer to the service. The customer cannot see or route to anything else in the provider's VPC.
+Because no routing between the VPCs happens, customers with overlapping CIDRs work fine, which matters with hundreds of customers.
+W: PrivateLink endpoint service: each customer reaches only the NLB-fronted API through a private IP in its own VPC, with no route into the rest of the provider's network and no CIDR coordination.
+X: A=Peering per customer: peering joins entire networks, requires non-overlapping CIDRs, and has a per-VPC limit on active peerings, so hundreds of customers do not fit, and security groups alone are one mistake away from exposing more.
+B=Transit Gateway shared through RAM: TGW sharing gives customers network-level routing into the provider's environment, and route tables must be managed for every customer, which is the broad access the provider wants to avoid.
+D=Public ALB with WAF allow lists: the API is exposed on the internet, customer traffic does not stay private, and per-customer IP lists become a constant maintenance task.
+T: To expose a single service to many VPCs without exposing the network, publish it with PrivateLink behind an NLB.
+
+@ Q001034 explain
+G: ## Route 53 Resolver DNS Firewall
+Instances resolve names through the VPC's Route 53 Resolver. **DNS Firewall** filters those queries at the Resolver itself:
+- A **rule group** holds rules that match **domain lists** and take an action: `ALLOW`, `BLOCK` (return NXDOMAIN, NODATA or a custom answer) or `ALERT`.
+- **AWS managed domain lists** cover threats such as malware and botnet command-and-control domains and are updated by AWS. **Custom lists** hold your own domains, for example `badsite.example`.
+- **Resolver query logging** records queries, including those DNS Firewall blocked, to CloudWatch Logs, S3 or Firehose.
+## Scaling across accounts
+**AWS Firewall Manager** DNS Firewall policies associate rule groups with every VPC in scope across the organization, including VPCs created later.
+W: DNS Firewall through Firewall Manager: managed and custom domain lists block the bad lookups at the Resolver, query logs show what was blocked, and Firewall Manager applies the policy to all 300 VPCs and new ones automatically.
+X: B=GuardDuty findings updating security groups: GuardDuty detects suspicious DNS activity after the query happens, and security groups have no deny rules, so adding IPs to them cannot block anything.
+C=NACLs on port 53: NACLs see only IPs and ports, not domain names, so they cannot tell a malicious domain from a normal one, and they must be maintained on every subnet by hand.
+D=Network Firewall per VPC: its domain list rules match HTTP Host headers and TLS SNI in traffic that passes through it, but deploying and routing through a firewall in 300 VPCs is costly and complex, and it does not filter queries at the Resolver or use the AWS managed DNS threat lists the way DNS Firewall does.
+T: Block malicious domains at the Route 53 Resolver with DNS Firewall, and let Firewall Manager push the rules to every VPC in the organization.
+
+@ Q001035 explain
+G: ## Direct Connect gateway and transit VIFs
+A **Direct Connect gateway** is a global object: it is not tied to one Region. On a DX connection you create a **transit virtual interface** that terminates on the DX gateway, then **associate** the DX gateway with Transit Gateways in different Regions.
+- Example: one transit VIF to DX gateway `dxgw-corp`, associated with TGWs in `us-east-1`, `eu-west-1` and `ap-southeast-1`. On-premises learns each TGW's allowed prefixes over BGP.
+- Each association lists the prefixes advertised to on-premises, so you control what is reachable.
+- Traffic goes from the DX location over the AWS backbone to whichever Region the destination is in.
+The DX gateway connects on-premises to VPCs or TGWs; it does not route traffic between the associated Regions.
+W: DX gateway with multiple TGWs: associating one DX gateway with each Region's Transit Gateway through a transit VIF lets a single hybrid setup reach all three Regions without a separate connection per Region.
+X: A=Peering between TGWs: VPC peering cannot connect Transit Gateways, and funneling every Region through one Region's DX adds extra hops and makes that Region a dependency for all hybrid traffic.
+C=Public VIF: a public virtual interface reaches AWS public endpoints such as S3 public IPs, not private VPC or Transit Gateway addresses.
+D=Separate VPN per Region: VPN tunnels run over the internet and ignore the existing Direct Connect link, and each Region's tunnels must be configured and managed on its own.
+T: One DX gateway can associate with Transit Gateways in many Regions, giving on-premises private access to all of them over the same Direct Connect.
+
+@ Q001036 explain
+G: ## Why identical CIDRs cannot be routed
+Both VPCs use `10.0.0.0/16`. Every VPC route table has a **local route** for its own CIDR, so `10.0.5.20` always means "here". VPC peering refuses overlapping CIDRs, and a Transit Gateway route table can point a destination at only one attachment.
+## Translating addresses instead
+When renumbering is not possible, hide one side behind addresses that do not overlap:
+- Add a small **secondary CIDR** to each VPC, for example `100.64.1.0/24` and `100.64.2.0/24`, and attach those subnets to a Transit Gateway.
+- A **private NAT gateway** in the routable subnet translates outgoing traffic, and a load balancer fronts the shared services so the other company connects to a routable address.
+- Only the chosen services are reachable. **PrivateLink** is another way to expose single services.
+W: NAT for the specific endpoints: translating only the shared services onto non-overlapping addresses avoids the conflict, limits exposure to what must talk, and buys time until one VPC is re-addressed.
+X: A=Peering the same CIDR: VPC peering cannot be created between VPCs with overlapping CIDR blocks, so there is nothing to route over.
+B=Route 10.0.0.0/16 to the other VPC: each VPC's local route already covers `10.0.0.0/16`, so a route for the same range pointing elsewhere cannot send traffic to the other company.
+D=TGW with propagation: both attachments propagate the same `10.0.0.0/16`, but a route table can send that prefix to only one of them, and each VPC's local route still keeps the traffic at home.
+T: Overlapping CIDRs cannot be routed; translate addresses (private NAT) or expose individual services (PrivateLink) until you can renumber.
+
+@ Q001037 explain
+G: ## Workforce sign-in across many accounts
+**AWS IAM Identity Center** is the central sign-in service for employees across an AWS Organization.
+- Users and groups come from its own directory or from an external identity provider, such as Microsoft Entra ID or Okta, often synced with SCIM.
+- A **permission set** is a template of policies, such as `ReadOnly` or `NetworkAdmin`.
+- You **assign** a group plus a permission set to specific accounts. Identity Center then creates a matching IAM role in each assigned account.
+Example: the group `DBAs` gets `DatabaseAdmin` in the 5 production accounts only. A DBA signs in once at the access portal and sees just those accounts and roles, with temporary credentials for the console or CLI.
+W: IAM Identity Center with permission sets: one sign-in gives each employee temporary access to only the accounts and roles their group is assigned, with no IAM users created in any account.
+X: A=Cognito federated to each account: Cognito user pools are built for customer-facing application sign-in, not for managing workforce access to 50 AWS accounts, and you would have to wire up federation in every account yourself.
+B=Replicated IAM users: this creates the very IAM users the company wants to avoid, with long-term passwords and keys in 50 accounts and a custom script to keep in sync.
+C=Manual cross-account roles: each account owner builds roles and trust policies differently, there is no single sign-in portal, and permissions drift and are hard to audit.
+T: For employees across many accounts, assign Identity Center permission sets to groups per account instead of creating IAM users or hand-built roles.
+
+@ Q001038 explain
+G: ## Security groups versus network ACLs
+- **Security groups** attach to network interfaces, have **allow rules only**, and are **stateful**: if inbound 443 is allowed, the response is allowed out automatically. They cannot say "everyone except this range".
+- **Network ACLs** apply to a subnet, support **ALLOW and DENY**, are evaluated in **ascending rule number** until the first match, and are **stateless**: return traffic needs its own rule.
+## Blocking one range
+Inbound NACL:
+- `90 DENY 203.0.113.0/24 TCP 443`
+- `100 ALLOW 0.0.0.0/0 TCP 443`
+Outbound NACL: `100 ALLOW 0.0.0.0/0 TCP 1024-65535` so responses reach clients' ephemeral ports.
+The abusive range hits rule 90 first and is dropped; everyone else matches rule 100.
+W: Lower-numbered inbound NACL deny: the DENY is evaluated before the broad ALLOW for 443, blocking only that range, while the existing outbound ephemeral port rule lets responses to everyone else through.
+X: A=Allow every other range: the rest of the IPv4 space must be split into a set of exact CIDR blocks that is easy to get wrong, uses up security group rules, and must be recalculated for every new range to block, while one NACL deny rule does the job.
+B=Outbound NACL deny because NACLs are stateful: NACLs are stateless, so an outbound rule does not block inbound requests; the abusive requests still reach the servers.
+D=Security group deny rule: security groups support only allow rules, so there is no way to add a deny above the existing rule.
+T: Security groups can only allow; to block a specific range, use a lower-numbered DENY in the subnet's network ACL and keep outbound ephemeral ports open.
+
+@ Q001039 explain
+G: ## KMS multi-Region keys
+A normal KMS key lives in one Region; its key material never leaves that Region. A **multi-Region key** is a set of related keys: one **primary** and **replicas** in other Regions. They share:
+- the same **key ID**, which starts with `mrk-`, for example `mrk-1234abcd...`;
+- the same **key material**, so data encrypted with one can be decrypted by another without calling across Regions.
+Each replica is its own KMS resource with its own key policy, aliases and grants, while key rotation is managed on the primary and applies to all related keys.
+## Why it fits global tables
+DynamoDB global tables encrypt each replica with a key in that replica's Region, and DynamoDB uses each Region's key on its own. Using a multi-Region key and its replicas gives every Region a customer managed key with the same ID and material, which simplifies key management, policies and auditing, and lets any client-side encrypted attributes be decrypted in every Region.
+W: Multi-Region keys: a primary key with replicas in the other two Regions gives each table replica a customer managed key with the same key ID and key material, exactly as required.
+X: A=AWS managed key: `aws/dynamodb` is owned and managed by AWS, so it is not a customer managed key and its policy cannot be controlled.
+B=Separate single-Region keys with the same alias: an alias is only a friendly name; each key has a different key ID and different key material, so ciphertext from one Region cannot be decrypted with another.
+D=Client-side encryption with a shared secret: the application must implement encryption and key handling, and a copied secret in Secrets Manager is not a KMS customer managed key with audited, policy-controlled use.
+T: When the same key ID and material must exist in several Regions, use KMS multi-Region keys; an alias only names a key, it does not make keys the same.
+
+@ Q001040 explain
+G: ## Amazon Inspector
+Amazon Inspector is a managed vulnerability scanner.
+- **EC2**: it uses the **SSM Agent** already on instances to inventory software packages and match them against CVEs; no extra scanner agent is needed. An agentless option also exists for instances without the agent.
+- **ECR**: it scans container images on push and continuously afterwards.
+- **Continuous rescans**: when a new CVE is published, affected resources are rescanned automatically.
+- **Risk score**: each finding gets an Inspector score that adjusts the CVSS base score, for example raising it when the instance is reachable from the internet.
+## Organization-wide
+In AWS Organizations you pick a **delegated administrator** account, which can enable Inspector for all member accounts, auto-enable new accounts and see every finding in one place.
+W: Inspector org-wide: it continuously scans EC2 through the existing SSM Agent and ECR images, rescans on new CVEs, prioritizes by reachability, and a delegated administrator runs it across all 40 accounts.
+X: B=Config rules for package versions: Config records configuration, not vulnerability data, so you would have to build and update your own CVE matching logic, and there is no built-in ECR image scanning or exposure scoring.
+C=Weekly third-party scanner AMI: scans only once a week, misses CVEs published in between, and adds scanner instances in 40 accounts to launch, license and maintain.
+D=GuardDuty Malware Protection: it looks for malicious files on EBS volumes and other storage when triggered, not for known software vulnerabilities (CVEs) in packages or images.
+T: Continuous CVE scanning for EC2 and container images across an organization is Amazon Inspector, not a threat detector like GuardDuty or a config tracker like Config.
+
+@ Q001042 explain
+G: ## Layers for sharing sensitive S3 data across accounts
+- **Access**: a **bucket policy** grants the other account's role `s3:GetObject` or `s3:PutObject` on a prefix such as `arn:aws:s3:::exchange-bucket/divB/*`. Removing that statement revokes access.
+- **Encryption at rest**: **SSE-KMS** with a customer managed key. The key policy lists who may use the key, so the key owner can grant or revoke `kms:Decrypt` and `kms:GenerateDataKey` for the other account.
+- **In transit**: a bucket policy statement that denies requests when `aws:SecureTransport` is `false`, forcing HTTPS.
+- **Audit**: CloudTrail **S3 data events** log each object read and write, and KMS use is logged too.
+Both keys and permissions are controlled by the divisions, not left to defaults.
+W: Bucket policy, SSE-KMS, TLS condition and data events: the bucket policy and KMS key policy grant and revoke per-exchange access, the customer managed key keeps key control, the SecureTransport condition forces TLS, and CloudTrail records every object access.
+X: A=SFTP with emailed static credentials: shared credentials sent by email can be leaked and reused, cannot tell users apart in audit logs, and are hard to revoke for one exchange without breaking the others.
+B=Replication with default encryption: default SSE-S3 keys are managed by AWS, so neither division controls or can revoke the encryption key, and replication copies objects automatically instead of granting and revoking access per exchange.
+C=Public bucket with presigned URLs: a public bucket lets anyone read the objects without a URL, which defeats the purpose; presigned URLs work on private buckets and are not a substitute for blocking public access.
+T: For sensitive cross-account S3 sharing, combine a bucket policy, a customer managed KMS key policy, a TLS-only condition and CloudTrail data events.
+
+@ Q001043 explain
+G: ## AWS Elastic Disaster Recovery (DRS)
+DRS protects physical servers, VMware VMs and cloud instances by replicating them to AWS.
+- An **agent** on each source server sends **continuous block-level replication** to a low-cost staging area in your AWS account, giving an RPO of seconds.
+- On failover, DRS launches **recovery instances** from the latest or an earlier point in time, typically within minutes, with no application changes.
+- You can run **drills** at any time without stopping replication, and fail back to the source environment afterwards.
+Example: a VMware SQL Server VM is replicated continuously; during an outage it is launched as an EC2 instance from the state a few seconds before the failure.
+W: Elastic Disaster Recovery: it continuously replicates whole servers at block level and launches them on EC2 within minutes, which is exactly lift-and-shift DR without re-architecting.
+X: A=AWS Backup: it takes scheduled backups, so the RPO is the backup interval, and it does not replicate on-premises VMware servers continuously for minute-level failover.
+B=Application Migration Service for one-time migration: MGN is built for cutting servers over once; it is not the service for ongoing DR with repeated drills, point-in-time recovery and failback.
+C=DataSync: it copies files and objects between storage systems; it does not replicate server disks or launch recovery instances.
+T: For continuous server replication to AWS with minutes of recovery time, use Elastic Disaster Recovery; backups, migration and file copy tools serve other goals.
+
+@ Q001044 explain
+G: ## AWS Backup for long-term, protected retention
+- A **backup plan** sets schedules and retention, for example keeping monthly RDS backups for 7 years.
+- **Copy actions** send recovery points to a **backup vault** in another account and another Region, so a problem in the source account or Region does not affect the copies. Cross-account copies require both accounts to be in the same AWS Organization, and for RDS a single copy action can change both the account and the Region. Encrypted RDS snapshots must use a customer managed KMS key shared with the destination account, because the default `aws/rds` key cannot be shared.
+## Vault Lock
+**AWS Backup Vault Lock** enforces WORM (write once, read many) on a vault:
+- **Governance mode**: users with special permissions can still change or remove the lock.
+- **Compliance mode**: after a grace period ends, no one, not even the root user or AWS, can delete recovery points early, shorten retention or remove the lock.
+Example: a compliance-mode lock with minimum retention of 7 years on the vault in the backup account.
+W: AWS Backup copies with Vault Lock in compliance mode: automated cross-account, cross-Region copies are kept for 7 years, and compliance mode stops anyone, including administrators, from deleting them.
+X: A=S3 Lifecycle without Object Lock: lifecycle rules only move or expire objects on a schedule; anyone with delete permission, including an administrator, can still remove the exported files.
+B=35-day automated backups: automated RDS backups can be kept for at most 35 days, far short of 7 years, and they stay in the same account where an administrator can delete them.
+D=Monthly cron copies: a custom script can fail silently, monthly copies leave large gaps, and manual snapshots in the other account can still be deleted by its administrators.
+T: Long-term, tamper-proof backups in a separate account and Region are AWS Backup copy actions plus a compliance-mode Vault Lock.
+
+@ Q001045 explain
+G: ## Scaling up versus scaling out
+- **Vertical scaling (up)**: move to a larger instance type. It has a ceiling, usually needs a stop and start, and one instance is still a single point of failure.
+- **Horizontal scaling (out)**: add more instances behind a load balancer. Capacity grows in small steps and a failed instance is simply replaced.
+## Auto Scaling groups
+An **Auto Scaling group** keeps a desired number of instances across several AZs and changes it with scaling policies, for example **target tracking** at 50% average CPU. During a flash sale that brings 5x traffic for hours, it adds instances as load rises and removes them afterwards, so you pay for the extra capacity only while it is needed. Scheduled actions can add capacity just before a known sale starts.
+W: Auto Scaling group across AZs: many smaller instances in several AZs remove the single point of failure, and scaling out and back in follows the sale traffic so extra capacity costs money only while it runs.
+X: B=Permanent copies of the large instance: it improves resilience but pays for peak capacity every hour of the year, even though the peak only lasts for the sale.
+C=Scale up before each sale: resizing needs a restart, has an upper limit on instance size, still leaves one instance as a single point of failure, and does not react if traffic exceeds the forecast.
+D=Single larger instance in another AZ: moving the one server to another AZ changes nothing about its single point of failure or its fixed capacity.
+T: For large, sustained traffic spikes, scale out with an Auto Scaling group across AZs rather than scaling up one bigger instance.
+
+@ Q001046 explain
+G: ## DR strategies from cheapest to fastest
+- **Backup and restore**: only backups in the DR Region; hours to recover.
+- **Pilot light**: data replicated, core infrastructure defined but app servers off.
+- **Warm standby**: data replicated and a scaled-down but working copy of the whole application running.
+- **Multi-site active-active**: full capacity running in both Regions.
+## Where warm standby loses time
+With warm standby, recovery time is mostly how fast the small tier grows to full size. Scaling policies that add a few instances every few minutes, slow instance start-up and cold caches all add up.
+Fixes that cost little while idle: failover automation that immediately raises the Auto Scaling group's desired and minimum capacity, AMIs with the application already installed, and pre-warmed components such as caches, tested in regular drills.
+W: Pre-configured, tested scaling with pre-warming: failover automation sets full capacity at once and warm components start ready, cutting scale-up time while the standing environment stays small.
+X: A=Relax the RPO: RPO measures how much data can be lost, not how long recovery takes, so changing it does nothing about the slow scale-up that caused the missed RTO.
+B=Move to pilot light: pilot light keeps even less running, so there is more to start during failover and recovery takes longer, not shorter.
+C=Active-active at full capacity: it removes scale-up time but doubles standing infrastructure cost, which the requirement explicitly wants to avoid.
+T: Warm standby meets its RTO only when the scale-up to full capacity is automated, fast and tested; moving up to active-active is the costly alternative.
+
+@ Q001047 explain
+G: ## What pilot light keeps running
+In **pilot light**, only the core, usually the database, is running and replicated in the DR Region. Everything else must be created during failover, so the RTO depends almost entirely on how fast that happens.
+## Making the rebuild fast
+- **Prebuilt AMIs** with the application installed, or **infrastructure as code** such as CloudFormation templates, create the app tier, load balancers and security groups in minutes.
+- **Automated runbooks**, for example Systems Manager Automation or Step Functions, run the steps in order: promote the database, launch the stack, run health checks.
+- **DNS cutover** with Route 53 failover records, or routing controls in Route 53 Application Recovery Controller, shifts traffic once the stack is healthy.
+- Regular **drills** prove the process meets the 30-minute target.
+W: Prebuilt AMIs or IaC with automated, tested runbooks: they replace the four hours of manual launching, deploying and reconfiguring with a repeatable process that brings up the app tier and switches DNS within the RTO.
+X: A=Relax the RPO: RPO is about how much data can be lost; the four hours were spent rebuilding servers and DNS, which a different RPO does not speed up.
+B=Periodic snapshots instead of replication: this makes data loss larger (worse RPO) and adds a restore step, while doing nothing about the manual app-tier rebuild.
+D=Cross-Region backups only: restoring from backups is slower than promoting a live replica, and the app tier would still have to be built by hand.
+T: Pilot light is only as fast as the automation that builds the missing tiers; use AMIs or IaC, runbooks and DNS failover, and test them.

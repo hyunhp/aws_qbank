@@ -1,0 +1,358 @@
+# SAP-C02 detailed explanations, e11 (explanation-only rewrites; letters are the published ones)
+
+@ Q003023 explain
+G: ## Orchestration versus messaging
+A workflow with many steps needs something that remembers where each run is, what happened in every step, and what to do when a step fails. That is orchestration. Queues and topics only move messages; they do not track the state of a multi-step process.
+## Step Functions Standard Workflows
+AWS Step Functions describes a workflow as a state machine in Amazon States Language. Each state can call Lambda, ECS, Glue, or many AWS APIs directly.
+- **Standard** workflows can run for up to one year and keep a visual, step-by-step execution history you can inspect.
+- `Retry` and `Catch` fields on a state give per-step retries with backoff and error handling without custom code.
+- A task with the `.waitForTaskToken` pattern pauses until something calls `SendTaskSuccess` or `SendTaskFailure` with the token, for example an approver clicking a link in an email.
+- **Express** workflows run for at most five minutes and suit high-volume, short event processing, not hours-long approvals.
+Example: extract data (Glue job, two hours), wait for a manager's approval (callback token), then load and notify.
+W: Step Functions Standard Workflows: long executions, built-in retries, callback tasks for human approval, and a per-execution history cover every requirement in the stem.
+X: A=SQS queue alone: a queue buffers messages between producers and consumers, but it has no notion of step order, approval waits or execution history. You would have to build the orchestration yourself.
+B=SNS with email alerts: SNS pushes notifications to subscribers. It can tell a human that approval is needed, but it cannot pause a workflow, resume it on the answer, or retry failed steps.
+C=One long Lambda function: a Lambda invocation stops after at most 15 minutes, so hours-long steps and waits for a human cannot fit in one function, and you get no per-step visibility.
+T: Multi-step, long-running processes with retries and human approval call for Step Functions Standard; queues and topics only move messages, and Lambda is capped at 15 minutes.
+
+@ Q003024 explain
+G: ## Why secrets need a dedicated store
+Credentials placed in code, scripts or files end up copied into repositories, AMIs, logs and backups, and changing them means redeploying everything that contains them.
+## How AWS Secrets Manager works
+- A secret (for example a database user name and password as JSON) is stored encrypted with an AWS KMS key.
+- Applications call `GetSecretValue` at runtime; IAM policies and an optional resource policy decide which roles may read it, and every read is logged in CloudTrail.
+- Rotation runs on a schedule. For Amazon RDS, Aurora, Redshift and DocumentDB there are managed or template rotation functions that change the password in the database and in the secret together.
+- Client-side caching libraries reduce calls and pick up the new value after rotation.
+Example: an ECS task role is allowed `secretsmanager:GetSecretValue` on `arn:aws:secretsmanager:...:secret:prod/orders-db-*`; the password rotates every 30 days and no code change is needed.
+W: AWS Secrets Manager: it encrypts the credential, serves it at runtime through IAM-controlled API calls, and rotates it automatically, so nothing lives in code.
+X: B=EC2 user data scripts: user data is plain text readable from the instance metadata service and by anyone allowed to describe the instance attribute. It has no encryption at rest control, no access policy per secret and no rotation.
+C=Text files in an S3 bucket: the object can be encrypted and access-controlled, but nothing rotates the password in the database, and every consumer must build its own retrieval and refresh logic.
+D=Code repository: committing credentials to source control is exactly what the requirement forbids; the value spreads to every clone and history, and rotation means a new commit and deployment.
+T: Runtime retrieval plus automatic rotation of database credentials is Secrets Manager's job; files, user data and repositories only store a static copy.
+
+@ Q003025 explain
+G: ## Managing a global network as a policy
+With dozens of VPCs in several Regions plus data centers, building and connecting transit gateways and route tables Region by Region becomes a lot of manual work. AWS Cloud WAN adds a managed global layer on top.
+## How Cloud WAN works
+- A **core network** has core network edges in the Regions you choose, connected to each other over the AWS backbone.
+- A JSON **core network policy** defines **segments** (for example `production` and `development`). Each segment is an isolated routing domain across all Regions.
+- **Attachments** (VPCs, Site-to-Site VPNs, Connect attachments for SD-WAN, transit gateway route tables, Direct Connect gateways) are placed into segments, often automatically by tag, such as `env=prod`.
+- Segment actions decide whether segments share routes, for example letting both reach a shared services segment while production and development stay separated.
+Example: a VPC in one of the development accounts tagged `env=dev` is attached and lands in the development segment in its Region, reachable from other dev VPCs worldwide but not from production.
+W: Cloud WAN with production and development segments: one central policy controls routing and segmentation for all Regions, accounts and on-premises attachments.
+X: A=Full mesh of VPC peering: 60 VPCs need 1,770 peering connections, each with its own routes. Peering is not transitive, cannot carry on-premises traffic, and has no segment concept, so it cannot be managed centrally.
+B=Internet gateways with security groups: that sends private traffic over public addresses and still gives no routing between the data centers and VPCs. Security groups filter packets; they do not create segmented routing domains.
+D=A VPN from every VPC to both data centers: 120 separate VPN connections give each VPC a path home but no direct VPC-to-VPC routing, no central segmentation and a large management burden.
+T: Global, policy-defined segmentation across many Regions and accounts is what Cloud WAN provides; peering meshes and per-VPC VPNs scale only by adding more manual connections.
+
+@ Q003026 explain
+G: ## The two directions of hybrid DNS
+Every VPC has the Route 53 Resolver at the VPC base address plus two (for example `10.0.0.2`). It answers private hosted zones and public names, but it is not reachable from on premises, and by itself it does not know the corporate DNS zones.
+- An **inbound endpoint** puts Resolver IP addresses (ENIs) in your subnets. On-premises DNS servers conditionally forward, say, `aws.corp.example` to those IPs.
+- An **outbound endpoint** plus a **forwarding rule** sends queries for a domain such as `corp.example` from the VPC to on-premises DNS server IPs.
+## Centralizing it
+Build both endpoints once in a shared services VPC connected by transit gateway or Direct Connect. Share the forwarding rules with other accounts through AWS Resource Access Manager and associate them with each spoke VPC; queries from the spokes are forwarded through the central outbound endpoint. Associate the private hosted zones with the shared services VPC so inbound queries can resolve them.
+W: Central Resolver endpoints with rules shared by RAM: one inbound and one outbound endpoint pair serves every VPC in both directions, and new VPCs only need a rule association, not new DNS servers.
+X: A=Hard-coded IP addresses: this removes DNS rather than fixing it. Any IP change, failover or scaling event breaks the application, and nothing is centralized.
+B=EC2 DNS servers forwarding to the internet: public resolvers cannot answer private corporate or AWS private hosted zone names, and running DNS servers in every VPC multiplies patching and availability work.
+C=Public hosted zones duplicating private records: this publishes internal names and IP addresses to the whole internet and requires keeping two copies of every record in sync.
+T: Hybrid DNS at scale is inbound plus outbound Resolver endpoints in one hub VPC with forwarding rules shared through RAM, not per-VPC DNS servers or public records.
+
+@ Q003027 explain
+G: ## Pieces of a Direct Connect design
+- A **Direct Connect connection** is a dedicated physical port (for example 10 Gbps) at a Direct Connect location that links your network to AWS.
+- A **virtual interface (VIF)** runs BGP over that port. A private VIF reaches one virtual private gateway (one VPC) or a Direct Connect gateway; a **transit VIF** reaches a Direct Connect gateway that is associated with transit gateways.
+- A **Direct Connect gateway** is a global object. It can be associated with transit gateways in different Regions and, through association proposals, in other accounts.
+## Putting it together
+One 10 Gbps connection carries a transit VIF to a Direct Connect gateway. That gateway is associated with a transit gateway in each Region, and each transit gateway has all the VPCs of that Region attached, including VPCs owned by other accounts (shared through RAM). On-premises routers learn the allowed VPC prefixes over BGP.
+Example: `us-east-1` and `eu-west-1` transit gateways both associate with the same Direct Connect gateway, so one physical link reaches 40 VPCs in two Regions.
+W: Direct Connect gateway with transit gateways: a dedicated link gives private, consistent bandwidth, and the global Direct Connect gateway plus per-Region transit gateways extend it to many VPCs, Regions and accounts.
+X: B=VPC peering to on premises: VPC peering connects only two VPCs; it cannot be established with an on-premises network, and public IP addresses would not make the traffic private.
+C=One private VIF to one VPC: a private VIF attached directly to a virtual private gateway reaches only that single VPC in its Region, leaving the other VPCs, Regions and accounts unreachable.
+D=A VPN per VPC over the internet: internet paths give variable latency and throughput, a VPN attached to a virtual private gateway uses standard tunnels of up to about 1.25 Gbps each, and dozens of separate tunnels are hard to operate.
+T: For consistent private bandwidth to many VPCs in many Regions and accounts, use Direct Connect into a Direct Connect gateway associated with transit gateways, not VIFs or VPNs per VPC.
+
+@ Q003028 explain
+G: ## What VPC sharing is
+Normally every account builds its own VPC, which leads to many VPCs, many NAT gateways and many connections to manage. With **VPC sharing**, one account (the owner, usually the network team) creates the VPC and shares selected subnets with other accounts in the same AWS Organization through AWS Resource Access Manager.
+## Who controls what
+- **Participants** launch EC2 instances, RDS databases, Lambda ENIs and load balancers into the shared subnets. They own and manage those resources and their own security groups.
+- The **owner** keeps control of the VPC, subnets, route tables, network ACLs, gateways and connectivity. Participants cannot change them.
+- Billing for each resource goes to the account that created it.
+Example: the network account shares `subnet-app-a` and `subnet-app-b` in a production VPC with the payments and orders accounts; both deploy there, reuse the same NAT gateways and transit gateway attachment, and the network team still owns all routing.
+W: VPC sharing with RAM: application accounts launch into subnets that the central team owns, so networking stays centrally controlled and the number of VPCs drops.
+X: A=Public subnets open to everyone: making subnets public does not let other accounts place resources into them, and exposing workloads to the internet is the opposite of central control.
+B=Peering every application account: each account still needs its own VPC, so sprawl remains, and a peering mesh adds many more connections and route tables to manage.
+C=A separate VPC per application with NAT: this is the VPC sprawl the team wants to avoid, with duplicated NAT gateways and the network team no longer owning the subnets.
+T: To let many accounts use centrally owned subnets, share the subnets with RAM (VPC sharing) instead of giving each application its own VPC.
+
+@ Q003029 explain
+G: ## Service control policies as guardrails
+A service control policy (SCP) is attached to the organization root, an OU or an account in AWS Organizations. It sets the maximum permissions for every IAM user and role in the affected member accounts, including their administrators and the root user. An SCP never grants access; it only filters it.
+## Writing the guardrail
+A deny statement blocks the listed actions no matter what the account's IAM policies allow:
+- `organizations:LeaveOrganization`
+- GuardDuty actions that turn it off or detach the account, such as `guardduty:DeleteDetector`, `guardduty:UpdateDetector` and `guardduty:DisassociateFromAdministratorAccount`
+Everything not denied stays governed by the account's own IAM policies, so local admins remain free otherwise. A condition such as `aws:PrincipalArn` can exempt a security break-glass role from the deny. SCPs do not apply to the management account, so that account must be protected separately.
+W: SCP denying those actions: it is a preventive control that applies to every principal in member accounts, including administrators, and it cannot be removed from inside the account.
+X: A=Written policy document: an acknowledgement is not enforced by any system, so an administrator can still leave the organization or disable GuardDuty.
+B=Permissions boundaries on every principal: boundaries must be attached to each user and role one by one, and an account administrator with IAM rights can remove or change them, so they are not an organization-wide guardrail.
+D=CloudWatch alarms: alarms (or EventBridge rules) fire after the action has already happened. They detect and notify but do not prevent it.
+T: To stop even account admins from doing specific things across an organization, use an SCP deny; boundaries are per principal and alarms only detect.
+
+@ Q003030 explain
+G: ## Organization trails
+An **organization trail** is created in the management account (or a delegated administrator account) and automatically logs every account in the AWS Organization, including accounts added later. Member accounts can see the trail but cannot stop, change or delete it.
+## Making the log archive tamper-proof
+- The trail delivers to an S3 bucket in a dedicated **log archive** account; a bucket policy lets CloudTrail write there, and workload admins have no access to that account.
+- **S3 Object Lock** (which requires versioning) stores objects in WORM mode. In **compliance mode**, no user, including the root user, can delete or overwrite an object version until its retention period ends.
+- CloudTrail **log file validation** adds signed digest files so you can prove logs were not modified.
+Example: an organization trail writes to `s3://org-cloudtrail-archive` in the log archive account with a default Object Lock retention of seven years in compliance mode.
+W: Organization trail to an Object Lock bucket: one trail covers every current and future account, the separate account keeps logs out of reach of workload admins, and Object Lock makes them immutable.
+X: A=A trail per account to a local bucket: an admin of that account can stop the trail or delete the bucket's objects and versions, so the logs are neither central nor immutable.
+C=CloudWatch Logs with seven-day retention: the logs are still in each account, are deleted after a week, and are not protected against deletion by account admins.
+D=Emailed daily summaries: a summary is not the complete event record, and email offers no integrity guarantee or central immutable storage.
+T: Immutable, central audit logs come from an organization trail delivering to a separate log archive account bucket protected with Object Lock.
+
+@ Q003031 explain
+G: ## What a permissions boundary does
+A permissions boundary is a managed policy attached to an IAM user or role that sets the **maximum** permissions it can have. The effective permissions are the intersection of the identity policies and the boundary: an action must be allowed by both.
+## Using it for safe delegation
+You let delegated administrators create roles, but only with the boundary attached:
+- Allow `iam:CreateRole` and `iam:PutRolePolicy` only with the condition `iam:PermissionsBoundary` equal to the approved policy ARN, for example `arn:aws:iam::111122223333:policy/AppBoundary`.
+- Deny `iam:DeleteRolePermissionsBoundary` and any change to the boundary policy itself.
+Now even if an admin attaches `AdministratorAccess` to a new role, that role can still do only what `AppBoundary` allows, so privilege escalation is blocked at creation time.
+W: Required permissions boundaries: every role the delegated admins create is capped by the boundary, so they can never grant more than the defined maximum, and the cap is enforced by IAM at request time.
+X: B=Monthly review: a review only finds excess permissions after they existed, possibly for weeks. It does not stop anyone from granting them.
+C=Shared administrator password: shared credentials destroy accountability because you cannot tell which person acted, and they place no limit on what permissions are granted.
+D=Tag policies requiring an owner tag: tag policies standardize tag keys and values. A role with a correct owner tag can still carry unlimited permissions.
+T: To let others create roles without exceeding a ceiling, require a permissions boundary on every role they create; reviews and tags do not cap permissions.
+
+@ Q003032 explain
+G: ## Shared services are a shared blast radius
+A shared services VPC hosts things like Active Directory, DNS forwarders and monitoring that every account depends on. If it fails, sign-ins, name resolution and alerting fail for all 40 accounts at once, so it needs the highest availability in the environment.
+## Designing it for resilience
+- Run each service in at least two Availability Zones: for example AWS Managed Microsoft AD always places two domain controllers in two AZs, and monitoring collectors run in an Auto Scaling group spread across AZs.
+- Create the transit gateway attachment with a subnet in every AZ used, so traffic can still enter and leave the VPC if one AZ fails.
+- Make on-premises connectivity redundant too (two Direct Connect links, or Direct Connect plus VPN).
+Example: domain controllers in `us-east-1a` and `us-east-1b`, a transit gateway attachment in both, and clients configured with both DC addresses.
+W: Multi-AZ shared services with redundant transit connectivity: losing one AZ or one path no longer takes down the services all accounts rely on, while keeping one central, consistently managed copy.
+X: B=Everything in a single AZ: one AZ outage would then stop the shared services for all 40 accounts; placing them near one workload does nothing for the rest.
+C=A copy in each of the 40 accounts: it removes the central failure point but multiplies cost, licenses and patching, and 40 separately managed copies drift apart in configuration.
+D=Remove shared services: each team would rebuild directory and monitoring on its own, which fragments identity and visibility instead of making the common services resilient.
+T: Protect services that everyone depends on by spreading them and their transit gateway attachment across AZs, not by duplicating them per account.
+
+@ Q003033 explain
+G: ## Removing the single point of failure in hybrid links
+One Direct Connect connection can fail because of a device, a fiber cut or an issue at the Direct Connect location. AWS publishes resiliency models:
+- **High resiliency**: one connection at each of two different Direct Connect locations, so a whole location can fail.
+- **Maximum resiliency**: two connections at each of two locations.
+- A **Site-to-Site VPN** over the internet as a lower-cost backup when a second circuit is not justified.
+## How failover works
+Both paths advertise the same prefixes with BGP. When a virtual private gateway or transit gateway learns the same prefix over Direct Connect and VPN, it prefers Direct Connect, so the VPN carries traffic only when the Direct Connect path goes down. BFD on the Direct Connect side speeds up detection.
+Example: a primary 10 Gbps link at location A, a second one at location B, and a VPN to the transit gateway as a last resort.
+W: D=Second Direct Connect at another location: a separate location protects against both circuit and site failure and keeps dedicated, consistent bandwidth during failover.
+E=Site-to-Site VPN backup: an encrypted tunnel over the internet provides a second path that BGP uses automatically when Direct Connect is down.
+X: A=More NAT gateways: NAT gateways give private subnets outbound internet access. They add no path between the VPC and the data center.
+B=A larger VPC CIDR: more IP addresses in the VPC change nothing about how many links connect it to on premises.
+C=More security groups: security groups filter traffic on ENIs. They cannot create or protect a network path.
+T: Hybrid resilience means a second path: another Direct Connect connection at a different location or a VPN backup, with BGP handling failover.
+
+@ Q003034 explain
+G: ## What a landing zone needs
+A new multi-account environment needs the same baseline everywhere: an organization structure with OUs, a central log archive, a security audit account, guardrails, and a repeatable way to create new accounts already configured.
+## AWS Control Tower
+AWS Control Tower builds this landing zone on top of AWS Organizations:
+- It creates a Security OU with a **Log Archive** account (central CloudTrail and Config logs) and an **Audit** account.
+- **Controls** (guardrails) are preventive (implemented with organization policies such as SCPs), detective (AWS Config rules) or proactive (CloudFormation hooks), enabled per OU.
+- **Account Factory** provisions new accounts into a chosen OU with the baseline applied, from the console, through Service Catalog, or with Account Factory for Terraform (AFT).
+- A dashboard shows controls that are out of compliance across accounts.
+W: Control Tower with Account Factory: it delivers guardrails, centralized logging and automated, governed account provisioning as one managed landing zone.
+X: A=AWS Config in one member account: Config records and evaluates resources in that account only. It does not create accounts, central logging or organization-wide guardrails.
+C=Organizations alone: Organizations provides accounts, OUs and SCPs, but you would have to build the log archive, detective controls and account baseline yourself.
+D=Service Catalog without Organizations: Service Catalog publishes approved CloudFormation products, but without Organizations it cannot create or govern accounts in a multi-account structure.
+T: A ready-made governed multi-account baseline with account vending is Control Tower; Organizations, Config and Service Catalog are only building blocks of it.
+
+@ Q003035 explain
+G: ## Sharing resources instead of duplicating them
+Some resources are meant to be used by many accounts: one transit gateway for the whole network, one set of Route 53 Resolver forwarding rules for hybrid DNS. **AWS Resource Access Manager (RAM)** shares such resources from the owning account.
+## How RAM works
+- Create a **resource share**, add resources (transit gateways, Resolver rules, subnets, prefix lists, IPAM pools and others) and choose principals: accounts, OUs or the whole organization.
+- With sharing for AWS Organizations enabled, accounts in the OU get access without invitations, and accounts added to the OU later receive it automatically.
+- The owner keeps control; for example, a participant can attach its VPC to the shared transit gateway, and a shared Resolver rule is associated with the participant's own VPCs.
+Example: the network account shares `tgw-0abc` and the rule for `corp.example` with the `Workloads` OU.
+W: AWS Resource Access Manager: it shares transit gateways and Resolver rules with every account in an OU, including accounts added later, without copying the resources.
+X: A=License Manager: it tracks and enforces software license usage (such as core or vCPU limits). It does not share network resources.
+B=Service Catalog portfolios: portfolios share approved products (CloudFormation templates) that accounts can launch, which would create new resources rather than share the existing transit gateway and rules.
+D=AWS Artifact agreements: Artifact provides AWS compliance reports and lets you accept agreements such as a BAA. It has nothing to do with resource access.
+T: To let many accounts use one existing network resource, share it with RAM; Service Catalog shares templates to create new ones.
+
+@ Q003036 explain
+G: ## Workforce access to many accounts
+Creating IAM users in every account means separate passwords, keys and permissions per account. **AWS IAM Identity Center** gives workforce users one sign-in to an access portal that lists every account and role they may use.
+## Permission sets and assignments
+- A **permission set** is a template of policies, such as `DevPowerUser` or `ReadOnly`.
+- An **assignment** combines a group (from the Identity Center directory or an external IdP such as Microsoft Entra ID or Okta), a permission set and an account. Identity Center creates a matching IAM role in that account.
+- Users choose an account and role in the portal and receive short-term credentials for the console or CLI.
+Example: group `developers` gets `DevPowerUser` on the dev accounts and `ReadOnly` on the prod accounts; one sign-in serves both.
+W: IAM Identity Center with permission sets: one portal, one identity, and per-account assignments give broad access in dev and read-only access in prod with temporary credentials.
+X: B=Cognito user pools: Cognito authenticates customers of your own applications. Custom attributes do not map users to AWS accounts and roles or provide a multi-account console portal.
+C=IAM users in every account: each developer ends up with a separate password (and often keys) per account, which is the opposite of single sign-on and hard to audit or revoke.
+D=One shared all-powerful IAM user: shared credentials remove individual accountability and give everyone full rights, including in production, violating least privilege.
+T: Workforce single sign-on with different rights per account is IAM Identity Center permission sets; Cognito is for application users.
+
+@ Q003037 explain
+G: ## Baselines that apply themselves
+A baseline is the set of resources every account must have, for example standard IAM roles for security and operations, a VPC built to the network standard, and AWS Config rules. The key is that it is applied automatically when the account is created, not later by a person.
+## Ways to automate it
+- **CloudFormation StackSets** with service-managed permissions and automatic deployment target an OU; when a new account joins the OU, the stacks are deployed to it and, unless you choose to retain them, removed if it leaves.
+- **Customizations for AWS Control Tower (CfCT)** runs CloudFormation templates and SCPs from a pipeline on account creation events.
+- **Account Factory for Terraform** and Account Factory blueprints do the same for Terraform or Control Tower vending.
+Example: a StackSet with `SecurityAuditRole`, `OpsRole`, a VPC template and a conformance pack is deployed automatically to every account in the `Workloads` OU.
+W: Customizations with StackSets or Control Tower: the baseline is deployed as code automatically when the account is created, so every account is identical without human steps.
+X: A=Monthly checking script: it only reports missing items, and only up to a month later; it does not create the roles, VPC or rules.
+C=Optional shared template: owners who skip it get no baseline, so consistency depends on each team's choice.
+D=Manual checklist: manual setup is slow and error-prone, and accounts drift from the standard as engineers interpret the checklist differently.
+T: Standard account setup should be deployed automatically at account creation with StackSets or Control Tower customizations, not checked afterward or left optional.
+
+@ Q003038 explain
+G: ## Allocating cost across many accounts
+Account-level billing is not enough when business units and projects share accounts, or when some costs (support, shared networking, data transfer) serve everyone.
+## The two building blocks
+- **Cost allocation tags** such as `BusinessUnit` and `Project` must be applied consistently and activated in the management account before they appear in billing data. **Tag policies** in AWS Organizations define the allowed keys, capitalization and values, and can block noncompliant tagging on supported resource types.
+- **AWS Cost Categories** create rules that map costs (by account, tag, service and more) to values such as `Retail` or `Payments`. **Split charge rules** then distribute a shared cost, such as Enterprise Support or a shared networking account, across categories proportionally, evenly or by fixed percentages.
+Cost Explorer, budgets and the Cost and Usage Report can then group spend by these categories.
+W: D=Tag policies for cost allocation tags: they keep tag keys and values consistent in all 80 accounts, so costs can be attributed to business unit and project reliably.
+E=Cost Categories with split charges: they group costs into business units and projects and allocate shared charges fairly across them.
+X: A=Removing tags: tags are how resource costs are attributed to projects; removing them makes the reports impossible, not simpler.
+B=Separate billing per account: it loses the organization-wide view and combined volume pricing and discount sharing, and still gives no project or business unit breakdown.
+C=One account per employee: thousands of accounts are unmanageable, and people do not map to business units and projects; shared costs would still need allocating.
+T: Chargeback across many accounts needs consistently enforced cost allocation tags plus Cost Categories with split charge rules for shared costs.
+
+@ Q003039 explain
+G: ## How commitment discounts are shared
+Reserved Instances and Savings Plans are bought in one account, but in an AWS Organization they belong to one consolidated bill. The management account pays for all member accounts, and usage across accounts is combined.
+- **Discount sharing** lets an unused RI or Savings Plan in one account apply to matching usage in any other account in the organization. The purchasing account's own usage benefits first.
+- Sharing is on by default and is controlled in the management account's billing preferences, where it can be turned off for specific accounts.
+- Combined usage also reaches volume pricing tiers (for example for S3 storage) sooner.
+Example: a Compute Savings Plan bought in the shared services account has commitment that account does not use, and that remainder applies to Fargate and EC2 usage in two workload accounts.
+W: Consolidated billing with discount sharing: accounts that share one bill can apply each other's unused RI and Savings Plans benefits, which is exactly the sharing requirement.
+X: A=Separate payment methods: accounts that are billed separately are not part of one consolidated bill, so their commitments cannot be applied to each other's usage.
+B=Tag policies on instances: tags help attribute costs, but they have no effect on how RI or Savings Plans discounts are applied.
+D=IAM roles to buy capacity: IAM controls who may purchase commitments, not which accounts the discounts apply to.
+T: RI and Savings Plans benefits flow between accounts only through consolidated billing with sharing enabled; tags and IAM do not move discounts.
+
+@ Q003040 explain
+G: ## Finding unexpected spend
+Budgets alert on fixed thresholds, but a spike in one service can hide inside a normal total. **AWS Cost Anomaly Detection** learns the normal spending pattern with machine learning and flags deviations.
+## How it works
+- **Monitors** watch spend by AWS service, linked account, cost category or cost allocation tag; one monitor can cover the whole organization from the management account.
+- **Alert subscriptions** send individual alerts for each anomaly to email or an Amazon SNS topic, or daily or weekly summaries by email, with a threshold on the dollar or percentage impact.
+- Each anomaly includes **root cause analysis** that points to the service, account, Region and usage type that drove it.
+Detection runs on billing data several times a day, and that data can lag by up to about a day, so alerts arrive within a day rather than instantly.
+Example: a monitor on all services alerts through SNS when a new NAT gateway data processing charge adds 60 percent to one account's daily spend.
+W: Cost Anomaly Detection with monitors and alerts: it detects unusual spend across the organization, alerts within about a day, and names the likely root cause.
+X: A=CPU alarms per instance: CPU utilization says nothing about spend, and most cost spikes (data transfer, storage, new services) have no CPU signal at all.
+C=Monthly invoice review: it finds the spike weeks too late, and an invoice PDF does not break down which account or usage type caused it.
+D=Config rules for cost tags: they check tag compliance on resources, not how much is being spent or whether spending changed.
+T: Machine-learning spend anomaly alerts with root cause hints are Cost Anomaly Detection; resource metrics and tag checks do not measure cost changes.
+
+@ Q003041 explain
+G: ## Central firewall policy across accounts
+Configuring AWS WAF web ACLs and Shield Advanced protections account by account leaves gaps whenever someone creates a new load balancer or CloudFront distribution. **AWS Firewall Manager** applies them from one place.
+## How Firewall Manager works
+- It requires AWS Organizations, a Firewall Manager administrator account and AWS Config recording in the member accounts.
+- A **policy** defines the protection (WAF rules, Shield Advanced, security group rules, Network Firewall, Route 53 Resolver DNS Firewall or supported third-party firewalls) and its scope: accounts, OUs, resource types and tags.
+- With auto remediation, Firewall Manager applies the protection to existing and **newly created** in-scope resources and reports noncompliant ones.
+Example: a WAF policy with the AWS managed core rule set is applied to every Application Load Balancer tagged `public=true` in the `Prod` OU, including ALBs created next month.
+W: AWS Firewall Manager: it centrally manages WAF rules and Shield Advanced protections for all accounts and automatically applies them to new resources.
+X: A=GuardDuty: it analyzes logs such as CloudTrail, VPC flow logs and DNS logs to detect threats. It does not deploy WAF rules or Shield protections.
+B=Security Hub: it aggregates findings and runs posture checks across accounts, but it does not configure WAF web ACLs or Shield Advanced.
+D=Trusted Advisor: it gives best-practice recommendations and checks. It does not create or enforce firewall policies.
+T: Centrally enforcing WAF, Shield Advanced and firewall rules across accounts, including new resources, is Firewall Manager; GuardDuty and Security Hub detect and report.
+
+@ Q003042 explain
+G: ## Why overlapping CIDRs block routing
+If both VPCs use `10.1.0.0/16`, a route to `10.1.0.0/16` cannot point to both. VPC peering refuses to connect overlapping VPCs, and a transit gateway route table can hold only one route per destination.
+## PrivateLink avoids routing entirely
+With **AWS PrivateLink** the provider places its service behind a Network Load Balancer and publishes it as an **endpoint service**. The consumer VPC creates an **interface endpoint**, which gets ENIs with IP addresses from the consumer's own CIDR.
+- The consumer's application connects to the endpoint's local IP or DNS name; AWS carries the traffic privately to the NLB.
+- Traffic reaching the provider appears to come from the NLB, so the two address spaces never meet and overlap does not matter.
+- Only that one service is exposed, and connections can be initiated only from consumer to provider.
+Example: business unit B's app calls `vpce-0123...` in its own `10.1.20.0/24` subnet to reach business unit A's pricing API.
+W: PrivateLink endpoint service: it connects one service in each direction as needed without any routing between the VPCs, so overlapping CIDRs are not a problem.
+X: B=Over the internet with public IPs: traffic leaves the private network and needs internet exposure of both services, which fails the private communication requirement.
+C=Transit gateway with one shared route table: one route table cannot hold the same `/16` pointing to two attachments, so one VPC becomes unreachable for that range.
+D=VPC peering: a peering connection cannot be created between VPCs with overlapping IPv4 CIDR blocks.
+T: When CIDRs overlap and only specific services must talk, use PrivateLink; peering and transit gateway routing both need unique address ranges.
+
+@ Q003043 explain
+G: ## Centralized egress
+In a centralized egress design, spoke VPCs have no internet gateway. Their default route points to a transit gateway, which sends internet-bound traffic to an egress VPC that holds NAT gateways and an internet gateway.
+## Why AZs matter
+- A **NAT gateway is zonal**: it is redundant inside its AZ but fails if that AZ fails.
+- A transit gateway attachment uses one subnet per AZ you enable, and the transit gateway delivers traffic to the attachment ENI in the same AZ where possible.
+The resilient pattern: one NAT gateway in each AZ of the egress VPC, a transit gateway attachment subnet in each of those AZs, and a route table per AZ that sends `0.0.0.0/0` to the NAT gateway in the same AZ. If one AZ fails, the other AZs keep their own NAT path.
+Example: egress VPC with NAT gateways in `a`, `b` and `c`; the attachment subnet in `a` routes to the NAT gateway in `a`, and so on.
+W: NAT gateways per AZ with multi-AZ attachments: no single AZ carries all egress, so the loss of an AZ removes only that AZ's path while the others keep working.
+X: A=One large NAT instance: a bigger instance adds throughput, not availability; the instance and its single AZ remain a single point of failure, and you must manage it yourself.
+B=Internet gateways on private spoke subnets: an internet gateway attaches to a VPC, not a subnet, and routing to it makes subnets public, which abandons the centralized egress and inspection design.
+C=One NAT gateway in one AZ: if that AZ fails, all 30 VPCs lose internet egress, and traffic from other AZs pays cross-AZ charges.
+T: Centralized egress survives an AZ failure only with a NAT gateway and a transit gateway attachment subnet in every AZ, each AZ routing to its local NAT gateway.
+
+@ Q003044 explain
+G: ## Discovery before migration
+Planning 800 servers into waves requires knowing what each server is, how busy it is, and which servers talk to each other. Servers that depend on each other should usually move in the same wave.
+## AWS Application Discovery Service
+- The **Discovery Agent** is installed on Windows and Linux servers. It collects configuration, CPU, memory and disk utilization, running processes and **network connections**, which are used to build dependency maps.
+- The **Agentless Collector** is a virtual appliance deployed in VMware vCenter. It collects VM inventory and utilization without installing anything in each guest, and its network data collection module (added in late 2024) also discovers server-to-server connections; it does not report running processes.
+- Data appears in AWS Migration Hub, where you can view network diagrams, group servers into applications, and export data (or feed it to Athena) for wave planning and right-sizing.
+Note: since November 7, 2025, Application Discovery Service and Migration Hub no longer onboard new customers (existing customers can keep using them); AWS points new migrations to AWS Transform. The exam still tests Application Discovery Service for this job.
+Example: agents show that three web servers, two app servers and one SQL Server talk to each other constantly, so they become one application in wave 2.
+W: Application Discovery Service: agents or the agentless collector gather utilization and dependency data, which is exactly what is needed to group servers into migration waves.
+X: A=Amazon Inspector: Inspector scans EC2 instances, container images and Lambda functions in AWS for vulnerabilities. It does not inventory on-premises servers or map their dependencies.
+C=Trusted Advisor: its checks evaluate resources in your AWS accounts, not servers in your data center.
+D=Cost Explorer: it analyzes AWS spending that already exists. It cannot read on-premises invoices or measure server utilization.
+T: Server inventory, utilization and dependency mapping for wave planning come from Application Discovery Service; Inspector, Trusted Advisor and Cost Explorer work on resources already in AWS.
+
+@ Q003045 explain
+G: ## Building a migration business case
+A credible business case compares today's cost with the projected AWS cost for the same workloads. Using list prices for current server sizes overstates AWS cost, because many servers are overprovisioned and licensing options change the price.
+## AWS Migration Evaluator
+- It collects actual utilization with an agentless collector or imports data from existing tools and inventory exports.
+- It models **right-sized** EC2 instances based on measured usage, compares purchase options, and models licensing, such as bring-your-own-license versus license-included Windows and SQL Server.
+- The output is a directional business case (Quick Insights and a detailed report) that leaders can use before committing.
+Example: 1,200 VMs averaging 15 percent CPU are mapped to smaller instances with Savings Plans pricing, showing a projected annual cost next to the current data center cost.
+W: Migration Evaluator with collected utilization: it produces a data-driven, right-sized cost projection and business case from how servers are actually used.
+X: A=Free Tier calculator per server: the Free Tier is a limited allowance of free usage, not an estate-wide cost model, and pricing servers one by one ignores utilization and licensing.
+B=Spreadsheet with list prices: sizing from current specs and list prices ignores real utilization and right-sizing, so the estimate is inaccurate and not data-driven.
+D=Inspector security report: Inspector reports vulnerabilities on AWS resources. It produces no cost estimate and does not assess on-premises estates.
+T: A right-sized, utilization-based migration cost case comes from Migration Evaluator, not from list-price spreadsheets or security tools.
+
+@ Q003046 explain
+G: ## Rehosting servers with AWS Application Migration Service
+Rehost (lift and shift) moves servers to EC2 without changing the application. **AWS Application Migration Service (MGN)** automates this for physical, virtual and cloud servers running Windows or Linux.
+- The **AWS Replication Agent** on each source server performs continuous block-level replication of its disks to a staging area subnet in your AWS account using low-cost replication servers and EBS volumes.
+- You launch **test instances** at any time to validate, without disrupting the source.
+- At **cutover** you stop the application, let the final changes replicate, and launch the production EC2 instance, so downtime is typically minutes.
+- Launch templates and post-launch actions adjust instance type, networking and agents automatically, which helps with hundreds of servers in waves.
+W: Application Migration Service: continuous replication plus test and cutover launches move Windows and Linux servers to EC2 quickly with minimal downtime and no code changes.
+X: B=Schema Conversion Tool: it converts database schemas and code between engines, for example Oracle to PostgreSQL; it does not move whole servers.
+C=Database Migration Service: it migrates data between database endpoints, not operating systems, applications and disks of entire servers.
+D=DataSync scheduled tasks: DataSync copies files and objects between storage systems such as NFS, SMB, S3, EFS and FSx; it does not produce bootable EC2 instances.
+T: Server lift and shift with short cutover is Application Migration Service; SCT, DMS and DataSync handle schemas, databases and files.
+
+@ Q003047 explain
+G: ## Heterogeneous database migration
+Moving from Oracle to Aurora PostgreSQL changes the engine, so two things must happen:
+- **Schema and code conversion**: tables, indexes, views and PL/SQL procedures must become PostgreSQL equivalents. The AWS Schema Conversion Tool (or DMS Schema Conversion in the DMS console) converts most objects automatically and produces an assessment report listing items that need manual work.
+- **Data movement with little downtime**: AWS DMS runs a **full load** of existing data and then **change data capture (CDC)**, reading Oracle's redo logs (with supplemental logging enabled) and applying ongoing changes to Aurora.
+## Cutover
+While CDC keeps the target in sync, you test against Aurora. At cutover you stop writes to Oracle, wait for DMS to apply the last changes, and switch the application's connection string, so downtime is minutes rather than hours.
+Example: a DMS task of type `full-load-and-cdc` with Oracle as the source endpoint and Aurora PostgreSQL as the target.
+W: SCT plus DMS with full load and CDC: SCT converts the Oracle schema and code for PostgreSQL, and DMS copies the data then keeps it synchronized until a short cutover.
+X: A=Application Migration Service to EC2: it rehosts the Oracle server as-is on EC2, so the database is still Oracle and never becomes Aurora PostgreSQL.
+B=One full-load task over a weekend: without CDC the application must stay offline for the whole copy, which is not minimal downtime, and the schema and code still are not converted.
+C=CSV exports imported manually: exports capture only a point in time, lose constraints and procedural code, and need a long outage to avoid missing changes.
+T: Oracle to Aurora PostgreSQL with minimal downtime means SCT for conversion plus DMS full load and CDC; rehosting keeps Oracle and full load alone needs a long outage.

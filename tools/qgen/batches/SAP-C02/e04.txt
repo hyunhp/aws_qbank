@@ -1,0 +1,373 @@
+# SAP-C02 detailed explanations, chunk e04 (explanation-only rewrites; letters are the published ones)
+
+@ Q001098 explain
+G: ## Two kinds of VPC endpoint
+A VPC endpoint lets resources in a private subnet reach an AWS service without an internet gateway or NAT gateway. There are two kinds:
+- **Gateway endpoints** exist only for Amazon S3 and DynamoDB. You attach the endpoint to route tables, and AWS adds a route whose destination is the service's prefix list (a `pl-...` ID such as `com.amazonaws.us-east-1.s3`) and whose target is the endpoint (`vpce-...`). There is no hourly or data processing charge.
+- **Interface endpoints** (AWS PrivateLink) place an elastic network interface with a private IP in your subnets. They exist for most services, including S3 and DynamoDB, and are billed per endpoint per AZ-hour plus per GB processed.
+## When each fits
+Gateway endpoints only serve traffic that starts inside the VPC in the same Region. Interface endpoints are the choice when on-premises networks (over VPN or Direct Connect) or other VPCs must reach the service through private IPs.
+Example: an app in `10.0.1.0/24` calls `s3.us-east-1.amazonaws.com`; the route table sends that prefix list to the gateway endpoint, so the traffic never touches a NAT gateway.
+W: Gateway endpoints for S3 and DynamoDB: they add private routes to both services from the VPC's route tables, remove the need for a NAT gateway for this traffic, and cost nothing, which meets both the security and cost goals.
+X: B=Peering to S3: VPC peering connects two VPCs. S3 is not a VPC you can peer with, so there is no peering connection that reaches the S3 API.
+C=Interface endpoints: these would also keep traffic private, but each endpoint is charged per AZ-hour and per GB. For traffic that originates in the VPC, gateway endpoints do the same job for free, so they are the better fit for the cost goal.
+D=NAT gateway: the traffic still leaves through the NAT gateway to the services' public endpoints, and NAT gateways charge per hour and per GB. A security group cannot even be attached to a NAT gateway.
+T: For S3 and DynamoDB traffic from inside a VPC, gateway endpoints are private and free; interface endpoints are for cases that need private IPs, such as access from on premises.
+
+@ Q001099 explain
+G: ## Two layers of DDoS
+DDoS attacks come in two broad shapes:
+- **Network and transport layer (L3/L4)** attacks, such as SYN floods or UDP reflection, try to saturate bandwidth or connection tables with huge volumes of packets.
+- **Application layer (L7)** attacks, such as HTTP floods, send requests that look valid (for example thousands of `GET /search` per second) to exhaust servers and databases behind them.
+## Which AWS service covers what
+- **AWS Shield Standard** is automatic and free and mitigates common L3/L4 attacks against all customers.
+- **AWS Shield Advanced** is a paid subscription that adds enhanced detection and mitigation for protected resources (CloudFront, Route 53, Global Accelerator, ALB, Elastic IPs), access to the Shield Response Team, cost protection for scaling during an attack, and automatic L7 mitigation that works together with AWS WAF.
+- **AWS WAF** inspects HTTP requests. A **rate-based rule** counts requests per source IP (or other keys) over a time window and blocks sources above a limit, for example 2,000 requests in 5 minutes.
+W: Shield Advanced plus WAF rate-based rules: Shield Advanced handles the large volumetric network-layer attack with enhanced mitigation and expert support, and WAF rate-based rules block the sources sending HTTP floods, so both layers are covered.
+X: B=Security groups: security groups only allow or deny traffic by port and source. They cannot absorb a volumetric attack and cannot tell an abusive HTTP request from a normal one on an allowed port such as 443.
+C=Shield Standard alone: Shield Standard mitigates common L3/L4 attacks but does not inspect HTTP requests, so it does not stop an application-layer flood of valid-looking requests.
+D=AWS WAF alone: WAF works on HTTP requests at L7. Volumetric packet floods at L3/L4 never become HTTP requests for it to evaluate, so it cannot mitigate them.
+T: Shield handles network-layer floods and WAF handles HTTP floods; defending against both needs both, with Shield Advanced adding enhanced protection and response support.
+
+@ Q001100 explain
+G: ## Temporary credentials instead of keys
+An **instance profile** attaches an IAM role to an EC2 instance. The application gets temporary credentials from the instance metadata service, and AWS rotates them automatically, so no access keys are stored on the instance.
+## Reaching another account with a role
+To act in Account B, the application calls `sts:AssumeRole` on a role in Account B:
+- The role's **trust policy** names the allowed caller, for example `arn:aws:iam::111111111111:role/app-ec2-role`.
+- The role's **permissions policy** allows only what is needed, for example `dynamodb:PutItem` on `arn:aws:dynamodb:us-east-1:222222222222:table/Orders`.
+- The instance role in Account A needs permission to call `sts:AssumeRole` on that role ARN.
+The result is a short-lived session for Account B, while the instance role itself keeps only S3 read access for the bucket in Account A plus permission to assume that one role.
+W: Instance profile plus cross-account role: the instance profile supplies temporary credentials for S3 in Account A, and assuming a narrowly scoped role in Account B that trusts only that instance role gives temporary, least-privilege access to the DynamoDB table.
+X: A=AdministratorAccess and full table access: this uses temporary credentials but grants far more than reading one bucket and writing one table, which breaks the least-privilege requirement on both sides.
+B=Account B user keys in Secrets Manager: storing the keys in Secrets Manager hides them better, but they are still long-term IAM user access keys used by the instance, which the security team forbids.
+D=IAM user keys in environment variables: these are long-term credentials sitting on the instance, readable by anything that can see the process environment, which is exactly what the security team forbids.
+T: Use roles, not users: an instance profile for the home account and sts:AssumeRole into a scoped role for the other account keeps credentials temporary and permissions minimal.
+
+@ Q001101 explain
+G: ## Two sides of cross-account access
+When a principal in one account accesses a resource in another account, **both accounts must allow it**:
+- The **identity policy** in Account B lets its role call `s3:GetObject` on the bucket.
+- A **resource-based policy** in Account A (the bucket policy) lets that external principal in.
+If either side is missing, the request is denied. Within a single account, one allow is enough; across accounts, the resource owner must agree too.
+## A least-privilege bucket policy
+Example statement on the bucket in Account A:
+- Principal: `arn:aws:iam::222222222222:role/analytics-reader`
+- Actions: `s3:GetObject` (and `s3:ListBucket` on the bucket if listing is needed)
+- Resource: `arn:aws:s3:::producer-data/*`
+Naming the specific role instead of the whole account keeps access tight. If the objects use SSE-KMS, the KMS key policy must also allow that role to decrypt.
+W: Bucket policy granting the Account B role read access: the bucket owner explicitly allows only the named role to read, which, combined with the role's own identity policy, completes cross-account access with least privilege.
+X: A=IAM policy in Account B only: an identity policy in Account B cannot grant access to a resource Account A owns. Without an allow in the bucket policy, S3 denies the request.
+C=Daily copy job: copying data creates stale duplicates, extra storage cost and another pipeline to run, and the copy job itself would still need cross-account permissions.
+D=Root user full access: granting Account B's root user full access to Account A is the opposite of least privilege, and an IAM policy in Account A cannot grant permissions to another account's principals anyway.
+E=Public bucket: a public bucket lets anyone on the internet read the data. An obscure bucket name is not access control, and S3 Block Public Access is designed to prevent exactly this.
+T: Cross-account access needs an allow on both sides: the consumer's identity policy and the owner's resource policy naming the specific role.
+
+@ Q001102 explain
+G: ## How Secrets Manager rotation works
+AWS Secrets Manager stores a secret (for example the username and password of an RDS database) and can rotate it on a schedule, such as every 30 days.
+- For RDS, Aurora and other supported databases, an AWS-provided rotation Lambda function (created from a rotation template) creates a new password, sets it on the database, tests it, and marks it as the current version (`AWSCURRENT`).
+- Applications do not store the password. They call `GetSecretValue` at runtime (often with a client-side cache), so they automatically pick up the new value.
+- The **alternating users** strategy keeps two database users and switches between them, so one valid login always exists during rotation.
+For the RDS master password, RDS can also manage the secret in Secrets Manager directly with `ManageMasterUserPassword` (managed rotation, no Lambda function to maintain).
+W: Secrets Manager with automatic RDS rotation: rotation runs on the 30-day schedule without people, updates the database password and the secret together, and applications read the current value at runtime, so no redeploy or config change is needed.
+X: A=Encrypted config file and monthly redeploy: the rotation depends on a person changing values and redeploying, which is manual work, risks mistakes, and a redeploy may cause disruption.
+B=Manual console rotation: someone must change the password and update the application at the same moment. Any gap between the two causes failed logins, and the process can be forgotten.
+D=Parameter Store SecureString with expiration: Parameter Store has no built-in rotation. An expiration policy (advanced parameters only) can delete the parameter or send a notification, but it does not generate a new password or change it on the database.
+T: Secrets Manager rotates the database password and the stored secret together, and apps that fetch the secret at runtime never need a manual update.
+
+@ Q001103 explain
+G: ## Posture checks across an organization
+AWS Security Hub (its posture-management checks are also known as Security Hub CSPM) continuously evaluates resources against **security standards**, including CIS AWS Foundations Benchmark and PCI DSS, using AWS Config rules underneath. Each standard gets a **security score**, the percentage of passed controls.
+## Organization-wide setup
+- A **delegated administrator** account in AWS Organizations enables Security Hub and the chosen standards in every member account, including new ones, often through central configuration policies.
+- **Cross-Region aggregation** pulls findings from linked Regions into one home Region, so 80 accounts across 3 Regions show up in one view.
+- Every finding is sent to **Amazon EventBridge**. A rule matching, for example, severity `CRITICAL` with workflow status `NEW` can invoke a Lambda function or API destination that opens a ticket.
+W: Security Hub org-wide with aggregation and EventBridge: it measures CIS and PCI DSS controls continuously in every account, shows one score per standard for the whole organization after aggregation, and EventBridge rules route new critical findings to ticketing automatically.
+X: A=AWS Artifact reports: Artifact provides AWS's own compliance reports, such as AWS's PCI DSS attestation. It says nothing about how your accounts are configured and a monthly download is not continuous monitoring.
+C=Trusted Advisor security checks: Trusted Advisor has a limited set of security checks that are not organized as CIS or PCI DSS controls, gives no per-standard score, and weekly emails do not route individual findings to tickets.
+D=Amazon Inspector CIS scans: Inspector's CIS scans assess operating-system settings inside EC2 instances. They do not check account-level controls such as CloudTrail, IAM or S3 settings, and do not produce a PCI DSS score.
+T: Continuous, standards-based posture scoring across many accounts and Regions is Security Hub with a delegated admin and aggregation; EventBridge turns its findings into automated tickets.
+
+@ Q001104 explain
+G: ## Scaling policy types in EC2 Auto Scaling
+- **Target tracking**: you pick a metric and a target, such as average CPU utilization at 50 percent. Auto Scaling creates and manages the CloudWatch alarms itself and adds or removes instances in proportion to how far the metric is from the target.
+- **Step scaling**: you define alarms and a table of adjustments, for example add 2 instances at 70 percent and 4 at 85 percent.
+- **Simple scaling**: one alarm, one fixed adjustment, then a cooldown before the next action.
+- **Scheduled scaling**: changes capacity at set times, useful for predictable daily patterns.
+## Example
+With a target of 50 percent and 4 instances at 75 percent CPU, target tracking calculates roughly how many instances bring the average back to 50 percent and adds them, then scales in more cautiously once load falls.
+W: Target tracking on average CPU: it keeps CPU near the chosen value automatically and needs no thresholds or step tables, which fits unpredictable load and the team's wish not to define them.
+X: A=Step scaling with multiple alarms: it can react to varying load, but the team must define every alarm threshold and step adjustment and keep tuning them, which is exactly what they want to avoid.
+C=Scheduled scaling: scheduled actions change capacity at fixed times. The load here is unpredictable, so the schedule would not match when CPU actually rises.
+D=Simple scaling with one alarm: the team still sets the threshold and adjustment size, and the fixed step plus cooldown reacts coarsely and slowly to fluctuating load.
+T: To hold a metric near a value without writing thresholds, use target tracking; step and simple scaling require you to design the alarms and adjustments yourself.
+
+@ Q001105 explain
+G: ## Poison messages
+A **poison message** is one that a consumer can never process, for example malformed JSON. After a failed attempt, the message becomes visible again when its visibility timeout ends, and it is received and fails again, over and over, wasting consumer capacity.
+## Dead-letter queues
+A **dead-letter queue (DLQ)** is a separate SQS queue set in the source queue's **redrive policy** together with `maxReceiveCount`. Each receive increases the message's `ApproximateReceiveCount`; once it exceeds `maxReceiveCount`, SQS moves the message to the DLQ.
+- Example: `maxReceiveCount` of 5 gives each message five chances; a malformed order then lands in the DLQ instead of looping.
+- The DLQ must be the same type as the source (standard or FIFO).
+- A CloudWatch alarm on the DLQ's depth alerts operators, and after a fix, **DLQ redrive** can move messages back to the source queue.
+W: Dead-letter queue with an appropriate maxReceiveCount: after a set number of failed receives the poison message is moved aside automatically, so consumers stop wasting time on it and the message is kept for inspection.
+X: A=Manual deletion: this depends on someone noticing the problem, so throughput suffers until then, and deleting destroys the message that is needed to find the bug.
+B=Very high visibility timeout: the message would just reappear less often, still failing every time. A long timeout also delays retries for messages that failed for a temporary reason.
+D=FIFO rejecting malformed messages: FIFO queues guarantee ordering and exactly-once processing within their deduplication window; they never validate message content. In FIFO a failing message would also block its message group.
+T: A DLQ with maxReceiveCount automatically removes messages that keep failing, protecting throughput and keeping the bad message for debugging.
+
+@ Q001106 explain
+G: ## Fan-out with SNS and SQS
+Some events must reach several independent systems. With the **fan-out** pattern:
+- The publisher sends each event once to an **Amazon SNS topic**.
+- Each downstream system has its **own SQS queue** subscribed to the topic, so every queue gets a copy of every message.
+- Each consumer reads its own queue at its own pace, with its own retries and DLQ. A slow email service does not delay inventory updates.
+Adding a new consumer later, such as a fraud-check service, means creating a new queue and subscribing it to the topic; the order service does not change.
+## Filtering
+Subscription **filter policies** let a queue receive only matching messages, for example only orders where `total > 1000`. Amazon EventBridge is an alternative with rule-based routing to many targets.
+W: SNS topic fanning out to one SQS queue per system: every subscriber queue receives each order, each system processes independently and buffers during slowdowns, and new subscribers are added without touching the publisher.
+X: A=One SQS queue polled by all three: an SQS message is delivered to one consumer and deleted after processing, so each order would reach only one of the three systems, not all of them.
+B=One Lambda calling all three in sequence: the systems become coupled. If the email call fails or is slow, the whole function fails or waits, and every new subscriber needs a code change.
+D=Synchronous HTTP calls from the order service: the publisher must know every consumer, waits on each one, and fails when any one is down, which is tight coupling and blocks adding subscribers freely.
+T: One event to many independent consumers is SNS fan-out to per-consumer SQS queues; a single shared queue delivers each message to only one consumer.
+
+@ Q001107 explain
+G: ## Orchestrating workflows with Step Functions
+AWS Step Functions runs **state machines** defined in Amazon States Language. Each state does one job:
+- **Task** states call Lambda functions or other AWS services directly.
+- **Choice** states branch on data, for example `payment.status == "declined"`.
+- **Retry** and **Catch** blocks on a state retry with exponential backoff and route failures to a compensating step.
+- **Parallel** and **Map** states run branches or items concurrently.
+## Visibility
+Every execution is recorded. The console draws the workflow graph and colors each step by result, and the execution history shows the input, output and error of every state, so you can see exactly where an order failed.
+Standard workflows can run for up to a year, which suits long order fulfillment; Express workflows suit high-volume, short runs.
+W: AWS Step Functions: it sequences the Lambda functions, handles conditional branching with Choice states, adds retries and error handling declaratively, and shows each execution's state visually.
+X: A=SQS with retry logic coded in each Lambda: queues pass messages but do not track the workflow's state or branching, so each function would carry custom retry and routing code and there is no single view of an order's progress.
+B=AWS Batch: Batch schedules containerized batch jobs on compute environments. It does not provide branching, per-step retry logic or visual tracking of a Lambda-based workflow.
+D=SNS fan-out to all Lambdas: SNS delivers the event to all subscribers at once, so there is no order, no branching based on earlier results and no workflow state.
+T: When steps must run in order with branches, retries and a visible execution history, use Step Functions; queues and topics move messages but do not orchestrate.
+
+@ Q001108 explain
+G: ## Reading throttling errors
+Error names tell you which limit you hit.
+- **DynamoDB throttling** happens when requests exceed a table's provisioned read or write capacity, the maximum throughput set on an on-demand table, a partition's limits (hot keys), or account-level throughput quotas. The SDK retries with backoff, and requests fail once retries run out.
+- **Lambda concurrency** is capped per account per Region (1,000 by default). When all concurrency is in use, extra synchronous invocations are throttled with a `TooManyRequestsException`.
+## First steps
+- Check quotas and usage in **Service Quotas** and CloudWatch (`ThrottledRequests` for DynamoDB, `ConcurrentExecutions` and `Throttles` for Lambda).
+- Request higher Lambda concurrency and DynamoDB quotas, raise provisioned capacity or use on-demand mode, and review reserved concurrency settings.
+- For future sales, load test and raise limits beforehand.
+W: DynamoDB throughput and Lambda concurrency limits: the reported errors come from exactly these two limits, so the first step is to raise the quotas and adjust capacity settings to match the flash-sale load.
+X: A=S3 request rate limits: S3 throttling returns `503 Slow Down` errors from S3. The symptoms here are DynamoDB throttling and Lambda concurrency limits, not S3 errors.
+C=Auto Scaling group maximum size: Lambda functions and DynamoDB tables do not run in an Auto Scaling group, so its maximum size cannot cause these errors.
+D=VPC out of IP addresses: IP exhaustion shows up as network interface creation errors for VPC-connected functions, not as DynamoDB throttling. It would not explain the DynamoDB errors at all.
+T: Match the error to its limit: DynamoDB throttling and Lambda concurrency throttles mean raising those quotas and capacity, ideally before the traffic spike.
+
+@ Q001109 explain
+G: ## High availability for ElastiCache
+In ElastiCache for Redis OSS (and Valkey), a **replication group** has one primary node that takes writes and up to five read replicas that copy its data **asynchronously**.
+- With **Multi-AZ** enabled and at least one replica in another Availability Zone, ElastiCache detects a failed primary and promotes a replica automatically, usually within a minute or so. The primary endpoint then points to the new primary, so clients keep the same address.
+- Because replication is asynchronous, a few writes made just before the failure can be lost, but almost all session data survives.
+## What does not help
+- **Memcached** has no replication or persistence: a lost node takes its data with it.
+- **Snapshots** restore data only up to the moment they were taken, and restoring takes time.
+W: Redis replication group with Multi-AZ and a replica: a replica already holds a near-current copy of the sessions, and Multi-AZ promotes it automatically when the primary fails, giving failover with minimal data loss.
+X: A=Memcached across AZs: Memcached spreads keys across nodes but does not replicate them. When a node fails, the sessions stored on it are gone and there is no failover.
+C=Single node with daily snapshots: a failure loses every session created since the last snapshot, and restoring from a snapshot is a manual recovery, not automatic failover.
+D=Cluster mode disabled with no replicas: with no replica there is nothing to promote, so a primary failure means downtime and lost data until a new node is created.
+T: Automatic Redis failover needs a replica to promote and Multi-AZ to promote it; Memcached and snapshots cannot keep sessions through a node failure.
+
+@ Q001110 explain
+G: ## Route 53 routing policies
+Route 53 answers DNS queries according to the routing policy on a record set:
+- **Simple**: one answer for everyone.
+- **Weighted**: several records with the same name, each with a weight from 0 to 255. Each answer is chosen in proportion to its weight divided by the total.
+- **Latency-based**: sends users to the Region with the lowest measured latency.
+- **Geolocation**: answers based on the user's country or continent.
+## Canary release with weights
+Example: record `api.example.com` has weight 95 pointing to the current version and weight 5 pointing to the new one, so about 5 percent of DNS answers go to the new version. If error rates stay low, change the weights to 75/25, then 0/100. Setting the new record's weight to 0 rolls back.
+A short TTL (for example 60 seconds) makes weight changes take effect quickly, since resolvers cache answers until the TTL expires. Health checks can remove an unhealthy record automatically.
+W: Route 53 weighted routing: it sends a chosen share of traffic to the new version and lets you raise that share step by step while monitoring errors, which is a DNS-level gradual cutover.
+X: A=Geolocation for one country: this splits by location, not by percentage. A whole country's users move at once, and that share may be far larger or smaller than intended.
+B=Simple routing to the new version: simple routing returns one answer, so all traffic moves at once. There is no small, controlled percentage to test first.
+D=Latency-based routing: latency routing picks the Region with the lowest latency for each user. It has no setting for "send 5 percent to the new version", and both versions in one Region would be indistinguishable.
+T: Gradual percentage-based traffic shifting in DNS is weighted routing; the other policies decide by location, latency or nothing at all.
+
+@ Q001111 explain
+G: ## Lifecycle hooks
+An Auto Scaling **lifecycle hook** pauses an instance during launch or termination so you can run custom actions.
+- A termination hook moves the instance to `Terminating:Wait` instead of terminating it right away.
+- The hook sends a notification through Amazon EventBridge, SNS or SQS, or the instance can detect it itself, and a script deregisters from the service registry and finishes in-flight requests.
+- The script calls `complete-lifecycle-action` with result `CONTINUE`; the instance then terminates. If nothing responds, the heartbeat timeout (default 3,600 seconds) ends the wait and the default result applies.
+Example: the instance removes itself from a Consul or Cloud Map registry, waits 30 seconds for requests to finish, then completes the hook.
+## Related settings
+Load balancer **deregistration delay** drains connections from a target group, but only a lifecycle hook gives time for custom steps such as registry deregistration.
+W: Termination lifecycle hook: it holds the instance in a wait state during scale-in so the application can deregister and flush requests, then the instance terminates once the action is completed or the timeout ends.
+X: B=Longer health check grace period: the grace period delays health checks after an instance launches. It has no effect on how an instance is terminated during scale-in.
+C=Termination protection: EC2 termination protection does not stop Auto Scaling from terminating instances, and the Auto Scaling equivalent, scale-in protection, blocks scale-in instead of giving a graceful shutdown window.
+D=Longer cooldown: cooldowns space out scaling activities. They do not delay the termination of an individual instance, so the app still gets no time to drain.
+T: To run shutdown steps before an Auto Scaling instance terminates, use a termination lifecycle hook; grace periods, cooldowns and protection settings do not provide a drain window.
+
+@ Q001112 explain
+G: ## The visibility timeout
+When a consumer receives a message from SQS, the message is not deleted. It is hidden for the **visibility timeout** (30 seconds by default, up to 12 hours). The consumer must call `DeleteMessage` before the timeout ends.
+If processing takes longer than the timeout, the message becomes visible again and another consumer receives it, so the same work runs twice.
+Example: timeout 30 seconds, processing 45 seconds. At second 30, a second consumer picks up the message while the first is still working.
+## Fixes
+- Set the visibility timeout above the maximum processing time, for example at least 6 times the function timeout when Lambda is the consumer.
+- For long jobs, extend the timeout while working with `ChangeMessageVisibility`.
+- Make processing idempotent, because standard queues are at-least-once and can occasionally deliver a message twice anyway.
+W: Visibility timeout shorter than processing time: messages reappear before the first consumer finishes and deletes them, so other consumers receive and process them again, causing the duplicate side effects.
+X: A=FIFO queues without deduplication: FIFO queues do offer deduplication, and while messages from a message group are in flight, no further messages from that group are delivered. This statement is false and does not explain the repeats.
+C=Long polling: long polling only makes `ReceiveMessage` wait up to 20 seconds for messages to arrive, reducing empty responses. It does not make messages visible again.
+D=Standard queues guarantee exactly once: standard queues provide at-least-once delivery, not exactly-once. Duplicates are expected behavior, not a service defect.
+T: If processing outlasts the visibility timeout, the message comes back for another consumer; set the timeout above processing time and make consumers idempotent.
+
+@ Q001113 explain
+G: ## Service quotas
+Every account has **service quotas** (formerly limits) per Region, for example:
+- **Lambda concurrent executions**: 1,000 by default per Region.
+- **EC2 On-Demand instances**: measured in **vCPUs** per instance-family group, for example "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances".
+## Planning ahead
+- The **Service Quotas** console shows each quota's applied value and, for many, current usage; CloudWatch alarms can warn at, say, 80 percent use.
+- Increases are requested there (or through Support). Some are approved automatically, but large increases can take days and may need review.
+- **Quota request templates** in AWS Organizations can apply increases to new accounts automatically.
+Example: a launch needs 3,000 concurrent Lambda executions and 2,000 more vCPUs of M instances; request both weeks in advance and confirm they are applied before load testing.
+W: Review usage in Service Quotas and request increases before launch: this confirms the current limits, and asking early gives AWS time to approve the Lambda and EC2 increases, so the launch is not throttled.
+X: A=Spread load over more accounts: this adds cross-account networking, deployment and operations complexity to work around quotas that can simply be raised, and each new account starts with low defaults too.
+C=Request after throttling appears: increases are not guaranteed to be applied within minutes, and large ones may need review. Users would see failures during the launch while the request is pending.
+D=Move EC2 to Spot: Spot capacity can be interrupted and may not be available, Spot has its own vCPU quotas, and this does nothing about the Lambda concurrency limit.
+T: Check quota usage and request increases well before a known traffic event; waiting for throttling means failures while the request is processed.
+
+@ Q001114 explain
+G: ## EC2 instance families and their ratios
+Each family has a different balance of vCPU and memory:
+- **Compute optimized, C family**: about 2 GiB of memory per vCPU, for CPU-heavy work.
+- **General purpose, M family**: about 4 GiB per vCPU, a balanced default.
+- **Memory optimized, R family**: about 8 GiB per vCPU; the X and high-memory families go much higher.
+- **Storage optimized, I and D families**: large, fast local NVMe or HDD storage for heavy disk I/O.
+## Right-sizing by bottleneck
+When memory runs out while CPU is still idle, you are paying for CPU you cannot use. Moving to a family with more memory per vCPU fits the workload better.
+Example: an `m6i.4xlarge` has 16 vCPUs and 64 GiB; an `r6i.2xlarge` has 8 vCPUs and the same 64 GiB, and an `r6i.4xlarge` has 16 vCPUs and 128 GiB. Tools such as AWS Compute Optimizer flag these mismatches.
+W: Memory-optimized R family: it gives twice the memory per vCPU of M instances, so in-memory processing stops hitting limits and you stop paying for unused CPU, which improves performance cost-effectively.
+X: A=Storage-optimized I family: I instances add fast local NVMe storage for disk-heavy workloads. The bottleneck here is memory, not disk I/O.
+B=Compute-optimized C family: C instances have less memory per vCPU than M instances, so the memory limit would be hit even sooner.
+D=More general-purpose instances: each instance still has the same memory, so a job that needs more memory per process keeps hitting the limit, and you pay for more idle CPU.
+T: Choose the family that matches the bottleneck: memory-bound with idle CPU means memory-optimized R instances, not more or faster CPU.
+
+@ Q001115 explain
+G: ## EBS volume types
+- **gp3** (general purpose SSD): a baseline of 3,000 IOPS, with IOPS and throughput provisioned separately. Designed for single-digit millisecond latency; fine for most workloads.
+- **io2 Block Express** (provisioned IOPS SSD): up to 256,000 IOPS and 4,000 MB/s per volume, up to 64 TiB, sub-millisecond latency and 99.999 percent durability. Built for large, latency-sensitive databases such as Oracle, SQL Server or SAP HANA.
+- **st1** (throughput optimized HDD) and **sc1** (cold HDD): priced per GB for large sequential reads and writes, such as logs or data lakes. Their IOPS are low and they cannot be boot volumes.
+## Consistency
+Provisioned IOPS volumes are designed to deliver the provisioned performance consistently, which is what "must not degrade under sustained load" asks for. Remember the instance must also support that EBS bandwidth.
+Example: a transactional database needing 80,000 IOPS at sub-millisecond latency gets an io2 Block Express volume provisioned for 80,000 IOPS.
+W: io2 Block Express: it delivers very high provisioned IOPS, far beyond 64,000, with consistent sub-millisecond latency and high durability, matching a demanding transactional database.
+X: A=gp3: gp3 targets single-digit millisecond latency, not consistent sub-millisecond latency, and its per-volume IOPS ceiling is well below io2 Block Express's 256,000, so it is not built for this tier of workload.
+B=st1: st1 is an HDD optimized for large sequential throughput. Its IOPS are a tiny fraction of what the database needs and its latency is much higher.
+C=sc1: sc1 is the lowest-cost HDD for rarely accessed data. It has even lower performance than st1 and is unsuitable for transactional I/O.
+T: Extreme, consistent IOPS at sub-millisecond latency means io2 Block Express; gp3 is general purpose and HDD types are for throughput, not IOPS.
+
+@ Q001116 explain
+G: ## Caching strategies
+- **Lazy loading (cache-aside)**: the app reads the cache first. On a miss it reads the database, writes the result into the cache, then returns it. The cache fills only with data that is actually requested.
+- **Write-through**: every database write also updates the cache, so cached data is always fresh, but data that is written and never read also takes cache space.
+- **Write-behind (write-back)**: writes go to the cache first and reach the database later, which risks losing data if the cache fails.
+## Example with a TTL
+Reading product `42`: cache miss, query the database (20 ms), store `product:42` in ElastiCache with a TTL of 300 seconds. The next thousand reads are cache hits of under a millisecond. The TTL limits staleness, and frequently read items stay cached while rarely read ones expire.
+Lazy loading and write-through are often combined: cache-aside for reads, updating or deleting the key on writes.
+W: Lazy loading (cache-aside): data is loaded into the cache on demand when requests miss, so the cache ends up holding the frequently accessed data, and later requests avoid the database penalty.
+X: B=Write-through: it populates the cache on writes, not on reads, so data that is read but rarely written still misses, and data written but never read wastes cache space.
+C=Write-behind: it delays database writes to speed them up, which does nothing for read misses and adds a risk of losing writes if the cache node fails.
+D=No cache, read replicas: replicas spread database load but every read is still a database query, so the latency penalty the team wants to avoid remains for every request.
+T: To fill a cache with the data requests actually use, load it on a miss (cache-aside); write-through and write-behind are about keeping writes in sync.
+
+@ Q001117 explain
+G: ## Purpose-built databases
+AWS offers databases designed for specific data shapes:
+- **Time series**: Amazon Timestream stores measurements with a timestamp, dimensions (such as `device_id`, `site`) and measure values. It is built for high ingest rates and queries over time ranges, with functions such as binning and interpolation.
+- **Graph**: Amazon Neptune stores nodes and relationships.
+- **Key-value**: Amazon DynamoDB.
+## Lifecycle built in
+Timestream for LiveAnalytics stores recent data in a fast **memory store** and moves older data to a cheaper **magnetic store**, then deletes it after the retention period you set, for example 24 hours in memory and 1 year in total. No custom cleanup jobs are needed. Note that Timestream for LiveAnalytics stopped accepting new customers in 2025; new workloads use Amazon Timestream for InfluxDB, a managed InfluxDB engine whose buckets also have retention periods that age out old data.
+Example query: average temperature per device in 5-minute bins over the last hour, `bin(time, 5m)` grouped by `device_id`.
+W: Amazon Timestream: it is purpose-built for time-series data at high ingest rates, runs fast time-range aggregations with built-in time functions, and ages data out automatically through retention settings.
+X: B=Amazon Neptune: Neptune is a graph database for relationship queries such as fraud rings or recommendations. It is not designed for high-rate time-stamped readings or time-range aggregations.
+C=DynamoDB with a single partition key: putting millions of readings per minute under one key value creates a hot partition that throttles, and DynamoDB has no time-series aggregation functions; only TTL deletes old items.
+D=Amazon QLDB: QLDB was a ledger database for an immutable, verifiable history of changes, and AWS has ended support for it. It was never meant for high-volume sensor analytics.
+T: High-rate timestamped data with time-range queries and automatic aging is a time-series database, Timestream, not a graph, ledger or single-key table.
+
+@ Q001118 explain
+G: ## Why metrics hide slow calls
+CloudWatch metrics are aggregates, such as average latency per service per minute. If 2 percent of requests are slow because one downstream call occasionally takes 3 seconds, averages barely move.
+## Distributed tracing with X-Ray
+AWS X-Ray follows single requests across services:
+- Each request gets a **trace ID**, passed along in the `X-Amzn-Trace-Id` header.
+- Each service records a **segment** with its timing, and **subsegments** for downstream calls such as a DynamoDB query or an HTTP call to another service.
+- The **trace map** shows services and their latencies and errors; a single trace's timeline shows exactly which hop took the time.
+Services are instrumented with OpenTelemetry (AWS Distro for OpenTelemetry, which AWS now recommends over the older X-Ray SDKs), and Lambda, API Gateway and others can enable tracing with a setting. CloudWatch Application Signals builds on the same trace data.
+W: X-Ray tracing across the services: traces show each request's path and the time spent in every segment, so the specific slow service call can be identified even when aggregate metrics look normal.
+X: A=More CPU alarms: CPU utilization says whether a host is busy, not which call in a request chain is slow. A slow downstream dependency often causes no CPU increase at all.
+B=VPC Flow Logs with manual correlation: flow logs record IP connections and bytes, not application requests or their latency, and correlating timestamps by hand across services is slow and imprecise.
+D=1-second high-resolution metrics: finer metrics are still aggregates per service. They show when latency rises but not which call inside a specific request was slow.
+T: To find the slow hop in a distributed request, trace individual requests (X-Ray); metrics and alarms only show aggregates.
+
+@ Q001119 explain
+G: ## Decoupling with a queue
+When a fast front end sends work to a slower back end directly, spikes overflow the back end and requests are dropped. Putting **Amazon SQS** between them changes this:
+- The web tier writes each order to the queue and returns immediately. SQS stores messages durably across multiple AZs, so orders are not lost when processors are busy.
+- Processors pull orders at their own pace and delete each one only after it is processed.
+## Scaling on backlog per instance
+Queue depth alone does not tell you how many instances you need. Use a custom metric: `ApproximateNumberOfMessagesVisible` divided by the number of running instances, with target tracking.
+Example: each order takes 2 seconds and an acceptable wait is 10 minutes (600 seconds), so one instance can clear 300 messages in time. Set the target to 300. With 30,000 orders waiting, the group scales toward 100 instances, then shrinks as the backlog falls.
+W: SQS with scaling on backlog per instance: the queue absorbs the 20x spike so no order is lost, customers get confirmation later as allowed, and the processors scale in proportion to the actual work waiting.
+X: A=Vertical scaling during sales: a bigger instance has a hard ceiling and resizing means stopping the instance. Without a buffer, anything beyond its capacity is still dropped.
+B=CPU scaling and web-tier retries: CPU is an indirect signal that lags the real backlog, and retries add even more load during the spike. Orders are still lost if retries run out.
+C=NLB with longer timeouts: the load balancer does not store requests. Requests still wait synchronously, and when processors are saturated they time out and are lost.
+T: When work can be done later, buffer it in SQS and scale consumers on backlog per instance; synchronous designs drop requests during spikes.
+
+@ Q001120 explain
+G: ## How RDS read replicas work
+An RDS read replica (MySQL, MariaDB, PostgreSQL, Oracle, SQL Server) receives changes from the primary through **asynchronous replication**:
+- The primary commits a write without waiting for replicas.
+- The replica applies the change shortly after, usually within seconds or less, but the delay grows under heavy write load. CloudWatch shows it as `ReplicaLag`.
+- Replicas serve reads only. Writes must still go to the primary.
+## The tradeoff
+Replicas let you scale reads horizontally, but a read right after a write might not see that write yet. Common approaches:
+- Send reads that must be current (for example "show my order just placed") to the primary.
+- Send reads that can be slightly stale (catalog pages, reports) to replicas.
+Aurora replicas share the cluster's storage and typically lag well under a second, but they are still not guaranteed to be perfectly current.
+W: Asynchronous replication means possible staleness: replicas take read load off the primary and scale reads, but because changes arrive after commit, a replica can briefly return older data.
+X: A=Replicas handle reads and writes: read replicas are read-only. All writes still go to the primary, so it cannot be downsized on the assumption that replicas take writes.
+C=Fully consistent with zero lag: replication is asynchronous, so some lag always exists and grows under heavy writes. Promising zero lag misstates the tradeoff.
+D=More replicas eliminate lag: lag comes from how fast each replica applies changes from the primary. Adding replicas spreads read load but does not remove replication delay, and each one is another copy to keep updated.
+T: Read replicas scale reads at the cost of eventual consistency; route reads that must be current to the primary.
+
+@ Q001121 explain
+G: ## CloudFront and Global Accelerator
+Both use AWS edge locations and the AWS backbone, but they do different jobs:
+- **Amazon CloudFront** is a CDN for HTTP(S). It caches content such as video segments at edge locations, so repeat requests are served close to viewers without reaching the origin.
+- **AWS Global Accelerator** gives two static anycast IP addresses. Traffic enters the nearest edge location and travels over the AWS network to the closest healthy regional endpoint (ALB, NLB, EC2). It does not cache, supports TCP and UDP, and fails over between Regions quickly based on health checks.
+## Combining them
+Example: `video.example.com` points to CloudFront, which caches HLS segments near viewers. `api.example.com` points to Global Accelerator, which routes each API call to the nearest healthy regional ALB in, say, us-east-1 or eu-west-1, with the same static IPs for all clients.
+W: CloudFront for video and Global Accelerator for the API: CloudFront reduces video latency by caching at the edge, and Global Accelerator speeds non-cacheable API calls over the backbone to the nearest healthy regional origin with fast failover.
+X: A=CloudFront for both: CloudFront can proxy dynamic requests, but it is built around caching and a single origin per behavior. Global Accelerator is the purpose-built fit for routing uncacheable API traffic to the best of several regional endpoints with static IPs and fast failover.
+B=Route 53 latency routing only: DNS can pick a nearby Region, but traffic then crosses the public internet all the way, with no edge caching for video and no backbone acceleration for the API.
+D=Global Accelerator for both: Global Accelerator does not cache, so every video request would travel to the origin, raising latency, origin load and cost compared with serving cached segments from the edge.
+T: Cacheable content goes to CloudFront; dynamic, non-cacheable traffic that needs backbone routing and fast regional failover goes to Global Accelerator.
+
+@ Q001122 explain
+G: ## The instance also limits EBS
+EBS volumes are network-attached storage. Two limits apply to every I/O:
+- The **volume's** limits: provisioned IOPS and throughput (for example gp3 at 3,000 IOPS and 125 MB/s by default).
+- The **instance's** EBS bandwidth: each instance type has a maximum EBS throughput and IOPS. **EBS-optimized** instances have dedicated bandwidth for EBS; most current-generation types are EBS-optimized by default, and many smaller sizes can only burst to their maximum for a limited time each day.
+## Reading the metrics
+- `VolumeQueueLength` shows I/O requests waiting; a high value means the storage path cannot keep up.
+- `EBSIOBalance%` and `EBSByteBalance%` on the instance show burst credits for EBS bandwidth; near 0 means the instance is capped.
+Example: four gp3 volumes of 500 MB/s each on an instance with a 593 MB/s EBS limit can never reach 2,000 MB/s together; the instance is the bottleneck.
+W: Not EBS-optimized or over the instance's EBS bandwidth: the instance's EBS path caps throughput, so I/O queues up even though the volumes and the instance's network bandwidth could do more.
+X: A=Subnet out of IP addresses: IP exhaustion prevents launching instances or creating network interfaces. It does not slow I/O to volumes already attached.
+C=Security group throttling EBS: security groups filter network traffic to and from network interfaces. They do not apply to EBS traffic and do not throttle anything.
+D=Placement group limits EBS: placement groups control how instances are placed relative to each other and affect instance-to-instance networking. They do not lower an instance's EBS bandwidth.
+T: EBS performance is capped by both the volume and the instance's EBS bandwidth; high queue length at low throughput often means the instance is the limit.

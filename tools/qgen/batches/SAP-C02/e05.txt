@@ -1,0 +1,338 @@
+# SAP-C02 detailed explanations, e05 (explanation-only rewrites; letters are the published ones)
+
+@ Q001123 explain
+G: ## Why a cache in front of DynamoDB
+DynamoDB serves reads in single-digit milliseconds at almost any scale. Some workloads need more: a few extremely hot keys read millions of times per minute, where every read still goes to the storage partitions and each partition has its own throughput limits.
+## How DAX works
+**DynamoDB Accelerator (DAX)** is a managed, in-memory, write-through cache cluster that sits in your VPC in front of a table.
+- It speaks the DynamoDB API, so the app swaps the DynamoDB client for the DAX client and keeps calls like `GetItem`, `Query` and `BatchGetItem`.
+- Cached eventually consistent reads return in **microseconds**; misses are read from the table and stored in the item cache or query cache.
+- Writes go through DAX to the table, keeping the cache current.
+Example: a leaderboard key read 50,000 times per second is served from DAX memory instead of hitting one hot partition.
+W: DynamoDB Accelerator (DAX): it is the purpose-built, API-compatible cache for DynamoDB, turning millisecond reads of hot keys into microsecond reads with minimal code change and no custom invalidation logic.
+X: A=On-demand capacity alone: on-demand changes how you pay for and scale throughput, but every read still hits the table at millisecond latency, and hot keys still concentrate on a partition.
+B=Memcached with custom invalidation as the only option: ElastiCache can cache DynamoDB data, but you must write and maintain cache-aside and invalidation code, and it is clearly not the only viable option because DAX does this natively.
+D=Global Tables: Global Tables replicate a table across Regions for multi-Region writes and resilience; reads in each Region still take milliseconds and hot keys remain hot.
+T: For microsecond reads of hot DynamoDB keys with minimal code change, use DAX; capacity modes and Global Tables change scaling and geography, not read latency.
+
+@ Q001124 explain
+G: ## What tightly coupled HPC needs
+MPI jobs split one problem across many nodes that constantly exchange small messages. Total runtime is dominated by network latency and bandwidth between nodes, so the instances must sit physically close with fast network interfaces.
+## Placement group strategies
+- **Cluster**: packs instances close together inside one Availability Zone for the lowest latency and highest per-flow throughput.
+- **Spread**: puts each instance on distinct hardware (at most 7 running instances per AZ per group) to limit correlated failures.
+- **Partition**: groups instances into partitions that do not share racks, for large replicated systems such as HDFS, HBase or Cassandra.
+Adding **enhanced networking** (ENA) or the **Elastic Fabric Adapter** (`EFA`), which lets MPI bypass the OS kernel, further cuts latency.
+W: Cluster placement group with enhanced networking: it places nodes on nearby hardware in one AZ, and ENA or EFA provides high packets-per-second and low jitter, which is exactly what MPI traffic needs.
+X: B=No placement group: EC2 may place the instances anywhere in the AZ or across AZs, so latency between nodes is higher and less predictable for chatty MPI traffic.
+C=Spread across AZs: spreading maximizes separation for resilience, which is the opposite goal; cross-AZ hops add latency and data transfer cost to every message.
+D=Partition placement group: partitions isolate failure domains for large distributed stores like Hadoop; they do not pack nodes together for minimum latency.
+T: Tightly coupled HPC wants nodes close together (cluster placement group plus ENA/EFA); spread and partition groups trade proximity for fault isolation.
+
+@ Q001125 explain
+G: ## How S3 Intelligent-Tiering works
+**S3 Intelligent-Tiering** monitors each object's access and moves it between tiers automatically:
+- **Frequent Access** by default.
+- **Infrequent Access** after 30 consecutive days without access.
+- **Archive Instant Access** after 90 days without access.
+- Optional **Archive Access** and **Deep Archive Access** tiers you can opt in to for asynchronous-retrieval savings.
+When an object in an automatic tier is read again, it moves back to Frequent Access. There are **no retrieval fees**; you pay a small monthly monitoring fee per object (objects under 128 KB are not monitored and stay in the frequent tier).
+Example: a video popular for three weeks drifts down to cheaper tiers once it goes quiet, and moves back up if it becomes popular again, with no rule to write.
+W: S3 Intelligent-Tiering: it optimizes each object individually based on its real access pattern, so unpredictable and changing usage is handled automatically without lifecycle tuning and without retrieval penalties.
+X: B=Deep Archive for everything: objects need a restore that takes up to 12 hours (48 for bulk) before they can be read, which breaks the frequently accessed objects, and it has a 180-day minimum storage charge.
+C=Standard-IA for everything: hot objects would pay per-GB retrieval fees on every read, and Standard-IA has a 30-day minimum and 128 KB minimum billable size, so frequently read data can cost more than in Standard.
+D=Fixed 30-day rule to Glacier: a single age-based rule ignores actual access; objects still hot after 30 days would be archived and need restores, which is the wrong fit for unpredictable patterns.
+T: When access patterns are unknown or changing, let Intelligent-Tiering move objects per access; fixed classes or age-based rules only fit predictable patterns.
+
+@ Q001126 explain
+G: ## Where the data transfer charges come from
+- **NAT gateway**: billed per hour plus a per-GB **data processing** charge on every byte it handles, including traffic to AWS services such as S3 in the same Region.
+- **Cross-AZ traffic**: data moving between Availability Zones in the same Region is billed per GB in each direction.
+## The two levers
+An **S3 gateway endpoint** adds a route for the S3 prefix list (`pl-xxxx`) to the private subnets' route tables. S3 traffic then goes straight to S3 without touching the NAT gateway, and gateway endpoints have no hourly or per-GB charge.
+**AZ affinity** means an app server prefers the database or cache node in its own AZ (for example, reading from a replica in the same AZ), so most calls never cross AZ boundaries, while standby copies in other AZs keep resilience.
+W: B=S3 gateway endpoint: it removes S3 traffic from the NAT gateway entirely, eliminating the per-GB processing charge at no extra cost.
+C=AZ-affine app and database: keeping calls within the same AZ removes the cross-AZ transfer charge for most traffic while the architecture stays Multi-AZ.
+X: A=S3 Transfer Acceleration: it speeds up long-distance uploads over the internet via edge locations and adds a per-GB fee; it does not reduce NAT processing or cross-AZ charges.
+D=Move everything to one AZ: this would remove cross-AZ charges, but it gives up Multi-AZ resilience, which is a far bigger cost than the savings for a production system.
+E=Larger NAT bandwidth: NAT gateways scale bandwidth automatically and have no bandwidth tier to buy; the per-GB processing price is the same regardless of throughput.
+T: Cut transfer costs by taking S3 traffic off the NAT gateway with a free gateway endpoint and by keeping chatty tiers in the same AZ, not by sacrificing Multi-AZ design.
+
+@ Q001127 explain
+G: ## Two tools for two kinds of waste
+**AWS Trusted Advisor** runs best-practice checks. Its cost optimization checks include **Idle Load Balancers**, **Underutilized Amazon EBS Volumes** and **Unassociated Elastic IP Addresses**. With Business Support or a higher support plan you get the full set of checks, and the **organizational view** aggregates results for all member accounts.
+**AWS Compute Optimizer** analyzes CloudWatch utilization history and recommends better EC2 instance types and sizes.
+- CPU, network and disk metrics are used automatically.
+- **Memory** is only visible inside the OS, so the CloudWatch agent must publish it for memory-aware recommendations.
+- It can be enabled for all accounts in an organization from the management or delegated administrator account.
+W: Trusted Advisor cost checks plus Compute Optimizer: Trusted Advisor finds the idle load balancers, underused volumes and unattached Elastic IPs across accounts, and Compute Optimizer gives the utilization-based, memory-aware EC2 rightsizing.
+X: A=Budgets and Pricing Calculator: Budgets alerts when spend crosses thresholds and Pricing Calculator estimates planned architectures; neither inspects running resources for idleness or recommends instance sizes.
+C=Cost Explorer forecasts and Trusted Advisor for memory rightsizing: forecasts project future spend, not idle resources, and Trusted Advisor's low-utilization EC2 check uses CPU and network, not memory.
+D=Compute Optimizer for load balancers and Elastic IPs, Budgets for rightsizing: Compute Optimizer does not flag idle load balancers or unassociated Elastic IPs, and Budgets produces no sizing recommendations.
+T: Trusted Advisor catches idle and unattached resources; Compute Optimizer rightsizes from utilization history (memory needs the CloudWatch agent).
+
+@ Q001128 explain
+G: ## How Savings Plans work
+A **Savings Plan** is a commitment to spend a fixed amount per hour (for example, `$10/hour`) on compute for a **1-year or 3-year term**, in exchange for lower rates than On-Demand.
+- **Compute Savings Plans** apply across EC2 instance families, sizes, Regions and operating systems, and also to Fargate and Lambda, so they are flexible about *what* you run.
+- The commitment itself is fixed: you pay the committed hourly amount for the whole term even if usage drops, and a plan cannot be cancelled or exchanged after purchase (only a very recent purchase within a short return window).
+- A longer term and more upfront payment give a deeper discount.
+Example: a 3-year plan may save noticeably more than a 1-year plan, but if the company moves to a different platform in year two, it keeps paying for the unused commitment.
+W: Bigger discount for 3 years, less flexibility: the longer commitment earns the higher discount but locks in spend for longer, while 1-year plans discount less and let you re-evaluate sooner.
+X: B=1-year always discounts more: the opposite is true; for the same plan type and payment option, 3-year rates are lower than 1-year rates.
+C=3-year can be cancelled anytime: Savings Plans are binding for the full term; you cannot cancel them to stop paying when usage changes.
+D=Same discount, different payment schedule: term length directly changes the rate; payment option (No, Partial, All Upfront) is a separate choice that also affects the discount.
+T: Savings Plans trade commitment length for discount: 3 years saves more but locks spend longer, 1 year saves less but keeps options open.
+
+@ Q001129 explain
+G: ## What total cost of ownership includes
+TCO is not just the EC2 bill. For a self-managed database on EC2 it also includes DBA hours for OS and engine patching, backup scripts and restore testing, replication and failover setup, and monitoring.
+## What managed relational databases take over
+**Amazon RDS** and **Amazon Aurora** run MySQL-, PostgreSQL- and other compatible engines as a managed service:
+- Automated backups with point-in-time restore.
+- Managed minor version patching in a maintenance window.
+- **Multi-AZ** deployments with automatic failover to a standby.
+- Aurora adds storage replicated six ways across three AZs and fast failover to replicas.
+Example: a team spending two days a month on patching and backup checks moves to RDS Multi-AZ and spends that time on schema and query work instead.
+W: Aurora or RDS: they keep SQL compatibility while AWS handles patching, backups and failover, which removes the labor that drives most of this cluster's TCO.
+X: A=Larger EC2 instances: bigger servers change performance, not operations; patching, backups and failover are still done by the DBA team.
+B=S3 as the transactional store: S3 is object storage without SQL transactions, joins or row-level updates, so the application would have to be rebuilt and would lose relational guarantees.
+C=More self-managed instances: extra nodes improve redundancy but add more servers to patch, back up and keep in sync, increasing labor.
+T: To cut database TCO including labor, move to a managed engine (RDS or Aurora); resizing or adding self-managed nodes keeps the toil.
+
+@ Q001130 explain
+G: ## Cheapest storage for data that is almost never read
+**S3 Glacier Deep Archive** is the lowest-cost S3 storage class. Retrieval requires a restore: standard within 12 hours, bulk within 48 hours. It has a 180-day minimum storage duration, which is irrelevant for 7-year retention.
+## Making deletion impossible
+**S3 Object Lock** stores objects in a write-once-read-many (WORM) model on a versioned bucket.
+- **Compliance mode**: no user, including the root user, can delete a locked object version or shorten its retention until it expires.
+- **Governance mode**: users with `s3:BypassGovernanceRetention` can override it.
+A **lifecycle rule** can transition objects from S3 Standard to Deep Archive shortly after upload; Object Lock retention stays with the object version.
+Example: set a default retention of 7 years in compliance mode on the bucket and a lifecycle transition to `DEEP_ARCHIVE` after 1 day.
+W: Deep Archive plus Object Lock compliance mode: it gives the lowest storage price with retrieval inside 48 hours, and compliance mode enforces the 7-year retention against everyone, including administrators.
+X: A=Intelligent-Tiering Deep Archive tier with an SCP: objects reach that tier only after 180 days without access and pay per-object monitoring fees, and an SCP can be edited or detached and never applies to the management account, so it is not a guaranteed retention control.
+B=Standard-IA with MFA Delete: Standard-IA costs many times more than Deep Archive for petabytes, and MFA Delete only adds a step; the root user with MFA can still delete versions or disable it.
+D=Glacier Flexible Retrieval with a delete-deny bucket policy: it costs more per GB than Deep Archive, and anyone who can change the bucket policy can remove the deny, so deletion is not truly prevented.
+T: For long, immutable retention of rarely read data, combine the cheapest class (Deep Archive) with Object Lock compliance mode; policies and MFA Delete can be changed by admins.
+
+@ Q001131 explain
+G: ## How a subscription filter delivers logs
+A **CloudWatch Logs subscription filter** forwards matching log events from a log group to a destination such as a Kinesis Data Stream, Firehose or Lambda. The log group itself always keeps the events, so Logs Insights queries see everything.
+## Kinesis shard limits
+In provisioned mode each shard accepts up to **1 MB/s or 1,000 records/s** of writes. When a traffic spike exceeds that, `PutRecords` calls are throttled with `ProvisionedThroughputExceededException`. CloudWatch Logs retries throttled deliveries, but if throttling lasts long enough, events can be delayed past the retry window and dropped from the stream.
+- Fix by adding shards (resharding), switching the stream to **on-demand** capacity mode, or delivering through Firehose.
+- Watch the stream's `WriteProvisionedThroughputExceeded` metric to confirm.
+W: Too few shards: gaps only during a spike, while the source log group is complete, is the signature of the destination stream throttling writes it has no capacity for.
+X: A=Logs Insights caching: Insights queries the log group directly; any caching there cannot remove records from the Kinesis stream.
+B=Reserved concurrency required: subscription filters work on any log group, including Lambda log groups, with no concurrency setting involved.
+C=Missing kms:Decrypt: a key permission problem would break delivery all the time, not only during traffic spikes.
+D=Retention deleted events: retention is measured in days, and subscription filters deliver events in near real time as they arrive, long before any retention expiry; the log group also still shows the events.
+T: If the source log group is complete but the stream has spike-time gaps, the destination is throttling; add shards or use on-demand mode.
+
+@ Q001133 explain
+G: ## Testing resilience on purpose
+**AWS Fault Injection Service (FIS)** runs controlled chaos experiments against real resources. An experiment template defines:
+- **Actions**, such as stopping instances, disrupting network connectivity in subnets, or pausing EBS I/O.
+- **Targets**, selected by tags, resource IDs or AZ.
+- **Stop conditions**, which are CloudWatch alarms; if one goes into ALARM, FIS stops the experiment and rolls back actions where possible.
+FIS includes a scenario for **AZ Availability: Power Interruption** that simulates the loss of an Availability Zone across several services.
+Example: run the AZ scenario against `us-east-1a`, with a stop condition on the ALB 5xx alarm, and measure how long the Auto Scaling group takes to rebalance capacity into the remaining AZs against the RTO.
+W: FIS AZ-impairment experiment with stop conditions: it reproduces the AZ failure on demand, scoped to chosen targets, and aborts automatically if customer impact crosses a threshold, so recovery time can be measured safely.
+X: A=Config rule after an outage: Config evaluates resource configuration, not live AZ health, and a report after a real outage is not a proactive test.
+B=Manual termination in business hours: terminating instances by hand has no guardrails or automatic stop, and doing it at peak risks real customer impact; it also does not simulate network or other service failures in the AZ.
+C=Wait for anomaly detection: waiting for a real event gives no validation beforehand; the first test would be the actual outage.
+T: Validate AZ failover proactively with FIS experiments guarded by stop conditions, not by waiting for real failures or breaking things by hand.
+
+@ Q001134 explain
+G: ## RDS Blue/Green Deployments
+An **RDS Blue/Green Deployment** copies the production (blue) database into a staging (green) environment that stays in sync through logical replication.
+- You can upgrade the green environment to a new major engine version, change parameters, and test it with production-like reads while blue keeps serving traffic.
+- **Switchover** runs guardrail checks, stops writes, waits for replication to catch up, then renames the green instances to take over the production endpoints. It typically completes in about a minute, and the application keeps its connection strings.
+- The old blue instances are kept (renamed with an `-old1` suffix), so they remain available for comparison or fallback; they are no longer receiving changes after switchover, so a fallback must account for writes made since.
+W: RDS Blue/Green with managed switchover: it lets the team test the upgraded engine on a synchronized copy of production and cut over with minimal downtime without changing endpoints, while the original environment is preserved.
+X: A=Snapshot restore and repoint: the restored copy stops receiving changes the moment the snapshot is taken, so cutover needs a long write freeze or data reconciliation, and the app must change endpoints.
+C=In-place major upgrade: it upgrades the only production instance with downtime and no prior test on a live copy, and backing out of a completed major upgrade generally means restoring from a snapshot rather than a quick rollback.
+D=Upgrade and promote a read replica: this is possible but manual; promotion permanently breaks replication, there are no managed switchover guardrails, and the application must be repointed to the replica's different endpoint.
+T: For major engine upgrades with a tested target and short cutover, use RDS Blue/Green Deployments rather than in-place upgrades or manual snapshot and replica tricks.
+
+@ Q001135 explain
+G: ## Composite alarms
+A **CloudWatch composite alarm** watches the state of other alarms and combines them with a rule expression, for example:
+`ALARM("api-latency-high") AND ALARM("api-5xx-high")`
+- It goes into ALARM only when the expression is true, so on-call is paged once for confirmed customer impact.
+- The child alarms can have no actions of their own, or send to a lower-priority SNS topic that opens a ticket.
+- **Actions suppression** can mute a composite alarm while a related alarm (such as a maintenance flag) is active.
+Example: the CPU alarm notifies a ticketing topic, and only the composite alarm notifies the paging topic.
+W: Composite alarm on latency AND 5xx: it pages only when both customer-facing symptoms are present, while the CPU alarm remains a separate, non-paging signal routed to tickets.
+X: B=Longer evaluation periods: fewer and later alarms, but still three independent pages when a real incident hits, plus slower detection of real problems.
+C=Metric math sum of all three: adding CPU percent, milliseconds and error counts produces a meaningless number, and it cannot express "latency and errors together" or send CPU to a ticket.
+D=Anomaly detection paging on each: anomaly bands change how thresholds are set, but each alarm still pages separately, so the noise remains.
+T: Use a composite alarm to page on the combination that means real impact, and route single cause-level signals like CPU to non-paging channels.
+
+@ Q001136 explain
+G: ## Drills in AWS Elastic Disaster Recovery
+**AWS Elastic Disaster Recovery (DRS)** continuously replicates source servers into a low-cost staging area in the recovery Region. You can launch **drill** instances at any time: they start from the replicated data while replication keeps running, so drills do not disrupt production or protection.
+## Catching drift early
+Configuration drift (changed dependencies, security groups, launch settings, app config) is only visible when the recovered system actually runs. DRS **post-launch actions** can run Systems Manager documents on recovery instances, for example scripts that check services start, ports answer and the app returns a healthy response.
+- Schedule drills frequently, not only quarterly.
+- Automate validation so every drill produces a pass or fail result.
+- Terminate drill instances afterward to control cost.
+W: Frequent non-disruptive drills with automated validation: regular DRS drills plus post-launch checks surface drift soon after it appears, instead of during a rare quarterly exercise or a real disaster.
+X: A=Test only after major releases: drift also comes from patches, infrastructure changes and config edits between releases, so infrequent, release-bound testing misses it.
+B=Fewer drills: reducing drills gives drift more time to accumulate unseen, which is the exact problem that occurred.
+C=Rely on replication lag metrics: healthy replication proves data is being copied, not that the recovered servers boot, connect and run the application correctly.
+T: Recovery readiness is proven by frequent, automated recovery drills, not by replication health metrics or occasional tests.
+
+@ Q001137 explain
+G: ## CodeDeploy deployment configurations for EC2 and on-premises
+A deployment configuration decides how many instances are updated at the same time:
+- `CodeDeployDefault.AllAtOnce`: deploys to every instance at once. Fastest, but all instances may be unavailable during the update.
+- `CodeDeployDefault.HalfAtATime`: up to half the instances at a time; about twice as long.
+- `CodeDeployDefault.OneAtATime`: one instance at a time; slowest, but keeps the most capacity online.
+- **Custom** configurations set a minimum number or percentage of healthy hosts.
+## Matching the configuration to the window
+Rolling configurations exist to keep capacity online. When a full outage is allowed inside a maintenance window and capacity loss can never happen during business hours, the priority becomes finishing quickly so the whole deployment fits inside the window.
+W: AllAtOnce: an outage is acceptable overnight, so updating every server in parallel gives the shortest total deployment time and avoids running mixed versions of a stateful app.
+X: A=OneAtATime: updating servers serially takes the longest and risks running past the window into business hours, which is exactly what must not happen.
+B=Custom 90% minimum healthy: it allows only a small fraction of servers to update at once, making the rollout long, and preserves capacity that the window does not require.
+C=HalfAtATime: it takes roughly twice as long as all-at-once and leaves the stateful app running two versions side by side during the rollout.
+T: When a full outage is allowed in the window, AllAtOnce minimizes deployment time; rolling configurations only pay off when capacity must stay online.
+
+@ Q001138 explain
+G: ## Metric dimensions and alarms
+A CloudWatch metric is identified by its namespace, name and **dimensions**. `Errors` with `InstanceId=i-0abc` and `Errors` with `InstanceId=i-0def` are two different metrics.
+An alarm watches exactly one metric (or one metric math expression). If it targets `InstanceId=i-0abc` and Auto Scaling terminates that instance, the metric stops receiving data and the alarm moves to `INSUFFICIENT_DATA`, while new instances publish under metrics the alarm does not watch.
+## Fleet-level alarms
+- Publish (or also publish) the metric with a stable dimension such as `AutoScalingGroupName`, or with no instance dimension, so all instances aggregate into one series.
+- Or use a metric math or Metrics Insights query that aggregates across instances.
+W: Aggregate metric not tied to InstanceId: the alarm then follows the whole fleet regardless of which instances come and go, so it keeps evaluating real data and alerts on genuine problems.
+X: A=More evaluation periods: the alarm still points at one specific instance's metric; when that instance is gone, no number of periods brings its data back.
+B=Treat missing data as breaching: this turns every scale-in into a false alarm while still ignoring the new instances where real problems would show.
+D=Switch to p90: the statistic changes how datapoints are summarized, not which metric is watched, so the alarm still loses its data when the instance is replaced.
+T: In dynamic fleets, alarm on fleet-level metrics (Auto Scaling group or no instance dimension); per-instance alarms go stale as instances are replaced.
+
+@ Q001139 explain
+G: ## Parameter Store versus Secrets Manager
+**Systems Manager Parameter Store** holds configuration as parameters.
+- **Standard** parameters (up to 10,000 per account and Region, 4 KB each) have no storage charge.
+- `SecureString` parameters are encrypted with AWS KMS, which may add small KMS request charges.
+- There is no built-in rotation.
+**AWS Secrets Manager** charges per secret per month plus per API call, and provides **built-in scheduled rotation** (as often as every 4 hours), with AWS-provided rotation functions for supported databases such as Amazon RDS.
+Example: 5,000 static config values in Parameter Store cost little or nothing to store, while three RDS passwords in Secrets Manager rotate daily for roughly a few dollars a month (approximate).
+W: Parameter Store for static values, Secrets Manager for rotating credentials: each value lands in the cheapest store that meets its need, and only the few rotating secrets pay the per-secret price.
+X: A=Everything in Secrets Manager: thousands of static values would each incur the monthly per-secret charge, far more expensive than Parameter Store for data that never rotates.
+B=KMS-encrypted objects in S3: this has no parameter hierarchy, versioned lookups by name or rotation feature, so services would need custom code to read values and rotate credentials.
+D=Parameter Store with custom rotation Lambdas: it works, but you must build, schedule and maintain rotation logic that Secrets Manager already provides, adding operational cost and risk.
+T: Keep large sets of static configuration in Parameter Store and reserve Secrets Manager's per-secret cost for secrets that actually need rotation.
+
+@ Q001140 explain
+G: ## Amazon Inspector scan types
+Amazon Inspector activates scanning **per resource type**, and each type is turned on separately (for the organization through the delegated administrator, including auto-enable for new members):
+- **Amazon EC2** scanning of instances.
+- **Amazon ECR** scanning of container images.
+- **AWS Lambda** standard and code scanning.
+When ECR scanning is activated, Inspector switches the registry to **enhanced scanning** and scans images on push and continuously as new CVEs appear. Registry scan filters can further limit which repositories are scanned.
+Example: an organization turned on EC2 scanning only; images pushed to `app/api` show no Inspector findings until ECR scanning is activated and the repository matches the scan filter.
+W: ECR scanning not enabled for those repositories: EC2 scanning working says nothing about ECR, because each scan type and the registry's scanning filters are configured independently.
+X: A=Missing ecr:PutImage: without that permission the push itself fails; images that were pushed successfully would still be scanned if scanning were enabled.
+B=Inspector does not scan container images: Inspector does scan ECR container images for OS and programming language package vulnerabilities.
+D=GuardDuty required first: GuardDuty is a separate threat detection service and is not a prerequisite for Inspector's ECR scanning.
+T: Inspector scanning is enabled per resource type; working EC2 findings do not mean ECR image scanning is on.
+
+@ Q001141 explain
+G: ## Patching stateless versus stateful servers
+- **Stateless fleets** behind an Auto Scaling group can be patched by replacing instances with a freshly patched AMI, because any instance can disappear without losing data.
+- **Stateful singletons** hold data or state and have no standby, so replacing or rebooting them is an outage. They must be patched in place, at a controlled time, with checks afterward.
+## Systems Manager tools for this
+- **Patch Manager** applies patches based on a **patch baseline** using the `AWS-RunPatchBaseline` document.
+- **Maintenance Windows** schedule it off-peak for the targeted instances.
+- Tasks after patching (for example, an `AWS-RunShellScript` health check) confirm the application came back, and a pre-patch snapshot gives a restore point.
+W: Patch Manager in an off-peak window, then validate app health: patches are applied on a controlled schedule when impact is lowest, and health checks catch problems quickly on servers that have no failover.
+X: A=Unattended OS upgrades: they install and reboot on their own schedule with no coordination, reporting or validation, which can take a singleton down at a bad time.
+B=Exclude from patching: leaving critical servers unpatched keeps known vulnerabilities open, which fails the security requirement.
+D=Monthly replacement from a new AMI: replacing a stateful singleton means migrating its state and accepting an outage each month, adding risk that the stateless approach does not face.
+T: Replace stateless instances, but patch stateful singletons in place during a scheduled maintenance window with post-patch validation.
+
+@ Q001142 explain
+G: ## Central backups with AWS Backup
+**AWS Backup** creates and manages backups for many services (EC2, EBS, RDS, Aurora, DynamoDB, EFS and more) through **backup plans** that set schedule, retention and copy rules.
+- With AWS Organizations, **backup policies** attached to OUs push the same plans into every member account, with resources selected by tags.
+- **Cross-account copy** sends recovery points to a vault in a dedicated backup account in the same organization.
+- **AWS Backup Vault Lock** in compliance mode makes that vault WORM: recovery points cannot be deleted or have retention shortened, even by the account's administrators.
+Example: a policy on the `Prod` OU backs up every resource tagged `backup=daily` and copies each recovery point to a locked vault in a separate backup account.
+W: Org-wide Backup policies with cross-account copies to a Vault Lock vault: one policy governs all accounts and services, and a locked vault in an isolated account survives ransomware or a compromised source account.
+X: B=DataSync nightly exports: DataSync moves files and objects, not consistent point-in-time backups of RDS, DynamoDB or EC2 volumes, and it provides no retention policy or restore workflow.
+C=Native snapshots per service and account: each team configures its own schedule and retention, so coverage is inconsistent and copies stay in the same accounts an attacker could compromise.
+D=Default 7-day RDS retention: it covers only RDS, keeps backups in the same account, and a short retention does not protect against a compromise noticed later.
+T: For multi-account, multi-service backup governance, use AWS Backup policies with cross-account copies into a locked vault in an isolated account.
+
+@ Q001143 explain
+G: ## Preventive versus detective controls
+- **Detective** controls, such as AWS Config rules, report a violation after the resource exists.
+- **Preventive** controls stop the API call before anything is created.
+## Service control policies
+An **SCP** attached to an OU sets the maximum permissions for every IAM user and role in its accounts, including account root users. A deny in an SCP cannot be overridden by any IAM policy in those accounts.
+Using the global condition key `aws:RequestedRegion`, an SCP can deny actions outside approved Regions:
+`"Condition": {"StringNotEquals": {"aws:RequestedRegion": ["eu-west-1","eu-central-1"]}}`
+For S3 bucket creation, teams often also check `s3:LocationConstraint`. SCPs do not apply to the management account, so workloads are kept in member accounts.
+W: OU-level SCP on aws:RequestedRegion: requests to create S3 buckets or RDS instances in other Regions are denied before anything is created, for every principal in every account under the OU.
+X: A=Config rule: it only flags resources that already exist in the wrong Region, so data may already be stored there before anyone reacts.
+B=Permissions boundaries per user: they must be applied to every user and role individually and can be missed or removed by account administrators, so they are not an organization-wide guarantee.
+D=EventBridge auto-delete: this reacts after creation, so data can land in the wrong Region, and automated deletion can fail or destroy data.
+T: To prevent, not detect, Region use across an organization, deny it with an SCP on `aws:RequestedRegion`.
+
+@ Q001144 explain
+G: ## Amazon Macie for sensitive data in S3
+**Amazon Macie** finds sensitive data such as names, credit card numbers and national ID numbers in S3.
+- **Automated sensitive data discovery** continuously samples representative objects across all buckets, building a sensitivity score per bucket without scanning every byte, which keeps cost predictable at petabyte scale.
+- **Sensitive data discovery jobs** scan chosen buckets in full, for targeted deep dives.
+- A **delegated administrator** account manages Macie for all member accounts in AWS Organizations.
+- **Custom data identifiers** use a regular expression plus optional keywords and proximity rules, for example a pattern like `EMP-[0-9]{6}` near the word "employee".
+W: Macie automated discovery with a custom data identifier: sampling-based discovery covers all 30 accounts continuously at controlled cost, and the custom identifier detects the internal employee ID format alongside built-in SSN and card detectors.
+X: A=Config rules on encryption: whether a bucket is encrypted says nothing about what the objects contain; Config does not read object contents.
+B=Comprehend in Lambda for every object: this means building and running custom code over 4 PB, paying per character analyzed, with no built-in multi-account management or S3-specific findings.
+D=Daily full Macie jobs on everything: re-scanning all 4 PB every day costs far more than sampling, and adds little visibility over automated discovery for estate-wide monitoring.
+T: For continuous, cost-controlled PII discovery across a large S3 estate, use Macie automated discovery with custom identifiers; reserve full jobs for targeted scans.
+
+@ Q001145 explain
+G: ## What AWS Global Accelerator does
+**AWS Global Accelerator** gives an application two static anycast IPv4 addresses (optionally dual-stack) advertised from AWS edge locations worldwide.
+- A player's traffic enters the AWS network at the nearest edge location and travels over the AWS backbone instead of the public internet.
+- A standard accelerator has **endpoint groups** per Region (NLBs, ALBs, EC2 instances or Elastic IPs), and sends traffic to the closest healthy group.
+- It works at layer 4, supporting both **TCP and UDP** listeners.
+- Health checks detect an unhealthy Region, and traffic moves to the next best Region within seconds, with no DNS caching involved.
+Example: clients allow-list the two accelerator IPs once; players in Seoul reach `ap-northeast-2`, and if that endpoint group fails they are routed to `ap-southeast-1` automatically.
+W: AWS Global Accelerator: it provides the fixed IPs for firewall allow-lists, carries custom TCP and UDP game traffic, routes to the best-performing healthy Region, and fails over quickly without relying on DNS.
+X: B=Route 53 latency routing alone: it answers DNS with Region-specific IPs, so there are no static IPs to allow-list, and failover depends on clients honoring DNS TTLs.
+C=CloudFront: CloudFront is a content delivery network for HTTP and HTTPS (plus WebSocket); it does not carry custom UDP or raw TCP game protocols.
+D=ALB with cross-zone load balancing: an ALB is a Regional layer 7 HTTP/HTTPS load balancer; it cannot route across Regions or handle UDP, and its IP addresses are not static.
+T: For multi-Region TCP/UDP apps needing static IPs and fast health-based failover, use Global Accelerator; Route 53 and CloudFront work at the DNS and HTTP layers.
+
+@ Q001146 explain
+G: ## Follow the request path
+A request goes through the load balancer, the application tier and its dependencies such as the database. If response time grows while EC2 CPU and Auto Scaling look normal, the application servers are mostly **waiting**, usually on a downstream dependency.
+## RDS Performance Insights
+**Performance Insights** shows **database load** as average active sessions, broken down by:
+- **Wait events**, such as lock waits, I/O waits or CPU.
+- **Top SQL**, showing which statements consume the most load.
+- Hosts and users.
+The same data is also surfaced in **CloudWatch Database Insights**, the newer console experience for database monitoring.
+Example: load rises steadily over a week, dominated by `io/table/sql/handler` waits from one query whose table has grown and lost its useful index plan, which matches a slow, gradual degradation.
+W: Review Performance Insights for waits, locks and slow queries: with healthy app servers, the database is the most likely bottleneck, and Performance Insights shows which waits and SQL statements are slowing requests.
+X: A=Replace the ALB with an NLB: load balancer overhead is in milliseconds and did not change this week; swapping it would not explain a 7x slowdown and would lose layer 7 features.
+B=Increase desired capacity: the application tier is not saturated, so more instances would just wait on the same slow dependency and add cost.
+C=Add CloudFront: API responses are generally dynamic and per-user, so little would be cached, and it does nothing about the backend delay.
+T: When compute looks healthy but latency climbs, find the real bottleneck (often the database) with Performance Insights before scaling or re-architecting.
+
+@ Q001147 explain
+G: ## Amazon Keyspaces (for Apache Cassandra)
+**Amazon Keyspaces** is a serverless, managed database compatible with Apache Cassandra.
+- Applications use the **Cassandra Query Language (CQL)** and existing Apache 2.0 licensed Cassandra drivers, so code and data model largely stay the same.
+- There are no nodes to provision, tune, patch or **repair**; storage scales automatically and data is replicated across three AZs.
+- Capacity is on-demand or provisioned with auto scaling, with single-digit millisecond reads at scale.
+Example: an app keeps its `CREATE TABLE sensor_readings (...)` schema and CQL queries, switches the contact point to the Keyspaces endpoint with TLS and SigV4 auth, and the team stops running `nodetool repair`.
+W: Amazon Keyspaces: it keeps the Cassandra data model and CQL API while AWS handles the cluster operations that cause the manual tuning, repair work and uneven latency.
+X: A=RDS for PostgreSQL: it is a relational database with SQL and a different data model, so the Cassandra schema, queries and drivers would all need rewriting.
+B=DynamoDB: DynamoDB is a managed NoSQL database, but it has its own API rather than CQL, so the application's data access layer would need to be rewritten.
+C=Neptune: Neptune is a graph database queried with Gremlin, openCypher or SPARQL, a different data model entirely from Cassandra's wide-column tables.
+T: To offload Cassandra operations without rewriting the app, choose Keyspaces (CQL-compatible); other databases require a new data model or API.

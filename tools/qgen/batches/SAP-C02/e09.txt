@@ -1,0 +1,383 @@
+# SAP-C02 detailed explanations (explanation-only rewrites; letters are the published ones)
+
+@ Q002002 explain
+G: ## Two separate problems: size and distance
+A 5-20 GB file sent as one PUT request has two weaknesses. If the connection drops at 90%, the whole upload starts again. And a single TCP stream across continents is slowed by high round-trip time and packet loss on the public internet.
+## Multipart upload fixes reliability
+The client splits the file into parts (for example 100 MB each), uploads them in parallel, and calls `CompleteMultipartUpload` at the end. A failed part is retried on its own, so a network glitch costs one part, not the whole file. The AWS CLI and SDK transfer managers do this automatically above a size threshold.
+## Transfer Acceleration fixes distance
+With S3 Transfer Acceleration enabled, clients upload to `<bucket>.s3-accelerate.amazonaws.com`. Data enters the nearest AWS edge location and travels to us-west-2 over the AWS backbone instead of the public internet.
+- A user in Singapore connects to a nearby edge, not across the Pacific.
+- You pay the acceleration fee only when the accelerated path is actually faster.
+W: Multipart upload with Transfer Acceleration: parallel, individually retried parts make large uploads resumable, and edge ingestion over the AWS backbone shortens the slow long-distance path to the single us-west-2 bucket.
+X: A=Cross-Region Replication: replication copies objects after they already exist in the source bucket, so every upload still has to cross the internet to us-west-2 first. It adds cost without touching the slow step.
+B=CloudFront with GET requests: GET requests download content from the origin; they do nothing for users pushing files into the bucket. Caching is a read-path optimization.
+D=Single EC2 proxy: every upload would still travel the long distance to us-west-2, and one instance adds a throughput bottleneck and a single point of failure in front of S3.
+T: Large files from far away need both multipart upload (reliability, parallelism) and Transfer Acceleration (edge entry onto the AWS backbone); replication and CloudFront GETs act after or outside the upload.
+
+@ Q002003 explain
+G: ## Ordering in Amazon SQS
+- A **standard queue** delivers at least once with best-effort ordering: messages can arrive out of order and occasionally twice.
+- A **FIFO queue** guarantees order and exactly-once processing within a **message group**.
+## Message groups give ordering and parallelism
+Every FIFO message carries a `MessageGroupId`. SQS delivers messages of one group strictly in order and does not hand out later messages of that group while earlier ones from it are still in flight (received but not yet deleted). Different groups are independent, so many consumers can work on different groups at once.
+Example: with `MessageGroupId = customerId`, orders for customer 42 are processed one after another, while customer 17's orders are processed in parallel by another consumer.
+## Deduplication
+If a producer retries a send, a `MessageDeduplicationId` (or content-based deduplication) makes SQS drop any message with the same ID received within the 5-minute deduplication interval.
+W: FIFO queue keyed by customer ID with deduplication IDs: ordering is enforced per message group, groups are processed in parallel, and duplicate sends from producer retries are discarded by the deduplication ID.
+X: B=Standard queue with idempotent consumers: idempotency can absorb duplicates, but a standard queue gives no ordering guarantee, and a long visibility timeout only delays redelivery; it does not order anything.
+C=FIFO with one shared message group: everything becomes one ordered stream, so only one message is in flight at a time and customers can no longer be processed in parallel.
+D=SNS standard topic with SQS standard queues: standard topics and queues both give best-effort ordering, and fanning out to several queues adds copies rather than preventing duplicates.
+T: Per-key order plus parallelism is exactly what FIFO message groups provide; one group serializes everything and standard queues give no order at all.
+
+@ Q002004 explain
+G: ## What a Lambda cold start is
+When Lambda needs a new execution environment, it downloads the code, starts the runtime and runs your initialization code. For Java frameworks such as Spring, that init phase can take seconds, and the request that triggered it waits.
+## How SnapStart works
+With Lambda SnapStart, Lambda runs initialization once when you **publish a version**, takes a snapshot of the initialized memory and disk state, and caches it. New environments are resumed from that snapshot instead of running init again.
+- It applies to published versions and aliases, not to `$LATEST`.
+- It supports Java 11 and later, Python 3.12 and later, and .NET 8 and later managed runtimes.
+- For Java runtimes it has no extra charge; for Python and .NET, snapshot caching and each restore are billed. In either case it is not capacity you keep running.
+- Code that must be unique per environment (random seeds, open connections) should be handled with runtime hooks after restore.
+Example: a function taking 6 seconds to start can often resume in well under a second.
+W: SnapStart on published versions: it removes most of the framework initialization time from cold starts by restoring a pre-initialized snapshot, and you do not pay for idle, always-warm environments, which fits spiky traffic.
+X: A=Provisioned concurrency at peak: it would remove cold starts, but you pay for that many environments every hour whether traffic arrives or not, which is exactly the always-on capacity the team wants to avoid.
+B=Attach to a VPC: VPC networking does not speed up Java framework initialization; at best it adds nothing, and the function would also need a path to anything outside the VPC.
+D=15-minute timeout: the timeout only limits how long an invocation may run. It does nothing to make initialization faster.
+T: For slow Java initialization with unpredictable traffic, SnapStart restores a pre-initialized snapshot at no idle cost, while provisioned concurrency pays to keep environments warm.
+
+@ Q002005 explain
+G: ## Why Lambda overwhelms relational databases
+Each Lambda execution environment usually opens its own database connection. A burst to 2,000 concurrent invocations can mean 2,000 new connections, each costing memory and CPU on the database for authentication and setup. PostgreSQL has a `max_connections` limit, so the burst ends in "too many connections" errors.
+## What RDS Proxy does
+Amazon RDS Proxy sits between the application and the database and keeps a pool of long-lived connections to Aurora.
+- Clients connect to the proxy endpoint; the proxy reuses and multiplexes a smaller number of database connections between them.
+- Connection storms are absorbed and queued at the proxy instead of hitting the writer.
+- It supports IAM authentication and reads database credentials from Secrets Manager.
+- During a failover it keeps client connections open and redirects to the new writer, shortening disruption.
+W: RDS Proxy: pooling and multiplexing turn thousands of short-lived Lambda connections into a small set of reused database connections, removing both the connection errors and the CPU spent on connection setup.
+X: B=More Aurora Replicas: replicas serve reads through the reader endpoint, but connections that need the writer still land on the writer, and nothing pools the burst.
+C=Reserved concurrency of 1: one connection at a time would stop the errors only by throttling the application to a single concurrent request, causing massive latency and throttling errors during bursts.
+D=Larger writer instance: a bigger instance raises the connection ceiling somewhat, but every invocation still opens its own connection, so the next larger burst hits the new limit.
+T: Lambda plus a relational database calls for RDS Proxy connection pooling; adding replicas or instance size does not stop each invocation from opening its own connection.
+
+@ Q002006 explain
+G: ## Shell access without SSH
+AWS Systems Manager Session Manager gives an interactive shell on EC2 instances without opening any inbound port.
+- The SSM Agent on the instance makes an **outbound** HTTPS connection to the Systems Manager service (or to VPC interface endpoints for private subnets). The session travels over that channel.
+- Access is controlled by **IAM policies** (for example, `ssm:StartSession` allowed only on instances with a given tag), so no key pairs are needed.
+- **Session logging** can stream session activity to CloudWatch Logs or S3, and CloudTrail records who started each session.
+Example: after the SSM Agent and an instance profile are in place, the security group rule for port 22 is deleted and the shared key pair is removed; engineers start sessions from the console or with `aws ssm start-session`.
+W: Session Manager with IAM access and logging: it needs no inbound ports and no SSH keys, ties every session to an IAM identity, and records session activity for audit, covering all three requirements across 400 instances.
+X: A=Rotate keys with Secrets Manager: rotation shortens how long a key is valid, but key pairs and port 22 remain, which contradicts the goal of closing all inbound ports and removing keys.
+C=Bastion hosts per VPC: bastions still use SSH and keys, keep port 22 open on the bastion and targets, and add hosts to patch and monitor.
+D=EC2 Instance Connect with port 22 open to the internet: short-lived keys help with key sprawl, but port 22 open to the internet greatly increases exposure instead of closing inbound access.
+T: To close SSH entirely, use Session Manager: outbound-only agent connections, IAM-based access and logged sessions, rather than managing keys or bastions.
+
+@ Q002007 explain
+G: ## How NAT gateway charges add up
+A NAT gateway bills per hour and per GB of data processed. When instances in private subnets call Amazon S3 or DynamoDB, that traffic normally goes through the NAT gateway and every GB is charged.
+## Gateway VPC endpoints
+S3 and DynamoDB are the two services that offer **gateway endpoints**.
+- You create the endpoint and associate it with the private subnets' route tables. AWS adds a route whose destination is the service's managed prefix list (for example `pl-xxxxxxxx`) and whose target is the endpoint.
+- Traffic to S3 or DynamoDB in the same Region then bypasses the NAT gateway.
+- Gateway endpoints have **no hourly or data processing charge**.
+- Endpoint policies can limit which buckets or tables are reachable.
+Example: a subnet sending 50 TB a month to S3 stops paying NAT processing on those 50 TB once the gateway endpoint route exists; application code does not change.
+W: Gateway endpoints in the private route tables: they take S3 and DynamoDB traffic off the NAT gateway at no extra charge, with a route-table change and no code changes.
+X: A=Public subnets with public IPs: this removes the NAT but exposes workloads directly to the internet and requires re-architecting subnets, which fails the security and minimal-effort goals.
+B=NAT instance: a NAT instance has no per-GB processing fee, but you pay for and must patch, scale and make highly available the instance yourself, and the traffic still flows through it.
+D=Interface endpoints: interface endpoints also bypass the NAT, but they charge per endpoint per AZ per hour plus per GB processed, so they cost more than gateway endpoints for this same-Region traffic.
+T: For same-Region S3 and DynamoDB traffic, free gateway endpoints beat both NAT processing fees and the hourly-plus-per-GB cost of interface endpoints.
+
+@ Q002008 explain
+G: ## Reactive versus proactive scaling
+**Target tracking** reacts to a metric that is already rising. If a new instance needs 7 minutes to boot and warm up, users feel the gap between the spike and the new capacity.
+## Predictive scaling
+Predictive scaling for EC2 Auto Scaling analyzes historical load (daily and weekly patterns from CloudWatch metrics) and creates a forecast for the next 48 hours.
+- It schedules capacity changes **before** the forecasted load arrives.
+- A scheduling buffer lets instances launch minutes ahead of the forecast, covering a slow boot.
+- It can run in forecast-only mode first so you can check the forecast.
+- It is typically combined with target tracking, which still handles unexpected changes.
+Example: with a recurring 8:00 AM weekday spike, predictive scaling can have instances launched around 7:50, so they are healthy when users arrive. If the pattern shifts, the forecast adapts with no one editing a schedule.
+W: Predictive scaling: it learns the recurring weekday peak and provisions capacity ahead of it, covering the 7-minute warm-up without a manually maintained schedule.
+X: A=Manually updated scheduled action: a schedule would add capacity early, but someone must keep editing it whenever the pattern changes, which is the maintenance burden the question asks to avoid.
+C=Longer health check grace period: the grace period only stops new instances from being replaced too soon; it does not make capacity arrive earlier.
+D=10% CPU target: the group would run far more instances all day to hold such a low target, and it would still react only after load starts rising, so the 7-minute delay remains.
+T: Recurring, predictable peaks with slow-starting instances call for predictive scaling, which launches capacity before the load instead of reacting to it.
+
+@ Q002009 explain
+G: ## Heterogeneous migration in two steps
+Oracle to Aurora PostgreSQL changes the database engine, so two jobs are needed.
+- **Schema conversion**: tables, indexes, views and procedural code (PL/SQL) are converted to PostgreSQL with AWS SCT or DMS Schema Conversion. Items that cannot be converted automatically are flagged for manual work.
+- **Data movement**: AWS Database Migration Service copies the rows.
+## Full load plus CDC
+A DMS task of type full load and change data capture first copies existing data while the source stays online, then reads ongoing changes from Oracle's redo logs (LogMiner or Binary Reader) and applies them to Aurora.
+Example: the 4 TB full load might take many hours, but the application keeps running. When replication lag drops close to zero, the team stops writes, waits for the last changes to apply, validates, and points the application at Aurora. The outage is only that final cutover, usually minutes.
+W: Schema conversion, then DMS full load plus CDC: the bulk copy happens while the source is live, and CDC keeps Aurora in sync so the cutover window is only minutes, well under 30.
+X: B=DMS full load only: without CDC, writes must stop for the whole 4 TB copy, which takes hours, far beyond the 30-minute limit.
+C=Oracle Data Pump to S3: Data Pump produces Oracle-specific dump files that Aurora PostgreSQL cannot import, and an export-copy-import of 4 TB means a long outage.
+D=Native PostgreSQL logical replication: logical replication works between PostgreSQL databases; Oracle cannot act as a PostgreSQL publisher, so there is nothing to pull changes from.
+T: Heterogeneous, low-downtime moves use schema conversion plus DMS full load with CDC; one-time copies force downtime for the entire transfer.
+
+@ Q002010 explain
+G: ## What AWS DataSync does
+AWS DataSync is a managed service for copying file and object data between on-premises storage and AWS storage services such as Amazon EFS, FSx and S3.
+- A DataSync **agent** (a VM on premises) reads from the NFS share and sends data over the network, which can be a Direct Connect link.
+- Each **task** compares source and destination and transfers only new or changed files after the first run.
+- It preserves file metadata such as POSIX permissions, ownership and timestamps.
+- It verifies integrity with checksums during transfer and can verify the destination afterwards.
+- Bandwidth limits and schedules keep production traffic safe.
+## Migration pattern
+Example: an initial task copies the 80 TB over several days while users keep working. Incremental runs catch up on changes. At cutover, writes stop, one final short task copies the last changes, and clients remount the EFS file system.
+W: DataSync with incremental tasks and a final sync: it moves NFS data directly into EFS over Direct Connect, preserves permissions and timestamps, verifies integrity, and the final incremental pass captures the last changes at cutover.
+X: A=Application Migration Service: MGN replicates whole servers block by block onto EC2 with EBS volumes; the result would be an NFS server on EC2, not data in Amazon EFS.
+B=aws s3 sync: the command writes to an S3 bucket, not to EFS, and it does not preserve POSIX ownership and permissions or offer DataSync's task-level verification of the destination.
+D=Transfer Family over SFTP: Transfer Family provides SFTP/FTPS/FTP endpoints for users and partners to exchange files; it is not a bulk migration tool with scheduled incremental sync and verification of 80 TB from an NFS share.
+T: For large, changing NFS data sets going to EFS with metadata and verification, use DataSync; MGN moves servers, and s3 sync and Transfer Family are not migration tools for EFS.
+
+@ Q002011 explain
+G: ## Discovery before migration
+To group 300 servers into migration waves, you need to know which servers talk to each other; otherwise one wave might move an application while its database stays behind.
+## AWS Application Discovery Service
+- The **Discovery Agent** is installed on each server (Windows or Linux, physical or virtual). It collects system configuration, performance data, running **processes**, and inbound and outbound **network connections**.
+- The **Agentless Collector** runs as a VM in vCenter. Its VMware module collects VM inventory and utilization without installing software on the servers, and an optional module can collect network connections, but it does not report the running processes that the agent sees from inside each OS.
+- Collected data is viewed in AWS Migration Hub, where server network connections can be visualized and servers grouped into applications for wave planning.
+Note: Migration Hub and Application Discovery Service stopped onboarding new customers in November 2025 (AWS Transform is the successor), but existing customers keep using them and the concepts still appear in the exam.
+Example: the agent shows that `app-07` opens connections to `db-12` on port 1521, so both are grouped into the same wave.
+W: Discovery agents viewed in Migration Hub: the agents capture process-level data and network connections from inside each server, which is exactly what is needed to map dependencies and plan waves.
+X: A=Trusted Advisor: Trusted Advisor inspects resources and settings in AWS accounts; it cannot examine on-premises servers.
+C=Spreadsheet import: an import records names and sizes you already know, but it contains no process or connection data, so dependencies stay unknown.
+D=Agentless vCenter discovery only: it gives inventory and utilization of VMware VMs, but not the process-level detail the agent collects from inside the OS, and its VMware inventory does not cover physical servers.
+T: Process-level dependency data for wave planning comes from the Application Discovery Service agents; inventories and agentless vCenter data alone do not show which processes open which connections.
+
+@ Q002012 explain
+G: ## Rehosting with AWS Application Migration Service
+AWS Application Migration Service (MGN) is the recommended service for lift-and-shift of servers to Amazon EC2.
+- A replication agent (or agentless replication from vCenter) sends **continuous block-level replication** of each source server's disks to lightweight replication servers in a staging subnet in AWS.
+- The source keeps running; changes are replicated continuously until cutover.
+- **Test launches** start EC2 instances from the replicated data without touching the source, so you can check boot, networking and application behavior.
+- At **cutover**, you stop the source, let the final changes replicate, and launch the production instances. Launch templates and post-launch actions standardize settings across hundreds of servers.
+Example: 500 VMs are replicated in waves; each wave gets a test launch, sign-off, then a cutover with minutes of downtime.
+W: Application Migration Service: it continuously replicates VMs to AWS, supports non-disruptive test launches, and converts servers to run on EC2 with minimal changes, at the scale of 500 servers.
+X: A=Database Migration Service: DMS replicates database tables between database engines; it does not replicate whole servers or operating systems.
+B=VM Import/Export: it converts a VM image into an AMI as a one-time copy, with no continuous replication, so each VM would need a new export and import to catch up before cutover.
+D=DataSync to EBS snapshots: DataSync copies files and objects between storage services; it does not replicate VM disks into bootable EBS snapshots.
+T: Rehosting many servers with continuous replication and test launches is MGN's job; VM Import/Export is a one-time image copy and DMS moves only databases.
+
+@ Q002013 explain
+G: ## The strangler fig pattern
+The strangler fig pattern replaces a monolith piece by piece. A routing layer sits in front of the application; each time a new microservice is ready, the router sends that feature's requests to it, while everything else still goes to the monolith. Over time the monolith shrinks until it can be retired.
+## Implementing it with an ALB
+An Application Load Balancer listener evaluates rules in priority order.
+- A rule with path pattern `/orders/*` forwards to a target group of new Amazon ECS tasks.
+- A rule with `/catalog/*` can follow later for the next service.
+- The default rule forwards all remaining paths to the monolith's target group.
+Users keep the same domain, and each migration step is a routing change that can be rolled back by editing a rule. Weighted target groups can shift a small percentage of traffic first.
+W: Strangler fig with ALB path rules: each new service takes over selected paths while the monolith serves the rest, giving incremental migration with no big-bang cutover and easy rollback.
+X: A=Rewrite the whole application: this is the big-bang approach the company wants to avoid; nothing reaches users until the entire rewrite is done, which concentrates risk.
+B=Cache everything in CloudFront: caching all responses would serve stale or wrong dynamic content and changes nothing about the architecture, so no modernization happens.
+C=Separate accounts and URLs: forcing users to switch between different URLs breaks the single application experience; the pattern needs one entry point that routes transparently.
+T: Incremental modernization means one routing layer that sends selected paths to new services (strangler fig), not a full rewrite or separate user-facing URLs.
+
+@ Q002985 explain
+G: ## Patching at organization scale
+AWS Systems Manager **Patch Manager** scans instances for missing patches and installs them according to a **patch baseline** (which classifications and severities to approve, and after how many days).
+## Patch policies in Quick Setup
+A Quick Setup **patch policy** configures Patch Manager across many accounts and Regions of an AWS Organizations organization from one place.
+- You choose the target OUs or accounts, the baselines, and separate schedules for scanning and installing.
+- Quick Setup deploys the needed configuration to each account, including to new accounts in targeted OUs.
+- Each instance reports patch compliance to Systems Manager, and the data can be viewed centrally (for example in the Patch Manager console of the delegated administrator, or aggregated to S3 with resource data sync).
+Instances need the SSM Agent and an instance profile that allows Systems Manager.
+Example: install critical and security patches every Sunday at 02:00 in production OUs, scan daily, and show auditors one compliance report.
+W: Patch Manager with Quick Setup patch policies: one organization-wide configuration applies consistent baselines and schedules to all 400 instances in 30 accounts and produces central compliance data for audits, with little ongoing effort.
+X: A=Owners patch weekly and email screenshots: this is still manual, easy to skip, and screenshots are not reliable audit evidence.
+B=Quarterly AMI refresh with manual patching: instances stay unpatched for up to three months unless manual patching happens, which is the step already being missed.
+C=Nightly cron on every instance: each instance patches itself with no central view of success or failure, no approval baseline, and no compliance report for auditors.
+T: For consistent, auditable patching across accounts, use Patch Manager patch policies with central compliance, not per-instance scripts or manual steps.
+
+@ Q002986 explain
+G: ## Runbooks as code
+An AWS Systems Manager **Automation runbook** is a document that defines steps to run against AWS resources: shell commands on the instance (`aws:runCommand`), API calls, scripts (`aws:executeScript`), waits, branches and approvals.
+## Triggering it automatically
+- A CloudWatch alarm watches disk usage (from the CloudWatch agent's disk metric).
+- When the alarm enters ALARM, an EventBridge rule matching that state change starts the runbook with the instance ID as input.
+- The runbook performs the same five steps every time, for example: rotate logs, clear temporary files, expand the EBS volume, extend the file system, and verify usage.
+- Each execution is logged with inputs, outputs and step results for later review.
+Example: disk usage passes 90% at 3 AM, and the runbook fixes it within a few minutes, before an engineer would even be paged.
+W: Automation runbook triggered by an alarm: the known five-step procedure runs identically and immediately when the condition occurs, cutting recovery time and removing human error.
+X: A=Two engineers per incident: a second person may catch some mistakes, but recovery still waits for humans to be paged and type commands, and it doubles the effort.
+B=Tenfold disk and stop monitoring: oversizing wastes money, and without monitoring the next full disk arrives with no warning and no automated recovery.
+C=Printed procedure: it can make manual execution slightly easier, but people still perform each step by hand, so delay and mistakes remain.
+T: A repeatable manual procedure should become an automated runbook triggered by the alarm, not a better-documented manual process.
+
+@ Q002987 explain
+G: ## Where applications get credentials
+AWS SDKs look for credentials in a fixed order called the **default credential provider chain**: roughly, environment variables, the shared credentials and config files, and then container or **EC2 instance profile** credentials from the instance metadata service.
+## IAM roles for EC2
+An **instance profile** attaches an IAM role to an instance. The SDK obtains temporary credentials for that role from the instance metadata service, and they are rotated automatically before they expire.
+- No secret is stored on disk or in code.
+- Permissions are managed centrally on the role.
+- Using IMDSv2 protects the metadata service from certain request forgery attacks.
+Important detail: static keys earlier in the chain win. After attaching the role, remove the access keys from environment variables and credential files, or the SDK keeps using them.
+Example: an application calling `s3:GetObject` with the default SDK client starts using the role automatically once the old keys are removed; the code is unchanged.
+W: Instance profile roles plus removing the keys: the SDK default chain picks up temporary role credentials automatically, so long-term keys disappear, usually without code changes.
+X: A=Encrypt keys with KMS: encrypted or not, the access keys are still long-term credentials that work until someone deactivates them, and the application must still decrypt and use them.
+B=Rotate every 90 days: rotation shortens the lifetime of each key but keeps long-term keys in configuration files, which the audit asked to eliminate.
+C=Move keys to environment variables: the same long-term keys just live in a different place on the instance; restricting SSH does not change what kind of credential they are.
+T: To eliminate long-term keys on EC2, attach an IAM role through an instance profile and remove the static keys so the SDK chain uses temporary credentials.
+
+@ Q002988 explain
+G: ## S3 Block Public Access
+S3 Block Public Access is a set of four settings that override bucket policies and ACLs that would grant public access. It can be set per bucket or per **account**; the account-level setting applies to every existing and new bucket in that account.
+- `BlockPublicAcls` and `IgnorePublicAcls` stop public ACLs.
+- `BlockPublicPolicy` and `RestrictPublicBuckets` stop public bucket policies.
+New buckets have Block Public Access turned on by default, but a bucket owner can still turn it off unless something prevents that.
+## Making it stick with an SCP
+A service control policy attached at the organization root or an OU can deny `s3:PutAccountPublicAccessBlock` (and optionally `s3:PutBucketPublicAccessBlock`) for everyone except a security role. Because SCPs apply to all member accounts under that root or OU (not the management account), including accounts created later, no one there can switch the protection off. Account-level Block Public Access can be enabled in new accounts through the account vending process (for example Control Tower or StackSets).
+W: Account-level Block Public Access with an SCP: the setting blocks public access for all buckets in each account, and the SCP prevents anyone from disabling it, in current and future accounts.
+X: A=Bucket policy on each existing bucket: this covers only buckets that exist today; new buckets are unprotected, and a bucket owner could still edit or remove the policy.
+B=Weekly script emailing owners: detection after the fact leaves data exposed for up to a week and relies on owners to act; it does not prevent anything.
+C=Versioning: versioning keeps older object versions for recovery but has no effect on who can read the bucket.
+T: Prevent public S3 access with account-level Block Public Access and lock it with an SCP; per-bucket policies and scans miss new buckets or only detect.
+
+@ Q002989 explain
+G: ## GuardDuty across an organization
+Amazon GuardDuty analyzes sources such as VPC Flow Logs, DNS logs and CloudTrail events to produce findings. For example, `Backdoor:EC2/C&CActivity.B!DNS` means an instance is querying a domain associated with a command-and-control server.
+- In AWS Organizations, you designate a **delegated administrator** account and auto-enable GuardDuty for member accounts, so new accounts are covered too.
+- Findings from member accounts appear in the administrator account, per Region.
+## Automated response
+GuardDuty sends each finding to Amazon EventBridge. In the administrator account, a rule matching specific finding types can start a response:
+- a Lambda function, Step Functions workflow or Systems Manager Automation runbook that replaces the instance's security groups with an isolation group, tags the instance and takes EBS snapshots for forensics;
+- a notification to the security team through SNS.
+Example: a C&C finding in any account triggers isolation within minutes of the finding being published, instead of waiting for someone to read a report.
+W: Delegated admin plus EventBridge-triggered isolation: all accounts' findings are collected centrally, and matching findings automatically start a consistent isolation runbook, giving fast response everywhere.
+X: A=Daily findings dashboard: a dashboard shows counts but takes no action, and a compromised instance can keep talking to the C&C server until someone notices.
+B=Disable GuardDuty: this removes the detection itself, so C&C activity would go unnoticed unless customers happen to report symptoms.
+C=Weekly manual review: an infected instance could communicate with the attacker for up to a week, and manual isolation across accounts is slow and inconsistent.
+T: Centralize GuardDuty findings in a delegated admin account and let EventBridge trigger automated isolation, rather than relying on dashboards or manual reviews.
+
+@ Q002990 explain
+G: ## Why distance hurts dynamic pages
+A user in Tokyo fetching a page from us-east-1 needs several round trips for the TCP and TLS handshakes and then the request itself, each crossing the Pacific over the public internet. The database is idle; the delay is network distance.
+## What CloudFront adds
+Amazon CloudFront places a distribution in front of the ALB (the ALB becomes the origin).
+- **Static assets** (images, CSS, JavaScript) are cached at edge locations near users, so they never travel to us-east-1 again until they expire.
+- **Dynamic requests** are not cached (for example with a caching-disabled cache policy), but the TCP and TLS handshakes end at a nearby edge, and CloudFront sends requests to the origin over the AWS global network using persistent, reused connections.
+- The application itself does not change; only DNS points to the distribution.
+Example: `/static/*` uses a long cache TTL, while `/*` forwards all headers and cookies to the ALB without caching.
+W: CloudFront in front of the ALB: edge caching removes long-distance trips for static content, and edge connection termination plus the AWS backbone speeds dynamic requests, all without re-architecting.
+X: B=More EC2 instances: the servers are not the bottleneck; extra instances in the same Region do nothing about the distance between Asia and us-east-1.
+C=Larger database instance: database load is already low, so faster queries would not reduce page load times caused by network latency.
+D=Second peered VPC in us-east-1: another VPC in the same Region leaves users exactly as far from the application as before.
+T: When latency comes from distance and not from servers or the database, CloudFront edge caching and backbone acceleration help without changing the application.
+
+@ Q002991 explain
+G: ## DynamoDB Accelerator (DAX)
+DynamoDB reads normally complete in single-digit milliseconds. When the same items are read again and again, an in-memory cache can answer in **microseconds** and take load off the table.
+DAX is a managed, highly available cache cluster in your VPC that sits in front of DynamoDB.
+- It is **API-compatible**: the application swaps the DynamoDB client for the DAX client and keeps the same `GetItem`, `Query` and `Scan` calls.
+- An **item cache** serves `GetItem` and `BatchGetItem`; a **query cache** stores results of `Query` and `Scan`.
+- It is **write-through**: writes go through DAX to DynamoDB and update the item cache.
+- It serves eventually consistent reads; strongly consistent reads are passed through to DynamoDB.
+Example: a report reading the same 10,000 product items repeatedly gets them from DAX memory instead of the table.
+W: DAX: an in-memory, DynamoDB-compatible cache that delivers microsecond reads for repeatedly read items, needing only a client change.
+X: A=Streams with Lambda: Streams capture item changes for event-driven processing; they do nothing to speed up reads.
+B=Global tables: global tables replicate a table to other Regions for multi-Region access and resilience; reads within a Region stay at millisecond latency with no caching.
+C=On-demand backups: backups create restorable copies of a table for data protection and have no effect on read performance.
+T: Microsecond reads of hot DynamoDB items with minimal code change means DAX; Streams, global tables and backups solve different problems.
+
+@ Q002992 explain
+G: ## Aurora endpoints
+An Aurora cluster has one **writer** and up to 15 **Aurora Replicas** that share the same storage volume. Aurora gives each cluster several DNS endpoints:
+- the **cluster (writer) endpoint** always points to the current writer and handles reads and writes;
+- the **reader endpoint** spreads connections across the available Aurora Replicas and is used for read-only work.
+Because replicas read from the shared storage, adding them does not require copying data, and replica lag is typically low.
+## Offloading reads
+If a reporting tool connects to the writer endpoint, its heavy `SELECT` queries compete for CPU with the application's writes. Pointing the tool at the reader endpoint moves that load to replicas. Aurora Auto Scaling can add or remove replicas based on CPU or connections.
+Example: the reporting tool's connection string changes from `mycluster.cluster-xxxx...` to `mycluster.cluster-ro-xxxx...`, and writer CPU drops.
+W: Reader endpoint with more replicas: moving the reporting reads to Aurora Replicas removes that load from the writer, and read capacity can grow by adding replicas.
+X: A=Single-AZ deployment: Aurora replicas share storage, so they add little replication overhead on the writer; removing them lowers availability and leaves all reads on the writer.
+B=Larger writer: scaling up adds cost and still makes reports and transactions compete on the same instance, instead of separating the workloads.
+C=Backtrack: Backtrack rewinds the database to an earlier point in time to undo data changes; it cannot stop or rewind slow queries.
+T: When reads overload the writer, send them to the reader endpoint and scale replicas, instead of scaling the writer up.
+
+@ Q002993 explain
+G: ## Single point of failure
+One EC2 instance behind an ALB means any hardware failure, AZ problem or bad deployment takes the application down. The load balancer has nowhere else to send traffic.
+## Making a monolith highly available
+- Create an **AMI** (or launch template with user data) so identical instances can be launched automatically.
+- Run them in an **Auto Scaling group** spanning at least two Availability Zones with a minimum of two instances, registered with the ALB target group.
+- The ALB health check removes failed instances, and Auto Scaling replaces them.
+- **Externalize state**: sessions stored in instance memory would be lost or split across instances, so move them to ElastiCache or DynamoDB (sticky sessions only reduce the problem, since a failed instance still loses its sessions).
+Example: if the instance in AZ-a fails, the ALB keeps sending users to the instance in AZ-b, and users stay logged in because their session is in ElastiCache.
+W: AMI, multi-AZ Auto Scaling group and external sessions: several identical instances across AZs remove the single point of failure, and moving session state out of the instance keeps users logged in during failures, with minimal code change.
+X: B=Termination protection and detailed monitoring: termination protection only blocks accidental API termination, and monitoring only reports problems; neither keeps the app up when the instance fails.
+C=Larger instance with enhanced networking: a bigger instance is still one instance, so it fails the same way.
+D=Hourly snapshots and manual restore: restoring by hand means downtime every time and up to an hour of lost data.
+T: Availability comes from multiple instances across AZs with external state, not from protecting, enlarging or backing up a single instance.
+
+@ Q002994 explain
+G: ## Synchronous calls lose work
+When the order service calls the inventory service directly over HTTP and the inventory service is down, the call fails and the order is lost unless the caller saves it somewhere.
+## Decoupling with Amazon SQS
+Put a queue between the services:
+- The order service sends each order as a message to SQS. SQS stores messages durably (the retention period can be up to 14 days), so orders are kept while inventory is unavailable.
+- The inventory service polls the queue. A received message becomes invisible for the **visibility timeout**; the consumer deletes it only after successful processing, otherwise it reappears and is retried.
+- A **dead-letter queue** (DLQ), set with a redrive policy and `maxReceiveCount`, captures messages that fail repeatedly (for example malformed orders) so they do not block others and can be examined or redriven.
+Example: inventory is down for 10 minutes; 3,000 orders wait in the queue and are processed when it comes back.
+W: SQS queue with a DLQ: the queue buffers orders durably while the inventory service is unavailable, and the DLQ keeps repeatedly failing messages for investigation, so no orders are lost.
+X: A=Vertical scaling: a larger instance does not prevent brief outages such as deployments or failures, and orders sent during them are still lost.
+B=Unlimited retry loop: retries without limits or backoff can overload the recovering service, and orders held only in memory are lost if the order service itself restarts.
+C=Longer synchronous timeout: waiting longer does not help while the service is down; the call eventually fails and the order is still lost.
+T: To avoid losing work when a dependency is briefly down, decouple with a durable queue plus a DLQ rather than retries or longer timeouts on synchronous calls.
+
+@ Q002995 explain
+G: ## RTO and RPO
+- **RTO** (recovery time objective): how long recovery may take, here 30 minutes.
+- **RPO** (recovery point objective): how much data may be lost, here under one minute.
+## Aurora Global Database
+Aurora Global Database has a primary cluster in one Region and read-only secondary clusters in other Regions. Replication happens at the storage layer, so lag is typically under a second.
+- In a Regional outage you can **fail over** to the secondary, which becomes the new primary within minutes. Data lost is only the small replication lag.
+- For planned moves, a **switchover** changes Regions without data loss.
+- For Aurora PostgreSQL, the `rds.global_db_rpo` parameter can enforce a maximum RPO.
+## Warm standby
+The database alone is not enough: the application tier must also run in the secondary Region. In a warm standby, a scaled-down but running copy of the application waits there and is scaled out during failover, with DNS (for example Route 53) moved to it.
+W: Global Database with a warm standby stack: sub-second storage-level replication keeps data loss well under one minute, and a running application copy plus database failover recovers within 30 minutes.
+X: B=Backups in the primary Region only: backups in the failed Region are unreachable during a Regional outage, and restoring from backups would not meet a one-minute RPO anyway.
+C=Same-Region replica: a replica in the same Region protects against instance or AZ failure but fails together with the Region.
+D=Daily cross-Region snapshots: up to 24 hours of data could be lost, and restoring a large snapshot plus rebuilding the stack is unlikely to fit 30 minutes.
+T: Minutes of RTO and seconds of RPO across Regions for Aurora need Global Database plus a warm standby, not backups or same-Region replicas.
+
+@ Q002996 explain
+G: ## Two levers for EC2 cost
+- **Right-sizing** reduces how much capacity you run. At 15% average CPU, most instances are larger than needed.
+- **Commitment discounts** reduce the price of the capacity you keep. Steady workloads are ideal for them.
+## AWS Compute Optimizer
+Compute Optimizer analyzes CloudWatch utilization (CPU, network, and memory if the CloudWatch agent publishes it) and recommends instance types and sizes, with estimated savings and performance risk. By default it looks at the last 14 days; a longer lookback period (up to about three months) can be set in recommendation preferences.
+## Compute Savings Plans
+You commit to a steady amount of compute spend per hour (for example $50/hour) for 1 or 3 years. The discount applies automatically to EC2 across instance families, sizes and Regions, and also to Fargate and Lambda.
+Order matters: right-size first, then buy the commitment for the smaller baseline. Committing first can lock in spending for capacity you are about to remove.
+W: A=Compute Savings Plans: steady usage is exactly what a commitment discounts, and Compute Savings Plans stay flexible if instance types change after right-sizing.
+E=Right-size with Compute Optimizer: recommendations based on measured utilization move the fleet to smaller or better-matched instances, cutting cost without architectural change.
+X: B=Larger instances: at 15% CPU the fleet is already oversized; bigger instances raise cost and waste more capacity.
+C=Dedicated Hosts: hosts are billed for whole physical servers and are meant for licensing or compliance needs; for general workloads they usually cost more, not less.
+D=Disable detailed monitoring: detailed monitoring charges are small compared with compute, and turning it off also reduces the one-minute data used for scaling and analysis.
+T: Cut steady EC2 cost by right-sizing with Compute Optimizer and then covering the remaining baseline with Savings Plans.
+
+@ Q002997 explain
+G: ## S3 Intelligent-Tiering
+S3 Intelligent-Tiering moves each object between access tiers based on its own access pattern, with no lifecycle rules to design and **no retrieval fees** for normal access (only optional expedited restores from the Archive Access tier are charged). It charges a small monthly monitoring fee per object; objects smaller than 128 KB are not monitored and are always billed at the frequent access rate.
+Automatic tiers:
+- **Frequent Access**: new or recently read objects.
+- **Infrequent Access**: not accessed for 30 days.
+- **Archive Instant Access**: not accessed for 90 days, still millisecond access.
+Optional tiers you opt in to per bucket or prefix:
+- **Archive Access** (after 90 days or more) and **Deep Archive Access** (after 180 days or more). Objects there must be restored before reading, so enable them only when the data can wait for retrieval.
+When an object is read, it moves back to Frequent Access automatically.
+Example: 2 PB of logs, mostly untouched after a few weeks, drift down to cheaper tiers, while the few logs someone queries return to the frequent tier. Existing objects need one move into the storage class (for example a single transition rule or S3 Batch Operations), not ongoing rule tuning.
+W: Intelligent-Tiering with archive tiers: it automatically places each object in the cheapest tier that matches how it is actually used, which fits unknown and changing patterns without managing lifecycle rules.
+X: A=Glacier Deep Archive for everything: every read would need a restore taking up to 12 hours (standard) or 48 hours (bulk), and objects deleted before 180 days incur early deletion charges, which is risky when access patterns are unknown.
+B=One Zone-IA for all objects: data is stored in a single AZ, and per-GB retrieval fees plus a 30-day minimum can make frequently read logs cost more.
+C=Standard without versioning: turning off versioning (it can only be suspended once enabled) only avoids storing extra versions; the storage class price of current data stays the same.
+T: Unknown or changing access patterns call for S3 Intelligent-Tiering, which tiers each object automatically, instead of committing all data to one cheap but restrictive class.

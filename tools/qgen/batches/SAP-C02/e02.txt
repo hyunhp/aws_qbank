@@ -1,0 +1,344 @@
+# SAP-C02 detailed explanations (explanation-only rewrites; letters are the published ones)
+
+@ Q001048 explain
+G: ## The four DR strategies
+AWS describes four disaster recovery strategies, ordered by cost and by how fast you recover:
+- **Backup and restore**: copy backups to another Region and rebuild everything after a disaster. RPO and RTO are measured in hours.
+- **Pilot light**: data is replicated continuously, but compute is off or minimal. You start and scale it after a disaster, so RTO is tens of minutes or more.
+- **Warm standby**: a smaller but fully working copy of the stack runs in the second Region and is scaled up during failover. RTO is minutes.
+- **Multi-site active-active**: full stacks run in both Regions and both serve production traffic all the time.
+## Why active-active hides a Region failure
+Because users are already spread across both Regions (for example with Route 53 latency or weighted records plus health checks), losing one Region only means its share of traffic moves to the other. Data layers such as DynamoDB global tables or Aurora Global Database keep the copies in sync, so RPO is close to zero and there is no recovery step for users to notice.
+W: Multi-site active-active: it is the only strategy where both Regions already serve live traffic at full capacity, so a Region failure needs no rebuild or scale-up and stays invisible to users.
+X: A=Backup and restore: infrastructure must be recreated and data restored from the last snapshot, which takes hours and loses everything written since that copy.
+B=Pilot light: the database is current, but application servers must be started and scaled before traffic can shift, so users see an outage of minutes or longer.
+C=Warm standby: the standby runs at reduced size and normally does not serve production traffic, so failover still requires a DNS switch and scale-up rather than being seamless.
+T: Only active-active serves both Regions at once; warm standby, pilot light and backup and restore all involve a visible recovery step.
+
+@ Q001049 explain
+G: ## EC2 Auto Scaling policy types
+- **Target tracking** keeps a metric (for example average CPU at 50%) near a target, adding or removing instances automatically as load changes. It reacts after the metric moves.
+- **Predictive scaling** uses machine learning on past CloudWatch load (it needs at least 24 hours of history and works best with about two weeks) to forecast the next 48 hours and launches capacity **before** the forecast rise.
+- **Scheduled scaling** changes capacity at fixed times you define.
+- **Simple and step scaling** change capacity by a set amount when a CloudWatch alarm fires.
+## Combining policies
+Policies can be used together. When several policies apply, Auto Scaling picks the one that gives the largest capacity. Example: predictive scaling launches instances at 8:50 AM for the 9 AM weekday peak, and a target tracking policy on CPU adds more instances if a news event causes an unexpected surge at 2 PM.
+W: Predictive plus target tracking: predictive scaling pre-provisions for the recurring 9 AM peak so instances are warm before users arrive, and target tracking covers spikes that no forecast could anticipate.
+X: B=Scheduled scaling only: it handles the known peak but has no reaction to load, so an unplanned spike outside the schedule leaves the group under-provisioned.
+C=Simple scaling only: it acts only after an alarm fires and then waits for a cooldown, so the group is always late for the predictable 9 AM ramp and adjusts in coarse steps.
+D=Manual scaling: it depends on a person every day, cannot respond to unexpected spikes at night or weekends, and is the least reliable choice.
+T: Forecastable load goes to predictive scaling, surprises go to target tracking; a schedule alone never reacts to real demand.
+
+@ Q001050 explain
+G: ## How Route 53 failover routing works
+Route 53 failover routing uses two records with the same name: one marked **primary** and one marked **secondary**. A Route 53 health check is attached to the primary (for example an HTTPS check on `/health` of the us-east-1 load balancer).
+- While the health check passes, Route 53 answers DNS queries with the primary.
+- When it fails for the configured number of checks, Route 53 automatically answers with the secondary (the us-west-2 endpoint).
+- When the primary recovers, answers switch back.
+## Things to tune
+- Keep the record TTL short (for example 60 seconds) so resolvers pick up the change quickly. Alias records to AWS load balancers use the target's TTL.
+- Health checkers run from several locations, so a single checker failing does not trigger failover.
+W: Failover routing with health checks: Route 53 itself detects the unhealthy primary and returns the standby record, so no one has to edit DNS during an incident.
+X: A=Simple routing plus runbook: simple routing has no health-check-driven switching, so failover waits for a person to follow the runbook and change the record.
+C=Weighted 50/50: it sends half of all traffic to the standby at all times, which is not an active-passive design, and without health checks on each record it would keep sending users to a failed Region.
+D=Manual CNAME change: it depends on an on-call engineer noticing and editing DNS, which adds delay and human error and is exactly what the requirement rules out.
+T: Automatic DNS failover means failover records plus a health check on the primary; simple, weighted-without-checks or manual changes do not switch by themselves.
+
+@ Q001051 explain
+G: ## Aurora Global Database
+An Aurora Global Database has one primary cluster in one Region and read-only secondary clusters in other Regions. Replication happens at the **storage layer**, not through MySQL binlogs, using dedicated infrastructure, with little impact on database performance.
+- Typical replication lag is under one second, which gives an RPO of seconds.
+- During a regional outage you can fail over (or detach and promote) a secondary to a full read/write cluster, typically within minutes.
+- A planned **switchover** swaps primary and secondary roles without data loss, useful for DR drills.
+Example: primary in `eu-west-1`, secondary in `eu-central-1` serving local reads; if `eu-west-1` fails, promote `eu-central-1` and point the application at its writer endpoint.
+W: Aurora Global Database: storage-level cross-Region replication gives sub-second lag and a promotable secondary, matching an RPO of seconds and fast Region recovery.
+X: A=Binlog replicas plus snapshots: binlog replication runs through the database engine and lags more under heavy writes, and 15-minute snapshot exports imply an RPO measured in minutes rather than seconds.
+C=Daily manual backup copies: the RPO is up to a day, and restoring a cluster from a snapshot takes far longer than promoting a replica.
+D=Serverless v2 with auto-pause: auto-pause only scales idle capacity to zero; two independent clusters have no replication between them, so it provides no DR at all.
+T: For seconds of RPO and fast promotion across Regions, use Aurora Global Database, not binlog replicas, snapshots or unconnected clusters.
+
+@ Q001052 explain
+G: ## What AWS Elastic Disaster Recovery does
+AWS Elastic Disaster Recovery (DRS) installs a replication agent on each source server (on premises or in another cloud). The agent continuously replicates block-level changes to a low-cost staging area subnet in AWS.
+- Because every write is sent continuously, the **RPO is typically seconds**.
+- On failover or a drill, DRS launches recovery instances from the latest (or a chosen point-in-time) state, so the **RTO is typically minutes**.
+- Drills launch recovery instances without stopping replication or affecting the source servers.
+## Snapshot-based backup and restore
+Periodic images or snapshots capture state every few hours or once a day. Recovery means restoring volumes, launching instances, and reconfiguring them, often with manual steps. RPO equals the time since the last snapshot and RTO is usually hours.
+W: Continuous replication with fast launch: DRS gives an RPO of seconds and an RTO of minutes, while snapshot restore loses data since the last snapshot and needs hours of mostly manual recovery work.
+X: A=Re-architecture required: DRS protects servers as they are (lift-and-shift style), with no need to rewrite applications as cloud-native services.
+B=Free automatic drills with backups: it is DRS, not snapshot backups, that offers non-disruptive recovery drills; restoring snapshots is a manual rebuild, and any test instances you launch are billed.
+D=DRS always cheaper: DRS adds a per-server replication fee plus staging storage and replication servers, so it usually costs more than storing periodic snapshots; its advantage is speed, not price.
+T: Choose DRS when RPO and RTO must be seconds and minutes; snapshot backup and restore is cheaper but loses hours of data and takes hours to recover.
+
+@ Q001053 explain
+G: ## Why Auto Scaling groups flap
+A target tracking policy compares a metric, such as average CPU, with a target and adds or removes instances to close the gap. A new instance does not help immediately: it must boot, run user data, warm caches and pass health checks.
+- The **instance warm-up** (for target tracking and step scaling; best set once as the group's default instance warm-up) tells Auto Scaling not to count a new instance in the aggregated metric until it is ready.
+- A **cooldown** (for simple scaling) pauses further actions after an activity.
+## What goes wrong when they are too short
+Example: CPU hits 80%, the group adds instances, but they are not yet serving. The metric stays high, so more instances are added. Minutes later all of them serve at once, CPU drops to 20%, and the policy scales in, and the cycle repeats. Setting warm-up to the real time an instance needs before it takes load (for example 300 seconds) stops the oscillation.
+W: Warm-up or cooldown too short: the policy reacts again before the instances it just launched affect the metric, overshooting on scale-out and then scaling in, which is the classic flapping pattern.
+X: B=Zero health check grace period: new instances may be marked unhealthy and replaced while booting, which causes replacement churn, not a repeating scale-out then scale-in cycle driven by the CPU target.
+C=Too few subnets: a lack of subnets or IP addresses makes launches fail with errors in the activity history; it does not cause a successful scale-out followed by scale-in.
+D=No launch template: a group needs a launch template (or launch configuration) to launch anything, so it could not scale out at all.
+T: Flapping means scaling decisions arrive before new capacity shows up in the metric, so fix warm-up and cooldown, not health checks or networking.
+
+@ Q001054 explain
+G: ## OUs and SCPs as environment guardrails
+In AWS Organizations, accounts are grouped into **organizational units (OUs)**. A **service control policy (SCP)** attached to an OU sets the maximum permissions for every account in it and in any nested OU, including the account's root user.
+- A typical layout has a Security OU (log archive, security tooling), an Infrastructure OU, and workload OUs split into `Prod` and `NonProd` (or `SDLC`).
+- The `Prod` OU might deny disabling encryption or leaving approved Regions, while `NonProd` allows more experimentation but blocks expensive instance types.
+- Each workload gets its own account, which gives a hard boundary for security, quotas and costs.
+Consolidated billing and delegated security services (GuardDuty, Security Hub, Config aggregation) still work across all OUs from the management and security accounts, so central tooling is not lost.
+W: Production and Non-Production OUs: different SCPs apply automatically to every account in each OU, while dedicated accounts isolate workloads and billing and security stay central.
+X: A=Tag-based IAM conditions without OUs: anyone allowed to change tags can change which rules apply to them, and IAM conditions are set per account, so this is weaker and harder to keep consistent than SCPs on OUs.
+C=Accounts with no OU structure: without OUs there is no place to attach environment-wide SCPs, so every account's guardrails must be built and maintained separately.
+D=One OU with IAM policies: IAM policies are managed inside each account and can be changed by its administrators, so they are not an organization-level guardrail and cannot differ by environment at the OU level.
+T: Environment-specific guardrails belong on separate OUs with their own SCPs; tags and IAM policies inside accounts are not organization-wide limits.
+
+@ Q001055 explain
+G: ## Centralizing GuardDuty findings
+**Amazon GuardDuty** analyzes CloudTrail events, VPC Flow Logs, DNS logs and other sources to produce threat findings. In an organization you designate a **delegated administrator** account (usually the security account) and can auto-enable GuardDuty for all current and new member accounts.
+- The administrator account sees findings from all member accounts in that Region.
+- GuardDuty publishes findings as events to **Amazon EventBridge**, and the administrator account receives events for member findings too.
+## Routing to remediation
+In the security account, an EventBridge rule matches `source: aws.guardduty` (for example with `severity >= 7`) and targets a central event bus, Lambda functions or Step Functions. Because GuardDuty is Regional, enable it and create the rule in each Region you use, or forward events from other Regions to one bus. Each finding carries the member `accountId`, so remediation can assume a role in that account.
+W: Delegated administrator plus EventBridge: GuardDuty itself aggregates all member findings into the security account, and EventBridge rules there deliver them in near real time to the central bus and remediation functions.
+X: B=Polling Lambdas in every account: it needs cross-account roles in a mesh between accounts, adds polling delay and API throttling risk, and duplicates what GuardDuty's administrator model already provides.
+C=Daily CSV export to S3: findings arrive up to a day late, which is far too slow for automated remediation, and CSV files do not trigger event-driven actions.
+D=CloudTrail Insights: Insights detects unusual API call volumes or error rates; it does not produce GuardDuty findings, so the remediation functions would be acting on different data.
+T: Org-wide GuardDuty automation means a delegated administrator that aggregates findings plus EventBridge rules in that account, not polling or file exports.
+
+@ Q001056 explain
+G: ## VPC sharing with AWS RAM
+**VPC sharing** lets the VPC owner account share individual subnets with other accounts in the same AWS Organization using **AWS Resource Access Manager (RAM)**. The participant accounts then launch their own resources (EC2 instances, RDS databases, Lambda functions in VPCs, load balancers) directly into the shared subnets.
+- The owner keeps control of the VPC, subnets, route tables, network ACLs, gateways and endpoints.
+- Participants own and pay for the resources they launch, and they cannot modify the subnet or the resources of other accounts.
+- Security groups belong to the account that created them.
+Example: the network account creates `app-subnet-a` and `app-subnet-b` and shares them with the `Workloads` OU through one RAM resource share; every account in that OU sees the subnets and can pick them in `RunInstances`.
+W: Share subnets through RAM: application accounts launch instances into the central subnets in their own account, with no copies of the VPC and the network team keeping full control.
+X: A=StackSets to recreate the VPC: it creates 20 separate VPCs, which duplicates the network, multiplies gateways and address ranges, and is the opposite of launching into the central subnets.
+C=Cross-account roles into the network account: the instances would be created and billed in the network account rather than the application accounts, and teams would get permissions inside the network account.
+D=VPC peering: peering connects separate VPCs, so each account still needs its own VPC and subnets; it never lets them launch into the network account's subnets.
+T: To let many accounts use the same central subnets, share them with AWS RAM; peering, copies and cross-account roles all give each workload a different network or the wrong owner.
+
+@ Q001057 explain
+G: ## How SCPs and IAM policies combine
+An action is allowed only if every applicable policy layer allows it:
+- The **service control policies** on the account, its OU and every parent up to the root must allow it (an SCP never grants anything; it sets the maximum).
+- The **identity-based policy** (or a resource policy) must allow it.
+- An explicit `Deny` anywhere wins over any `Allow`.
+SCPs attached to the root apply to every account below it, including accounts in nested OUs. The only account SCPs do not affect is the management account.
+## Applying it here
+The root SCP has a `Deny` on `s3:DeleteBucket` for all accounts outside the `Backup-Exempt` OU. The developer's IAM allow is real but can never exceed what the SCP permits, so the result is `AccessDenied`. The fix is organizational: move the account into the exempt OU, or have the organization administrators change the SCP exception, if the business agrees.
+W: SCPs cap permissions: the explicit deny from the root SCP applies to this account, and no IAM policy in the account can grant an action the SCP denies.
+X: A=Add a matching allow to the SCP: an allow in an SCP cannot cancel an explicit deny in the same or another SCP, and developers in a member account cannot edit organization SCPs anyway.
+B=Only direct children of the root: SCPs are inherited down the whole OU tree, so a root SCP affects accounts in nested OUs as well.
+D=IAM takes precedence: evaluation is the other way round; the effective permissions are the intersection of the SCP and IAM policies, and explicit denies always win.
+T: Effective permissions are the overlap of SCPs and IAM policies, and an SCP deny inherited from the root cannot be overridden by an IAM allow.
+
+@ Q001058 explain
+G: ## Separation of duties in a Control Tower landing zone
+AWS Control Tower sets up a landing zone with a **Security OU** that contains two shared accounts:
+- **Log Archive**: a central S3 bucket that receives the organization CloudTrail trail and AWS Config data from every enrolled account.
+- **Audit**: read and security access for the security team.
+Control Tower also applies **mandatory controls**, implemented mainly as SCPs, that stop member accounts from deleting or changing the Control Tower-managed CloudTrail trail, its settings and the log archive resources.
+## Why administrators cannot erase their tracks
+A workload administrator may be fully privileged in their own account, yet the logs of their actions are written to a bucket in a different account where they have no access, and the SCPs prevent them from stopping the trail at the source. Deleting evidence would require permissions in two places that are held by different teams.
+W: Log Archive account plus preventive controls: logs leave the workload account for a separate account the admins cannot access, and mandatory SCP-based controls stop them from disabling or altering the trail.
+X: B=Permission sets without DeleteTrail: users with other rights in the account could still stop logging, delete the log bucket, or grant themselves access, and permission sets do not protect logs already delivered elsewhere.
+C=Local trails with MFA Delete: the bucket is owned by the same account whose administrators are being audited, so they control its policy and settings; MFA Delete also needs the root user and does not stop logging being turned off.
+D=Logs stored in the management account: best practice keeps workloads and log storage out of the management account; Control Tower uses the dedicated Log Archive account instead.
+T: Protecting audit logs means moving them to a separate Log Archive account and blocking changes with SCPs, not trusting controls inside the account being audited.
+
+@ Q001059 explain
+G: ## Organization trails
+An **organization trail** is created once in the management account (or a CloudTrail delegated administrator account). It automatically logs events for every account in the organization, including accounts added later, and delivers them to one S3 bucket, usually in the Log Archive account.
+- Member accounts can see the trail but cannot modify or delete it.
+- Log files are stored under a prefix per account ID, such as `AWSLogs/o-exampleorg/111122223333/`.
+## Querying the logs
+- **Amazon Athena** can query the central bucket with SQL, for example to find every `DeleteSecurityGroup` call across all accounts in the last week.
+- **CloudTrail Lake** can also collect organization events into an event data store that is queried with SQL, without managing tables yourself. Note that CloudTrail Lake is no longer open to new customers from May 31, 2026 (existing customers can keep using it), so for new setups Athena on the central bucket, or Amazon CloudWatch as AWS suggests, is the usual choice.
+W: Organization trail to a central bucket: one configuration covers all 60 accounts automatically, member teams have nothing to manage, and Athena or CloudTrail Lake gives a single queryable view.
+X: B=VPC Flow Logs: flow logs record IP traffic metadata, not API calls, so they cannot show who changed or deleted a resource.
+C=On-premises SIEM without aggregation: each account would ship data separately, leaving the per-account configuration burden in place and no single view inside AWS.
+D=Per-account trails: 60 teams maintaining their own trails leads to gaps and inconsistent settings, and administrators could stop logging in their own accounts.
+T: One organization trail into a Log Archive bucket, queried with Athena or CloudTrail Lake, beats per-account trails for org-wide investigations.
+
+@ Q001060 explain
+G: ## What AWS Control Tower provides
+AWS Control Tower is a managed way to set up and govern a multi-account environment. It is built **on top of** AWS Organizations and uses services such as CloudTrail, AWS Config, CloudFormation StackSets and (optionally) IAM Identity Center underneath.
+- **Landing zone**: Security OU with Log Archive and Audit accounts, organization-wide logging and baseline configuration.
+- **Controls**: a library of preventive (mainly SCPs and RCPs), detective (AWS Config rules) and proactive (CloudFormation hook) controls you enable per OU.
+- **Account Factory**: vends new accounts already enrolled with the baseline and controls.
+Control Tower itself has no additional charge; you pay for the underlying services such as Config and CloudTrail.
+## The tradeoff
+A custom landing zone can do anything but must be designed, built and maintained by your team. Control Tower delivers a best-practice setup in hours, with some limits on how far you can change its managed resources.
+W: Prebuilt baselines, controls and Account Factory: the enterprise gets a working, best-practice landing zone and standardized account vending immediately instead of engineering it all itself.
+X: A=Custom is always cheaper: Control Tower has no separate service fee, both approaches pay for the same underlying services, and a custom build adds large engineering and maintenance costs.
+B=Replaces Organizations: Control Tower is built on AWS Organizations and creates OUs, accounts and SCPs through it; it does not remove the need for it.
+D=No limitations: Control Tower manages specific resources and supports certain Regions and structures; unusual requirements may need customizations or a custom approach.
+T: Control Tower wins on speed and standardization through ready-made baselines, controls and Account Factory, not on unlimited flexibility or replacing Organizations.
+
+@ Q001061 explain
+G: ## Sharing a transit gateway with AWS RAM
+A transit gateway lives in one account (the network account). With **AWS Resource Access Manager (RAM)** the owner creates a resource share containing the transit gateway and shares it with specific accounts, an OU or the whole organization.
+- Spoke accounts see the shared transit gateway and call `CreateTransitGatewayVpcAttachment` for their own VPCs from their own accounts.
+- If **auto accept shared attachments** is off, the network team accepts each attachment; either way the network team controls the transit gateway route tables.
+- Spoke accounts get no IAM permissions in the network account and cannot change the transit gateway or other attachments.
+Example: share `tgw-0abc` with the organization; a new account in any OU can attach its VPC the same day, and the network team associates the attachment with the right route table.
+W: Share through RAM: all 50 accounts can attach their VPCs to the central transit gateway themselves, without IAM access to the network account, and new accounts are covered automatically.
+X: A=Direct VPC peering: 50 peering connections are hard to manage, are not transitive, and abandon the transit gateway hub the design is built around.
+B=IAM users in the network account: it hands spoke teams long-term credentials and permissions inside the network account, which the requirement forbids.
+C=Network team creates every attachment: an attachment must be created from the account that owns the VPC, and funnelling every request through one team does not scale to 50 accounts.
+T: Central network resources such as transit gateways are shared with RAM so owners keep control and other accounts get no extra permissions.
+
+@ Q001062 explain
+G: ## Centralized versus decentralized cloud governance
+Multi-account governance sits on a spectrum:
+- **Centralized**: a platform or security team defines account baselines, networking, approved services and change processes. Benefits are consistency, a smaller set of patterns to secure, and simpler audits. The cost is slower delivery and more requests waiting on a central team.
+- **Decentralized**: business units own their accounts and choose their own tooling and patterns. They move faster and experiment more, but configurations drift, security posture varies, and audits must cover many different designs.
+## A common middle ground
+Many enterprises centralize a small set of non-negotiable guardrails (SCPs, central logging, identity, network connectivity) and let teams work freely inside those limits. For example, the platform team enforces encryption and approved Regions, while each team picks its own compute and CI/CD.
+W: Consistency versus speed: centralization gives uniform controls and easier audits but can slow teams, and decentralization gives autonomy and agility at the risk of inconsistent security and configuration.
+X: A=No tradeoff: centralized control clearly costs agility and can create bottlenecks, so it is not better in every dimension.
+C=Removes the need for SCPs: SCPs are one of the main tools a central team uses to enforce guardrails, so centralization relies on them rather than removing them.
+D=Decentralized is always cheaper: autonomy does not guarantee right-sizing; teams without common tooling often duplicate resources, so costs can go either way.
+T: Governance models trade central consistency and auditability against team autonomy and speed; neither side wins on every dimension.
+
+@ Q001063 explain
+G: ## How a Region-deny SCP is usually written
+SCPs restrict Regions with the `aws:RequestedRegion` condition key. The common pattern is a `Deny` statement with `NotAction` for global services and a `StringNotEquals` condition:
+- `"Effect": "Deny"`, `"NotAction": ["iam:*", "organizations:*", "route53:*", "cloudfront:*", "sts:*", "support:*", ...]`
+- `"Condition": {"StringNotEquals": {"aws:RequestedRegion": ["eu-west-1", "eu-central-1"]}}`
+## Typical mistakes
+- Using `Allow` statements for approved Regions: an allow in an SCP does not block anything if another SCP (such as the default `FullAWSAccess`) already allows everything.
+- A misspelled or wrong condition operator or key, so the condition never matches.
+- A missing or overly broad `NotAction` list: too broad lets services through, too narrow breaks global services and leads teams to loosen it.
+SCPs take effect as soon as an account is in the OU; they never apply to the management account.
+W: Faulty SCP logic: the SCP is attached and inherited, so if resources still appear in other Regions the statement itself is wrong, typically the condition, an allow-based design, or the exemption list.
+X: A=SCPs cannot restrict Regions: restricting Regions with `aws:RequestedRegion` in an SCP is a standard, documented pattern, and Control Tower even offers it as a Region deny control.
+B=Must be in the management account's OU: the management account is the one account SCPs never affect, and member accounts in any OU are subject to the SCPs above them.
+C=Manual re-registration: SCPs apply automatically as soon as an account is moved into an OU; there is no re-registration step in Organizations.
+T: When an attached SCP does not block what you expect, debug the policy statement (deny structure, condition key, exemptions), not the attachment.
+
+@ Q001064 explain
+G: ## Account Factory for Terraform (AFT)
+AWS Control Tower **Account Factory** vends new accounts that are enrolled in the landing zone with its controls. **Account Factory for Terraform (AFT)** adds a GitOps pipeline around it:
+- A team commits an account request (name, email, OU, tags) as Terraform to a Git repository.
+- AFT's pipelines create the account through Control Tower, so guardrails apply from the start.
+- **Global customizations** run in every account (for example a baseline VPC, security tooling, IAM roles), and **account customizations** run only in accounts that reference them, such as a data team's extra buckets.
+- Changes to customizations are re-applied through the same pipelines, so the platform team manages everything as code.
+Example: a pull request adding `team-payments-dev` produces a new account in the Dev OU with the standard VPC and security agents, and no one logs in to click through setup.
+W: Account Factory for Terraform: account requests and baseline plus team-specific customizations live in Git as Terraform, and AFT vends and configures each account with Control Tower guardrails with no manual steps.
+X: A=Config aggregator: it only reports on resources across accounts; it neither creates accounts nor builds the missing baseline.
+C=Permission sets for self-build: they grant access to accounts but leave each team to build its own baseline, so results are inconsistent and not automated.
+D=CreateAccount script plus checklist: the manual checklist is the exact work the platform team wants to remove, and it invites missed guardrails and drift.
+T: Weekly, fully automated account vending with Terraform customizations points to Control Tower AFT, not scripts, access grants or reporting tools.
+
+@ Q001065 explain
+G: ## EC2 purchase options for batch work
+- **On-Demand**: pay only for the time you run, with no commitment; never interrupted by AWS for capacity.
+- **Spot Instances**: spare EC2 capacity at discounts of up to about 90% compared with On-Demand. AWS can reclaim the instance with a **two-minute interruption notice**, available through instance metadata and EventBridge.
+- **Reserved Instances and Savings Plans**: discounts in exchange for a 1- or 3-year commitment, billed whether or not you use the capacity.
+- **Dedicated Hosts**: whole physical servers, mainly for per-socket or per-core licensing and compliance.
+## Making Spot safe
+A checkpointing job saves progress, for example to S3 every few minutes. On an interruption notice it writes a final checkpoint, and a replacement instance resumes from there. Spreading requests across several instance types and Availability Zones (for example with an EC2 Fleet or Auto Scaling group using the price-capacity-optimized strategy) lowers the chance of interruption.
+W: Spot Instances: the workload tolerates the two-minute notice and resumes from checkpoints, so it can use the deepest EC2 discount with little risk.
+X: A=On-Demand: it avoids interruptions the workload can already tolerate, so it pays full price for no real benefit.
+B=Dedicated Hosts: they are billed for the whole physical server and exist for licensing or compliance needs, making them one of the most expensive options for plain batch compute.
+C=3-year Standard RIs: you pay for the capacity 24 hours a day for three years while the job runs only at night, and the discount is smaller than Spot.
+T: Interruptible, checkpointed batch jobs belong on Spot; commitments and dedicated hardware only pay off for steady or licensed usage.
+
+@ Q001066 explain
+G: ## AWS cost tools and what each one does
+- **Cost Explorer** visualizes past and current spend, grouped and filtered by service, account, Region or activated **cost allocation tags** such as `CostCenter`. By default it shows 13 months of history, and longer history (up to 38 months at monthly granularity) can be enabled for multi-year analysis.
+- **AWS Budgets** tracks actual or **forecasted** cost and usage against a threshold and notifies by email, SNS or chat.
+- **Budget actions** run when a threshold is crossed: apply an IAM policy or an SCP, or stop specific EC2 or RDS instances, either automatically or after approval.
+Example: a budget of 2,000 USD per month on the `sandbox` account alerts when the forecast exceeds 100%, and an action stops the tagged EC2 instances when actual spend passes 100%.
+W: Cost Explorer plus Budgets with actions: Cost Explorer covers the multi-year trend analysis by service and cost-center tag, and a budget provides forecast alerts and a budget action that stops the non-production instances.
+X: B=Trusted Advisor plus email alerts: Trusted Advisor gives optimization checks, not historical spend trends, and an email that asks people to stop instances is not automatic.
+C=Pricing Calculator plus Anomaly Detection: the Pricing Calculator estimates planned architectures rather than analyzing history, and Cost Anomaly Detection alerts on unusual spend but cannot stop instances.
+D=Billing alarms plus Cost Explorer: CloudWatch billing alarms watch estimated charges rather than forecasts, and Cost Explorer only analyzes costs; it cannot act on resources.
+T: Analyze history with Cost Explorer and enforce limits with Budgets (forecast alerts and actions); calculators, anomaly alerts and billing alarms do not stop resources.
+
+@ Q001067 explain
+G: ## AWS Trusted Advisor
+Trusted Advisor runs checks across several categories:
+- **Security**: for example security groups allowing unrestricted access to specific ports, or public S3 bucket permissions.
+- **Service limits**: usage above about 80% of a service quota.
+- **Cost optimization**: idle load balancers, underutilized EBS volumes, low-utilization EC2 instances.
+- **Fault tolerance** and **performance**.
+With Basic support only a small set of core checks is available; Business support or higher unlocks the full set.
+## Organizational view
+With the organizational view enabled from the management account, you can create reports that aggregate check results from all member accounts and download them (JSON or CSV). Trusted Advisor can also send weekly email notifications, so a central team gets a regular organization-wide picture without logging in to each account.
+W: Trusted Advisor with organizational view: its checks cover open security groups, quota usage, idle load balancers and underused EBS volumes, and organizational view reports them across all accounts with Business support.
+X: A=Compute Optimizer: it gives rightsizing recommendations for compute resources and EBS volumes but has no checks for open security groups, service quotas or idle load balancers.
+B=Config managed rules: rules evaluate resource configuration and could flag open security groups, but there are no rules for service quota usage, coverage of idle or underused resources is limited, and you would assemble the rule set yourself.
+C=Cost Explorer rightsizing: it covers only EC2 rightsizing savings and offers nothing on security groups, quotas or load balancers.
+T: One service covering security, quotas and idle-resource checks across an organization is Trusted Advisor with organizational view.
+
+@ Q001068 explain
+G: ## AWS Compute Optimizer
+Compute Optimizer analyzes CloudWatch utilization history (CPU, memory if the CloudWatch agent is installed, network, disk I/O) with machine learning and recommends better-fitting configurations.
+- It covers EC2 instances, Auto Scaling groups, EBS volumes, Lambda functions, ECS services on Fargate and RDS databases, among others.
+- Each resource is classified as over-provisioned, under-provisioned or optimized, with up to three specific options, for example moving from `m5.2xlarge` to `m6i.xlarge`, plus projected utilization and savings.
+- By default it looks at the last 14 days; **enhanced infrastructure metrics** (paid) extend the lookback to up to 93 days.
+Example: an EBS `io1` volume that rarely exceeds 3,000 IOPS gets a recommendation to switch to `gp3` with the right provisioned IOPS.
+W: Compute Optimizer: it uses machine learning on historical utilization to recommend specific instance types and EBS configurations, exactly the right-sizing detail requested.
+X: A=Trusted Advisor cost checks: its own checks flag low-utilization instances and underused volumes using simple utilization thresholds; the ML-based analysis that proposes specific target instance types is Compute Optimizer's job.
+C=S3 Storage Lens: it analyzes S3 storage usage and activity and has nothing to say about EC2 or EBS sizing.
+D=Budgets usage alerts: budgets tell you when spend or usage crosses a threshold but do not analyze utilization or recommend resource changes.
+T: For ML-driven, specific instance and volume right-sizing, use Compute Optimizer; Trusted Advisor, Storage Lens and Budgets answer different questions.
+
+@ Q001069 explain
+G: ## S3 Storage Lens
+S3 Storage Lens gives organization-wide visibility into S3 usage and activity. From the management account or a delegated administrator, one **organization dashboard** can cover every account and Region.
+- **Free metrics** include storage bytes and object counts, noncurrent version bytes, incomplete multipart upload bytes, and some encryption and replication status metrics, aggregated by organization, account, Region and bucket.
+- **Advanced metrics and recommendations** (paid) add activity metrics, contextual recommendations, prefix-level detail and 15 months of history instead of 14 days.
+- A **metrics export** writes the data daily to an S3 bucket in CSV or Apache Parquet format for analysis with Athena or QuickSight.
+Example: the dashboard shows that 30% of bytes in one account are noncurrent versions, suggesting a lifecycle rule to expire them.
+W: Storage Lens organization dashboard with daily export: it aggregates all 900 buckets across the 70 accounts, shows growth, noncurrent versions and incomplete uploads, adds cost-saving recommendations with the advanced tier, and exports metrics daily.
+X: A=CloudWatch storage metrics: the daily metrics cover bucket size and object count only, so there is no view of noncurrent versions or incomplete uploads, no recommendations, and dashboards must be stitched together across accounts.
+B=Trusted Advisor S3 checks: they check bucket configuration such as permissions, logging, versioning or whether an abort-incomplete-multipart-upload lifecycle rule exists, but give no storage growth or noncurrent-version metrics and no daily metrics export.
+D=S3 Inventory plus Athena and QuickSight: it can work, but you must configure inventory on 900 buckets and build every metric, aggregation and recommendation yourself, which is far more effort.
+T: Organization-wide S3 usage metrics with recommendations and daily exports come built in with Storage Lens; inventory and CloudWatch need heavy custom work.
+
+@ Q001070 explain
+G: ## Allocating costs by business unit
+- **Cost allocation tags** such as `BusinessUnit=Payments` let Cost Explorer and the Cost and Usage Report break down spend by tag. They must be activated in the management (payer) account, and coverage can be enforced with **tag policies**, SCP conditions and account baselines.
+- **AWS Cost Categories** define rules that group costs into categories (for example by account, tag or service) and support **split charge rules** that divide a shared cost across other categories proportionally, evenly or by fixed percentages.
+## Handling shared network costs
+Transit gateway and NAT gateway charges sit in the central network account, and one shared gateway serves many business units, so a tag on it cannot divide its cost. A Cost Category named `SharedNetwork` can capture them, and a split charge rule spreads them across the `Payments`, `Retail` and `Data` categories, for example in proportion to each unit's direct costs.
+W: Enforced tags plus Cost Categories: tags attribute direct costs to business units, and Cost Categories with split charge rules divide shared costs such as TGW and NAT charges, producing repeatable chargeback reports.
+X: B=Manual spreadsheets: they are error-prone, do not scale, and must be redone every month rather than being built into the billing data.
+C=Group by service without tags: it shows how much the transit gateway costs but not which business unit caused it, so no chargeback is possible.
+D=Account-level billing only: the shared network account serves many business units, so charging by account cannot split its costs.
+T: Chargeback of shared costs needs enforced cost allocation tags plus Cost Categories with split charges, not account or service groupings alone.
+
+@ Q001071 explain
+G: ## AWS Pricing Calculator
+The AWS Pricing Calculator estimates the cost of workloads **before** they are deployed. You add services, choose Regions, instance types, pricing models and quantities, and see monthly and upfront costs.
+- Compare pricing models, for example On-Demand versus a 3-year Compute Savings Plan for the same EC2 instances.
+- Model storage options such as EBS `gp3` versus `io2` with provisioned IOPS, and data transfer out, for example 20 TB per month.
+- Organize services into **groups** (such as web, app and database tiers) and create several estimates for alternative designs.
+- Save the estimate as a shareable link or export it (CSV, JSON or PDF) for leadership review.
+W: Pricing Calculator with grouped, shared estimates: it models a not-yet-built three-tier design with each pricing, instance, storage and data transfer choice, and produces a shareable estimate for approval.
+X: A=Cost Explorer forecasts: forecasts project spending history, and an application that has not been migrated has no history to forecast from.
+C=Compute Optimizer: it analyzes the utilization of resources that are already running, so there is nothing to analyze for a planned application, and it does not produce a full estimate that includes data transfer.
+D=Budgets with a forecast: budgets track actual and forecasted spend against thresholds after deployment; they do not estimate alternative designs.
+T: Estimating cost for something not yet built is a Pricing Calculator job; Cost Explorer, Budgets and Compute Optimizer all need existing usage.
+
+@ Q001072 explain
+G: ## Reserved Instances versus Savings Plans
+Both give a discount for a 1- or 3-year commitment that cannot simply be canceled (Savings Plans only have a short return window right after purchase).
+- **Standard Reserved Instances** apply to a specific instance family, Region, operating system and tenancy (Regional Linux RIs are size-flexible within the family). They offer some of the highest discounts, but if usage moves to another family or Region the RI goes unused. They can be sold on the RI Marketplace, but not exchanged; only Convertible RIs can be exchanged.
+- **Compute Savings Plans** commit to a dollar amount per hour (for example 20 USD/hour) and apply automatically to EC2 in any family, size, Region, OS and tenancy, plus **AWS Fargate** and **AWS Lambda**. Discounts are slightly lower than Standard RIs.
+## Choosing
+For steady, predictable usage of one family, Standard RIs (or EC2 Instance Savings Plans) save the most. For variable usage across families, Compute Savings Plans keep the commitment fully used, which often yields more real savings.
+W: Discount versus flexibility: Standard RIs give a slightly larger discount but lock to a family and Region, while Compute Savings Plans follow usage across families, Regions, Fargate and Lambda, which fits variable workloads.
+X: B=Savings Plans can be canceled any time: a Savings Plan is a binding term commitment (apart from a short return window right after purchase), and Standard RIs cannot be exchanged (only Convertible RIs can), so both parts of the statement are wrong.
+C=Functionally identical: they differ in scope and flexibility, which is exactly why the choice matters for variable usage.
+D=Standard RIs cover Fargate and Lambda: RIs apply only to the matching EC2 (or other reserved service) usage; only Compute Savings Plans extend to Fargate and Lambda.
+T: Standard RIs maximize the discount for fixed usage, Compute Savings Plans trade a little discount for flexibility across families, Regions and compute services.

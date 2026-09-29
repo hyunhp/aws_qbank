@@ -1,0 +1,356 @@
+# SAP-C02 detailed explanations, e10 (explanation-only rewrites; letters are the published ones)
+
+@ Q002998 explain
+G: ## How cross-AZ traffic is billed
+Traffic between two Availability Zones in the same Region is billed per GB, and it is billed in each direction. Traffic that stays inside one AZ over private IPs is free. A chatty app tier that makes thousands of small database calls per second can therefore turn into a large line item.
+## Keeping traffic local without losing resilience
+- Put the database primary and the busiest app servers in the same AZ, and prefer AZ-local endpoints (for example, zonal DNS names or AZ affinity in the load balancer or service mesh).
+- Keep a synchronous standby (such as RDS Multi-AZ) or replicas in another AZ so a failure of the primary AZ still fails over automatically.
+- Example: app servers in `us-east-1a` talk to the primary in `us-east-1a`; the standby in `us-east-1b` only receives replication traffic, which is far smaller than the query traffic.
+Because the workload tolerates a brief failover, you can accept the short switch-over time in exchange for mostly free AZ-local traffic.
+W: AZ-local primary path with a standby elsewhere: most requests stay within one AZ, so the per-GB cross-AZ charge applies only to replication and failover traffic, while the standby in a second AZ keeps the workload resilient.
+X: A=CloudFront in front of the database: CloudFront is an HTTP(S) content delivery network; it cannot proxy database protocols such as MySQL or PostgreSQL connections, and it would not change where the database sits.
+B=NAT gateway for internal traffic: a NAT gateway is for private resources reaching the internet or other networks; it adds a per-GB processing charge on top of the transfer charge instead of removing it.
+C=Database in another Region: inter-Region data transfer is priced higher than cross-AZ transfer and adds tens of milliseconds of latency to every query, so costs and response times both get worse.
+T: Cut cross-AZ charges by keeping the hot request path inside one AZ and using another AZ only for the standby, not by adding extra network hops or Regions.
+
+@ Q002999 explain
+G: ## What stack drift is
+**Drift** happens when someone changes a resource outside CloudFormation, for example editing a security group rule in the console. The stack's template no longer describes reality, and the next stack update can overwrite or fail on the manual change.
+## How drift detection works
+- `DetectStackDrift` compares each supported resource's current configuration with the template's expected values; `DescribeStackResourceDrifts` lists what changed (`MODIFIED`, `DELETED`).
+- Drift detection only runs when invoked. To run it on a schedule, use an EventBridge schedule (or EventBridge Scheduler) that triggers a Lambda function or an SSM Automation runbook to start detection, wait for the result and publish findings to an SNS topic for the owners.
+- An alternative is the AWS Config managed rule `cloudformation-stack-drift-detection-check`, which flags drifted stacks and can feed the same notification path.
+Not every resource type supports drift detection, so review the supported list for critical resources.
+W: Scheduled drift detection with SNS alerts: an EventBridge schedule runs detection weekly without human effort, and SNS delivers the list of drifted stacks to the owners so they can fix or re-import the change.
+X: B=Blocking all console access: it only tries to prevent drift and does not detect changes made through the API, CLI or break-glass access; removing administrator access also blocks legitimate incident response.
+C=Recreating every stack weekly: deleting and recreating production stacks causes downtime and can destroy stateful resources such as databases, and it still gives owners no report of what drifted.
+D=Comparing console screenshots: a manual monthly visual check misses the weekly requirement, cannot compare hidden properties reliably and does not scale across many stacks.
+T: Drift detection is on-demand, so schedule it with EventBridge and route the results to owners through SNS instead of trying to prevent or wipe out change by hand.
+
+@ Q003000 explain
+G: ## What Amazon Inspector scans
+Amazon Inspector is a vulnerability management service. It discovers workloads automatically and scans them continuously for known software vulnerabilities (CVEs) and, for EC2, unintended network exposure.
+- **EC2 instances**: package vulnerabilities, using the SSM Agent or agentless scanning of EBS snapshots.
+- **ECR container images**: scanned on push and rescanned when new CVEs are published.
+- **Lambda functions**: package dependencies, and optionally the function code itself.
+Each finding gets an Inspector risk score that adjusts the CVSS score for the environment, such as whether the instance is reachable from the internet, which helps prioritize.
+## Organization-wide setup
+In AWS Organizations, the management account designates a **delegated administrator** account (often the security tooling account). That account can enable Inspector for all members, auto-enable new accounts and view all findings centrally, and findings can flow to Security Hub.
+W: Amazon Inspector with a delegated administrator: it covers exactly the three workload types in the question, ranks findings by contextual risk and manages scanning across every account from one place.
+X: B=Macie sensitive data discovery: Macie inspects S3 objects for sensitive data such as PII or credentials; it does not scan operating system packages, container images or Lambda dependencies for CVEs.
+C=Trusted Advisor security checks: Trusted Advisor flags configuration issues such as open security group ports or missing MFA on the root user; it does not inventory software packages or match them against vulnerability databases.
+D=AWS Artifact: Artifact is a portal for downloading AWS's own compliance reports and accepting agreements such as a BAA; it says nothing about vulnerabilities in your workloads.
+T: CVE scanning of EC2, ECR images and Lambda across an organization is Inspector; Macie is about data, Trusted Advisor about configuration and Artifact about AWS's compliance paperwork.
+
+@ Q003001 explain
+G: ## How S3 request throughput scales
+Amazon S3 scales request rates per **prefix** (the part of the key before the object name, such as `logs/2026/09/`). Each partitioned prefix supports at least 3,500 write and 5,500 read requests per second, and there is no limit on the number of prefixes.
+For millions of small files, the bottleneck is usually request latency, not bandwidth: each GET takes tens of milliseconds, so one thread reading one file at a time spends most of its time waiting.
+## Getting more throughput
+- Open many concurrent connections and requests (multiple threads or async I/O, or tools such as the AWS CRT-based clients).
+- Spread keys across several prefixes so requests are not concentrated on one partition.
+- Example: 200 parallel readers at 30 ms per GET can fetch roughly 6,600 small objects per second, versus about 33 per second with a single reader; that rate is above one prefix's 5,500 GET baseline, which is why the keys should also be spread across prefixes.
+- If possible, also combine small files into larger objects to reduce the request count.
+W: Parallelize across prefixes and connections: throughput for small objects grows with concurrency, and S3 scales per prefix, so many parallel requests spread over many prefixes raise aggregate throughput the most.
+X: A=Fewer worker threads: S3 is not suffering from contention here; fewer threads mean fewer requests in flight, so each request's latency limits throughput even more.
+B=Single EBS volume: copying millions of files to one volume is itself slow, the volume has its own IOPS and throughput limits, and it can only serve one instance, so it becomes a new bottleneck.
+C=S3 Glacier Flexible Retrieval: objects in this class must be restored before they can be read, which takes minutes to hours and adds retrieval charges, so the job becomes slower, not faster.
+T: S3 performance for many small files comes from parallelism across connections and prefixes, not from fewer requests in flight or moving the data somewhere slower.
+
+@ Q003002 explain
+G: ## Handling a flaky dependency
+When a third-party API has outages, your application must avoid two failure modes: giving up too early on brief glitches, and overwhelming the dependency (and your own threads) during a longer outage.
+## Two standard patterns
+- **Retries with exponential backoff and jitter**: wait longer after each failure (for example 100 ms, 200 ms, 400 ms) and add randomness so thousands of clients do not retry at the same instant. Cap the number of attempts and pair retries with timeouts. Payment calls should also use idempotency keys so a retried charge is not applied twice.
+- **Circuit breaker**: after a threshold of failures, the breaker "opens" and calls fail fast for a cool-down period instead of waiting on timeouts. It then lets a few test calls through ("half-open") and closes again when they succeed.
+- **Graceful degradation**: while the breaker is open, offer a fallback, such as queueing the payment for later processing or showing "payment pending", instead of an error page.
+W: A=Backoff with jitter: short outages are absorbed by spaced-out retries, and jitter prevents synchronized retry storms that could prolong the provider's outage.
+E=Circuit breaker with degradation: during long outages it stops wasting threads and connections on a dead dependency and keeps the rest of the application usable through a fallback.
+X: B=Crash on first failure: a single transient error would take the whole process down, turning a partial outage of one dependency into a full outage of your application.
+C=Unlimited immediate retries: retrying instantly and forever multiplies load on a struggling provider (a retry storm) and ties up your own resources without improving the chance of success.
+D=No timeouts: calls to a hung API would wait indefinitely, exhausting threads and connection pools until the application stops responding to all users.
+T: Survive flaky dependencies by retrying politely (backoff, jitter, limits) and by failing fast with a fallback when the dependency is clearly down.
+
+@ Q003003 explain
+G: ## Why task startup time matters for scale-out
+When ECS service auto scaling adds Fargate tasks, each new task must pull its container image before it can pass health checks and receive traffic. Fargate does not keep images cached between tasks, so a multi-GB image that takes two minutes to download delays every scale-out by two minutes, and existing tasks stay overloaded meanwhile.
+## Faster startup
+- **Smaller images**: multi-stage builds, slim or distroless base images and removing build tools shrink the download.
+- **Lazy loading with SOCI**: a Seekable OCI (SOCI) index stored in ECR next to the image lets Fargate start the container before the whole image has downloaded, fetching file data on demand.
+- Keep the image in ECR in the same Region so pulls stay on the AWS network.
+- Example: trimming a 3 GB image to 400 MB and adding a SOCI index cuts the time before the new task can serve traffic from minutes to a small fraction of that.
+W: Smaller images and SOCI lazy loading: they attack the actual cause, the image pull time, so new tasks become healthy sooner and absorb the load spike before p99 latency climbs.
+X: A=Public registry outside AWS: pulls would cross the internet and may hit the external registry's rate limits, making startup slower and less reliable; ECR pull throughput is not the problem here.
+B=More CPU for running tasks: it changes nothing about how long new tasks take to download their image, and CPU size cannot be changed on a running Fargate task without replacing it anyway.
+C=Disable health checks: traffic would reach tasks that are still starting, producing errors, and unhealthy tasks would no longer be replaced; startup time stays the same.
+T: Slow scale-out on Fargate is usually an image pull problem, so shrink the image and lazy-load it rather than adding CPU or skipping health checks.
+
+@ Q003004 explain
+G: ## Paying only for the hours you use
+On-Demand EC2 and RDS are billed for the time they run. A dev/test environment used 10 hours a day, 5 days a week, is needed about 50 of the 168 hours in a week, so running it 24/7 wastes roughly 70% of the spend.
+## Automating stop and start
+- **Instance Scheduler on AWS** (an AWS solution) or EventBridge Scheduler with SSM Automation or Lambda can stop instances at 18:00 and start them at 8:00 on weekdays, driven by tags such as `Schedule=office-hours`.
+- EC2 instances with EBS volumes keep their disks while stopped; you pay only for storage.
+- RDS instances and Aurora clusters can also be stopped, but only for up to 7 days before AWS starts them again, so a schedule that stops them nightly handles this naturally.
+Once tags and the schedule exist, no one needs to remember anything, which keeps the effort minimal.
+W: Scheduled stop and start: compute stops being billed for about 118 of 168 hours a week, cutting compute cost by roughly 70%, and the automation needs almost no ongoing effort.
+X: A=Three-year Reserved Instances: a Reserved Instance is billed for every hour of the term whether or not a matching instance runs, so committing for 24/7 capacity that is needed only 30% of the time locks in waste for three years.
+B=Delete and rebuild manually: it saves compute cost but costs engineer time every day, risks inconsistent rebuilds and loses any state, which is the opposite of minimal effort.
+C=Larger instances: developers use the environments during fixed hours regardless of speed, so bigger instances simply raise the hourly price while they still run 24/7.
+T: For part-time non-production workloads, automate turning resources off when idle; commitments and bigger instances only pay more for idle hours.
+
+@ Q003005 explain
+G: ## A standard delivery pipeline for microservices
+With many services, each team inventing its own deployment process leads to inconsistent quality and slow recovery. A shared pipeline template gives every service the same stages: source, build, test, deploy.
+## Blue/green with automatic rollback
+- **CodePipeline** orchestrates the stages and can be stamped out per service from one template.
+- **CodeDeploy blue/green for ECS** starts the new task set (green) beside the old one (blue), then shifts load balancer traffic all at once, in a canary step (for example 10% for 5 minutes) or linearly.
+- The deployment group lists **CloudWatch alarms** such as 5xx rate or p99 latency. If an alarm fires during the deployment, including the wait period before the blue tasks are terminated, CodeDeploy rolls back automatically by sending traffic back to the blue task set, which is still running.
+Rollback is therefore a traffic switch that takes seconds, not a rebuild.
+W: CodePipeline with CodeDeploy blue/green and alarm rollback: every service goes through the same automated stages, and alarms trigger a fast, automatic return to the previous version when a release misbehaves.
+X: B=Nightly cron redeploy: it redeploys unchanged services for no reason, ships changes on a timer instead of through tests, and has no alarm-driven rollback.
+C=Spreadsheet and manual rollback: tracking deployments by hand and waiting for user complaints means problems are detected late and reversed slowly, with no automation at all.
+D=Local builds pushed by hand: images built on laptops are not reproducible, skip shared tests and approvals, and leave no automatic rollback path.
+T: Consistent, safe releases come from one automated pipeline with blue/green traffic shifting and alarm-triggered rollback, not from schedules or manual steps.
+
+@ Q003006 explain
+G: ## Deploying one template to many places
+**CloudFormation StackSets** let you create, update or delete stacks across multiple accounts and Regions with one operation from an administrator account.
+- A stack set holds one template; each target account and Region pair becomes a **stack instance**.
+- **Parameter overrides** set different values per stack instance, for example a different AMI ID, CIDR or domain name per Region, while the template stays identical.
+- Deployment options control rollout: the order of Regions, maximum concurrent accounts and failure tolerance, so a bad change can stop after the first Region.
+- With service-managed permissions and AWS Organizations, stack instances can even be deployed automatically to new accounts in an OU.
+Example: one stack set targeting 12 Regions, with overrides for `VpcCidr` and `CertificateArn` in each Region, is updated with a single `UpdateStackSet` call.
+W: StackSets with per-Region overrides: one template and one operation deploy identical infrastructure to all 12 Regions, and overrides handle the Region-specific values, which is the least operational effort.
+X: A=Manual console setup from a wiki: repeating clicks in 12 Regions is slow and error-prone, and the Regions will drift apart with every change.
+B=Twelve separate templates: every change must be made 12 times, the copies inevitably diverge, and each deployment is still a manual step.
+C=Single template, app replicates itself: a CloudFormation stack deploys only in the Region where it is created, and applications do not create their own infrastructure in other Regions.
+T: Same infrastructure in many Regions or accounts with small differences equals one StackSet plus parameter overrides.
+
+@ Q003007 explain
+G: ## RTO, RPO and multi-Region writes
+- **RTO** is how long recovery takes; **RPO** is how much recent data you can lose.
+- Under 1 minute RTO and near-zero RPO means another Region must already be running and already have the data. Accepting writes in multiple Regions means every Region is a writer (active-active).
+## DynamoDB global tables
+A global table has a replica table in each chosen Region, and every replica accepts reads and writes.
+- With the default multi-Region eventual consistency mode, changes typically replicate to other Regions within about a second, and conflicting concurrent writes to the same item are resolved by last writer wins.
+- A multi-Region strong consistency mode is also available for applications that need an RPO of zero.
+- If one Region fails, the application (for example using Route 53 health checks) simply sends traffic to another Region that is already writable; no promotion step is needed.
+W: DynamoDB global tables: every Region is already writable and holds a near-current copy of the data, so failover is a routing change measured in seconds and data loss is at most the last moments of replication.
+X: B=S3 Cross-Region Replication with JSON files: S3 has no transactions or conditional multi-item updates suited to payments, and replication is asynchronous; even with Replication Time Control, the commitment is to replicate objects within 15 minutes, far from near-zero RPO.
+C=Single-Region Aurora with daily snapshots: restoring a snapshot in another Region takes far longer than a minute and can lose up to 24 hours of transactions, and only one Region accepts writes.
+D=RDS MySQL cross-Region read replica: the replica is read-only until promoted, promotion takes minutes and loses writes not yet replicated, and writes are never accepted in multiple Regions.
+T: Multi-Region active-active writes with seconds-level RTO point to DynamoDB global tables; replicas that must be promoted or restored cannot meet it.
+
+@ Q003008 explain
+G: ## The four DR strategies
+AWS describes four disaster recovery strategies, from cheapest and slowest to most expensive and fastest:
+- **Backup and restore**: only backups exist in the recovery Region; infrastructure is recreated (ideally with IaC) and data restored after a disaster. RTO in hours, RPO equals backup frequency.
+- **Pilot light**: core data stores run and replicate continuously in the recovery Region, but compute is off. RTO in tens of minutes.
+- **Warm standby**: a scaled-down but fully working copy runs all the time and scales up on failover. RTO in minutes.
+- **Multi-site active-active**: full capacity serves traffic in several Regions. RTO near zero.
+## Implementing backup and restore
+AWS Backup plans can copy backups of EBS, RDS, DynamoDB, EFS and other resources to a vault in a second Region automatically. With CloudFormation templates ready, the application can be rebuilt there within hours.
+W: Backup and restore to a second Region: nothing runs in the recovery Region except stored backups, so it is the cheapest strategy, and restoring from copies plus IaC fits an RTO measured in hours.
+X: B=Pilot light: continuously replicating databases means paying for running database instances in the second Region all the time, which buys a faster RTO than the requirement needs.
+C=Warm standby at 50%: half of production capacity runs 24/7 in another Region, a large ongoing cost to achieve minutes of RTO when hours are acceptable.
+D=Multi-site at full scale: it roughly doubles infrastructure cost to achieve near-zero RTO, the most expensive option for a requirement that tolerates hours.
+T: Match the DR strategy to the RTO: when hours are acceptable and cost matters most, backup and restore beats any strategy that keeps resources running.
+
+@ Q003009 explain
+G: ## Enforcing tenant isolation in IAM
+In a pooled multi-tenant model, all tenants share one DynamoDB table. Isolation must be enforced by AWS, not just trusted to application code.
+## How LeadingKeys works
+- Make the tenant ID the **partition key**, so every item belongs to exactly one tenant, for example `TENANT#acme`.
+- The IAM condition key `dynamodb:LeadingKeys` restricts which partition key values a request may touch. A policy condition such as `ForAllValues:StringEquals` on `dynamodb:LeadingKeys` with value `${aws:PrincipalTag/TenantID}` allows access only to that tenant's items.
+- At request time, the Lambda function (after validating the tenant from the JWT) calls `sts:AssumeRole` with a session tag `TenantID=acme` and uses the returned temporary credentials for DynamoDB calls.
+If a bug builds a query for another tenant's key, DynamoDB rejects it with `AccessDeniedException`.
+W: Tenant partition key with LeadingKeys-scoped credentials: IAM itself checks every request against the tenant's own partition key, so even faulty application code cannot read or write another tenant's items.
+X: A=Filtering in application code: the function still reads other tenants' data and a single missing filter leaks it; nothing outside the code enforces isolation.
+B=One IAM user per tenant with embedded keys: long-term access keys in client apps can be extracted and are hard to rotate, and IAM user quotas make this unworkable for many tenants.
+C=Same KMS key for all tenants: anyone allowed to use the shared key can decrypt every tenant's items, and DynamoDB decrypts transparently for authorized callers, so encryption adds no isolation between tenants.
+T: Pooled DynamoDB tenancy is isolated by tenant-keyed partitions plus scoped credentials with `dynamodb:LeadingKeys`, not by filtering, embedded keys or a shared encryption key.
+
+@ Q003010 explain
+G: ## Protecting at the edge
+**Amazon CloudFront** serves traffic from edge locations worldwide. Attaching an **AWS WAF web ACL** to the distribution inspects every HTTP request at the edge, so blocked requests never reach the origin.
+## What the web ACL contains
+- **AWS Managed Rules** rule groups such as the Core rule set, Known bad inputs and SQL database rules block common exploits like SQL injection and cross-site scripting, and AWS keeps them updated.
+- **Rate-based rules** count requests per client (by IP or other keys such as a header) over a time window and block or challenge clients that exceed a limit, for example 1,000 requests in 5 minutes.
+- CloudFront also brings AWS Shield Standard for network-layer DDoS protection.
+To stop attackers bypassing the edge, restrict the origin to CloudFront, for example with origin access control for S3 or a CloudFront-only prefix list on the ALB security group.
+W: CloudFront with WAF managed and rate-based rules: requests are inspected at layer 7 at the edge, exploit patterns are blocked by managed rules and abusive clients are throttled before they consume origin capacity.
+X: A=Security group allowing only office IPs: it would lock out every real internet user of a public web app, and security groups cannot inspect HTTP content or rate-limit.
+B=Network ACLs denying foreign countries: NACLs match only IP ranges and ports, have no notion of countries, hold a small number of rules and cannot see HTTP requests or count them.
+C=EC2 instance with a custom firewall: a self-managed box in the Region is a bottleneck and single point of failure, needs its own rule maintenance and does not stop traffic at the edge.
+T: Layer-7 exploit blocking plus rate limiting before the origin equals AWS WAF on CloudFront; security groups and NACLs work only at the IP and port level.
+
+@ Q003011 explain
+G: ## Ordering and deduplication in SQS
+- **Standard queues** offer nearly unlimited throughput but deliver at least once and in best-effort order.
+- **FIFO queues** deliver messages in order and remove duplicates sent within a 5-minute deduplication window (using a deduplication ID or content-based deduplication).
+## Message groups give ordering and parallelism
+Every message in a FIFO queue carries a **message group ID**. Ordering is guaranteed only within a group, and while one message of a group is being processed, the next one of the same group is not delivered. Different groups are processed in parallel by different consumers.
+- Example: group ID `customer-123` keeps that customer's orders strictly in sequence, while orders for `customer-456` are processed at the same time by another consumer.
+- High throughput mode for FIFO queues raises the request limits when there are many groups.
+Consumers should still be idempotent, since a message can be redelivered if processing fails before deletion.
+W: SQS FIFO with customer ID as group ID: order is preserved per customer, duplicates are removed, and thousands of customer groups can be consumed in parallel for high throughput.
+X: B=Standard queue with one consumer: standard queues can deliver duplicates and out of order, and a single consumer caps throughput for all customers.
+C=S3 uploads with nightly jobs: orders would wait up to a day, and S3 provides neither per-customer ordering nor deduplication of events.
+D=SNS standard topic fanned out to Lambda: standard topics give no ordering guarantee and can deliver more than once, and parallel functions would process the same customer's orders out of sequence.
+T: Per-key ordering plus parallelism across keys is exactly what FIFO message groups provide; standard queues and topics trade ordering for throughput.
+
+@ Q003012 explain
+G: ## How Lambda absorbs spikes
+AWS Lambda runs a new execution environment for each concurrent request it needs, without any servers to provision.
+- Each function can scale up by 1,000 concurrent executions every 10 seconds, until it reaches the account's Regional concurrency quota (1,000 by default, raisable on request).
+- You pay per request and per GB-second of execution, so capacity that is not used costs nothing.
+- **API Gateway** in front handles HTTPS, authentication and throttling, and scales automatically as well.
+Example: traffic jumps from 100 to 1,000 requests per second; with a 200 ms average duration Lambda needs about 200 concurrent executions, which it reaches within seconds.
+Provisioned concurrency is optional and only needed if cold starts are unacceptable.
+W: Lambda behind API Gateway: both scale automatically within seconds from the request rate itself, so a sudden tenfold spike is served without any pre-provisioned capacity.
+X: B=Fixed EC2 fleet: its capacity is set in advance, so either it is sized for peak and mostly idle, or it is overwhelmed when load jumps tenfold.
+C=EMR cluster sized for peak: EMR is built for big data frameworks like Spark and Hadoop, not for serving API requests, and sizing for peak is exactly the pre-provisioning the question wants to avoid.
+D=Single large EC2 instance: one instance has a hard capacity ceiling and is a single point of failure; resizing it requires a stop and start, which cannot happen in seconds.
+T: Unpredictable, seconds-scale spikes without pre-provisioning point to serverless compute such as Lambda, not to fixed or manually sized servers.
+
+@ Q003013 explain
+G: ## What an analytical data store needs
+Dashboards over terabytes of data run aggregations that scan many rows but few columns, and join large fact tables with dimension tables.
+## Why Amazon Redshift fits
+- **Columnar storage** reads only the columns a query needs, and compression shrinks I/O further.
+- **Massively parallel processing (MPP)** splits each query across nodes and slices, so joins and aggregations over terabytes return quickly.
+- **Result caching** and materialized views make repeated dashboard queries sub-second.
+- **Concurrency scaling** automatically adds transient cluster capacity when many queries queue up, then removes it; Redshift Serverless scales in a similar way.
+Example: 200 analysts open dashboards at 9:00; concurrency scaling handles the burst so queries do not wait in line.
+W: Redshift with concurrency scaling: it is built for SQL joins and aggregations over terabytes, and concurrency scaling keeps response times low when many dashboards query at once.
+X: A=DynamoDB with global indexes: DynamoDB is a key-value store with no joins or ad hoc aggregation; complex analytics would need full table scans and application-side joining.
+B=S3 with S3 Select: S3 Select runs a simple filter on one object at a time, cannot join, and is no longer available to new customers; analytics on S3 would use Athena or Redshift Spectrum instead.
+C=ElastiCache for Memcached: it is an in-memory key-value cache with no query language, so it cannot run joins or aggregations over terabytes.
+T: Complex SQL joins on terabytes for many concurrent dashboards is a data warehouse job, Redshift, not a key-value store, cache or single-object filter.
+
+@ Q003014 explain
+G: ## Matching the database to the access pattern
+A game backend reads and writes one player profile at a time by player ID, millions of times per hour, and must stay fast as the player base grows. This is a key-value access pattern.
+## Amazon DynamoDB
+- Data is spread across partitions by the partition key (for example `PlayerId`), so each read or write goes directly to one partition and latency stays in single-digit milliseconds regardless of table size.
+- **On-demand capacity** scales automatically with request volume; provisioned capacity with auto scaling is an alternative for steady traffic.
+- Global tables add multi-Region replicas, and DAX can cache reads for microsecond latency if needed.
+Example: `GetItem` on `PlayerId=p-8812` returns the profile in a few milliseconds whether the table has a thousand or a billion items.
+W: DynamoDB: it delivers consistent single-digit millisecond reads and writes for key-based access at virtually any scale, which is exactly the player profile pattern.
+X: A=Neptune: a graph database optimized for traversing relationships, such as friend networks; it is not the natural or simplest fit for high-volume single-key profile lookups.
+B=Athena: a serverless SQL engine that scans data in S3; queries typically take seconds and it has no way to perform low-latency single-item writes.
+C=Redshift: a data warehouse for analytical queries over large datasets; it is not designed for high rates of small transactional reads and writes.
+T: Simple key-based reads and writes at millisecond latency and any scale equals DynamoDB; graph, query-on-S3 and warehouse services serve other patterns.
+
+@ Q003015 explain
+G: ## Spot Instances for interruptible work
+Spot Instances use spare EC2 capacity at discounts of up to 90% compared with On-Demand. AWS can reclaim them with a **two-minute interruption notice**.
+## Making Spot reliable for batch
+- **Checkpointing**: the job saves progress, for example to S3, so an interrupted task resumes instead of restarting.
+- **Diversification**: request many instance types and sizes across several AZs, for example `m6i`, `m7i`, `c6i` and `r6i` families, so the fleet can still find capacity when one pool is reclaimed.
+- Use the **price-capacity-optimized** allocation strategy in an EC2 Fleet, Auto Scaling group or AWS Batch compute environment to pick pools with low interruption risk and low price.
+- Example: a nightly four-hour job run on a diversified Spot fleet with hourly checkpoints loses at most minutes of work when an instance is reclaimed.
+W: Diversified Spot with checkpointing: the workload already tolerates interruptions, so it can take the largest discount EC2 offers while diversification and checkpoints keep the job completing reliably.
+X: B=On-Demand, single instance type: it pays full price for a workload that could run on Spot, and depending on one instance type offers no pricing advantage.
+C=Three-year Reserved Instances: an RI is billed for every hour of the term, but the job runs only about 4 of 24 hours, so most of the reserved capacity is paid for and unused.
+D=Dedicated Hosts at all times: paying for whole physical servers around the clock is the most expensive option and is only justified by licensing or compliance needs, which the question does not mention.
+T: Interruption-tolerant, checkpointed batch jobs belong on diversified Spot capacity; reservations and dedicated hardware pay for idle hours.
+
+@ Q003016 explain
+G: ## S3 storage classes by access pattern
+- **S3 Standard**: highest storage price, no retrieval fee; right for frequently accessed data.
+- **S3 Glacier Instant Retrieval**: much lower storage price, millisecond access like Standard, but a per-GB retrieval fee and a 90-day minimum storage duration. Designed for data accessed about once a quarter.
+- **S3 Glacier Flexible Retrieval** and **Deep Archive**: cheaper still, but objects must be restored first, taking minutes to hours (up to 12 hours or more for Deep Archive).
+## Lifecycle rules
+A lifecycle rule moves objects automatically based on age, for example a `Transition` to `GLACIER_IR` after 30 days. Media files are large, so the 128 KB minimum billable object size of the infrequent-access classes does not matter here.
+When access patterns are unknown, S3 Intelligent-Tiering is an alternative, but here the pattern is known.
+W: Standard, then Glacier Instant Retrieval at 30 days: files are cheap to access while hot, much cheaper to store once they go cold, and still readable in milliseconds whenever needed.
+X: B=Deep Archive on upload: the frequently accessed first 30 days would require restores taking hours, which breaks the millisecond requirement, and retrieval fees would pile up.
+C=EBS gp3 volumes: EBS costs several times more per GB than S3, is tied to instances and AZs, and must be provisioned and grown manually for large media libraries.
+D=S3 Standard forever: access stays fast, but paying the Standard storage price for years of rarely accessed data is the most expensive S3 choice.
+T: Known "hot then rarely read, but must be instant" data equals S3 Standard with a lifecycle transition to Glacier Instant Retrieval, not an archive class that needs restores.
+
+@ Q003017 explain
+G: ## GitOps for infrastructure
+The goal is that every infrastructure change is a code change: reviewed, tested and deployed the same way each time.
+- **Infrastructure as code (IaC)**: CloudFormation, AWS CDK or Terraform files describe the desired resources.
+- **Version control**: the files live in a Git repository; a change is a pull request that teammates review, and the history shows who changed what and when.
+- **CI/CD pipeline**: on each pull request it runs checks such as `cfn-lint`, `cdk synth`, policy-as-code scans and a change set or plan preview; on merge it deploys to the target accounts automatically, for example with CodePipeline or GitHub Actions.
+Example: a developer opens a pull request that widens an Auto Scaling group; the pipeline shows the change set, a reviewer approves, and merging deploys it with no console access needed.
+W: C=IaC in version control: it gives the reviewable, auditable artifact that pull requests work on and the single source of truth for what should exist.
+E=CI/CD pipeline on merge: it tests every change automatically and applies the merged code the same way every time, which provides the "applied automatically on merge" part.
+X: A=Shared administrator console account: console changes bypass pull requests entirely, and a shared identity destroys accountability in audit logs.
+B=Console screenshots: a picture of a configuration cannot be reviewed as a diff, tested or deployed, and it is outdated as soon as something changes.
+D=Email approval for every change: approvals by email live outside the code history, slow down small changes and do nothing to test or deploy them.
+T: Reviewed, tested and auto-applied infrastructure equals IaC in Git plus a pipeline that validates on pull request and deploys on merge.
+
+@ Q003018 explain
+G: ## Customer managed keys in AWS KMS
+AWS KMS offers AWS owned keys, AWS managed keys and **customer managed keys**. Only customer managed keys give you full control of the key policy and rotation settings.
+- **Automatic rotation**: can be enabled on symmetric customer managed keys, with a rotation period you choose (yearly by default); old key material is kept so existing data still decrypts.
+- **Logging**: every use of the key, such as `Decrypt` or `GenerateDataKey`, is recorded in CloudTrail with the caller's identity.
+- **Separation of duties**: the key policy grants **key administrators** actions like `kms:EnableKeyRotation` and `kms:ScheduleKeyDeletion` without `kms:Decrypt`, and grants **key users** `kms:Encrypt`, `kms:Decrypt` and `kms:GenerateDataKey*` without administration rights.
+Services such as S3 (SSE-KMS), EBS and RDS then encrypt with these keys.
+W: KMS customer managed keys with rotation and split key policies: they meet all three needs at once: automatic rotation, CloudTrail records of every key use, and key policies that keep administrators and data users in separate roles.
+X: A=One shared key with full admin for all developers: giving every developer administration and usage rights removes any separation of duties, and one key shared by all teams widens the blast radius.
+B=Keys in a text file in the repo: anyone with repository access can decrypt the data, there is no automatic rotation and no log of key usage.
+C=SSE-S3 for all buckets: S3 manages those keys for you, so there is no key policy to split administrators from users, no per-key usage events in CloudTrail and no control over rotation.
+T: Rotation, auditable key usage and separation of duties together require KMS customer managed keys with carefully split key policies.
+
+@ Q003019 explain
+G: ## Surviving the loss of a Region
+Multiple Availability Zones protect against a data center failure, but everything in one Region can still be affected by a Region-wide event. Regional resilience needs two ingredients:
+- **A second deployment**: the API, its compute and its data layer must exist in another Region, with data replicated (for example DynamoDB global tables or Aurora Global Database).
+- **Automatic traffic steering**: clients must be sent to the healthy Region without manual changes.
+## Route 53 routing with health checks
+- **Failover routing**: a primary record and a secondary record; when the primary's health check fails, Route 53 answers with the secondary.
+- **Latency routing** with health checks: users go to the closest Region, and an unhealthy Region is dropped from answers.
+Keep DNS TTLs short (for example 60 seconds) so clients pick up changes quickly. Route 53 Application Recovery Controller can add routing controls for more deliberate failover.
+W: D=API in two Regions: without a second, independent deployment there is nowhere for traffic to go when the primary Region fails.
+E=Route 53 with health checks: it detects that a Region is unhealthy and automatically stops returning its endpoints, shifting clients to the healthy Region.
+X: A=Larger instance in one Region: more capacity in the same Region fails together with that Region and adds no geographic redundancy.
+B=One NAT gateway shared by both Regions: a NAT gateway belongs to one VPC in one Region and cannot serve subnets in another Region, and it only provides outbound internet access, not failover of the API.
+C=More AZs in one Region: extra AZs protect against a zone failure, not against a Region-wide outage.
+T: Regional failure tolerance requires a deployment in a second Region plus health-checked DNS routing to move traffic there automatically.
+
+@ Q003020 explain
+G: ## How Aurora differs from standard RDS
+Amazon Aurora is a MySQL- and PostgreSQL-compatible relational database with a distributed storage layer.
+- **Storage**: data is kept as six copies across three AZs in a shared cluster volume that grows automatically as data is added, to at least 128 TiB (the exact maximum depends on engine version), with no storage to provision in advance.
+- **Replicas**: up to **15 Aurora Replicas** read from the same shared volume, so replica lag is typically well under 100 milliseconds, and any replica can be promoted on failover.
+- **Reader endpoint**: one DNS name spreads read connections across all replicas; Aurora Auto Scaling can add or remove replicas based on load.
+Example: a reporting spike adds replicas behind the reader endpoint without changing application connection strings.
+W: Amazon Aurora: it is relational, supports up to 15 low-lag read replicas on a shared volume, and its storage grows automatically without provisioning, matching every requirement.
+X: A=RDS for SQL Server Express: the Express edition limits each database to 10 GB and does not support RDS read replicas, so neither the storage nor the read scaling requirement is met.
+B=Amazon Keyspaces: it is a Cassandra-compatible wide-column service using CQL, not a relational database with SQL joins and transactions across tables.
+D=Amazon DynamoDB: it is a NoSQL key-value and document database; it scales enormously but has no relational model, joins or read replica concept.
+T: Relational plus up to 15 replicas plus automatically growing storage is the classic Aurora signature.
+
+@ Q003021 explain
+G: ## High availability for ECS services
+An ECS service keeps a desired number of tasks running and replaces any that stop. Resilience to an AZ failure comes from where those tasks run and how traffic reaches them.
+- **Subnets in several AZs**: give the service subnets in at least two (ideally three) AZs; the scheduler spreads tasks across AZs, which Fargate does automatically.
+- **Application Load Balancer**: an ALB must be enabled in at least two AZs and health-checks each task, sending traffic only to healthy targets.
+- **Service auto scaling**: if one AZ fails, the service launches replacement tasks in the remaining AZs and scaling policies add capacity to carry the full load.
+Example: six tasks across three AZs; one AZ fails, the ALB stops routing to its two tasks, and ECS starts replacements in the other two AZs within minutes.
+W: Tasks across multiple AZs behind an ALB with auto scaling: the ALB instantly routes around the failed AZ, and ECS plus auto scaling restore capacity in the surviving AZs without any manual action.
+X: B=All tasks in one AZ with task definition backups: an AZ outage stops every task, and backed-up task definitions only describe containers; someone would still have to redeploy them manually.
+C=One large task in one AZ: a single task is a single point of failure for both task crashes and AZ outages, no matter how much CPU and memory it has.
+D=ALB in one AZ, tasks in another: an ALB cannot be created with only one AZ, and even if it could, each component would fail with its own AZ, doubling the ways to go down.
+T: AZ-failure tolerance on ECS means tasks spread over multiple AZs, an ALB health-checking them and a service that automatically replaces lost capacity.
+
+@ Q003022 explain
+G: ## Cost at very low request volumes
+50 requests per hour is about 36,000 requests per month. With always-on infrastructure you pay for every hour whether or not requests arrive; with pay-per-request services you pay almost only for the requests.
+## API Gateway HTTP API with Lambda
+- **HTTP APIs** are the lower-cost, lower-latency API Gateway type, billed per million requests, which makes 36,000 requests cost a few cents.
+- **Lambda** bills per request and per GB-second of execution, and the monthly free tier (1 million requests) would likely cover this workload entirely.
+- Both scale automatically for bursts, and there are no servers, patches or clusters to manage.
+By contrast, a single always-on small EC2 instance, a load balancer hourly charge or an EKS control plane (approximately 0.10 USD per hour, about 73 USD per month, under standard support) each cost more per month than the whole serverless design.
+W: API Gateway HTTP API with Lambda: cost follows the tiny request volume instead of the clock, bursts are handled automatically, and there are no servers to operate.
+X: A=NLB with a fixed Auto Scaling group: the load balancer and instances are billed every hour even when idle, and the fixed group does not follow bursts or manage itself.
+B=EKS with three worker nodes: the cluster control plane fee plus three nodes running 24/7 is far more expensive than the traffic justifies, and the nodes still need patching and upgrades.
+D=ALB with two always-on EC2 instances: two instances plus ALB hours are billed around the clock for a workload that is idle most of the time, and the instances must be managed.
+T: Tiny, bursty traffic with no servers to manage equals pay-per-request serverless; anything always-on pays for idle hours.

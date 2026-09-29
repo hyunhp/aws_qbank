@@ -1,0 +1,348 @@
+# SAP-C02 detailed explanations e06 (explanation-only rewrites; letters are the published ones)
+
+@ Q001148 explain
+G: ## SLOs, error budgets and burn rate
+An availability **SLO** states a target for the ratio of good requests to total requests over a period. At 99.9% per month, 0.1% of requests may fail: that 0.1% is the **error budget**.
+- Example: 10,000,000 requests in a month allow 10,000 failures. If 2,000 have already failed by day 3, the budget is being spent about twice as fast as a steady pace (about 1,000 by day 3).
+- **Burn rate** compares the current failure rate with the rate that would use the budget exactly by month-end. A burn rate of 1 lands on the target; a burn rate of 10 empties the budget in about 3 days.
+## Doing it without servers
+CloudWatch Application Signals lets you define request-based (or period-based) SLOs on a service or operation, shows attainment and remaining error budget, and publishes burn-rate metrics you can alarm on, for example a short and a long look-back window. Without Application Signals, metric math over load balancer metrics such as `RequestCount` and `HTTPCode_Target_5XX_Count` can produce the same good/total ratio for an alarm.
+W: Request-based SLOs with burn-rate alarms: they measure what users actually experienced (good requests out of all requests), track the remaining error budget continuously, and alarm when the current burn rate would exhaust the budget before month-end, all as managed CloudWatch features with no servers to run.
+X: A=Monthly Athena over CloudTrail: CloudTrail records AWS API calls made against your account (control plane), not the HTTP requests your customers send to your API, and a monthly query gives neither real-time budget tracking nor early warning.
+B=Trusted Advisor checks: Trusted Advisor reviews account configuration against best practices (for example, idle resources or missing redundancy). It does not measure the success rate of your API's requests, and a month-end review cannot alert on burn rate.
+C=Route 53 health checks: synthetic probes every 30 seconds only sample one path from outside. They miss partial failures such as 2% of real requests failing, and they do not compute an error budget or burn rate.
+T: Measure availability as good requests over total requests and alert on how fast the error budget burns, not on external pings or after-the-fact log counts.
+
+@ Q001149 explain
+G: ## EMR instance groups versus instance fleets
+An EMR cluster has primary, core and task nodes. Core nodes store HDFS data, so losing them hurts the cluster; task nodes only compute and are safe to run on Spot.
+- **Instance groups** use one instance type per group and one purchasing option, so a Spot shortage for that type stalls the group.
+- **Instance fleets** let each node type list many instance types (with weighted capacity), several subnets, and separate **On-Demand** and **Spot target capacities**.
+## How fleets improve Spot success
+At launch EMR evaluates the listed subnets and picks one Availability Zone (the cluster runs in a single AZ) with the best capacity for the requested types, then uses an allocation strategy (such as capacity-optimized for Spot) to draw from the deepest pools. A provisioning timeout can switch Spot requests to On-Demand if capacity is not found.
+- Example: core fleet with an On-Demand target of 4 units; task fleet with a Spot target of 40 units across `m5`, `m6i`, `r5` and `c5` sizes.
+W: EMR instance fleets: diversifying instance types and subnets raises the chance of getting Spot capacity at a good price, while the On-Demand/Spot split (and On-Demand fallback on timeout) keeps core nodes stable, which is exactly the throughput-per-dollar plus stability goal.
+X: A=Dedicated Hosts: they allocate whole physical servers for licensing or compliance needs and are billed per host whether or not instances fill it, which is the opposite of cheap, elastic Spot-based capacity for a periodic job.
+B=Single Spot type in one AZ: depending on one Spot pool maximizes the chance of insufficient capacity and interruptions, and there is no On-Demand fallback for core nodes.
+D=Reserved Instances for each run: RIs are a 1- or 3-year billing commitment that is paid whether or not the periodic job is running, and they do nothing to diversify capacity or protect against Spot shortages.
+T: Use instance fleets to spread Spot across many types and AZ choices while keeping core nodes On-Demand; a single Spot pool or long-term commitments do not fit periodic batch jobs.
+
+@ Q001150 explain
+G: ## Two ways to run code at CloudFront
+- **CloudFront Functions** run lightweight JavaScript directly at the edge locations, only on **viewer request** and **viewer response** events. Startup is sub-millisecond, they scale to very high request rates, and they cost far less per invocation. They suit header rewrites, redirects, URL normalization and simple token checks. They cannot make network calls and have tight size and runtime limits.
+- **Lambda@Edge** runs Node.js or Python functions in regional edge caches, on all four events (viewer and origin request/response). It supports network access, larger payloads and longer runtimes, but has higher latency and cost per request.
+## Choosing
+If the logic is simple and must run on every viewer request, CloudFront Functions is the fit. Example: adding a `x-request-source` header or normalizing `Accept-Encoding` on each request.
+W: Replace with a CloudFront Function: static header manipulation is exactly the lightweight viewer-event work CloudFront Functions are built for, giving lower latency and a much lower per-request price while still running on every viewer request.
+X: A=Move to origin-request: the function would then run only on cache misses, so cached responses would no longer get the header manipulation, changing the required behavior.
+C=Provisioned concurrency: Lambda@Edge does not support provisioned concurrency, and even if it did, pre-warmed capacity adds cost rather than reducing it.
+D=More memory: raising memory raises the price per millisecond; for trivial header logic it barely changes latency, so cost goes up (viewer-event Lambda@Edge functions are also capped at 128 MB).
+T: Simple, high-volume viewer-request logic belongs in CloudFront Functions; keep Lambda@Edge for heavier logic that needs network access or origin events.
+
+@ Q001151 explain
+G: ## Managed Redis-compatible caches on AWS
+Amazon ElastiCache offers Redis OSS- and Valkey-compatible engines in two forms:
+- **Node-based clusters**: you choose node types and shard/replica counts. With Multi-AZ and automatic failover, a replica is promoted when the primary fails, typically within seconds to tens of seconds.
+- **ElastiCache Serverless**: you create a cache and get an endpoint. AWS scales capacity automatically, stores data redundantly across multiple Availability Zones, handles failover and applies software updates. There are no nodes to size.
+## Why self-managed Redis hurts
+On EC2 the team owns detection, promotion, client redirection and OS/Redis patching. Manual failover is what causes minutes of downtime. Example: a session store that switches to a managed endpoint keeps using the same Redis commands (`GET`, `SET`, `EXPIRE`) with only the endpoint changed.
+W: ElastiCache Serverless: it keeps Redis compatibility, replicates across AZs with automatic failover, removes patching, and scales without any node sizing, meeting every requirement including the preference to avoid sizing.
+X: B=DynamoDB with DAX: DAX is an in-memory cache for the DynamoDB API, not a Redis-compatible endpoint, so the session code would have to be rewritten, which breaks the Redis-compatibility requirement.
+C=Single node with snapshots: a single node has no replica to fail over to; recovery means restoring a snapshot onto a new node, which takes minutes and loses writes made since the last daily snapshot.
+D=Self-managed Sentinel: Sentinel can automate failover, but the team still owns the EC2 instances, patching, monitoring and sizing, which is exactly the operational load they want to remove.
+T: For Redis compatibility with automatic failover and no nodes to manage, choose ElastiCache Serverless rather than self-managed Redis or a non-Redis service.
+
+@ Q001152 explain
+G: ## How gp3 performance works
+A **gp3** EBS volume includes a baseline of 3,000 IOPS and 125 MiB/s regardless of size. Unlike the older **gp2**, where IOPS grew with volume size (3 IOPS per GiB), gp3 lets you provision extra IOPS and throughput **independently of size**, with a modify-volume call and no downtime.
+- If the workload needs 25,000 IOPS and the volume provides 3,000, requests queue and latency climbs, even though MiB/s is fine.
+- Example: `aws ec2 modify-volume --volume-id vol-0abc --iops 25000` raises IOPS on a gp3 volume, as long as the value is within the current gp3 limits for that volume size.
+## When to go further
+**io2 Block Express** provides much higher IOPS per volume, sub-millisecond latency and higher durability for demanding databases. In either case, the instance type's own EBS bandwidth and IOPS limits must also be large enough.
+W: Raise gp3 provisioned IOPS, or move to io2 Block Express: the bottleneck is IOPS, and on gp3 IOPS is a separately provisioned setting, so raising it (or moving to a higher-performance io2 Block Express volume) addresses the cause directly.
+X: A=Increase size only: gp3 performance is not tied to capacity; a larger gp3 volume still delivers the provisioned 3,000 IOPS until IOPS itself is raised.
+B=More instances behind a load balancer: a single self-managed PostgreSQL database cannot spread its storage I/O across extra web-style instances; that would need replicas or sharding, and the disk bottleneck on the primary would remain.
+D=Data files on S3: PostgreSQL needs a block file system for its data files; S3 is object storage accessed through an API, not a place to host a live database's data directory.
+T: gp3 IOPS is provisioned separately from size, so an IOPS bottleneck is fixed by raising IOPS (or using io2 Block Express), not by adding capacity or servers.
+
+@ Q001153 explain
+G: ## Why averages hide tail latency
+CloudWatch can report a metric with statistics such as `Average`, `Maximum`, `SampleCount` and percentiles like `p90`, `p99`.
+- If 98% of requests take 50 ms and 2% take 4,000 ms, the average is roughly 130 ms and looks healthy, yet 1 in 50 users waits 4 seconds.
+- **p99** is the value that 99% of requests are faster than. In that example, p99 is about 4,000 ms, so the problem is visible immediately.
+## Controlling alert noise
+An alarm evaluates a number of recent periods. **M of N** ("datapoints to alarm") fires only when M of the last N periods breach, for example 3 of 5 one-minute periods. One slow request, or one bad minute, does not page anyone, but sustained tail degradation does.
+W: p99 with M-of-N datapoints: the percentile reflects what the slowest customers actually experience, and requiring several breaching datapoints filters out isolated slow requests, so alerts track real, sustained impact.
+X: A=Maximum with one datapoint: the maximum is driven by the single slowest request in each period, so any outlier breaches it, and evaluating only one datapoint pages on every blip, which is exactly the noise the team wants to avoid.
+C=SampleCount: SampleCount is the number of data points (roughly request volume); it detects traffic drops, not slow responses, so the 4-second tail stays invisible.
+D=Keep Average: the average is already about 120 ms and healthy while customers complain, so keeping it (even with a tighter threshold) keeps the tail hidden.
+T: Alert on high percentiles such as p99 for user experience, and use M-of-N evaluation to avoid paging on single slow requests.
+
+@ Q001154 explain
+G: ## Static stability for an AZ failure
+A design is **statically stable** if it keeps working through a failure without needing to launch anything new. For an Availability Zone failure, the surviving AZs must already hold enough capacity for peak.
+- Formula: with N AZs and a peak of P instances, each AZ needs P / (N - 1) instances.
+- 2 AZs: 12 / 1 = 12 per AZ, 24 total (100% extra).
+- 3 AZs: 12 / 2 = 6 per AZ, 18 total (50% extra).
+- 4 AZs: 12 / 3 = 4 per AZ, 16 total (33% extra), if the Region and service support it.
+## Why not rely on Auto Scaling
+Auto Scaling replaces lost capacity, but that takes minutes, and during a large AZ event many customers try to launch in the remaining AZs at once, so launches can be delayed. "No capacity loss" means the capacity must already be running.
+W: Three AZs with 6 each: losing any one AZ leaves 12 instances, which covers peak with no capacity loss, and 18 total is the least over-provisioning among the options that meet the goal.
+X: A=Two AZs with 6 each: an AZ failure leaves only 6 of the 12 needed until Auto Scaling launches replacements, so capacity is lost for several minutes or longer.
+C=One AZ with a spread placement group: spread placement puts instances on distinct racks to survive hardware failures, but all 12 still sit in one AZ, so an AZ outage removes everything.
+D=Two AZs with 12 each: this meets the goal but needs 24 instances, 6 more than the three-AZ design, so it fails the minimize-over-provisioning requirement.
+T: To survive an AZ loss with no capacity drop, pre-provision P / (N - 1) per AZ; spreading across more AZs lowers the extra capacity needed.
+
+@ Q001155 explain
+G: ## DynamoDB global tables
+A **global table** is a set of replica tables in several Regions that DynamoDB keeps in sync for you. Every replica accepts reads and writes, so applications in each Region work locally (active-active).
+- With the default **multi-Region eventual consistency** mode, a write in one Region typically appears in the other replicas within a second. Conflicting concurrent writes to the same item are resolved with last-writer-wins.
+- DynamoDB also offers a **multi-Region strong consistency** mode (a three-Region setup) for workloads that need strongly consistent reads across Regions, at the cost of higher write latency.
+## Example
+A `Sessions` table with replicas in `us-east-1` and `eu-west-1`: users in Europe use the European app, which writes to the `eu-west-1` replica; the change appears in `us-east-1` about a second later with no custom code.
+W: DynamoDB global tables: a managed, fully active-active multi-Region feature where each Region reads and writes locally and changes replicate automatically, typically within a second.
+X: A=VPC peering between Regions: peering only connects networks so traffic can flow privately; it does not replicate any data, and DynamoDB is reached through a regional endpoint, not a VPC address range.
+C=Streams with custom Lambda replication: it can copy changes, but you would own conflict handling, retries, ordering, loop prevention and monitoring, rebuilding what global tables already provide as a managed feature.
+D=Backup and restore into another Region: backups are point-in-time copies; restoring creates a new table and takes time, so there is no continuous replication and no local writes in the other Region.
+T: For multi-Region active-active DynamoDB with sub-second replication, use global tables rather than networking, backups or hand-built stream pipelines.
+
+@ Q001156 explain
+G: ## What Gateway Load Balancer does
+**Gateway Load Balancer (GWLB)** exists to put a fleet of third-party appliances (firewalls, IDS/IPS, deep packet inspection) transparently in the traffic path.
+- It works at layer 3 and uses the **GENEVE** protocol (port 6081) to wrap the original packet and send it to an appliance, then receives it back. The original source, destination and payload stay unchanged, and TLS is not terminated.
+- It keeps flows **sticky** to one appliance so stateful inspection works, performs health checks, and lets you scale the appliance fleet in an Auto Scaling group.
+- Traffic is steered into it with a **Gateway Load Balancer endpoint** used as a route-table target, for example an ingress route table on the internet gateway that sends traffic for the application subnet to the endpoint (`10.0.1.0/24 -> vpce-...`), and a `0.0.0.0/0 -> vpce-...` route in the application subnets for the return path.
+## Example
+Inbound internet traffic enters through the internet gateway, is routed to the GWLB endpoint, inspected by a firewall appliance, then continues to the application subnets.
+W: Gateway Load Balancer: it is purpose-built to insert and scale inline inspection appliances transparently, distributing flows across the fleet with health checks and without changing packets or terminating TLS.
+X: A=Classic Load Balancer: a legacy layer 4/7 load balancer that proxies connections to targets; it cannot be placed in routing paths as a transparent bump-in-the-wire for inspection.
+B=Application Load Balancer: it terminates HTTP(S) connections and routes by host or path, which alters the traffic and cannot carry arbitrary IP flows through appliances.
+D=Network Load Balancer: it balances TCP/UDP/TLS connections to targets as a destination endpoint; it is not a route-table target and does not encapsulate traffic so appliances can inspect and return it unchanged.
+T: Transparent inline appliance fleets use Gateway Load Balancer with GENEVE and GWLB endpoints; ALB, NLB and CLB are destinations, not inspection hops.
+
+@ Q001157 explain
+G: ## Why one NAT gateway is a single point of failure
+A NAT gateway in the classic **zonal** mode is created in one public subnet, so it lives in a single Availability Zone. Private subnets reach the internet through a route such as `0.0.0.0/0 -> nat-0abc`.
+- If every private subnet in three AZs points to the one NAT gateway in AZ-a, an AZ-a outage cuts internet egress for AZ-b and AZ-c too, even though their instances are healthy.
+- Cross-AZ traffic to that NAT gateway also incurs inter-AZ data transfer charges.
+## The zone-independent design
+Create a NAT gateway in a public subnet in each AZ, and give each AZ's private route table a default route to the NAT gateway in the same AZ. Example: `rtb-private-b` has `0.0.0.0/0 -> nat-b`. An outage in one AZ then only affects that AZ, which is already down.
+- AWS now also offers NAT gateways in a **regional** availability mode that automatically spans the AZs where your workloads run; it removes the same single point of failure with one gateway ID.
+W: One NAT gateway per AZ with AZ-local routes: each AZ's egress depends only on resources in that AZ, so losing one AZ no longer removes internet access from the others, and cross-AZ NAT traffic charges go away.
+X: A=More bandwidth: NAT gateways scale bandwidth automatically, and more throughput does nothing about the gateway living in one AZ; an outage there still cuts egress for every AZ.
+B=Consolidate into one AZ: this makes the whole application depend on a single AZ, turning an egress problem into a full outage whenever that AZ fails.
+C=Self-managed NAT instance: a single NAT instance is still in one AZ, has lower resilience than a managed gateway, and adds patching, scaling and failover scripting to operate.
+T: Egress should be zone-independent: deploy a NAT gateway in every AZ and route each AZ's private subnets to its local one.
+
+@ Q001158 explain
+G: ## Snapshot-based DR versus continuous replication
+**RPO** (recovery point objective) is how much data you can afford to lose. Nightly snapshots mean a failure just before the next snapshot loses up to 24 hours of changes.
+## AWS Elastic Disaster Recovery (DRS)
+- An agent installed on each source server (on premises, another cloud or another AWS Region) replicates disk writes **continuously at the block level** to a low-cost staging area in the target AWS Region.
+- Because every write is streamed, the RPO is typically seconds.
+- On failover or a drill, DRS launches recovery EC2 instances from the latest (or a chosen point-in-time) state, typically within minutes, and supports failback afterward.
+- Example: 40 on-premises servers replicate to a staging subnet in `eu-central-1`; a drill launches them into an isolated test VPC without disrupting replication.
+W: Elastic Disaster Recovery: its continuous block-level replication of whole servers delivers an RPO of seconds, far under the 15-minute requirement, and replaces the nightly snapshot process with managed recovery launches.
+X: A=Snowball: a physical device for offline bulk data transfer that takes days to ship, so it cannot provide ongoing replication or a minutes-level RPO.
+B=S3 Cross-Region Replication: it copies objects between S3 buckets, not the disks of running servers, so it does not replicate an application's block storage for recovery.
+C=AWS Backup: it centralizes scheduled backups; for whole servers the RPO is bounded by the backup frequency, and it is not continuous block-level replication of on-premises servers.
+T: For server DR with an RPO of minutes or less, use Elastic Disaster Recovery's continuous replication rather than scheduled backups or snapshots.
+
+@ Q001159 explain
+G: ## Two kinds of Auto Scaling health checks
+- **EC2 status checks** (the default) test the instance and host: power, networking, OS reachability. A hung application process on a healthy OS passes them.
+- **ELB health checks** use the load balancer's target group check, such as `GET /health` expecting `200`. If the app hangs, the check times out, the target becomes unhealthy, and with the ELB health check type enabled the Auto Scaling group terminates and replaces the instance.
+## The grace period
+The **health check grace period** tells the group to ignore health check results for a set time after launch. If the app needs 5 minutes to load caches and warm up, a grace period of about 300 seconds prevents the group from killing instances that are simply still starting.
+- Example: health check type `ELB`, grace period `300`, target group path `/health` that checks the app's worker threads.
+W: ELB health checks with a 5-minute grace period: application-level checks catch the hung process that EC2 status checks miss so the group replaces those instances, while the grace period protects new instances during warm-up.
+X: A=Grace period of 0: new instances would be judged immediately and fail while still warming up, so the group would terminate and relaunch them in a loop; it also does nothing to detect hung apps with EC2 checks.
+B=CPU alarm that reboots: a hung process often uses little CPU, so the alarm may never fire, and a reboot is not a replacement through the group; the instances keep passing EC2 checks meanwhile.
+C=Higher minimum capacity: more instances do not remove the hung ones; they stay in service, keep receiving traffic and keep returning errors.
+T: Health checks must test the thing that fails: use ELB (application) health checks for hung apps, with a grace period that covers warm-up.
+
+@ Q001160 explain
+G: ## How one slow dependency takes down a service
+When a service calls a dependency synchronously, each call holds a thread until it gets a response or a timeout. If the dependency hangs, threads pile up waiting, the pool runs out, and even unrelated features that need a thread fail. This is a **cascading failure**.
+## Three patterns that contain it
+- **Circuit breaker**: after a threshold of failures, stop calling the dependency for a while and fail fast (or use a fallback), then test with a few calls before closing again.
+- **Bulkhead**: give each dependency its own bounded thread pool or connection limit, so the payment calls can exhaust only their own slice.
+- **Queue-based decoupling**: accept the order, put a payment request on a queue such as Amazon SQS, and let a worker process it when the provider is healthy.
+- Example: the order API returns "order received, payment pending" while the queue holds requests during the provider outage.
+W: Circuit breaker, bulkhead isolation and queue-based decoupling: together they stop wasting threads on a failing provider, confine any exhaustion to the payment path, and let orders be accepted and completed later, so the rest of the service stays up.
+X: A=Infinite retries: retrying forever multiplies load on the failing provider and keeps threads and connections busy even longer, which speeds up resource exhaustion instead of containing it.
+C=Longer timeouts: each call holds its thread for longer, so the pool empties faster during an outage; this worsens the cascade.
+D=Horizontal scale-out: every new instance also blocks its threads on the same hung dependency, so more instances only delay exhaustion while adding cost.
+T: Contain dependency failures with circuit breakers, bulkheads and asynchronous queues; more time, retries or instances only feed the cascade.
+
+@ Q001161 explain
+G: ## Self-healing versus elasticity in Auto Scaling
+An Auto Scaling group has three capacity numbers: **minimum**, **maximum** and **desired**.
+- **Health replacement (self-healing)**: the group continually works to keep the number of healthy, running instances equal to desired capacity. When an instance is marked unhealthy, the group terminates it and launches a replacement. This happens regardless of traffic.
+- **Scaling (elasticity)**: scaling policies, schedules or manual changes adjust the desired capacity itself, within min and max, based on load.
+## Example
+With min 4, desired 6, max 20, one instance failing at 3 AM leaves 5 healthy. The group launches one replacement to get back to 6. Later, if target tracking decides request count per target is low, it may lower desired capacity toward 4, but that is a separate decision.
+W: Replaces the failed instance to restore 6: a health failure does not change desired capacity, so the group replaces the unhealthy instance immediately to return to 6 healthy instances.
+X: A=Waits for scale-out: health replacement does not depend on any scaling policy or event; it happens as soon as the instance is marked unhealthy.
+B=Waits for an operator: automatic replacement of unhealthy instances is core Auto Scaling behavior, so no manual action is needed.
+D=Scales in to 4: an instance failure never changes desired capacity; only a scaling policy, schedule or manual edit does, so the group restores 6 first.
+T: Auto Scaling replaces unhealthy instances to keep desired capacity, independent of load; scaling policies are what change the desired number.
+
+@ Q001162 explain
+G: ## What a Route 53 health check actually tests
+Route 53 health checkers probe an endpoint from several locations. The protocol decides what "healthy" means:
+- **TCP**: healthy if a TCP connection opens. An ALB accepts connections even when the app behind it returns errors, so this passes.
+- **HTTP/HTTPS**: healthy if the response status is 2xx or 3xx within the timeout. A path like `/health` returning `500` fails.
+- **HTTP/HTTPS with string matching**: additionally requires specific text in the first part of the body.
+## Failover routing
+With failover records, Route 53 answers with the primary while its health check is healthy and switches to the secondary when it is not. For alias records pointing to an ALB, **Evaluate Target Health** can also be used so the record reflects the health of the ALB's targets.
+- Example: HTTPS check on `app.example.com/health` in `us-east-1`; when it returns `500`, DNS answers point to the `us-west-2` ALB.
+W: TCP-only health check: a TCP check only confirms the ALB accepts connections, which it still does while the application returns 500s; an HTTP(S) check on an application path would see the errors and trigger failover.
+X: A=No failover for ALB records: failover routing works with alias records that target ALBs, including Evaluate Target Health, so this is a supported configuration.
+B=ALBs cannot be health-checked: Route 53 health checks can target an ALB's DNS name over HTTP, HTTPS or TCP, and alias records can inherit ALB target health.
+D=Low TTL on the secondary: TTL controls how long resolvers cache an answer; a low TTL speeds up failover once it happens and does not stop Route 53 from detecting the primary's failure.
+T: A health check must test what users need; TCP reachability passes while the app fails, so use HTTP(S) checks on an application path.
+
+@ Q001163 explain
+G: ## DynamoDB capacity modes
+- **Provisioned** mode: you set read and write capacity units (RCU/WCU). Requests beyond them (after burst capacity is used) are throttled with `ProvisionedThroughputExceededException`.
+- **Auto scaling** for provisioned mode adjusts capacity toward a target utilization, reacting within minutes; good for traffic that changes gradually.
+- **On-demand** mode: no capacity planning; you pay per request, and the table instantly accommodates traffic up to double its previous peak and keeps adapting as traffic grows. It is the usual choice for spiky or unpredictable workloads.
+## Example
+A table set to 500 WCU that suddenly receives 5,000 writes per second throttles most of them. In on-demand mode, the same table serves the spike (within the doubling behavior and partition limits) with no manual change.
+W: On-demand mode or auto scaling: both remove the dependence on manual capacity settings; on-demand in particular absorbs sudden unpredictable spikes, directly reducing throttling errors.
+X: A=Enable Streams: DynamoDB Streams is a change log of item modifications for downstream processing; it does not serve reads or add read or write capacity.
+B=Lambda reserved concurrency: that sets how many copies of the function run concurrently; more concurrency can send even more requests into the throttled table.
+C=Add a GSI: a global secondary index supports a different query pattern and has its own capacity; it does not increase the base table's write capacity or absorb spikes on existing queries.
+T: Throttling from unpredictable spikes is a capacity-mode problem: switch to on-demand (or enable auto scaling), not streams, indexes or more Lambda concurrency.
+
+@ Q001164 explain
+G: ## Three layers of tag governance
+Chargeback by business unit depends on every resource carrying a consistent `BusinessUnit` tag, and on that tag being visible in billing data.
+- **Tag policies** (AWS Organizations) define the allowed key spelling and capitalization and allowed values, such as `BusinessUnit` in `Retail | Finance | Logistics`. With enforcement enabled for chosen resource types, noncompliant tagging operations are blocked.
+- **AWS Config** rule `required-tags` continuously evaluates resources and flags those missing the tag, which can trigger notifications or remediation.
+- **Cost allocation tags**: a user-defined tag must be **activated** in the Billing console of the management account before it appears as a column in Cost Explorer and the Cost and Usage Report.
+## Example
+A new EC2 instance tagged `businessunit=retail` is flagged by the tag policy report; an untagged RDS instance is flagged by Config; activated `BusinessUnit` then drives monthly cost-by-BU reports.
+W: Tag policy, required-tags Config rule and activated cost allocation tag: together they standardize the tag, detect missing tags continuously, and make the tag usable in billing, preventing the problem from recurring instead of cleaning it up afterward.
+X: B=Cost Explorer untagged filter: it only shows spend that is already untagged after the fact; it does not standardize or enforce tags, so the gap keeps coming back each month.
+C=Quarterly manual audits: spreadsheets are slow and error-prone, and three months of spend can be misallocated before anyone notices.
+D=Team self-reporting: it has no enforcement or verification and produces inconsistent numbers that cannot be reconciled with the bill.
+T: Accurate chargeback needs enforced, standardized tags plus continuous detection and activated cost allocation tags, not after-the-fact reviews.
+
+@ Q001165 explain
+G: ## Matching purchase options to the usage shape
+Split the fleet into the part that always runs and the part that comes and goes.
+- **Baseline** (always running): commit with **Savings Plans** or **Reserved Instances** for 1 or 3 years for a large discount versus On-Demand.
+- **Bursts** (hours per day): a commitment would sit unused most of the time. Use **On-Demand** for guaranteed capacity and **Spot** for deep discounts on the part that can tolerate interruption.
+## Example
+An Auto Scaling group with a mixed instances policy: `OnDemandBaseCapacity` covers 10 instances (billed at the Savings Plan rate), then above that a percentage split such as 50% On-Demand and 50% Spot across several instance types with a capacity-optimized allocation strategy.
+W: Commit for the 10-instance baseline and use Spot plus On-Demand for bursts: the steady part gets the commitment discount at near-full utilization, and the variable part pays only while it runs, with Spot cutting cost and On-Demand keeping reliability.
+X: A=RIs for all 30: 20 of those reservations would be paid for 24 hours a day but used only during peaks, wasting most of their value.
+C=100% Spot: Spot capacity can be reclaimed with a two-minute notice, so running the always-needed baseline entirely on Spot risks the application's availability.
+D=100% On-Demand: simple, but the steady baseline would pay full price all year when a commitment would give a large discount.
+T: Commit for the steady baseline and use flexible pricing (Spot and On-Demand) for bursts.
+
+@ Q001166 explain
+G: ## How burstable (T) instances work
+T-class instances such as `db.t3.medium` provide a **baseline CPU level** and earn **CPU credits** while below it. Bursting above baseline spends credits.
+- In **standard** mode (an EC2 option), when credits run out the CPU is held at baseline, so work slows down.
+- In **unlimited** mode, the instance can keep bursting, but surplus credits are billed extra per vCPU-hour. Amazon RDS runs T3 and T4g DB instances in unlimited mode, so on RDS sustained depletion shows up mainly as surplus credit charges.
+## What sustained depletion means
+If credits are exhausted every night, the workload is not spiky; it needs more sustained CPU than the baseline provides. Either the jobs run longer (more billable hours on everything involved) or surplus credit charges accumulate.
+- Example: a nightly job that takes 5 hours throttled might take 1.5 hours on a `db.m6g.large`, and the total bill for the window can be lower.
+W: Undersized; move to a non-burstable or larger class: sustained credit depletion shows the workload exceeds the burstable baseline, so a fixed-performance or larger class finishes faster and can cost less overall than throttling or surplus credits.
+X: A=RI for db.t3.medium: a reservation lowers the hourly rate of the wrong size for 1 or 3 years, while the throttling and longer runtimes continue.
+C=Downsize to db.t3.small: a smaller burstable instance has a lower baseline and earns fewer credits, making depletion and slowdowns worse.
+D=Spot pricing for RDS: Amazon RDS does not offer Spot pricing for DB instances, so this option is not available.
+T: Burstable instances fit occasional spikes; sustained credit exhaustion means the instance is undersized and should move to a larger or non-burstable class.
+
+@ Q001167 explain
+G: ## Where S3 egress costs come from
+Serving objects directly from an S3 bucket to users worldwide means every download is billed as data transfer out from that Region to the internet, and every user pays the latency of reaching that single Region.
+## How CloudFront changes this
+- CloudFront caches objects at edge locations near users. Repeated requests are served from the cache, so the origin bucket sends each object far less often.
+- Data transfer from S3 to CloudFront is not charged, and CloudFront's delivery pricing (plus its free tier and volume tiers) is generally lower than S3 direct internet egress.
+- Users get lower latency because content comes from a nearby edge, over connections CloudFront optimizes.
+- Example: a 20 MB installer downloaded 1 million times worldwide is fetched from S3 only when a cache does not already hold it, not a million times from one Region.
+W: CloudFront in front of the bucket: edge caching cuts both origin transfer and latency, and delivery through CloudFront is typically cheaper than S3 direct egress, addressing cost and performance together.
+X: A=Replicate to every Region: users still download from S3 over the internet and pay egress, plus you now pay storage and replication in every Region, raising total cost.
+C=Transfer Acceleration: it speeds long-distance transfers over the AWS edge network but adds a per-GB charge on top of normal transfer and does not cache, so costs rise.
+D=One Zone-IA storage class: it lowers storage price for infrequently accessed, re-creatable data, adds retrieval charges and has no effect on data transfer out costs or delivery speed.
+T: For global downloads from S3, put CloudFront in front: caching and edge delivery lower egress cost and latency together.
+
+@ Q001168 explain
+G: ## Discount versus flexibility
+AWS commitment options trade flexibility for discount. Longer terms and more money paid upfront give bigger discounts.
+- **Compute Savings Plans**: apply to any instance family, size, Region, OS and tenancy, plus Fargate and Lambda. Most flexible, smaller maximum discount.
+- **EC2 Instance Savings Plans**: tied to one instance family in one Region (size, OS and tenancy can change). Less flexible, deeper discount, up to about 72% versus On-Demand for 3 years all upfront.
+- **Reserved Instances**: similar discounts to Instance Savings Plans for matching terms; Standard RIs give more than Convertible RIs.
+- Payment: all upfront > partial upfront > no upfront; term: 3 years > 1 year.
+## Example
+A workload that will run `m6i` instances in `eu-west-1` for three years gets the most savings from a 3-year, all-upfront commitment tied to `m6i` in that Region.
+W: EC2 Instance Savings Plans, 3-year all upfront: it matches the stable single-family, single-Region usage and combines the least flexible plan type with the longest term and full upfront payment, which gives the deepest discount among these options.
+X: A=Compute Savings Plans, 3-year all upfront: the extra flexibility across families and Regions is paid for with a smaller discount, and this workload does not need it.
+C=On-Demand: it offers full flexibility with no commitment, but that also means no discount at all, the opposite of what a stable three-year workload should buy.
+D=Standard RIs, 1-year no upfront: a 1-year term with no upfront payment sits at the low end of the RI discount range, well below a 3-year all-upfront commitment.
+T: When the workload will not change family or Region, take the least flexible, longest, most upfront commitment to maximize the discount.
+
+@ Q001169 explain
+G: ## Tracking a multi-tool migration
+Large migrations rarely use one tool. Servers may move with AWS Application Migration Service (MGN), databases with AWS DMS, and some apps with partner tools. The program office needs one view of what has started, is in progress or is complete.
+## AWS Migration Hub
+- Provides a single place to group servers and databases into **applications** and see migration status per application.
+- Receives status updates from integrated AWS migration services and from partner tools that integrate with it, so progress from different tools appears together.
+- Can use discovery data (for example, from AWS Application Discovery Service or imports) to build the application inventory.
+- Availability note: AWS closed Migration Hub to new customers in November 2025 and points new migrations to AWS Transform; existing customers can keep using it, and the tracking role described here is what the question tests.
+- Example: an application "Billing" groups 6 servers moved by MGN and 1 database moved by DMS; the console shows it as in progress until all 7 finish.
+W: AWS Migration Hub: it is designed to aggregate migration status from multiple AWS and partner migration tools into one console, so the office can track 200 applications without building custom reports.
+X: A=AWS Config: it records resource configurations and evaluates compliance rules; it does not know the migration state of on-premises applications.
+B=AWS Systems Manager: it manages and operates instances (patching, run commands, inventory), but it does not aggregate migration progress from MGN, DMS and partner tools.
+D=AWS Organizations: it manages multiple accounts, consolidated billing and policies; it has no view of application migration status.
+T: One console for migration progress across several tools is Migration Hub; Config, Systems Manager and Organizations manage resources and accounts, not migrations.
+
+@ Q001170 explain
+G: ## How migration waves are sequenced
+A **migration factory** moves applications in repeated waves, improving tooling and runbooks each time.
+- **Early waves (pilot)**: pick applications that are low complexity, low business criticality and have few dependencies. They teach the team the process, reveal gaps in the runbook, and deliver quick wins that build confidence.
+- **Later waves**: as the process matures, move larger, more critical and more interconnected applications, grouped so tightly coupled apps move together.
+## Example
+Wave 1 might include an internal wiki, a reporting tool and a test environment. Lessons such as DNS cutover steps or firewall rule gaps are fixed before wave 5 moves the order management system.
+W: Start with low-complexity, low-criticality apps with few dependencies: mistakes in early waves have little business impact, the runbook improves with each wave, and quick successes build momentum for the harder waves.
+X: A=Big-bang cutover: moving all 300 apps at once concentrates all risk in one event, gives no chance to refine the runbook, and makes rollback extremely hard.
+C=Most critical first: an immature process is applied to the applications where a failure hurts most, maximizing business risk.
+D=Alphabetical order: sequencing by name ignores complexity, criticality and dependencies, so it can split coupled apps and put risky ones in the first waves.
+T: Early waves should be simple, low-risk apps that refine the factory; critical, complex apps come later once the process is proven.
+
+@ Q001171 explain
+G: ## Why dependencies drive wave planning
+Discovery tools (for example, agent-based discovery showing network connections) reveal which applications talk to each other at runtime. If two dependent apps move at different times, the one that stays on premises must reach the one in AWS over the hybrid link.
+- That adds latency on every call; chatty database traffic can slow badly across a VPN or Direct Connect link.
+- Firewall rules, DNS names and connection strings must be updated for the split state.
+## Two ways to handle it
+- **Move together**: put tightly coupled apps, such as a web tier and the database it queries constantly, in the same wave.
+- **Planned hybrid state**: if they must move separately, keep reliable hybrid connectivity (Site-to-Site VPN or Direct Connect), test the latency, and plan for the interim period.
+- Example: A's web tier makes 200 queries per page to B's database; a 30 ms round trip would add seconds, so they move in one wave.
+W: Same wave, or hybrid connectivity until both move: it keeps the runtime dependency working through the migration, either by moving the pair together or by deliberately planning and testing the interim cross-environment connection.
+X: A=Ignore it because Migration Hub reroutes: Migration Hub tracks migration status; it does not change application network routes, DNS or connection strings during cutover.
+C=Migrate B first regardless: A would then call its database across the hybrid link without planning, risking latency problems and broken connectivity.
+D=Postpone B until all dependents are found: waiting for perfect discovery stalls the program; the known dependency can be handled now by grouping or planned connectivity.
+T: Plan waves around discovered dependencies: move coupled apps together or deliberately plan hybrid connectivity for the interim.
+
+@ Q001172 explain
+G: ## The migration strategies ("7 Rs")
+AWS describes common strategies for each application:
+- **Retire**: turn off an app that is no longer needed.
+- **Retain**: leave it where it is for now.
+- **Rehost** (lift and shift): move as is to EC2.
+- **Relocate**: move at the hypervisor or platform level, for example VMware workloads to VMware Cloud on AWS.
+- **Replatform** (lift, tinker and shift): keep the app but make a few cloud optimizations, such as a managed database.
+- **Repurchase** (drop and shop): replace the app with a different product, often SaaS, and migrate its data.
+- **Refactor**: re-architect the app's own code to be cloud-native.
+## The deciding question
+Ask what happens to the existing application's code. If it is thrown away and a purchased product delivers the same business function, that is repurchase, even if some integrations are built around the new product.
+W: Repurchase: the custom CRM is decommissioned and its function moves to a commercial SaaS CRM with the data migrated; the Lambda integrations extend the new product rather than re-architecting the old one.
+X: A=Retire: retire means the function is no longer needed; here the CRM function continues in a new product, so it is a replacement, not a retirement.
+C=Refactor: refactor rewrites the same application's code as cloud-native services, but here the existing CRM code is discarded rather than re-architected.
+D=Replatform: replatform keeps the same application and adds small optimizations like a managed database; this plan replaces the application entirely.
+T: If the existing application is replaced by a bought product (often SaaS), the strategy is repurchase, regardless of small integrations built around it.

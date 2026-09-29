@@ -1,0 +1,346 @@
+# AIP-C01 detailed explanations, e14 (explanation-only rewrites; letters are the published ones)
+
+@ Q002935 explain
+G: ## Where time to first token goes in RAG
+**Time to first token (TTFT)** is how long a user waits before seeing any part of the answer. In a RAG request it is roughly: embed the question + search the vector index + build the prompt + the model reading that prompt before emitting its first token.
+- Retrieval is on the critical path: nothing can be generated until the chunks arrive. A 1.5-second search means at least 1.5 seconds of blank screen.
+- Every extra retrieved chunk adds input tokens, and the model must process all input tokens before its first output token.
+- Without streaming, the client also waits for the whole answer to finish.
+## Levers that actually help
+- Tune the index: an approximate nearest neighbor index such as HNSW with sensible parameters, filters that shrink the search space, and right-sized capacity in Amazon OpenSearch Service.
+- Retrieve fewer, better chunks, for example top 3 to 5 instead of 20, optionally after a reranker.
+- Stream the response, for example with `ConverseStream` or `InvokeModelWithResponseStream`, so tokens appear as soon as they are produced.
+W: D=Stream tokens: streaming sends each token to the client as it is generated, so the user sees the answer begin right after the first token instead of waiting for the full completion.
+E=Faster, leaner retrieval: an optimized index shortens the 1.5-second search that blocks generation, and fewer chunks mean a shorter prompt for the model to process before its first token.
+X: A=Higher max tokens: the output limit only caps how long an answer may get; raising it never speeds up retrieval or the first token and can make total response time longer.
+B=Largest model everywhere: retrieval uses an embedding model and a vector search, and a bigger generation model reads prompts and produces tokens more slowly, so both steps get slower, not faster.
+C=Second retrieval pass: running another full search for every question adds a second blocking step before generation, increasing time to first token.
+T: Cut TTFT by shrinking the blocking retrieval step and streaming output; bigger models, extra passes and higher token limits all add waiting time.
+
+@ Q002936 explain
+G: ## Sequential versus parallel model calls
+When one request needs several model calls whose inputs do not depend on each other (for example summarize, classify sentiment and extract entities from the same ticket), running them one after another adds up their latencies.
+- Sequential: 3 calls of 2 s each take about 6 s.
+- Parallel: the same 3 calls started together take about 2 s, roughly the time of the slowest call.
+## Ways to fan out on AWS
+- In code: `asyncio.gather` in Python or `Promise.all` in JavaScript around the Bedrock `Converse` calls.
+- In orchestration: an AWS Step Functions **Parallel** state (or a Map state over a list) runs branches concurrently and joins their outputs.
+Keep concurrency within the account's Bedrock quotas and add retries with backoff for throttling. Calls that truly depend on an earlier result still have to run in order.
+W: Parallel calls: because the sub-tasks are independent, starting them at the same time turns the sum of their latencies into roughly the latency of the slowest one, the biggest possible gain here.
+X: A=One call at very high temperature: temperature only changes how randomly tokens are sampled; it does not make processing faster, and a very high value makes the combined output less reliable.
+B=Nightly batch job: batch processing suits offline workloads; users of an interactive request cannot wait until the next night for their answer.
+D=Sleep between calls: pausing between calls adds idle time on top of the already serial latency; throttling is handled by retries with backoff or higher quotas, not by fixed sleeps.
+T: Independent model calls should run concurrently so latency equals the slowest call, not the sum of all calls.
+
+@ Q002937 explain
+G: ## Why a GPU can be busy but underused
+An LLM generates one token at a time per sequence. If the server processes requests one by one, or waits to fill a fixed batch, much of the GPU's compute sits idle and you pay for the whole instance per request.
+**Continuous batching** (also called rolling or in-flight batching) lets the server add new requests to the running batch at each generation step and remove finished ones, so the GPU always works on many sequences at once.
+- Example: instead of 1 request per forward pass, the GPU handles 16 active sequences, so throughput rises several times on the same instance.
+## On Amazon SageMaker AI
+Large model inference (LMI) containers bundle optimized engines such as vLLM and TensorRT-LLM with continuous batching, paged KV-cache management, and optional quantization. Under steady load this raises GPU utilization and lowers cost per request.
+W: Optimized container with continuous batching: it keeps the GPU filled with many concurrent sequences, raising throughput per instance, which directly lowers cost per request under steady traffic.
+X: A=One instance, no auto scaling: fewer instances do not make each GPU more efficient; a single unscaled instance risks overload, queuing and outages when load rises.
+C=Longer request timeout: a timeout only controls how long a caller waits; it does not put more work on the GPU, and letting GPUs idle is the problem being solved.
+D=CPU instances for a large model: large LLMs rely on GPU parallelism and memory bandwidth, so on CPUs latency becomes far too high and throughput per dollar usually gets worse.
+T: Low GPU utilization under steady load is fixed with an optimized serving engine that batches continuously, not by removing capacity or switching to CPUs.
+
+@ Q002938 explain
+G: ## Built-in Bedrock metrics in CloudWatch
+Amazon Bedrock automatically publishes runtime metrics to Amazon CloudWatch in the `AWS/Bedrock` namespace, with the `ModelId` dimension so you can split them by model. Common metrics:
+- `Invocations`: number of successful calls.
+- `InvocationLatency`: time per call.
+- `InputTokenCount` and `OutputTokenCount`: tokens in and out.
+- `InvocationClientErrors`, `InvocationServerErrors`, `InvocationThrottles`: failures and throttling.
+You can add these to a CloudWatch dashboard, set alarms (for example on p90 latency or throttles), and combine them with model invocation logging to CloudWatch Logs or Amazon S3 when you also need full prompts and responses.
+W: CloudWatch metrics from Bedrock: Bedrock emits invocation counts, latency and token counts per model to CloudWatch without extra code, which is exactly what the dashboards need.
+X: B=Amazon Inspector findings: Inspector scans EC2 instances, container images and Lambda functions for software vulnerabilities and network exposure; it does not measure model calls or tokens.
+C=AWS Config history: Config records how resource configurations change over time for compliance; it has no data on invocation volume, latency or tokens.
+D=AWS Artifact reports: Artifact is a portal for downloading AWS compliance documents such as SOC and ISO reports, not an operational metrics source.
+T: Operational Bedrock metrics (invocations, latency, tokens by model) come from CloudWatch; Inspector, Config and Artifact serve security and compliance, not runtime monitoring.
+
+@ Q002939 explain
+G: ## Tracing a multi-step agent
+One user request to an agent can involve several model calls, tool invocations, memory lookups and retries. A **trace** follows that single request end to end; each step is a **span** with its own start time, duration, inputs, outputs and errors.
+**Amazon Bedrock AgentCore Observability** collects this telemetry using the OpenTelemetry (OTEL) standard:
+- Agents hosted on AgentCore Runtime emit traces, and agents running elsewhere can be instrumented with the AWS Distro for OpenTelemetry.
+- Data lands in Amazon CloudWatch, where GenAI observability views show sessions, traces, spans, latency, token usage and errors.
+- Example: a slow request shows that 80% of the time was spent in one tool call, which points straight to the fix.
+W: AgentCore Observability with OTEL traces: it records each agent step and tool call as spans with timing, so the team can see the full path and latency of every production request in CloudWatch.
+X: A=Single log line at the end: one summary line shows only total duration and outcome, hiding which step or tool was slow or failed, and nothing is recorded if the request never finishes.
+B=Cost report by service: AWS Cost Explorer style reports aggregate spend over time; they contain no per-request steps, tool calls or latency.
+C=CloudTrail management event exports: management events record control-plane API calls such as creating resources; they do not capture an agent's reasoning steps, and monthly exports are far too late for production debugging.
+T: Step-level visibility into agents needs distributed traces (OpenTelemetry spans in CloudWatch via AgentCore Observability), not summary logs, bills or audit trails.
+
+@ Q002940 explain
+G: ## What makes a good alert
+An alert should fire on a signal that means users are being harmed or soon will be, and that someone can act on. For a GenAI application the useful signals fall into a few groups:
+- **Reliability**: latency percentiles (p90, p99), error rates, throttling (`InvocationThrottles`), timeouts.
+- **Safety**: how often Amazon Bedrock Guardrails intervene on inputs or outputs, which Bedrock reports in CloudWatch.
+- **Cost**: tokens per request or per day rising unexpectedly.
+- **Quality**: drops in evaluation scores or user feedback.
+Use CloudWatch alarms on sustained changes (for example p90 latency above target for 3 of 5 minutes) or anomaly detection, rather than single spikes, to avoid alert fatigue.
+W: C=Latency or error rise: a sustained increase means users are waiting longer or getting failures, which is an actionable reliability problem such as throttling, a dependency outage or a bad deployment.
+E=Guardrail intervention spike: a sudden jump in blocked inputs or outputs can indicate an abuse campaign, prompt injection attempts, or a change that makes the model produce policy-violating content.
+X: A=New calendar month: a date change says nothing about the health of the system; billing cycles are tracked with budgets, not operational alerts.
+B=Vendor model announcement: new model releases are information for planning and evaluation, not a sign that the running application is failing.
+D=Console theme change: the console's appearance has no effect on the application or its users, so alerting on it only creates noise.
+T: Alert on actionable reliability and safety signals such as latency, errors and guardrail interventions, never on events that do not affect the running system.
+
+@ Q002941 explain
+G: ## Model routing (model cascading)
+Most traffic is a mix: many simple questions (order status, short definitions) and some complex ones (multi-step reasoning, long documents). A single model forces one trade-off for all of them.
+**Routing** sends each request to the cheapest model that can handle it well:
+- A lightweight classifier, rules (length, intent, keywords) or a small model decides "simple" or "complex".
+- Simple requests go to a small, fast model; complex ones go to a larger model.
+- Amazon Bedrock also offers **intelligent prompt routing**, which picks between models of one family per request based on predicted quality and cost.
+Example: if 70% of traffic is simple and the small model costs a fraction of the large one, total cost falls sharply while complex queries keep full quality. Validate the router with an evaluation set so misrouted hard questions stay rare.
+W: Route by complexity: the smaller model handles the easy majority cheaply, and the larger model is kept for complex queries where the quality drop was observed, balancing cost and quality.
+X: B=All traffic on the smaller model: this saves the most money but accepts the known quality loss on complex queries, so it does not balance the two goals.
+C=All traffic on the larger model: quality stays high, but the team pays large-model prices even for simple requests the small model handles fine.
+D=Alternate models every hour: switching by time of day ignores what each query needs, so complex queries still hit the weaker model half the time and users get inconsistent answers.
+T: Match the model to the request: route simple queries to a cheap model and complex ones to a strong model instead of one global choice.
+
+@ Q002942 explain
+G: ## Why embedding dominates ingestion
+When a knowledge base ingests documents it splits each one into chunks, calls an **embedding model** to turn every chunk into a vector, and writes the vectors to the vector store. Millions of documents can mean tens of millions of embedding calls, so throughput of that step decides total ingestion time.
+## Raising embedding throughput
+- **Batch**: send many chunks per request where the model supports it, or use Amazon Bedrock batch inference for large offline jobs with supported embedding models.
+- **Parallelize**: run several workers at once, for example concurrent workers in a custom embedding pipeline that each process a separate slice of the documents.
+- **Stay within limits**: size concurrency to the account's requests-per-minute and tokens-per-minute quotas and retry throttled calls with exponential backoff.
+Example: 8 workers each sending batched requests finish far sooner than one worker embedding a single chunk per call.
+W: Batch and parallelize within limits: grouping chunks and running workers concurrently raise the number of embeddings produced per minute, while respecting quotas avoids throttling that would slow the job again.
+X: A=One document at a time with delays: serial processing with pauses is the slowest possible pattern and would stretch ingestion of millions of documents even further.
+B=Generation model for embeddings: text generation models return text, not the fixed-length vectors the index needs; embeddings come from dedicated embedding models such as Amazon Titan Text Embeddings.
+D=Skip embeddings: without vectors there is no semantic search, so the retrieval quality the team is happy with would be lost.
+T: Speed up large ingestions by batching and parallelizing embedding calls within quotas, not by changing the model type or dropping embeddings.
+
+@ Q002943 explain
+G: ## What drives token usage
+Bedrock charges and meters by tokens, and each request uses **input tokens** (system prompt + instructions + retrieved context + conversation history + user question) plus **output tokens**. If traffic is flat but tokens double, tokens per request must have changed.
+Typical causes:
+- A new prompt template with longer instructions or many few-shot examples.
+- Retrieval now returning more or larger chunks (for example top-k raised from 3 to 10, or bigger chunk sizes).
+- Conversation history no longer being truncated or summarized.
+- An agent loop making extra model calls per request.
+Check the `InputTokenCount` and `OutputTokenCount` metrics per model in CloudWatch, compare against recent deployments, and inspect sample prompts in model invocation logs.
+W: Prompt or retrieval changes: with steady traffic, doubling usage points to more tokens per request, and a recent prompt template or retrieval setting change is the most common and quickest thing to confirm.
+X: A=Regional electricity pricing: power costs are not visible to customers and have no effect on how many tokens a request contains.
+B=Logo update in the mobile app: a visual branding change does not change the prompts sent to the model, so it cannot affect token counts.
+C=Engineers with console access: the number of people who can open the console does not generate application traffic or change prompt size.
+T: Flat traffic with rising tokens means tokens per request grew, so start with recent prompt and retrieval changes.
+
+@ Q002944 explain
+G: ## Evaluating a RAG application
+A RAG answer can fail in two places: retrieval can miss the right passages, or generation can misuse them. A good evaluation scores both.
+**Amazon Bedrock Evaluations** supports RAG evaluation jobs for Amazon Bedrock Knowledge Bases (and for your own RAG pipeline by bringing its responses):
+- **Retrieve only** jobs score retrieved passages, for example context relevance and context coverage.
+- **Retrieve and generate** jobs score the final answer, for example correctness, completeness, faithfulness to the retrieved context, and responsible-AI metrics.
+Scoring is done by a judge model on your prompt dataset, optionally with reference answers, and results can be compared across knowledge base configurations such as chunking or top-k settings.
+W: Bedrock Knowledge Bases evaluation: it is a managed service that measures both retrieval quality and answer quality with RAG-specific metrics, covering the end-to-end requirement.
+X: A=Trusted Advisor performance checks: Trusted Advisor recommends improvements to account resources such as idle or over-used instances; it cannot judge whether answers are correct.
+C=X-Ray service maps: X-Ray shows how requests flow between services and where time is spent, but it does not score the relevance of retrieved passages or the correctness of answers.
+D=CloudWatch Synthetics canaries: canaries check that endpoints respond and flows work on a schedule; they verify availability, not the quality of generated answers.
+T: RAG quality needs retrieval and generation metrics from Bedrock RAG evaluation; tracing, canaries and advisor checks only cover performance and availability.
+
+@ Q002945 explain
+G: ## Automated evaluation gates
+A prompt tweak or a new model version can quietly break answers that used to be right. An **evaluation gate** catches this before users see it.
+- **Golden dataset**: a fixed, curated set of representative questions, each with an expected answer or grading criteria, including edge cases and past failures.
+- **Pipeline stage**: in CI/CD (for example AWS CodePipeline with an AWS CodeBuild step, or a Bedrock evaluation job started by the pipeline), every change runs against the dataset and scores are computed with exact checks, similarity or an LLM judge.
+- **Thresholds**: the stage passes only if scores meet targets, for example correctness at least 0.85 and no drop larger than 2 points from the current version; otherwise the deployment stops.
+W: D=CI/CD evaluation stage with thresholds: it runs automatically on every change and blocks deployment when scores fall below the bar, which turns evaluation into an enforced gate.
+E=Curated golden dataset: fixed reference questions with expected answers give every version the same test, so score differences reflect the change rather than different inputs.
+X: A=Test only on user reports: this waits until users are already affected and never scores changes before deployment.
+B=Average response length metric: length says nothing about correctness; a longer answer can be wrong and a short one right, so it cannot catch regressions.
+C=Manual spot checks after deployment: checks after release come too late to stop a regression, and manual sampling is neither automatic nor consistent.
+T: Automated pre-deployment quality gates need two things: a fixed golden dataset and a pipeline stage that enforces score thresholds.
+
+@ Q002946 explain
+G: ## Evaluating answers with no single right wording
+For open-ended tasks (advice, explanations, summaries) many different answers can be good. Metrics that compare text to one reference, such as exact match or word overlap, punish valid rephrasing.
+**LLM-as-a-judge** uses a capable model to grade each answer against a written **rubric**, for example:
+- Helpfulness 1 to 5: does it address the user's actual need?
+- Accuracy: are the claims correct and supported?
+- Clarity and tone.
+Amazon Bedrock Evaluations offers model-as-a-judge jobs with built-in and custom metrics. Because judges can be biased (for example favoring longer answers), teams periodically compare judge scores with human ratings on a sample and refine the rubric when they disagree.
+W: Rubric-based LLM judge with human review: a judge model can score thousands of open-ended answers consistently against clear criteria, and periodic human review keeps the judge calibrated and trustworthy.
+X: B=Prefer the longest answers: length rewards padding and repetition; a concise answer is often more helpful, so this metric can move opposite to quality.
+C=Count product names: keyword counts measure mentions, not whether the answer solves the user's problem, and they are easy to game.
+D=Exact string matching: open-ended answers vary in wording, so exact matching marks almost every correct answer as wrong, and there is no single reference answer anyway.
+T: Open-ended quality at scale is scored by a rubric-driven LLM judge checked by humans, not by length, keyword or exact-match metrics.
+
+@ Q002947 explain
+G: ## Why agents get stuck in tool loops
+An agent works in a loop: the model picks a tool, the application runs it, the result goes back to the model, and it decides the next step. It loops forever when it cannot tell that it already has what it needs, for example:
+- The tool description is vague, so the model is unsure when the tool applies or what its output means.
+- The tool returns unstructured text, an empty result, or an error the model cannot interpret, so it simply tries again.
+## Two complementary fixes
+- **Clear tool contract**: precise description and input schema, plus structured results such as `{"status": "not_found", "orderId": "123"}` that tell the model clearly what happened.
+- **Hard limit**: a maximum number of iterations or tool calls per request in the orchestration code or agent framework, after which the agent stops and returns a fallback answer or escalates.
+W: C=Clearer tool description and structured results: when the model understands what the tool does and what each result means, it can recognize success or failure and move on instead of repeating the call.
+E=Iteration or tool-call limit: a cap guarantees the request ends even if the model still misjudges a result, protecting latency and cost from runaway loops.
+X: A=Remove the tool: the agent would lose the capability it needs and answer from general knowledge, which is often outdated or wrong for task-specific data.
+B=Higher temperature: more random sampling does not help the model understand an unclear tool; it just makes choices less predictable without addressing the cause.
+D=Double the session timeout: more time only lets the loop run longer and consume more tokens before it fails.
+T: Stop agent tool loops by making tool contracts unambiguous and by enforcing a maximum number of iterations.
+
+@ Q002948 explain
+G: ## Seeing why a Bedrock agent chose an action
+An Amazon Bedrock agent decides which **action group** (a set of API operations or Lambda functions) to call based on the user input, the agent instructions and each action group's description and schema. When it picks the wrong one, you need to see its reasoning.
+The **agent trace** exposes this:
+- Enable it with `enableTrace` in the `InvokeAgent` call, or view it in the console test window.
+- The trace includes pre-processing, **orchestration** steps (the model's rationale, the chosen action group and API, the input parameters, and the observation returned), knowledge base lookups and post-processing.
+- Example: the rationale shows the agent treated "cancel my booking" as a lookup because the cancellation action's description was vague, so you rewrite that description.
+W: Agent trace: it shows step by step what the agent considered, which action group it selected and why, which is exactly the information needed to diagnose wrong routing.
+X: A=S3 access logs for the knowledge base bucket: these record requests to objects in the bucket, not the agent's decision about which action group to call.
+C=IAM credential report: this lists users and the status of their passwords and access keys; it contains nothing about agent reasoning.
+D=VPC Flow Logs: flow logs capture IP traffic metadata such as source, destination and ports, not model decisions or prompts.
+T: To understand an agent's choices, read its orchestration trace; storage, identity and network logs cannot show model reasoning.
+
+@ Q002949 explain
+G: ## Making structured output reliable
+Models follow format instructions well but not perfectly, and a new model version can change how it formats JSON. Robust applications treat model output as untrusted input:
+- **Validate**: parse the output and check it against a JSON Schema (required fields, types, allowed values).
+- **Retry with feedback**: on failure, send the validation error back ("field `price` must be a number") and ask for a corrected response, with a small retry cap.
+- **Constrain the shape**: define a tool in the Converse API `toolConfig` whose `inputSchema` is the desired JSON schema, and on models that support it set `toolChoice` to force that tool, so the model returns arguments matching the schema.
+- Keep temperature low for extraction tasks.
+This works across model versions and is also checked in regression tests before each upgrade.
+W: Validate, retry with the error, use tool schemas: validation catches bad output, corrective retries fix most failures automatically, and schema-based tool use makes well-formed JSON far more likely in the first place.
+X: B=Remove validation: malformed JSON would flow into downstream systems and cause crashes or corrupt data instead of being caught.
+C=Permanent rollback: this avoids the symptom but blocks all future improvements, security fixes and eventual model deprecations, and it does not make the output handling robust.
+D=Higher temperature: more randomness makes the output less consistent and increases, not reduces, schema violations.
+T: Treat model JSON as untrusted: validate it, retry with the error message, and constrain structure with tool schemas.
+
+@ Q002950 explain
+G: ## How documents become retrievable
+An Amazon Bedrock knowledge base does not read its data source live. Documents become searchable only after an **ingestion job** (sync) runs: it reads the data source (for example an S3 prefix), splits files into chunks, creates embeddings and writes them to the vector store.
+- Start a sync from the console or with the `StartIngestionJob` API.
+- New, changed or deleted files are reflected only after the next sync.
+- To keep production current, automate syncs, for example an Amazon EventBridge schedule or an S3 event that triggers a Lambda function calling `StartIngestionJob`, and monitor job status and failed documents.
+Here the test environment was synced but production was not, so production retrieval finds nothing and the model correctly says it has no information.
+W: Run and automate ingestion for production: syncing the production data source indexes the missing documents immediately, and automating the job prevents the gap from reappearing when content changes.
+X: A=Larger context window: the context window only limits how much retrieved text fits in the prompt; if nothing was indexed, nothing is retrieved to fill it.
+C=Switch vector store engine: a new store starts empty too; without running ingestion the documents are still not indexed anywhere.
+D=Prompt the model to try harder: the model cannot answer from documents that were never retrieved, and pushing it to answer anyway invites hallucinations.
+T: When retrieval returns nothing, check that the data was actually ingested and keep syncs automated; model, prompt and store changes cannot replace indexing.
+
+@ Q002951 explain
+G: ## Red teaming a GenAI assistant
+**Red teaming** means deliberately attacking your own system the way a malicious user would, before launch. For an assistant the attack set typically includes:
+- **Jailbreaks**: role-play or "ignore previous instructions" prompts aiming to bypass safety rules.
+- **Prompt injection**: hidden instructions inside documents or web pages the assistant reads.
+- **Data exfiltration**: attempts to reveal the system prompt, other users' data or secrets reachable through tools.
+The team curates these prompts, runs them repeatedly (manually and in automated test suites), records which ones succeed, and hardens the system, for example with Amazon Bedrock Guardrails prompt attack filters, sensitive information filters, tighter tool permissions and better instructions. The same set then becomes a regression test for future changes.
+W: Red-team testing with adversarial prompts: it directly exercises the assistant against jailbreak and exfiltration attempts and shows which defenses fail, which is what the team wants to learn before launch.
+X: A=Load testing with benign requests: identical harmless requests measure capacity and latency, but never try to bypass safety controls.
+B=User safety survey: perceptions of safety are not evidence; users do not systematically attempt attacks, so defenses remain untested.
+D=UI rendering unit tests: checking layout on phones validates the front end, not how the model responds to malicious input.
+T: Adversarial robustness is tested by red teaming with curated attack prompts, not by load, perception or UI tests.
+
+@ Q002952 explain
+G: ## Hosting agents with Amazon Bedrock AgentCore Runtime
+Agents built with open-source frameworks such as Strands Agents, LangGraph or CrewAI still need somewhere to run in production. **AgentCore Runtime** is a serverless hosting environment designed for them:
+- Framework and model agnostic: you package the agent code (for example as a container) and AgentCore runs it; it can use models from Bedrock or elsewhere.
+- **Session isolation**: each user session runs in its own isolated microVM, so one session's memory and state cannot leak into another.
+- **Long-running work**: sessions can run for hours (up to 8 hours), well beyond typical function time limits, which suits multi-step agent tasks.
+- Built-in integration with AgentCore Identity, Memory, Gateway and Observability, and you pay for active usage without managing servers.
+W: AgentCore Runtime: it runs agents from any framework serverlessly with per-session isolation and long execution times, meeting every requirement without operating infrastructure.
+X: A=Manually managed EC2: it can run any agent, but the team must provision, patch, scale and isolate sessions itself, the opposite of a managed, serverless runtime.
+B=Lightsail instance per user: one virtual server per user is costly, slow to provision and still needs management; it is not a serverless agent runtime.
+C=Lambda with 15-minute timeout: Lambda is serverless, but an invocation cannot run longer than 15 minutes, which cuts off long-running agent tasks.
+T: For serverless, session-isolated, long-running hosting of framework-built agents, use AgentCore Runtime rather than servers or time-limited functions.
+
+@ Q002953 explain
+G: ## Short-term and long-term agent memory
+A model is stateless: it only knows what is in the current request. Agents that should "remember" need a memory store.
+**Amazon Bedrock AgentCore Memory** is a managed service with two layers:
+- **Short-term memory**: raw conversation events within a session, so the agent can refer back to earlier turns.
+- **Long-term memory**: information extracted asynchronously from conversations using **memory strategies**, such as user preferences ("prefers vegetarian meals"), semantic facts, and session summaries. Custom strategies are also possible.
+In a later session the agent retrieves relevant long-term records (for example by user ID as the namespace) and adds them to its context, so it personalizes answers without replaying every past conversation.
+W: AgentCore Memory with long-term strategies: its preference and summary strategies extract and persist exactly this information across sessions for the agent to retrieve later.
+X: A=Guardrail storing preferences: Amazon Bedrock Guardrails evaluate and filter inputs and outputs against safety policies; they keep no user data between sessions.
+C=Higher temperature: temperature changes sampling randomness in a single response; it gives the model no knowledge of past sessions.
+D=Larger context window: a context window holds tokens for one request only; once the session ends nothing is kept, and resending full histories is costly.
+T: Cross-session memory needs a persistent store such as AgentCore Memory; guardrails, sampling settings and context windows do not persist anything.
+
+@ Q002954 explain
+G: ## Amazon Q Business for enterprise knowledge
+**Amazon Q Business** is a fully managed generative AI assistant for employees that answers questions over company content without building a RAG stack.
+- **Data source connectors** index content from sources such as Microsoft SharePoint, Amazon S3, Confluence and many others.
+- **IAM Identity Center** integration provides SSO with the corporate identity provider.
+- **Permission-aware answers**: connectors ingest document access control lists, and at query time Q Business uses the signed-in user's identity so answers only draw on documents that user may see.
+Example: an HR policy draft restricted to HR staff in SharePoint never shows up in answers for an engineer.
+Admins also get web experience deployment, admin controls and guardrails without writing application code, which makes delivery fast.
+W: Q Business with connectors and Identity Center: it provides SSO, built-in connectors for SharePoint and S3, and document-level permission enforcement as a managed service, meeting security and speed together.
+X: A=Custom chatbot with shared login: a shared account removes individual identity, so the system cannot enforce who may see which document, and building it takes longer.
+B=Public endpoint with pasted documents: sending all content in every prompt ignores permissions, exceeds context limits, costs a lot and exposes data beyond the approved boundary.
+D=Search index ignoring access controls: every user could retrieve restricted documents through the assistant, which is a data leak.
+T: A fast, secure, permission-aware employee assistant is Amazon Q Business with connectors and IAM Identity Center; anything ignoring per-user access leaks data.
+
+@ Q002955 explain
+G: ## The tool use loop in the Converse API
+Models cannot run code or reach the internet themselves. With **tool use** (function calling) the model asks your application to run a tool:
+- The request includes `toolConfig` with a tool definition: name, description and an `inputSchema` (JSON Schema), for example `get_weather(city)`.
+- If the model needs the tool, the response has `stopReason` `tool_use` and a `toolUse` content block with a `toolUseId`, the tool name and input such as `{"city": "Seoul"}`.
+- Your code calls the real weather API.
+- You send a new user message containing a `toolResult` block with the same `toolUseId` and the data.
+- The model then writes the final answer using that result, or asks for another tool.
+W: toolConfig, handle toolUse, run tool, return toolResult: this is the documented Converse API flow in which the model requests the call and the application executes it and returns the result for the final answer.
+X: B=Weather data in every system prompt: preloading data for all possible locations wastes tokens on every call and goes stale, and the model still cannot fetch anything that was not preloaded.
+C=Model calls the API directly: foundation models on Bedrock only generate tokens; they have no network access, so the application must execute the call.
+D=Knowledge base of yesterday's weather: retrieval returns stored, outdated content, while weather must be fetched live when the question is asked.
+T: In tool use the model only requests the call; the application executes it and returns a `toolResult` matched by `toolUseId`.
+
+@ Q002956 explain
+G: ## Per-client quotas with API Gateway usage plans
+Amazon API Gateway REST APIs can meter clients with **API keys** and **usage plans**:
+- Each partner gets its own API key, and methods are configured to require a key.
+- A usage plan attached to the API stage sets **throttling** (steady rate and burst in requests per second) and a **quota** (maximum requests per day, week or month).
+- Example: a plan with a quota of 10,000 requests per `DAY`; once a partner's key reaches it, further calls are rejected with HTTP 429 until the period resets.
+- Usage per key can be viewed or exported for reporting.
+Quotas and throttling are applied on a best-effort basis, and API keys identify callers rather than authenticate them, so combine them with an authorizer (IAM, Amazon Cognito or a Lambda authorizer).
+W: Usage plans with per-partner API keys: a usage plan enforces a daily request quota for each key, which is exactly a 10,000-requests-per-day limit per partner without custom code.
+X: A=Lambda counting in memory: Lambda execution environments are created and discarded independently, so in-memory counters are not shared across concurrent instances and are lost when environments end.
+B=S3 bucket policy by IP: bucket policies control access to S3 objects; they cannot count or limit calls to a GenAI API.
+C=CloudWatch dashboard: a dashboard only displays request volumes; it does not stop a partner once the limit is reached.
+T: Enforce per-partner request quotas with API Gateway usage plans and API keys; dashboards and in-memory counters cannot enforce limits.
+
+@ Q002957 explain
+G: ## Content filters in Amazon Bedrock Guardrails
+Guardrail **content filters** detect harmful content in categories: hate, insults, sexual, violence, misconduct, plus a prompt attack filter.
+- Each category has a filter strength of none, low, medium or high, set **separately for inputs (prompts) and outputs (responses)**.
+- A higher strength blocks content even when the classifier's confidence is lower, so **high** blocks the most, including milder cases.
+- When a filter triggers, the guardrail returns your configured blocked message instead of the prompt reaching the model or the response reaching the user.
+Example for a children's app: sexual = high on input and high on output, so an inappropriate question is stopped before the model sees it, and any unsuitable generated text is replaced before display.
+W: Sexual content filter at high on inputs and outputs: the guardrail enforces the policy on both directions at the strictest strength, independent of how the model behaves.
+X: B=Polite system prompt: instructions are a request the model may not always follow, and they can be overridden by jailbreaks; nothing checks the prompt or response.
+C=Contextual grounding relevance threshold: grounding checks judge whether an answer is supported by the source and relevant to the question; they do not detect sexual content.
+D=Short word list: a few listed words miss synonyms, misspellings and context, so most inappropriate content would pass.
+T: Strict category blocking in both directions comes from guardrail content filters set to high on inputs and outputs, not from prompts, grounding checks or short word lists.
+
+@ Q002958 explain
+G: ## Amazon Bedrock data handling
+Amazon Bedrock is designed so customer data stays under the customer's control:
+- Prompts and completions are **not used to train** the base foundation models and are **not shared with the model providers**. Model providers have no access to the deployment accounts where models run.
+- Bedrock does not store prompts and responses by default; storing them requires you to enable **model invocation logging** to your own CloudWatch Logs or S3.
+- Inference runs in the Region you call. **Cross-Region inference** profiles, if you choose them, can route requests to other Regions within a defined geography (or globally for global profiles) to gain throughput.
+- Fine-tuning creates a private copy of the model that only your account can use.
+W: No training on prompts, in-Region unless cross-Region inference: this matches how Bedrock handles data; the only way requests leave the chosen Region is by opting into a cross-Region inference profile.
+X: A=Shared with providers unless you pay to opt out: Bedrock never shares prompts with providers for training, and there is no paid opt-out because it is the default for everyone.
+C=Stored permanently in one global location: Bedrock does not keep prompts by default, and any logs you enable go to storage in your own account and chosen Region.
+D=Sent to every Region automatically: requests are processed in the Region you call; routing to other Regions happens only when a cross-Region inference profile is used, and even then only to a defined set of Regions.
+T: Bedrock does not train on or share customer prompts, and data stays in the calling Region unless you opt into cross-Region inference.
+
+@ Q002959 explain
+G: ## Functional versus non-functional requirements
+A **functional** requirement says what the system does: summarize a ticket, draft a reply. A **non-functional** requirement says how well: latency, throughput, availability, cost and security.
+For a goal like "cut support handling time by 30%", the assistant only helps if it responds fast enough while agents are working, including at the busiest hours.
+- **Latency target**, for example p90 time to first token under 1 second and full reply under 4 seconds.
+- **Throughput target**, for example 200 concurrent agents and 50 requests per second at peak.
+These numbers drive architecture choices: model size, streaming, caching, on-demand versus provisioned throughput or cross-Region inference, quotas to request, and cost estimates.
+W: Latency and throughput at peak: if replies are slow or throttled when support volume peaks, handling time does not fall, so these targets directly shape model choice, capacity and cost.
+X: A=Date of the all-hands meeting: a meeting date is a scheduling detail with no effect on how the system must be designed or perform.
+B=Chat widget color: the color is a cosmetic UI choice; it does not influence models, capacity or response time.
+D=Names of first testers: who tests the feature is a rollout detail, not a property the architecture has to meet.
+T: Business goals such as faster handling translate into measurable latency and throughput targets under peak load, and those targets shape the architecture.

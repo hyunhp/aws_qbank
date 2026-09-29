@@ -1,0 +1,343 @@
+# ANS-C01 detailed explanations, batch e02 (explanation-only rewrites; letters are the published ones)
+
+@ Q001587 explain
+G: ## What the CloudFront cache key is
+Every cached object at an edge location is stored under a **cache key**. By default it is the domain name plus the URL path. A **cache policy** decides which extra query strings, headers and cookies are added to that key.
+- Two requests with the same cache key get the same cached response.
+- Every value you add to the key splits the cache: `?sessionId=1&utm=a` and `?sessionId=1&utm=b` become two different objects if `utm` is in the key.
+Values included in the cache key are also forwarded to the origin automatically.
+## Cache policy versus origin request policy
+An **origin request policy** sends extra values to the origin **without** adding them to the cache key. It is useful when the origin needs data that does not change the response.
+## Example
+If the key includes only `sessionId`, then `/api/profile?sessionId=42&utm_source=x` and `/api/profile?sessionId=42&fbclid=y` hit the same cached object, while `sessionId=43` gets its own response.
+W: Cache key with only sessionId: the one parameter that changes the response keeps personalized answers separate, and the tracking parameters no longer fragment the cache, so the hit ratio goes up without serving one user another user's data.
+X: A=Forward all query strings: every random tracking value becomes part of the cache key, so nearly every request is a unique key and a cache miss. Personalization works, but the hit ratio collapses.
+B=Origin request policy with User-Agent and Referer: an origin request policy never changes the cache key, and these headers do not carry `sessionId` at all, so the API cannot personalize and responses could be shared between users.
+C=Disable caching: correct but gives up all caching for the API, so every request reaches the ALB, the opposite of maximizing the hit ratio.
+T: Put in the cache key exactly the values that change the response (here `sessionId`) and nothing else; origin request policies forward data without touching the key.
+
+@ Q001588 explain
+G: ## AWS Global Accelerator in one paragraph
+Global Accelerator gives you **static anycast IP addresses** (two by default) announced from many AWS edge locations at once. A user's packets enter AWS at the nearest edge and then travel over the AWS backbone to your endpoints (NLBs, ALBs, EC2 instances or Elastic IPs) in one or more Regions.
+- It works at Layer 4, so it carries **TCP and UDP** on the ports you define, including custom game protocols.
+- Health checks run continuously; if a Region's endpoints become unhealthy, new traffic goes to healthy endpoints in another Region within seconds, and the IP addresses the client uses never change.
+## Why not DNS or a CDN
+DNS-based failover depends on clients and resolvers honoring TTLs, and returns different IPs over time. CloudFront is a content delivery network for HTTP and HTTPS (including WebSocket), built around caching.
+W: Global Accelerator: static anycast IPs that can be hardcoded into the game client, native support for custom UDP ports, and health-based cross-Region failover that does not wait for DNS caches to expire.
+X: A=ALB with cross-zone: an ALB handles only HTTP and HTTPS, lives in a single Region and does not offer static IP addresses, so it fails on UDP, fixed IPs and cross-Region failover.
+C=Route 53 latency routing: it only answers DNS queries. It gives no static anycast IPs, and failover speed depends on resolver caching of the TTL rather than on the network.
+D=CloudFront custom origin: CloudFront proxies HTTP and HTTPS traffic and does not carry a custom UDP protocol, and its value (caching) is explicitly not needed here.
+T: Non-HTTP (TCP/UDP) traffic that needs fixed anycast IPs and fast multi-Region failover → Global Accelerator; HTTP content with caching → CloudFront.
+
+@ Q001589 explain
+G: ## AWS WAF scopes
+A WAF **web ACL** is created with a scope:
+- **CLOUDFRONT** scope: created in us-east-1 (N. Virginia) and usable only with CloudFront distributions.
+- **REGIONAL** scope: created in the same Region as the resource it protects, such as an Application Load Balancer, API Gateway REST API, AppSync API or Cognito user pool.
+An ALB in `eu-central-1` can only be associated with a REGIONAL web ACL in `eu-central-1`.
+## Rules that cover the requirements
+- The AWS managed SQL database rule group detects SQL injection patterns.
+- A **rate-based rule** counts requests per client IP and blocks IPs above a threshold.
+## Central management
+**AWS Firewall Manager** (with AWS Organizations) applies a WAF policy to every in-scope resource, such as all ALBs with a given tag, across accounts, and fixes resources that drift from it.
+W: REGIONAL web ACL on the ALB via Firewall Manager: the scope and Region match the ALB, WAF supplies SQL injection and rate-based rules, and Firewall Manager deploys and enforces the web ACL centrally.
+X: A=Shield Advanced alone: Shield Advanced targets DDoS protection and response; it does not by itself provide SQL injection filtering. Application-layer rules still come from a WAF web ACL.
+B=CLOUDFRONT-scoped web ACL: that scope can be attached only to CloudFront distributions. It cannot be associated with an ALB, and there is no distribution here.
+C=Web ACL on a route table: WAF inspects HTTP requests at supported resources like ALBs; it cannot be associated with VPC route tables, which only steer packets by destination.
+T: ALB, API Gateway and similar Regional resources → REGIONAL web ACL in the same Region; CloudFront → CLOUDFRONT scope in us-east-1; Firewall Manager to manage either centrally.
+
+@ Q001590 explain
+G: ## CloudFront origin groups
+An **origin group** pairs a primary and a secondary origin for high availability. CloudFront sends each request to the primary first and retries it on the secondary when:
+- the connection to the primary fails or times out, or
+- the primary returns one of the HTTP status codes you selected as **failover criteria**. The codes you can choose from are `403`, `404`, `500`, `502`, `503` and `504`.
+Only codes you tick trigger failover; for any other code, CloudFront returns the primary's response to the viewer. Failover applies to `GET`, `HEAD` and `OPTIONS` requests.
+## Example
+If the criteria list only `500`, `502`, `503` and `504`, a primary S3 bucket that answers `403 Forbidden` is treated as a valid response, and viewers keep getting the 403 even though the secondary bucket is healthy.
+W: 403 not in the failover criteria: CloudFront only fails over on the status codes listed for the origin group, so a 403 from the primary is passed straight to viewers. Adding 403 to the criteria makes CloudFront retry on the secondary bucket.
+X: A=Only TCP timeouts trigger failover: origin groups fail over on connection failures and on the selected HTTP status codes; status-code failover is a core feature.
+C=S3 origins not supported: S3 buckets are a common primary and secondary pair in an origin group for cross-Region disaster recovery.
+D=Secondary bucket policy blocks OAC: that would make the secondary fail after a failover attempt. The question describes CloudFront never trying the secondary for a 403, which points to the failover criteria on the primary.
+T: Origin group failover happens only on connection errors and on the exact status codes you select; if a code is not in the list, viewers see it.
+
+@ Q001591 explain
+G: ## Two kinds of CloudFront edge compute
+- **CloudFront Functions** run lightweight JavaScript at edge locations on the **viewer request** and **viewer response** events only. They are built for sub-millisecond work such as header changes, redirects, URL rewrites and simple token checks. They have **no network access** and no request body access.
+- **Lambda@Edge** runs Node.js or Python functions at Regional edge caches on all four events: viewer request, viewer response, **origin request** and origin response. It can make network calls, runs longer and can use more memory, especially on origin events.
+## Why origin request
+The origin request event fires only on a cache miss, just before CloudFront contacts the origin. A function there can call an external API, read its answer, and then allow, change or reject the request before it reaches the origin.
+W: Lambda@Edge on origin request: it can make the outbound call to the fraud API and act on the response before forwarding to the origin, which CloudFront Functions cannot do because they have no network access.
+X: A=CloudFront Functions with outbound calls: CloudFront Functions cannot open network connections, so calling a third-party API is impossible there.
+B=CloudFront Functions on origin response with more resources: CloudFront Functions run only on viewer events and have far tighter time and memory limits than Lambda@Edge, not larger ones.
+D=Lambda@Edge on viewer response only: Lambda@Edge supports origin request, and a viewer response function runs after the origin has already been contacted, too late to check the request before forwarding it.
+T: Lightweight, no-network logic on viewer events → CloudFront Functions; external calls, heavier logic or origin events → Lambda@Edge.
+
+@ Q001594 explain
+G: ## CloudFront price classes
+CloudFront charges different data transfer prices in different parts of the world. A **price class** limits which edge locations serve your distribution:
+- **Price Class All**: every edge location, best performance, highest price.
+- **Price Class 200**: most Regions, excluding the most expensive ones.
+- **Price Class 100**: mainly North America and Europe, the lowest cost.
+Viewers outside the selected areas are **not blocked**. They are served from an edge location inside the price class, which is farther away, so their latency is higher.
+## Price class versus geo restriction
+**Geo restriction** is an access control: it returns an error to viewers in countries you did not allow. A price class is a cost control: everyone is served, some from farther away.
+W: Price Class that excludes other regions: it lowers cost by using only cheaper edge locations where the customers are, while viewers elsewhere are still served, the trade-off being higher latency for them.
+X: B=Shorter TTL: a shorter TTL causes more cache misses and more requests to the origin, which usually raises cost and does not change which edge locations are billed.
+C=Geo restriction: it blocks viewers outside the allowed countries, which directly breaks the requirement not to block anyone.
+D=Origin Shield in South America: Origin Shield is an extra caching layer that should sit close to the origin to reduce origin load; it adds its own charges and does not reduce edge delivery cost.
+T: Cheaper delivery for a regional audience without blocking anyone → price class (trade-off: latency for distant viewers); blocking countries → geo restriction.
+
+@ Q001595 explain
+G: ## How CloudFront caching is layered
+Requests reach CloudFront at one of hundreds of edge locations. On a miss, an edge asks a **Regional edge cache**; on a miss there, CloudFront goes to the origin. Because there are several Regional edge caches, the same object can still be fetched from the origin several times, once per cache that misses.
+## Origin Shield
+**Origin Shield** adds one more central caching layer in a single AWS Region you choose, ideally the Region closest to your origin. All Regional edge caches then go through Origin Shield, so:
+- the origin sees roughly one request per object instead of one per cache location, and
+- simultaneous requests for the same object are collapsed into a single origin fetch.
+This matters most for origins with limited capacity, such as an on-premises data center reached over Direct Connect.
+W: Origin Shield near the origin: it funnels all cache misses from around the world through one caching layer, so each object is fetched from the on-premises origin once and the peak load drops.
+X: A=Second distribution: two distributions have separate caches, so the origin gets misses from both and the load rises instead of falling.
+B=Short-lived signed URLs: signed URLs control who can access content. They do nothing to reduce cache misses and can make caching less effective if URLs vary per user.
+D=Field-level encryption: it encrypts specific form fields in POST requests for sensitive data; it has no effect on caching or origin load.
+T: Many cache locations missing on the same objects and hammering one origin → Origin Shield in the Region closest to the origin.
+
+@ Q001596 explain
+G: ## Weighted routing for gradual rollouts
+Route 53 **weighted routing** lets several records with the same name and type share traffic. Each record has a weight from 0 to 255, and the chance of returning a record is its weight divided by the total.
+- Old version weight `95`, new version weight `5` → about 5% of DNS answers point to the new backend.
+- Change to `75`/`25`, then `0`/`100` to finish. Rolling back is setting the new version's weight to `0`.
+- Health checks on the records remove an unhealthy backend from answers automatically.
+## Why DNS rollback is not instant
+Resolvers and clients cache answers for the record's **TTL**. After you change the weights, users keep using the cached IP until it expires, and some clients cache longer than the TTL. Use a low TTL (for example 60 seconds) during the rollout.
+W: Weighted records with health checks: weights give exact percentage steps (5%, 25%, 100%) and fast rollback by changing a number, while TTL caching is what limits how quickly each change reaches users.
+X: A=Failover records: failover is all-or-nothing, the secondary receives traffic only when the primary is unhealthy, so there is no way to send 5% or 25%.
+B=Latency records: latency routing sends each user to the Region with the lowest latency; it has no setting for a percentage split between two versions.
+C=Geolocation by continent: traffic moves by where users are, in large all-or-nothing blocks, not by controlled percentages.
+T: Percentage-based canary and rollback with DNS → weighted routing with low TTLs; DNS caching is the limit on how fast shifts take effect.
+
+@ Q001601 explain
+G: ## How Route 53 health checks work
+A Route 53 health check on an endpoint is performed by **health checkers in several AWS Regions** on the internet. They connect to the IP or domain name you specify, on the given port and path, and the endpoint is considered healthy only if enough checkers report success.
+- The checkers use published IP ranges (listed in `ip-ranges.json` with the service `ROUTE53_HEALTHCHECKS`).
+- If a security group, network ACL or firewall allows only your users' ranges, the checkers' requests are dropped, and the check fails even though users can reach the site.
+## Failover routing
+With failover routing, the primary record answers while its health check is healthy; when it is unhealthy, Route 53 answers with the secondary record.
+W: Security group blocks health checker IPs: the endpoint works for users, but the checkers cannot connect, so Route 53 marks it unhealthy and fails over. Allow the Route 53 health checker ranges on the health check port.
+X: A=Secondary TTL too low: a low TTL makes clients pick up DNS changes faster; it has nothing to do with whether the primary health check passes.
+B=Private zones do not support failover: private hosted zones do support failover records. Health checks cannot reach private IPs directly, so there you would use a health check based on a CloudWatch alarm, but that is not this scenario.
+C=Health checks not supported on the primary: associating a health check with the primary record is the normal way failover routing is configured.
+T: A healthy endpoint that Route 53 calls unhealthy usually means the health checkers cannot reach it: check security groups, NACLs and firewalls for their IP ranges.
+
+@ Q001602 explain
+G: ## Resolver rules across accounts
+A **Route 53 Resolver forwarding rule** says "send queries for `corp.example.com` to these on-premises DNS IPs through this outbound endpoint". Two separate steps make a rule take effect for a VPC:
+- **Share** the rule with other accounts using AWS RAM. This only makes the rule visible and usable by those accounts.
+- **Associate** the rule with each VPC that should use it. Only VPCs with an association send matching queries through the rule.
+The outbound endpoint stays in the shared services VPC; spoke VPCs do not need their own endpoint.
+## Example
+A spoke account sees the shared rule in its Resolver console. VPC-1 was associated with it and resolves `corp.example.com`; VPC-2 was not, so its queries go to the default Resolver, which has no answer for the on-premises domain.
+W: Associate the rule with the failing VPC: sharing via RAM makes the rule available, but each VPC must also be associated with it, which is exactly the difference between the working and the failing spoke VPC.
+X: A=Endpoint IP per consuming VPC: one outbound endpoint serves every VPC associated with its rules; there is no per-VPC IP allocation.
+C=RAM cannot share Resolver rules: Resolver rules are a supported RAM resource type, and the working spoke VPC already proves the shared rule functions.
+D=Outbound endpoint security groups: the endpoint's security group controls traffic from the endpoint to on-premises DNS. Queries from associated VPCs are handled by the Resolver itself, and another spoke using the same endpoint already works.
+T: Shared Resolver rules do nothing until they are associated with each VPC: share with RAM, then associate per VPC.
+
+@ Q001603 explain
+G: ## Multivalue answer routing
+**Multivalue answer routing** lets you create up to eight records with the same name, each holding one IP address and, optionally, its own health check.
+- For each query, Route 53 returns up to **eight healthy records**, picked at random.
+- Records whose health checks fail are left out of the answer.
+- The client receives several IPs and can try another if one fails.
+It is not a replacement for a load balancer, but it gives simple, health-aware DNS distribution.
+## Compared with other policies
+- **Simple routing** can put several IPs in one record, but it has no health checks, so dead IPs keep being returned.
+- **Weighted routing** returns one record per query, chosen by weight.
+W: Multivalue answer with a health check per record: it returns several healthy IPs in each answer and automatically drops IPs whose health checks fail, meeting every requirement without a load balancer.
+X: A=Simple routing with 8 IPs: all IPs are returned, but simple routing cannot use health checks, so unhealthy IPs are never removed.
+C=Weighted routing with equal weights: it removes unhealthy records, but each answer contains a single record, not several IPs.
+D=Latency routing: it picks one record based on the Region with the lowest latency. Eight servers behind one site are not separate Regions, and each answer has one record.
+T: Several healthy IPs per DNS answer without a load balancer → multivalue answer routing with health checks.
+
+@ Q001604 explain
+G: ## Private hosted zones and VPC association
+A **private hosted zone** answers only for VPCs associated with it. Associating a VPC in the same account is one step. When the zone and the VPC are in different accounts, both owners must take part, using the API, CLI or SDK:
+- **Step 1, zone owner (Account A)**: create a VPC association authorization (`CreateVPCAssociationAuthorization`) naming Account B's VPC ID and Region.
+- **Step 2, VPC owner (Account B)**: associate the VPC with the zone (`AssociateVPCWithHostedZone`) using Account A's hosted zone ID.
+After the association exists, Account A can delete the authorization; the association stays.
+## Example
+`aws route53 create-vpc-association-authorization --hosted-zone-id Z123 --vpc VPCRegion=eu-west-1,VPCId=vpc-0b1` in Account A, then `aws route53 associate-vpc-with-hosted-zone --hosted-zone-id Z123 --vpc ...` in Account B.
+W: A=Account B associates the VPC: the VPC owner performs the actual association, referencing Account A's hosted zone ID. It succeeds only after the authorization exists.
+D=Account A creates the authorization: the zone owner first authorizes that specific VPC, which is the permission step that allows another account's VPC to be associated.
+X: B=Recreate the zone as shared: hosted zones are not recreated as shared resources for this; the authorization and association work with the existing zone.
+C=Share the VPC with RAM: the process needs no RAM share of the VPC; the authorization in Account A is the only cross-account permission required.
+E=NACL entry on the hosted zone: network ACLs belong to subnets, not hosted zones, and a hosted zone has no CIDR allow-list.
+T: Cross-account private hosted zone access: the zone owner authorizes the VPC, then the VPC owner associates it.
+
+@ Q001605 explain
+G: ## How latency-based routing chooses
+With **latency-based routing**, you create one record per AWS Region where your application runs, each tagged with that Region. When a query arrives, Route 53 uses its measurements of latency between the user's network and AWS Regions and returns the record for the Region with the lowest latency **among the records that exist**.
+- It never considers a Region that has no latency record, even if a stack is running there.
+- Adding a new Region therefore means deploying the stack **and** creating a latency record for it.
+## Example
+Records exist for `us-east-1` and `eu-west-1` only. For a user in Sydney, `us-east-1` has the lower latency of the two, so that is the answer, even though a stack in `ap-southeast-1` is running.
+W: No latency record for ap-southeast-1: Route 53 can only choose among existing records, so Australian users get the best of the two existing Regions until a record for the new Region is created.
+X: A=First record created wins: latency routing chooses by measured latency, not by creation order.
+B=Needs at least three records: there is no minimum; latency routing works with two records or even one.
+C=Caching cleared by DNS Firewall: DNS Firewall filters queries from VPCs by domain; it does not control caching by Australian resolvers, and caching would expire after the TTL anyway.
+T: Latency routing only picks among the records you created; a new Region needs its own latency record.
+
+@ Q001606 explain
+G: ## Network Load Balancer at Layer 4
+A **Network Load Balancer (NLB)** forwards TCP, UDP and TLS connections with very low latency.
+- **Client IP preservation**: for instance targets the backend sees the real client source IP in the packet by default; for IP targets it is a target group attribute that can be turned on. No HTTP header is needed.
+- **TLS passthrough**: with a `TCP` listener on port 443, the NLB forwards the encrypted bytes untouched and the backend terminates TLS, so encryption is end to end.
+- If IP preservation is not possible, NLB can add **Proxy Protocol v2**, which carries the client address in a header the backend reads.
+## Application Load Balancer at Layer 7
+An ALB terminates the client's HTTP/HTTPS connection and opens a new one to the target, so the target sees the ALB's IP, and the client address is passed in the `X-Forwarded-For` HTTP header.
+W: NLB preserving the client IP at Layer 4: the backend sees the original source IP directly, latency stays minimal, and a TCP listener passes TLS through untouched, all without parsing HTTP headers.
+X: B=NLB terminating TLS with ACM: an NLB can terminate TLS, but doing so decrypts traffic at the load balancer, which violates the requirement to pass TLS through untouched.
+C=ALB with X-Forwarded-For: the client IP is only available by parsing an HTTP header, and the ALB must terminate TLS to add it, which breaks both requirements.
+D=ALB with Proxy Protocol v2: Proxy Protocol v2 is a Network Load Balancer feature; ALB does not support it.
+T: Real client IP at the TCP layer plus TLS passthrough → NLB with a TCP listener; ALB means TLS termination and X-Forwarded-For.
+
+@ Q001607 explain
+G: ## Gateway Load Balancer
+A **Gateway Load Balancer (GWLB)** is built to put third-party virtual appliances (firewalls, IDS/IPS, deep packet inspection) into the traffic path without changing the traffic.
+- It works at Layer 3 and listens for all IP packets on all ports.
+- It sends packets to appliances wrapped in **GENEVE** encapsulation on UDP port `6081`, so the appliance sees the original packet with source and destination unchanged.
+- It health-checks appliances and keeps each flow on the same appliance, so the fleet can scale in and out, for example with an Auto Scaling group.
+- **Gateway Load Balancer endpoints** (a PrivateLink-based endpoint type) in other VPCs are used as route table targets, so traffic from many VPCs can be steered to one appliance fleet.
+W: Gateway Load Balancer: it is the purpose-built service for transparent, scalable insertion of appliances, using GENEVE to preserve the original packets and endpoints to serve many VPCs.
+X: A=ALB with a Lambda target: an ALB handles HTTP requests, and Lambda is not a virtual firewall appliance; nothing about this is transparent packet inspection.
+B=Classic Load Balancer with Auto Scaling: a Classic Load Balancer terminates connections and does not use GENEVE, so appliances would not see the original packets, and it is a previous-generation service.
+D=NLB with UDP listeners: an NLB forwards specific TCP/UDP ports to targets but does not encapsulate whole packets or act as a route-table next hop for inspection.
+T: Transparent insertion and scaling of third-party inspection appliances with GENEVE → Gateway Load Balancer.
+
+@ Q001608 explain
+G: ## Cross-zone load balancing on an NLB
+An NLB has a node in each enabled Availability Zone. Without cross-zone load balancing, each node sends traffic only to targets in its own AZ.
+## Example
+Two AZs each get 50% of client traffic. AZ-a has 2 targets and AZ-b has 8. With cross-zone off, each AZ-a target gets 25% of all traffic and each AZ-b target about 6%. With cross-zone on, all 10 targets get about 10% each.
+## The costs
+- For NLB, cross-zone is **off by default**, and traffic sent from one AZ to a target in another AZ is charged regional data transfer.
+- It can be turned on or off at any time, for the whole load balancer or per target group.
+- It does not change client IP preservation.
+W: Even distribution with cross-AZ charges: turning cross-zone on spreads traffic evenly across all registered targets, fixing the imbalance, but traffic crossing AZs is billed as data transfer.
+X: A=Cannot change after creation: cross-zone is an attribute you can change on an existing NLB or target group at any time.
+B=Disables client IP preservation: client IP preservation is a separate target group attribute and keeps working with cross-zone enabled.
+C=Free and only affects health checks: it changes how traffic is distributed across targets, and for NLB the cross-AZ traffic is not free.
+T: NLB cross-zone evens out traffic across uneven AZs, at the cost of inter-AZ data transfer charges.
+
+@ Q001609 explain
+G: ## How ALB target health checks work
+An ALB sends a request to each target at the **health check path** (for example `GET /status`) on a schedule. A target is healthy when it returns a status code in the success codes (default `200`) within the timeout.
+- **Unhealthy threshold**: consecutive failures that mark a target unhealthy.
+- **Healthy threshold**: consecutive successes needed to mark it healthy again.
+- **Timeout**: how long to wait for each response (2 to 120 seconds).
+If the path returns `404` because the page does not exist, every check fails, every target becomes unhealthy, and an ALB with no healthy targets returns `503 Service Unavailable`.
+## Example
+The app serves only `/status`. After the path changes to `/health`, every check gets `404`, so after a few intervals all targets are unhealthy.
+W: Restore /status or implement /health: the checks fail because the path does not exist; pointing the check at a working endpoint, or adding the endpoint the check expects, makes targets healthy again and ends the 503s.
+X: A=Higher healthy threshold: this requires more consecutive successes, so recovery is slower, and it cannot help when every check returns 404.
+C=Deregistration delay: it controls how long in-flight requests are allowed to finish when a target is removed; it has no effect on health check results.
+D=300-second timeout: the ALB timeout maximum is 120 seconds, and a longer wait does not change a 404 into a success.
+T: All targets unhealthy right after a health check change → the check points to a path the app does not serve; fix the path or the endpoint.
+
+@ Q001610 explain
+G: ## ALB sticky sessions
+Stickiness makes an ALB send a client's requests to the same target. ALB offers two cookie-based types, set on the target group:
+- **Duration-based**: the ALB creates its own cookie `AWSALB` and keeps the client on the same target for a duration you set.
+- **Application-based**: you name a cookie your application already sets, such as `SESSIONID`. The ALB also issues its own `AWSALBAPP` cookie to track the target and follows the application's session, with a duration you configure.
+Both durations can range from 1 second to 7 days, so 30 minutes (1800 seconds) is fine.
+## Where source-IP stickiness fits
+Source-IP stickiness is a Network Load Balancer target group option. ALBs work at the HTTP layer and use cookies instead.
+W: Application-based stickiness with SESSIONID: the ALB keeps users on the same target based on the cookie the app already issues, with the stickiness duration set to 30 minutes.
+X: A=Duration-based because ALB cannot use app cookies: ALB does support application-based cookie stickiness; duration-based stickiness would work but ignores the app's own session cookie.
+B=Source-IP stickiness: ALB target groups do not offer source-IP stickiness, and many users behind one NAT would share an IP anyway.
+C=Stickiness only on NLB: ALB supports two kinds of cookie-based stickiness; NLB offers source-IP stickiness.
+T: ALB stickiness that follows the app's own session cookie → application-based stickiness; ALB-generated cookie only → duration-based.
+
+@ Q001611 explain
+G: ## Deregistration delay (connection draining)
+When a target is deregistered from an ALB target group, the ALB stops sending it **new** requests immediately. The **deregistration delay** is how long the ALB waits before fully removing the target, so requests already in progress can finish.
+- Default: `300` seconds; range `0` to `3600` seconds.
+- If it is set too short for the application's longest requests or uploads, those requests are cut off when the target is removed.
+## Example
+A deployment script sets the delay to 5 seconds to speed up rollouts. Report generation requests take 40 seconds, so any report running on an old instance at deregistration fails. Raising the delay to 60 seconds lets them complete.
+W: Increase the deregistration delay: it gives in-flight requests on old instances time to complete after they stop receiving new traffic, which removes the dropped connections at deregistration.
+X: A=Cross-zone load balancing: it changes how traffic is spread across AZs; it does nothing for requests on a target that is being removed.
+B=Shorter health check interval: health checks decide whether a target is healthy; they do not control how deregistration handles connections already in progress.
+D=Switch to NLB: an NLB also removes deregistered targets and has its own deregistration delay, so the same setting would still need tuning, and the ALB's Layer 7 features would be lost.
+T: Requests failing at the moment targets are deregistered → lengthen the deregistration delay so in-flight work can drain.
+
+@ Q001612 explain
+G: ## Which load balancers have fixed IPs
+- **Network Load Balancer**: one static IP per enabled AZ, and for internet-facing NLBs you can assign your own **Elastic IP** per AZ. Partners can allow-list these addresses.
+- **Application Load Balancer**: its IP addresses change over time; you reach it by DNS name, and you cannot assign Elastic IPs to it.
+## NLB in front of ALB
+An NLB target group can use the target type **`alb`**, registering an ALB as the target. The NLB's TCP listener forwards the connection to the ALB, which then:
+- terminates TLS with its ACM certificate, and
+- applies host- and path-based routing rules.
+Result: `203.0.113.10` and `203.0.113.11` (the NLB's Elastic IPs) never change, while the ALB does Layer 7 work behind them.
+W: NLB with Elastic IPs in front of an ALB target: the NLB provides the small fixed set of allow-listable IPs, and the ALB behind it provides ACM TLS termination and path routing.
+X: A=ALB with Elastic IPs per AZ: ALBs do not support Elastic IPs or static addresses, so there is nothing stable for the partner to allow-list.
+C=Gateway Load Balancer with static IPs: a GWLB inserts inspection appliances into routed traffic; it has no internet-facing listener, TLS termination or path routing.
+D=Classic Load Balancer with fixed IPs: Classic Load Balancers have changing IPs reached through DNS, and they offer no path-based routing.
+T: Fixed IPs plus Layer 7 features → NLB with Elastic IPs forwarding to an ALB target.
+
+@ Q001613 explain
+G: ## One ALB, several domain names
+**Host-based routing** lets ALB listener rules match the HTTP `Host` header:
+- `Host: api.example.com` → API target group
+- `Host: www.example.com` → web target group
+## Certificates with SNI
+An HTTPS listener has a default certificate and can hold additional certificates. When a client connects, it sends the requested name through **Server Name Indication (SNI)**, and the ALB picks the matching certificate automatically.
+- You can attach one certificate per name, or one certificate that lists both names (for example with subject alternative names).
+- ACM provides the certificates and renews them automatically.
+So one ALB can serve many HTTPS domains, each with a valid certificate and its own routing.
+W: Host-header rules plus SNI: the host rules split traffic by domain name, and SNI lets the one HTTPS listener present the right certificate for each name.
+X: A=Path rules on /api and /www: the sites differ by host name, not by path, so path rules cannot tell a request for `api.example.com/` from one for `www.example.com/`.
+B=Query-string rules: clients do not add a site identifier to query strings; the domain name is in the Host header, which is what should be matched.
+D=Two ALBs with a wildcard certificate: it could work, but it doubles the load balancers and cost and contradicts the requirement that one ALB serves both names.
+T: Several domains on one ALB → host-header rules for routing plus SNI for certificates.
+
+@ Q001614 explain
+G: ## Why stateful firewalls need symmetric paths
+A stateful firewall remembers each connection. It accepts a reply only if it saw the request go out. If the reply goes through a different appliance, that appliance has no record of the flow and drops it.
+## Where asymmetry comes from
+In a centralized inspection design, spoke VPCs connect to a **transit gateway**, which sends traffic to an inspection VPC with a GWLB endpoint in each AZ. By default the transit gateway tries to keep traffic in the AZ where it entered, so the request can enter the inspection VPC in AZ-a while the reply enters in AZ-b and reaches a different appliance.
+## Appliance mode
+**Appliance mode** on the inspection VPC's transit gateway attachment makes the transit gateway choose one AZ per flow (based on a flow hash) for both directions. Both legs then reach the same GWLB endpoint, and GWLB's flow stickiness sends them to the same appliance.
+W: Appliance mode: it keeps both directions of each flow in the same AZ of the inspection VPC, so the same stateful appliance sees the request and the reply.
+X: A=Source-IP stickiness on the GWLB target group: GWLB already keeps a flow on one appliance per load balancer node; the problem is that the return leg arrives in a different AZ, which stickiness settings do not change.
+B=Cross-zone on the GWLB: it lets GWLB nodes use appliances in other AZs but does not make the reply enter the same AZ as the request; AWS's documented fix for this asymmetry is appliance mode.
+C=NAT gateway per AZ: NAT gateways translate addresses for outbound internet traffic; they do not decide which AZ a flow's return traffic uses.
+T: Stateful appliances dropping return traffic that crosses AZs in a centralized inspection VPC → enable appliance mode on the transit gateway attachment.
+
+@ Q001615 explain
+G: ## Where TLS ends
+- **ALB termination**: the client's TLS session ends at the ALB, which decrypts, inspects the HTTP request and applies host/path rules and AWS WAF. It can re-encrypt to targets over HTTPS, but the traffic is plaintext inside the load balancer, so it is two TLS sessions, not one.
+- **NLB passthrough**: a `TCP` listener forwards the encrypted bytes unchanged; the backend holds the certificate and private key and terminates TLS itself. Only the client and the backend ever see plaintext.
+- **NLB TLS listener**: an NLB can also terminate TLS with an ACM certificate, but then it is no longer passthrough.
+## The trade-off
+Passthrough satisfies strict end-to-end requirements but gives up Layer 7 features (no host/path routing, no WAF, no header insertion) and moves certificate management to the backends.
+W: NLB passthrough versus ALB termination: passthrough keeps one TLS session from client to backend but loses Layer 7 routing, while ALB termination gives Layer 7 features and centralized ACM certificates at the cost of decrypting at the load balancer.
+X: A=NLB cannot handle TLS: an NLB supports both TLS passthrough (TCP listener) and TLS termination (TLS listener).
+C=ALB always keeps end-to-end encryption: the ALB decrypts every request to route it; re-encrypting to targets is optional and still creates a second session, not one continuous one.
+D=No difference, both always re-encrypt: neither load balancer always re-encrypts; ALB re-encrypts only to HTTPS targets, and NLB passthrough never decrypts at all.
+T: Strict end-to-end TLS → NLB passthrough (lose L7); L7 routing, WAF and central certificates → ALB termination (TLS ends at the ALB).
+
+@ Q001616 explain
+G: ## Where VPC Flow Logs can go
+A flow log captures IP traffic metadata for a VPC, subnet or network interface and publishes it to one destination. You can create several flow logs for the same resource to feed several destinations. The supported destinations are:
+- **Amazon CloudWatch Logs**: search, metric filters and alarms.
+- **Amazon S3**: cheap, durable storage; you can choose Parquet format and Hive-compatible prefixes, and query with Amazon Athena. S3 Lifecycle rules can move old logs to Glacier storage classes for multi-year retention.
+- **Amazon Data Firehose**: near-real-time delivery to HTTP endpoints and third-party tools such as SIEMs, or to other destinations.
+## Example
+One flow log to Firehose feeds the SIEM within seconds to minutes; a second flow log on the same VPC writes Parquet files to an S3 bucket with a seven-year lifecycle, queried with Athena when auditors ask.
+W: B=Data Firehose to the SIEM: Firehose is a native flow log destination built for near-real-time streaming delivery to third-party endpoints, which is what the security team needs.
+D=Amazon S3 with Athena: S3 gives low-cost long-term storage with lifecycle tiering, and Athena queries the logs in place only when needed, which fits the compliance team.
+X: A=CloudWatch Logs only: storing seven years of flow logs in CloudWatch Logs costs far more than S3, and it is not a streaming pipeline to the SIEM by itself.
+C=AWS Config: Config records resource configuration changes; it is not a flow log destination and does not store traffic records.
+E=AWS CloudTrail: CloudTrail records API calls, not network traffic, and cannot receive flow logs.
+T: Flow logs to a SIEM in near real time → Data Firehose; cheap long-term retention with occasional queries → S3 plus Athena.

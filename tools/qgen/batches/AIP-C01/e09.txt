@@ -1,0 +1,362 @@
+# AIP-C01 detailed explanations, batch e09 (explanation-only rewrites; letters are the published ones)
+
+@ Q001986 explain
+G: ## What intelligent prompt routing does
+Amazon Bedrock intelligent prompt routing puts one endpoint (a prompt router) in front of two models from the same family, for example a small and a large model from one provider. For each request, the router predicts how well each model would answer and sends the prompt to the cheaper model unless the larger one is expected to be meaningfully better.
+- You call the router's ARN as the `modelId` in `InvokeModel` or `Converse`, the same way you would call a model.
+- A default router is ready to use; a configured router lets you pick the two models and a response quality difference threshold.
+- The response tells you which model actually served the request, so you can monitor the split.
+## Why it fits a mixed workload
+A help desk with many "how do I reset my password" questions and a few deep troubleshooting cases wastes money if every request goes to the most capable model. Routing sends the easy ones to the small model and keeps the large model for hard ones, without the team training or hosting its own classifier.
+W: Intelligent prompt routing: it chooses per request between a smaller and a larger model in the same family based on predicted response quality, which cuts cost on trivial questions without any custom routing code.
+X: A=Batch inference: batch jobs process a file of prompts asynchronously from Amazon S3 and return results later, which does not suit an interactive support assistant and still sends every prompt to the same model.
+C=Cross-Region inference: an inference profile spreads requests across Regions to gain throughput and resilience; it keeps using the model you chose and never swaps in a smaller model for easy questions, and it is not a way to pick a cheaper Region for each request.
+D=Provisioned Throughput: it reserves dedicated model units billed per hour whether or not they are used; it does not route easy questions to a cheaper model and is usually more expensive unless utilization is consistently high.
+T: When request difficulty varies and you do not want to build a classifier, intelligent prompt routing picks the cheaper model per request; the other options only change pricing or capacity for one model.
+
+@ Q001987 explain
+G: ## Application inference profiles
+An inference profile is a Bedrock resource you invoke in place of a model ID. An **application inference profile** is one you create yourself (`CreateInferenceProfile`), copying a foundation model or a system cross-Region profile, and you can attach tags to it.
+- Each application calls its own profile ARN, for example `app=claims-bot` and `app=hr-bot`.
+- After you activate those tags as cost allocation tags in the Billing console, AWS Cost Explorer and the Cost and Usage Report split Bedrock charges by tag, with daily granularity.
+- Usage metrics such as `InputTokenCount` and `OutputTokenCount` and model invocation logs are recorded against the profile, so token volume per application is visible too.
+## Example
+Five apps share one model. Create five profiles, tag each with its application name, change each app's `modelId` to its profile ARN, and build the finance dashboard from Cost Explorer (cost) and CloudWatch (tokens). No extra accounts or log parsing are needed.
+W: Per-application inference profiles with tags: each application gets its own invocable identity, so both tagged cost and token metrics can be separated per application with only a model ID change in each app.
+X: A=Latency as a cost proxy: `InvocationLatency` measures response time, which depends on output length, load and model, not on billed tokens; two apps with the same latency can have very different token costs.
+B=Estimate tokens from characters: tokens are counted by the model's tokenizer and the ratio to characters varies by language and content, so estimates are inaccurate, and building and maintaining log parsing for five services is far more effort.
+D=One account per application: moving five applications into separate accounts is a large migration, and comparing monthly bills does not give the daily breakdown finance asked for.
+T: To attribute shared-model usage per application, give each application its own tagged application inference profile rather than approximating cost from latency, text length or separate accounts.
+
+@ Q001988 explain
+G: ## Exact caches, prompt caches and semantic caches
+- An **exact-match cache** stores an answer under the literal prompt text (or a hash of it). "reset my VPN password" and "how do I change my VPN password" are different keys, so the second question misses.
+- **Bedrock prompt caching** keeps the model's processed state for a repeated prompt prefix (for example a long system prompt) for a few minutes. It lowers cost and latency of the input side, but the model still generates a new answer every time.
+- A **semantic cache** converts each question into an embedding and searches previously answered questions by vector similarity. If the nearest stored question is above a similarity threshold (for example cosine similarity of 0.95), the stored answer is returned without calling the model.
+## Building one
+Store question embeddings and answers in a vector-capable store such as Amazon MemoryDB, Amazon ElastiCache with vector search or Amazon OpenSearch Service, add a time-to-live so answers stay fresh, and tune the threshold so different intents do not collide.
+W: Semantic cache on embeddings: paraphrased questions have nearby embeddings, so they hit the same cached answer, skipping the model call and cutting latency for repeated intents.
+X: A=Higher temperature: temperature only changes how random token sampling is; it does not make generation faster or avoid any model calls.
+B=Bedrock prompt caching: it reuses the processing of an identical prompt prefix, not stored answers, and it does not match differently worded questions; the model still runs for every request.
+D=Exact-match cache: normalizing case and whitespace still leaves differently worded questions with different keys, so paraphrases like the VPN examples miss the cache.
+T: Paraphrased repeats need matching by meaning, which a semantic cache on embeddings provides; exact-match and prompt caching only help when the text itself repeats.
+
+@ Q001989 explain
+G: ## Time to first token
+For voice, the delay before the first words arrive (time to first token, TTFT) matters most, because speech synthesis can start as soon as tokens stream in.
+## Latency-optimized inference in Bedrock
+For selected models in selected Regions, Bedrock offers latency-optimized inference: the same model served on infrastructure tuned for faster responses. You opt in per request with `performanceConfig` set to `latency: optimized` in `InvokeModel` or `Converse`.
+- It is billed at a different (higher) per-token price than standard inference, so you can use it only for the latency-sensitive part of a workload.
+- If a request cannot be served with optimized latency, it falls back to standard latency rather than failing.
+- Combine it with streaming (`ConverseStream`) so tokens reach the voice pipeline as soon as they are produced.
+## Example
+A voice bot uses latency-optimized inference for live turns, while the nightly call-summary job keeps using standard or batch inference.
+W: Latency-optimized inference: it is designed to lower response latency, including time to first token, on supported models in exchange for a higher price, which matches a voice workload that is willing to pay more only for that path.
+X: A=Batch inference: batch jobs are asynchronous and complete in minutes to hours, so no timeout setting makes them usable for live voice replies.
+C=Global cross-Region inference: it spreads requests across Regions for throughput and availability; it is not a latency tier, and a request may be served farther away than the source Region.
+D=Larger maxTokens: `maxTokens` only caps how long the output may be; it has no effect on when the first token is produced.
+T: For the lowest time to first token on a supported model at a premium price, use latency-optimized inference; cross-Region profiles buy throughput and batch trades latency for price.
+
+@ Q001990 explain
+G: ## Evaluating a RAG system in two parts
+A retrieval-augmented generation (RAG) system can fail in two places: retrieval brings back the wrong passages, or the model writes an answer that is not supported by the passages it received.
+## Amazon Bedrock knowledge base evaluation
+Bedrock Evaluations can run a RAG evaluation job that uses an LLM as a judge:
+- **Retrieve-only** jobs score the retrieved context, for example context relevance and context coverage.
+- **Retrieve-and-generate** jobs also score the answer, for example correctness, completeness and faithfulness (is the answer grounded in the retrieved context), plus responsible-AI metrics.
+- You upload the test prompts (and optional reference answers) as a JSONL dataset in Amazon S3, point the job at a Bedrock knowledge base or supply your own RAG outputs, and get per-question and aggregate scores.
+## Example
+500 test questions in one dataset, one job, and a report showing where retrieval is weak versus where the answer drifts from the sources, with no custom harness to build.
+W: Knowledge base evaluation job with an LLM judge: it scores retrieval quality and answer faithfulness across all 500 questions as a managed job, which is exactly the two measurements required.
+X: A=BLEU against source documents: BLEU counts n-gram overlap with reference text; a faithful answer can paraphrase and score low, while an answer copying phrases can score high yet be wrong, and it says nothing about retrieval quality.
+B=Latency metrics in a load test: `InvocationLatency` shows performance, not whether the retrieved context was relevant or the answer was grounded.
+D=Human review of 10 answers: expert review is valuable for calibration, but 10 of 500 questions is too small a sample to measure quality reliably before launch.
+T: To measure both retrieval relevance and answer faithfulness at scale without custom tooling, run a Bedrock knowledge base (RAG) evaluation job with an LLM judge.
+
+@ Q001991 explain
+G: ## How a Bedrock agent picks an action
+An agent's orchestration prompt tells the foundation model which tools exist. For each action group, the model sees the action names, their descriptions and the parameter descriptions (from the OpenAPI schema or function details). It chooses a tool by reading that text, the same way a person would read an API catalog.
+- Vague descriptions such as "gets status" for both `getOrderStatus` and `getShipmentStatus` leave the model guessing.
+- Clear descriptions say what each action returns and when to use it, for example "Use getShipmentStatus when the user asks where a package is, about delivery or tracking; returns carrier, tracking number and location."
+## Using the trace
+The agent trace shows the model's rationale for each step. If it says "the user asks about an order, so I call getOrderStatus", the descriptions are the thing to fix, then re-test the same prompts.
+W: Clarify action and parameter descriptions: the model routes to tools based on those descriptions, so making the two actions clearly distinct in purpose and inputs fixes the wrong selection while both APIs keep working.
+X: B=Guardrail blocking "package": a guardrail filter on that word would block legitimate customer questions instead of steering them to the right action, and it does not change how the agent chooses tools.
+C=Longer idle session timeout: the timeout only controls how long conversation state is kept between turns; it has no influence on which action group the model selects.
+D=Larger embedding model: agents do not choose actions through an embedding model; the choice is made by the orchestration model reading the tool descriptions, so an embedding change has no effect.
+T: When an agent calls the wrong tool but both tools work, rewrite the action and parameter descriptions and confirm with the trace; timeouts, guardrails and embeddings do not drive tool choice.
+
+@ Q001992 explain
+G: ## Treat prompts like code
+A prompt change can alter every answer, so it deserves the same gate as a code change: automated tests that must pass before promotion.
+## A golden dataset gate
+- A **golden dataset** is a fixed set of representative questions with reference answers or grading criteria, including past failure cases.
+- A pipeline stage (for example in AWS CodePipeline or another CI system) runs the candidate prompt against the dataset, scores the outputs with automated metrics or an LLM judge (for example a Bedrock evaluation job), and compares them with the current production baseline.
+- If scores fall below a threshold, the stage fails and the prompt version is not promoted.
+- Versioned prompts, for example in Bedrock Prompt Management, make it clear which version passed.
+## Example
+Baseline accuracy is 92%. A new prompt scores 85% on the golden set, so the pipeline blocks it before any user sees it.
+W: Pipeline evaluation stage on a golden dataset: every prompt change is scored automatically against the same reference questions and blocked when it regresses, which prevents the production regressions seen this quarter.
+X: A=Self-rating in production: the model grading its own answers is unreliable, and scores reviewed weekly in production come after users are already affected, so nothing blocks promotion.
+B=Higher temperature in staging: raising temperature adds randomness that makes results harder to compare, and it does not score changes against reference questions or gate promotion.
+C=Deploy to everyone and roll back on complaints: this finds regressions only after users experience them, which is exactly the problem the team wants to prevent.
+T: Stop prompt regressions before release by scoring every change against a fixed golden dataset in the pipeline and failing the stage on low scores, not by watching production.
+
+@ Q001993 explain
+G: ## Reading stopReason in the Converse API
+Every `Converse` response includes a `stopReason` that tells you why generation ended:
+- `end_turn`: the model finished naturally.
+- `max_tokens`: the output reached the `maxTokens` limit in `inferenceConfig` (or the model's output cap), so the text is cut off.
+- `stop_sequence`: a configured stop sequence appeared.
+- `tool_use`, `guardrail_intervened`, `content_filtered`: the model requested a tool or content was blocked.
+## Fixing truncation
+Output length is limited separately from the context window. A model can accept a large input but still stop at, say, 1,000 output tokens if that is what `maxTokens` allows.
+- Raise `maxTokens` up to the model's maximum output tokens.
+- If the report is longer than the model can produce in one response, generate it section by section (outline first, then each section) and join the parts.
+W: Raise maxTokens or generate in sections: `max_tokens` means the output hit its token limit, so allowing more output tokens, or splitting the report into several smaller generations, lets the documents finish.
+X: A=Stop sequence: a stop sequence makes the model stop earlier when that text appears; it cannot extend output that is already being cut off by the token limit.
+B=Shorter input: the input is well within the context window, and `max_tokens` refers to the output limit, so trimming the prompt does not raise the output ceiling.
+D=Lower temperature: temperature controls randomness, not length; a lower value does not make the model plan a shorter report that fits the limit.
+T: A `stopReason` of `max_tokens` means the output limit was hit, so raise `maxTokens` or chunk the generation; stop sequences, input size and temperature do not fix it.
+
+@ Q002818 explain
+G: ## Hard constraints first
+Some requirements are negotiable (a slightly better tone), others are hard constraints that eliminate options outright. Here there are two:
+- **Data residency**: processing must stay in `eu-central-1` (Frankfurt). Not every Bedrock model, feature (for example knowledge bases, agents, guardrails, fine-tuning) or inference option is available in every Region, and cross-Region inference profiles can send requests to other Regions, so the allowed set must be confirmed.
+- **Latency**: p95 under three seconds. Models differ a lot in speed; a model that is available but too slow for typical prompts and answer lengths fails the requirement.
+The citation requirement then points to RAG (for example a Bedrock knowledge base) which also has to be available in that Region.
+## Practical order
+Check the Bedrock model and feature availability for `eu-central-1`, shortlist models, measure p95 latency with representative prompts, then choose and build.
+W: Confirm what is available in eu-central-1 and meets latency: residency and latency are hard constraints, so checking Regional model and feature availability and measured latency first avoids building on something that cannot be deployed.
+X: A=Highest benchmark score first: a leaderboard result says nothing about whether the model is offered in Frankfurt or meets a three-second p95, so the Region check could invalidate the choice later.
+B=UI first, model after the pilot: deferring the model decision ignores the constraints that decide whether the solution is feasible and risks rework after launch.
+C=Fine-tune before confirming deployment: customization is not available for every model in every Region, and fine-tuning first could produce a model that cannot be hosted where the data must stay.
+T: Start with the non-negotiables: confirm which models and features exist in the required Region and meet the latency target before picking by benchmark, UI or customization.
+
+@ Q002819 explain
+G: ## Why success criteria come first
+Before choosing models or drawing architecture, a team needs to know what "good enough" means in numbers. Measurable success criteria turn a vague idea ("a helpful assistant") into testable targets:
+- **Quality**: for example at least 90% correct answers on a representative test set, or a maximum hallucination rate.
+- **Latency**: for example p95 response time under 3 seconds.
+- **Cost**: for example under a fixed amount per request or per month at expected volume.
+- **Business outcome**: for example 30% fewer tickets escalated to humans.
+## How they are used
+These criteria drive model selection (which models meet quality and latency), architecture (RAG versus fine-tuning, caching), and the evaluation plan (the golden dataset and thresholds). They also answer the product team's question, whether the solution is worth building, because the expected benefit can be compared with the estimated cost.
+W: Measurable success criteria: accuracy, latency and cost targets define what the solution must achieve, which is what architecture choices and later evaluation are measured against.
+X: A=List of every recent model: a catalog of models is input for later model selection, not a requirement; without criteria there is no way to decide between them.
+B=UI colors and display name: branding details can be decided at any time and have no effect on architecture, model choice or feasibility.
+C=Fine-tuning contract before requirements: committing to a vendor and to fine-tuning before knowing the requirements reverses the process; many use cases are solved with prompting or RAG instead.
+T: Define measurable accuracy, latency and cost targets before architecture work; model lists, branding and vendor contracts come after you know what success looks like.
+
+@ Q002820 explain
+G: ## Model routing by complexity
+Larger models are more capable but cost more per token and respond more slowly. Many workloads are skewed: most requests are simple, a few are hard.
+- A **router** classifies each request (with rules, a small classifier, or a managed feature such as Bedrock intelligent prompt routing) and sends simple queries to a small, cheap model and complex ones to a large model.
+- Quality is protected because hard questions still reach the capable model.
+## Example
+Suppose the large model costs ten times more per token than the small one. If 80% of traffic is simple FAQs that the small model answers well, routing moves 80% of requests to the cheap model, so total model cost drops substantially while complex queries keep the same quality.
+The design should still be validated: measure answer quality on a test set for both paths to confirm the small model really handles the FAQ traffic.
+W: Route by complexity: most traffic is simple and goes to the cheaper, faster model, while the remaining complex queries still get the large model, so cost falls without lowering quality where it matters.
+X: A=Smallest model for everything: it is cheapest, but complex queries would get weaker answers, which breaks the requirement not to hurt quality.
+B=Random alternation: splitting traffic at random ignores difficulty, so some complex questions go to the small model and some FAQs still pay for the large one.
+C=Largest model for everything: quality is high but every simple FAQ pays the large-model price, which is the least cost-effective design for an 80% simple workload.
+T: With skewed traffic, route simple requests to a small model and hard ones to a large model; one-size-fits-all choices either overpay or underperform.
+
+@ Q002821 explain
+G: ## Intelligent prompt routing in Bedrock
+Intelligent prompt routing gives you a single prompt router that sits in front of two models from the same model family. For each prompt, the router predicts the response quality of each model and sends the request to the cheaper model unless the larger model is expected to answer noticeably better.
+- You invoke the router ARN as the `modelId` in `Converse` or `InvokeModel`, so application code barely changes.
+- Default routers are provided; configured routers let you choose the models and set the quality difference threshold that decides when to pay for the larger model.
+- The response indicates which model handled the request, which helps with monitoring cost and quality.
+## When to use it
+Use it when requests vary in difficulty and you want cost savings without building and maintaining your own classifier.
+W: Intelligent prompt routing: it selects per request between models in the same family based on predicted response quality and cost, which is exactly the automatic routing described.
+X: B=Batch inference jobs: batch processes a file of prompts asynchronously at a lower price, but all prompts go to the one model you specify; nothing is routed.
+C=Model distillation: distillation trains a smaller custom model from a larger teacher model's responses; it produces a model, it does not route live prompts between models.
+D=Provisioned Throughput: it reserves dedicated capacity for one model for a committed term; it has no logic to pick a model per prompt.
+T: Automatic per-request choice between models in one family is intelligent prompt routing; batch, distillation and Provisioned Throughput change price, model or capacity, not routing.
+
+@ Q002822 explain
+G: ## On-demand quotas and cross-Region inference
+On-demand Bedrock use has per-Region, per-model quotas (requests and tokens per minute). A burst in `us-east-1` can hit those limits and return throttling errors.
+A **cross-Region inference profile** lets Bedrock serve your requests from several Regions in a geography. A geographic profile such as one prefixed `us.` routes among US Regions, so traffic from `us-east-1` can be served in other US Regions when capacity is needed.
+- The change is small: replace the model ID with the inference profile ID in the call.
+- IAM policies (and any SCPs) must allow invoking the profile and the model in the destination Regions.
+- Data at rest (logs, knowledge bases) stays in the source Region; only inference is processed elsewhere in the geography, which the company has allowed.
+W: Cross-Region inference profile: it spreads requests across US Regions to absorb peaks and raise available throughput, and adopting it only requires switching the model ID to the profile ID.
+X: A=Larger max tokens: `maxTokens` caps each response's length; it does not reduce the number of requests, and longer outputs actually consume more of the token quota.
+B=Second account in us-east-1: a new account means duplicating the deployment, splitting traffic between accounts and managing quotas and access in both, which is far more change than using a profile, and it still depends on capacity in the same Region.
+C=Larger context window: context window size limits how much input a request can hold; it does not increase requests or tokens per minute.
+T: When on-demand throughput limits bite and other Regions in the geography are allowed, a cross-Region inference profile adds capacity with a one-line model ID change.
+
+@ Q002823 explain
+G: ## Context window as a hard filter
+The context window is the maximum number of tokens a model can take in one request, counting the input (document plus instructions) and, for many models, the generated output too.
+- English text averages very roughly 1.3 tokens per word. A 400-page contract at a few hundred words per page can reach a couple of hundred thousand tokens or more.
+- If the document does not fit, the request fails or the text has to be split, which the single-request requirement rules out.
+## Selection order
+First filter models whose context window can hold the whole contract, instructions and summary with room to spare. Then compare the remaining models on summary quality, latency and price. Also check the maximum output tokens so the summary itself is not truncated.
+## Example
+If the contract measures about 250,000 tokens, a model with a 128,000-token window is excluded no matter how cheap it is, while a model with a much larger window can take it in one request.
+W: Context window large enough for the full contract: a single-request summary is only possible if the model can accept the whole document plus instructions, so this is the first filter.
+X: A=Image generation: creating images from text is a different capability and has nothing to do with reading and summarizing a long contract.
+B=Lowest output token price: price only matters among models that can fit the document; the cheapest model is useless if the contract exceeds its window.
+C=Speech-to-text interface: the input is written contract text, so audio transcription does not affect whether the model can summarize it.
+T: For long single-request inputs, filter models by context window first, then compare quality and price among those that fit.
+
+@ Q002824 explain
+G: ## How prompt caching works
+When the same long prefix is sent with every request, the model re-processes it each time, paying for all input tokens and adding latency.
+With Bedrock prompt caching, you mark a **cache checkpoint** after the stable part of the prompt (for example the 50,000-token policy document). On the first request the prefix is processed and cached; later requests that start with the identical prefix read it from the cache.
+- Tokens read from the cache are billed at a reduced rate (writing the cache can cost somewhat more on some models) and are processed faster, which lowers time to first token.
+- The cache lives for a short time-to-live (minutes) that is refreshed on each hit, so it suits steady interactive traffic.
+- Only an exact, identical prefix matches, so put the static document first and the changing question last.
+- Support and minimum prefix sizes vary by model.
+## Example
+Document (cached) + "What is the travel limit for managers?" (new). Each question pays full price only for its short new part.
+W: Prompt caching for the repeated prefix: the unchanged 50,000-token document is processed once and then read from cache on later requests, cutting both input cost and latency for the short questions.
+X: A=Higher temperature: temperature changes sampling randomness; it does not speed up processing or reduce the number of billed input tokens.
+C=Batch inference: batch jobs are asynchronous and return results later, which does not fit interactive questions, and each prompt would still include the full document.
+D=Smaller context window: the document needs a large window to fit, and a smaller window would simply reject the requests rather than reduce cost.
+T: When a large identical prefix repeats across requests, cache it with prompt caching; temperature, batch and smaller windows do not remove the repeated processing.
+
+@ Q002825 explain
+G: ## Running custom models in Bedrock
+When you customize a Bedrock model (fine-tuning, continued pre-training or distillation), the result is a custom model in your account. Custom models do not share the on-demand pool of base models in the same way.
+- **Provisioned Throughput** buys dedicated model units for the custom model, with a no-commitment, 1-month or 6-month term. You invoke the provisioned model ARN, and the purchased units give consistent, guaranteed capacity.
+- Some custom models can instead be deployed for on-demand use, billed per token without reserved capacity, but that option is model-dependent and does not guarantee capacity.
+## Example
+A fine-tuned model powers a contact-center assistant with steady daytime traffic. Buying Provisioned Throughput for it ensures predictable throughput at all times, which is exactly the "consistent, guaranteed capacity" requirement.
+W: Provisioned Throughput for the custom model: it provides dedicated, reserved model units for the customized model, which is the way to run it with consistent, guaranteed capacity.
+X: B=Notebook per user: SageMaker notebooks are development environments; they do not host or serve a Bedrock custom model for applications.
+C=On-demand with no configuration: a custom model is not automatically invocable on demand; where on-demand deployment exists it must be set up and it offers no reserved capacity.
+D=Cross-Region inference profile only: system cross-Region profiles route base-model traffic across Regions; they do not provide dedicated capacity for your custom model.
+T: Guaranteed capacity for a customized Bedrock model comes from Provisioned Throughput; on-demand and cross-Region options do not reserve capacity for it.
+
+@ Q002826 explain
+G: ## HIPAA on AWS in short
+HIPAA protects patient health information (PHI). On AWS it follows the shared responsibility model:
+- **AWS side**: you sign a Business Associate Addendum (BAA) with AWS, typically accepted in AWS Artifact, and process PHI only in **HIPAA-eligible services**. Amazon Bedrock, Amazon S3, AWS Lambda and many others are on the eligible list.
+- **Your side**: configure those services securely. That means encryption in transit (TLS) and at rest (for example AWS KMS keys for S3 and Bedrock resources), least-privilege IAM so only the right roles can read notes or invoke the model, and audit logging with AWS CloudTrail.
+## Example
+Patient notes sit in an encrypted, private S3 bucket. A Lambda role that can read only that bucket calls a Bedrock model; CloudTrail records every call; the account is covered by the BAA.
+W: B=Encryption and least-privilege IAM: HIPAA requires safeguards for PHI, and encrypting data at rest and in transit plus limiting access to the minimum needed roles are core technical controls.
+E=HIPAA-eligible services under a BAA: PHI may only be processed in services covered by the BAA with AWS, so using eligible services such as Bedrock under a signed BAA is a prerequisite.
+X: A=Disable CloudTrail: removing the audit trail weakens compliance; HIPAA expects records of who accessed PHI, so logging should stay on and be protected.
+C=Public bucket: making patient notes publicly readable exposes PHI to anyone and is a direct breach, whatever the convenience.
+D=Free public chatbot: a consumer chatbot is not covered by your BAA and may retain or use the data, so sending patient notes to it violates HIPAA.
+T: PHI workloads need HIPAA-eligible services under a BAA plus your own safeguards such as encryption, least-privilege access and audit logging.
+
+@ Q002827 explain
+G: ## Managed API versus self-hosted endpoint
+- **Amazon Bedrock** serves foundation models as a fully managed API. There are no instances to choose, no containers to maintain and no scaling policies to tune; you call `Converse` or `InvokeModel` and pay per token (or buy Provisioned Throughput).
+- **A SageMaker AI endpoint** hosts a model you deploy, such as an open-weight model. You choose instance types, container and inference code, configure auto scaling, patch and monitor it. That control is useful when you need custom inference logic, a model Bedrock does not offer, or specific hardware.
+## Choosing
+If the requirements are fast delivery, minimal operations and no custom inference code, the extra control of self-hosting brings cost and effort without benefit. A managed Bedrock model that meets the quality bar is the simpler fit.
+W: Managed Bedrock model: it removes hosting, scaling and patching work, so the team can deliver quickly with minimal operations, and nothing in the requirements needs custom inference code.
+X: B=Run both and merge results: sending every request to two models doubles cost and latency and requires merging logic, which contradicts minimal operations.
+C=SageMaker endpoint for control: hosting control is not needed here, and running an endpoint means managing instances, scaling and updates, which slows delivery.
+D=Train a new foundation model: pretraining a model from scratch takes large datasets, compute budgets and months of work, the opposite of fast delivery.
+T: Without a need for custom inference code or hosting control, prefer a managed Bedrock model over running your own endpoint.
+
+@ Q002828 explain
+G: ## Multilingual quality is model-specific
+Foundation models are trained on different mixes of languages. A model that is excellent in English can be noticeably weaker in Japanese, for example with tokenization, formality or product terminology.
+## Evaluate in every target language
+- Build an evaluation set with representative product questions written natively in English, Spanish and Japanese, including tricky cases such as product names, units and mixed-language queries.
+- Run each candidate model against all three sets, scoring with human reviewers or an LLM judge (for example a Bedrock model evaluation job), and compare per language.
+- Choose the model only if it meets the quality bar in every language, since the requirement is consistent quality.
+## Example
+Model X scores 93% in English, 91% in Spanish and 78% in Japanese; model Y scores 90%, 89% and 88%. Y is the better fit for consistent quality even though X wins in English.
+W: Evaluation set in all three languages: quality varies by language and model, so testing with representative questions in each language confirms the model meets the bar everywhere before selection is final.
+X: A=English only at launch: restricting users to English fails the stated requirement to answer in Spanish and Japanese.
+B=Fine-tune on English and hope: cross-lingual transfer is not guaranteed, and a plan without measurement cannot confirm consistent quality in the other languages.
+C=English test set with translated results: English scores say nothing about how the model actually handles Spanish or Japanese questions, so language-specific weaknesses go unnoticed.
+T: For multilingual requirements, validate candidate models with native test questions in every target language before choosing one.
+
+@ Q002829 explain
+G: ## InvokeModel versus Converse
+- **InvokeModel** sends a request body in each provider's own format. The body for an Anthropic model differs from the body for Meta Llama, Amazon Nova or Mistral, and responses differ too, so switching models means changing request and parsing code.
+- **Converse** (and `ConverseStream`) defines one message format for all models that support it: a list of `messages` with roles and content blocks, an optional `system` prompt, `inferenceConfig` (such as `maxTokens`, `temperature`), and `toolConfig` for tool use. Responses come back in the same shape with a `stopReason` and token `usage`.
+## Example
+To compare two providers' models, the application changes only the `modelId` string; the rest of the call, including tool definitions and guardrail settings, stays the same. Model-specific options can still be passed through `additionalModelRequestFields` when needed.
+W: Converse API: it provides a consistent request and response format across supported models, so switching providers is mostly a change of model ID instead of a rewrite of request bodies.
+X: A=GetFoundationModel: it is a control-plane call that returns details about a model, such as its modalities and supported features; it does not run inference.
+B=InvokeModel with provider bodies: this is exactly the per-provider request formatting the company wants to avoid, since each model family expects a different body.
+D=CreateModelCustomizationJob: it starts a fine-tuning or continued pre-training job; it has nothing to do with sending prompts in a common format.
+T: For model-agnostic chat requests in Bedrock, use the Converse API; InvokeModel ties your code to each provider's body format.
+
+@ Q002830 explain
+G: ## Getting structured output with tool use
+Asking a model "reply in JSON" in plain text usually works, but not always: it may add a sentence before the JSON, miss a field or produce invalid syntax, which breaks downstream code.
+With **tool use** (function calling), you describe a tool in `toolConfig` with a JSON Schema `inputSchema`, for example a `record_order` tool with required fields `orderId` (string) and `amount` (number).
+- The model responds with a `toolUse` content block whose `input` is a JSON object for that schema, separate from any free text.
+- With `toolChoice` set to a specific tool (on models that support it), the model is required to call that tool, so every response contains the structured arguments.
+- Your code reads the `input` object directly and still validates it against the schema before use.
+## Example
+Extracting invoice fields: the model returns `{"orderId":"A-123","amount":42.5}` inside the tool call, and the pipeline never has to scrape text.
+W: Tool schema with tool use: the model returns arguments shaped by a JSON Schema in a dedicated structured block, which is far more reliable for downstream processing than parsing free text.
+X: B=Higher temperature: more randomness makes the output less consistent, so it increases, rather than reduces, the chance of malformed or varying JSON.
+C=Markdown table converted manually: an extra manual conversion step is slow and fragile, and tables do not express nested or typed fields well.
+D=JSON in plain text parsed with regex: free-text JSON can be wrapped in prose or malformed, and regular expressions are a brittle way to parse it.
+T: For dependable structured output, define a tool with a JSON Schema and use tool use instead of asking for JSON in free text.
+
+@ Q002831 explain
+G: ## Data constraints shape the architecture
+When a GenAI feature processes customer data from several countries, two data questions decide much of the design and must be answered early, with legal and compliance teams:
+- **Data residency and cross-border transfers**: laws or contracts may require data to be processed in a specific country or Region (for example within the EU). This decides which AWS Regions you can use, whether cross-Region inference profiles are allowed, where logs and vector stores live, and which models are available there.
+- **Permitted use of the data**: whether customer data may be used to fine-tune, distill or otherwise customize models. If not, the design relies on prompting and RAG, and data must be excluded from training sets. If yes, consent, retention and deletion obligations follow.
+## Example
+If German customer data must stay in the EU and may not be used for training, the team picks EU Regions and EU inference profiles only, and plans RAG instead of fine-tuning.
+W: D=Data residency and cross-border rules: they decide which Regions, inference options and storage locations are allowed, so they constrain the architecture from the start.
+E=Permitted use for model customization: whether data can be used to train or customize models decides between RAG-only and fine-tuning designs and drives consent and retention requirements.
+X: A=Mobile icon set: icons are a cosmetic detail that can be decided late and have no effect on how data is processed.
+B=Booked meeting rooms: logistics of the project team are irrelevant to the feature's data and architecture requirements.
+C=Document font: the formatting of the requirements document does not constrain the solution in any way.
+T: Clarify early where customer data may be processed and whether it may be used for customization; those two answers constrain Regions, models and the RAG versus fine-tuning choice.
+
+@ Q002832 explain
+G: ## Embedding dimensions and storage
+An embedding is a vector of floating-point numbers. Storage grows linearly with the number of dimensions: a 1,024-dimension float32 vector takes about 4 KB, a 512-dimension one about 2 KB, before index overhead. With millions of chunks, that difference is large.
+Some embedding models let you choose the output size. For example, Amazon Titan Text Embeddings V2 supports 1,024 (default), 512 or 256 dimensions through the `dimensions` parameter.
+- Smaller vectors cut storage and memory in the vector store and speed up similarity search.
+- Accuracy usually drops only slightly, so the trade-off is often acceptable; measure retrieval quality on your own queries before switching.
+- The same dimension must be used for indexing and querying.
+## Example
+10 million chunks at 1,024 dimensions need roughly 40 GB of raw vectors; at 512 dimensions roughly 20 GB.
+W: Smaller supported embedding dimension: halving the dimension roughly halves vector storage, and models built for it keep acceptable retrieval accuracy.
+X: A=Remove normalization: normalizing scales a vector to unit length but keeps the same number of values, so skipping it saves no storage and can hurt cosine or dot-product scoring.
+C=JSON text in a relational column: text representation of floats is larger than binary storage, and with no vector index every search must scan all rows, which is slow and costly.
+D=One huge vector per document: very large chunks blur many topics into one vector, which harms retrieval precision, and chunk size does not change the per-vector dimension anyway.
+T: To save vector storage with acceptable accuracy, pick a smaller output dimension the embedding model supports; normalization, text storage and giant chunks do not help.
+
+@ Q002833 explain
+G: ## Specifying ungrounded behavior
+A RAG assistant sometimes receives questions that its documents do not cover. If nothing is specified, the model may answer from general knowledge or invent an answer, which is a hallucination risk in an enterprise setting.
+Turning this into an explicit requirement makes the behavior testable:
+- **Requirement**: "If no retrieved source supports the answer, reply with a clear message such as 'I can't answer that from the available documents' and suggest where to get help."
+- **Implementation**: prompt instructions to answer only from provided context, a relevance threshold on retrieval, and optionally the contextual grounding check in Amazon Bedrock Guardrails, which can block responses that are not grounded in the source.
+- **Testing**: include out-of-scope questions in the evaluation set and measure how often the assistant correctly declines.
+W: Require a clear "cannot answer" response: it settles the disagreement with a defined, testable behavior that reduces hallucination risk for questions the documents cannot support.
+X: A=Leave it undefined until complaints: undefined behavior produces inconsistent answers and discovers problems only after users are affected.
+C=Always answer: forcing an answer when no source exists pushes the model to use unsupported general knowledge or invent facts, which is exactly the hallucination risk.
+D=Let the model decide case by case: without an explicit rule, behavior is unpredictable and cannot be tested against a clear expectation.
+T: Write down how the assistant must respond when it cannot ground an answer, and test it; leaving it to chance or forcing answers invites hallucinations.
+
+@ Q002834 explain
+G: ## What model distillation is
+Model distillation transfers task-specific skill from a large **teacher** model to a smaller **student** model.
+In Amazon Bedrock:
+- You pick a teacher and a supported student model (typically from the same model family) and provide prompts for your use case, or use existing model invocation logs.
+- Bedrock has the teacher generate responses (and can create extra synthetic examples), then fine-tunes the student on them.
+- The result is a custom model that is smaller, faster and cheaper to run, while getting close to the teacher's quality on that specific task.
+## How it differs from other customization
+- **Fine-tuning** needs your own labeled prompt-response pairs.
+- **Continued pre-training** uses large amounts of unlabeled domain text to teach vocabulary and knowledge, not to copy a teacher's answers.
+## Example
+A large model classifies support tickets very well but is expensive. Distilling it into a smaller model lets the team keep near-teacher accuracy on ticket classification at a fraction of the cost.
+W: Model distillation: it trains a smaller student model on the large teacher model's responses for the specific task, which delivers a cheaper model with quality close to the large one.
+X: A=Guardrail policies: guardrails filter harmful content, denied topics and sensitive information in inputs and outputs; they do not train or shrink a model.
+B=Prompt management: it stores, versions and tests prompt templates; it does not change which model runs or its size.
+D=Continued pre-training: it adapts a model with unlabeled domain data and does not use a teacher model's outputs to make a smaller model match it.
+T: To get a smaller, cheaper model that matches a large model on one task by learning from its outputs, use Bedrock model distillation, not continued pre-training.

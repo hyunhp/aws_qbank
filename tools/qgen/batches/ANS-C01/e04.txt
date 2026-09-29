@@ -1,0 +1,377 @@
+# ANS-C01 detailed explanations, e04 (explanation-only rewrites; letters are the published ones)
+
+@ Q001642 explain
+G: ## Unicast versus multicast
+With unicast, a sender that must reach 20 receivers sends 20 copies of every packet, one per receiver. With **IP multicast**, the sender sends one copy to a group address (for example `239.1.1.1`) and the network replicates it to every receiver that joined the group.
+## Multicast on AWS
+A normal VPC does not forward multicast between instances. The AWS feature for it is **Transit Gateway multicast**:
+- You create the transit gateway with multicast support enabled, then create a **multicast domain**.
+- You associate subnets from attached VPCs with the domain.
+- Group members are registered either **statically** (API calls that add ENIs as sources or members) or dynamically with **IGMPv2**, where instances send join and leave messages.
+The transit gateway then copies each packet from the source to every member ENI in the group, across all associated VPCs.
+W: Transit Gateway multicast domains: they are the only AWS construct that replicates one multicast stream to receivers in several VPCs, with membership managed by IGMPv2 or by static registration.
+X: A=Transit Gateway Connect: a Connect attachment runs GRE tunnels and BGP between the transit gateway and SD-WAN or third-party appliances. It carries routed unicast traffic and does nothing to replicate a stream to group members.
+C=Peering with broadcast mode: there is no broadcast mode on transit gateway peering, and multicast traffic is not forwarded over peering attachments at all.
+D=Flow Logs multicast filter: VPC Flow Logs only record metadata about traffic that already flows. A log filter cannot create or deliver a multicast stream.
+T: One source, many receivers across VPCs → Transit Gateway multicast domain; Connect attachments are for SD-WAN, and logging never moves traffic.
+
+@ Q001643 explain
+G: ## Sharing a transit gateway with AWS RAM
+A transit gateway lives in one account (here the network account). Other accounts cannot attach VPCs to it until the owner shares it with **AWS Resource Access Manager (RAM)**.
+- With RAM sharing for AWS Organizations turned on, the owner can share with the whole organization or an OU. Member accounts get the share without accepting invitations, and accounts added later receive it automatically.
+- Each member account then creates its own VPC attachment, pointing at its own VPC and subnets.
+## Accepting attachments
+Attachments from other accounts arrive in `pendingAcceptance` state unless the transit gateway option **Auto accept shared attachments** is enabled. Because only accounts that received the share can create attachments at all, sharing only with the organization plus auto-accept means "accept automatically, but only from our organization".
+Example: account 1111 shares `tgw-0abc` with the organization; account 2222 creates an attachment for its VPC, and it becomes `available` without any action from the network team.
+W: RAM share to the organization with attachments created by each account: the network account keeps one transit gateway, members self-serve their attachments, and auto-accept applies only to accounts that the organization share reached.
+X: A=Copy the configuration with StackSets: this deploys 30 separate transit gateways, one per account, instead of letting 30 accounts attach to the one central gateway, so there is still no shared hub.
+C=Central attachments by assuming roles: it can work, but the network team must run and maintain cross-account automation for every VPC. It is exactly the manual, centralized work that a RAM share plus auto-accept removes.
+D=Transit gateway delegated administrator: there is no delegated administrator role that attaches other accounts' VPCs to a transit gateway. Delegated administration exists for services such as Network Manager monitoring, not for creating attachments.
+T: Many accounts, one transit gateway → share it through RAM with the organization and let each account create its attachment; do not copy or centrally script it.
+
+@ Q001644 explain
+G: ## What MACsec adds to Direct Connect
+**MACsec** (IEEE 802.1AE) encrypts traffic at Layer 2, hop by hop, between your router and the AWS Direct Connect device at the location. It protects data on the physical cross-connect without IPsec overhead and works at line rate.
+## Where it is available
+MACsec is not a software switch you can flip on any link. It needs:
+- A **dedicated connection** (you own the physical port), not a hosted connection provided through a partner.
+- A supported port speed: **10 Gbps, 100 Gbps or 400 Gbps**. 1 Gbps ports do not support MACsec.
+- A **MACsec-capable device** at a Direct Connect location that offers MACsec. You can request a MACsec-capable port when ordering.
+Because port type, speed and device are fixed when the connection is provisioned, a connection ordered without them usually has to be replaced by a new one to gain MACsec later.
+W: Dedicated 10/100/400 Gbps at a MACsec-capable location: choosing a supported speed on a dedicated port at a location and device that support MACsec is what leaves the option open; the key can then be associated when the company is ready.
+X: A=1 Gbps dedicated connection at any location: 1 Gbps ports are not eligible for MACsec, and not every location or device supports it, so this connection could not simply be upgraded later.
+B=Any hosted connection: hosted connections share a partner's port and do not support MACsec between the customer router and AWS, so the choice rules MACsec out.
+C=Automatic MACsec on LAGs: a LAG does not turn encryption on by itself. MACsec still needs eligible dedicated members, CKN/CAK keys and an encryption mode configured explicitly.
+T: MACsec is a provisioning decision: dedicated port, 10/100/400 Gbps, MACsec-capable location and device; hosted and 1 Gbps links cannot get it later.
+
+@ Q001645 explain
+G: ## How MACsec keys work
+MACsec protects one physical Ethernet link. The two ends of the link (your router port and the AWS device port) run the **MACsec Key Agreement (MKA)** protocol using a pre-shared pair of values:
+- **CKN** (Connectivity Association Key Name): identifies the key.
+- **CAK** (Connectivity Association Key): the secret from which session keys are derived.
+On AWS you store the pair in AWS Secrets Manager through Direct Connect and associate it with a connection.
+## MACsec and a LAG
+A LAG bundles several physical connections, but each member is still a separate cable with its own two ports. MKA and encryption therefore run **per member link**: each member must have a CKN/CAK association, and your router must configure the matching key on each member port. Associating a key with the LAG ID is a convenience that applies it to the members, but each member still negotiates its own MACsec session.
+Example: a LAG with members `dxcon-a` and `dxcon-b` has two MKA sessions; if only `dxcon-a` has a key, `dxcon-b` cannot encrypt.
+W: CKN/CAK per member: MACsec is a link-layer, point-to-point protocol, so every physical member of the LAG needs a key association and a matching router configuration.
+X: A=Single session at the LAG level: a LAG is a logical bundle, while MACsec secures individual physical links. There is no one session spanning several cables.
+B=Only one member needs keys: the member without keys would carry traffic unencrypted, or none at all in must-encrypt mode, so the LAG would not be encrypted end to end.
+D=Recreate as hosted connections: hosted connections do not support MACsec at all. The members are already the right kind, dedicated 100 Gbps at a MACsec-capable location.
+T: MACsec encrypts each physical link, so every LAG member needs its own CKN/CAK association; there is no LAG-wide session.
+
+@ Q001646 explain
+G: ## MACsec encryption modes
+A MACsec-capable Direct Connect connection or LAG has an encryption mode:
+- **must encrypt**: traffic is allowed only after a MACsec session is established. If MKA cannot agree, the link passes nothing.
+- **should encrypt**: MACsec is preferred, but traffic flows unencrypted if the session fails.
+- **no encrypt**: MACsec is not used.
+## What makes MKA fail
+Both ends must hold the same **CKN** and **CAK**, plus compatible MACsec settings such as the cipher suite. A typo in the CAK on the router, a key rotated on one side only, or a CKN that does not match the one associated in AWS all stop the session from forming.
+Example: AWS has CKN `aa11...` associated with the member, but the router port uses `aa12...`. In must-encrypt mode that member drops all frames, while the other member (not yet enforcing MACsec) keeps passing traffic.
+W: CKN/CAK mismatch with must-encrypt: the member's MACsec session cannot form, and must-encrypt blocks all traffic on it rather than falling back to cleartext, which matches one member at zero while the other works.
+X: A=Cannot be enabled per member: MACsec runs per physical link, and keys and modes are applied to each member connection, so this setup is possible. The symptom is a failed session, not an unsupported configuration.
+B=Minimum links threshold: the minimum-links setting controls whether the whole LAG stays up. If it were not met, the entire LAG would go down, not one member while the other passes traffic.
+C=BGP local preference: BGP sessions run on virtual interfaces over the LAG as a whole. Local preference chooses between routes, it cannot steer traffic to one physical member of a LAG, which LACP hashing handles.
+T: Must-encrypt plus zero traffic on one link → the MACsec keys on that link do not match; should-encrypt would have fallen back instead of blocking.
+
+@ Q001647 explain
+G: ## Controlling the return path from AWS
+Traffic from AWS to on-premises follows the routes that AWS learns from your routers over BGP. To make AWS prefer one Direct Connect connection, you change what you **advertise** on each connection.
+## AS path prepending
+The AS path lists the autonomous systems a route passes through. BGP prefers the shorter path. **Prepending** means adding your own ASN several extra times on the less preferred link.
+Example with customer ASN `65001`:
+- Connection A advertises `192.168.0.0/16` with AS path `65001`.
+- Connection B advertises the same prefix with AS path `65001 65001 65001`.
+AWS sees equal prefixes, compares AS path length, and sends traffic over A. If A fails, the route over B is the only one left and is used automatically.
+## Direction matters
+Settings applied to routes you **receive** (local preference, inbound policies) change how your routers send traffic to AWS, not how AWS sends traffic back.
+W: Prepend on Connection B: a longer AS path on B's advertisement makes AWS choose A for AWS-to-on-premises traffic while keeping B as an automatic backup.
+X: A=Lower MED on Connection A: the question asks for AS path manipulation, and MED is a weak tie-breaker that BGP evaluates after AS path length and normally compares only between routes from the same neighboring AS, so it is not the reliable lever here.
+C=Local preference on routes from B: local preference is applied to routes your router receives, so it only changes your outbound choice toward AWS. It does not change which connection AWS uses to reach you.
+D=Prepend on routes from AWS: you do not control what AWS advertises, and prepending on received routes would again affect only your own outbound path selection, not AWS's return traffic.
+T: To steer AWS's traffic toward you, change what you advertise (prepend on the backup); local preference only steers your own outbound traffic.
+
+@ Q001648 explain
+G: ## Local preference communities on Direct Connect
+You cannot log in to AWS routers, but Direct Connect lets you influence them with **BGP communities** attached to the routes you advertise on private and transit virtual interfaces:
+- `7224:7100`: low preference
+- `7224:7200`: medium preference
+- `7224:7300`: high preference
+AWS turns these into local preference on its side. Local preference is evaluated **before** AS path length, so it gives a clear, consistent choice without changing the AS path.
+Example: advertise `10.20.0.0/16` over VIF A with `7224:7300` (or no tag) and over VIF B with `7224:7100`. AWS sends traffic to `10.20.0.0/16` over VIF A, and uses VIF B only if VIF A's route disappears.
+This works in the same Region and across Regions, and it does not require the two routers to use the same ASN.
+W: Low local-preference community on VIF B: tagging B's routes with `7224:7100` makes AWS assign them lower local preference, so VIF A is consistently preferred and AS path length is unchanged.
+X: A=Higher MED on VIF A: a higher MED makes a route less preferred, so this would push traffic toward VIF B, the opposite of the goal.
+C=Support case to change local preference: AWS does not set per-customer local preference by request. The supported, self-service mechanism is the local preference communities.
+D=Static route with administrative distance: you cannot add static routes or administrative distances on the AWS side of a Direct Connect virtual interface; routing to on-premises is learned only through BGP.
+T: Prefer one VIF without prepending → tag the backup's routes with the low local-preference community `7224:7100`.
+
+@ Q001649 explain
+G: ## Where MED sits in BGP path selection
+**MED** (Multi-Exit Discriminator) is a value you attach to routes to tell a neighbor which of your entry points to prefer; lower is better. It is a late tie-breaker, evaluated after local preference and AS path length.
+## The same-AS rule
+By default, BGP compares MED **only between routes received from the same neighboring AS**. The idea is that MED values are meaningful only within one network's numbering; comparing MED set by two different ASes would be comparing unrelated numbers.
+Example:
+- Primary data center advertises `172.16.0.0/16` from AS `65010` with MED `50`.
+- Backup data center advertises it from AS `65020` with MED `200`.
+The routes come from different neighboring ASes, so AWS skips the MED comparison and decides on other attributes, which can pick the backup path.
+## What to use instead
+Use the local preference communities (`7224:7100`/`7200`/`7300`) or AS path prepending on the backup, which work regardless of the customer ASN.
+W: MED compared only within the same neighboring AS: with two different customer ASNs, the lower MED on the primary is never compared against the backup, so it does not influence AWS's choice.
+X: A=Backup learned via iBGP: AWS learns routes from customer routers over eBGP sessions on the virtual interfaces. And even where iBGP is involved, BGP prefers eBGP-learned routes over iBGP-learned ones, not the other way around.
+B=MED must be higher: lower MED is preferred. Raising the primary's MED would make it less attractive, not more.
+C=No MED support on any VIF: Direct Connect does take MED into account as a tie-breaker; the issue here is that the two routes come from different ASNs, so the comparison does not happen.
+T: MED only breaks ties between routes from the same neighbor AS; across different customer ASNs, use local preference communities or AS path prepending.
+
+@ Q001650 explain
+G: ## The BGP best-path order
+When a router has several routes to the same prefix, BGP compares attributes in a fixed order and stops at the first difference. The common order (vendor-specific weight aside) is:
+- **Highest local preference**
+- Locally originated routes
+- **Shortest AS path**
+- Lowest origin type
+- **Lowest MED**
+- eBGP over iBGP, then lowest IGP metric and other tie-breakers
+Local preference is a local policy decision: the administrator is saying "I prefer this exit", and BGP honors that before looking at path length.
+## Example
+Path 1 has AS path `64512` with local preference `100`. Path 2 has AS path `64512 64512 64512` with local preference `200`. The router compares local preference first, sees `200` is higher, and chooses path 2; AS path length is never reached.
+W: Higher local preference path: local preference is compared before AS path length, so the path with the higher local preference wins even though its AS path is longer.
+X: B=Both installed and load-balanced: multipath needs the paths to be equal on the attributes up to that step and multipath to be configured; routes with different local preference are not equal, so only one is chosen.
+C=Shorter AS path first: AS path length is evaluated after local preference, so it only matters when local preference is equal.
+D=MED before local preference: MED is one of the last tie-breakers, after both local preference and AS path, so it does not come into play here.
+T: BGP compares local preference before AS path and MED; a manual local preference setting overrides a shorter path.
+
+@ Q001651 explain
+G: ## Static versus dynamic routing on Site-to-Site VPN
+Every AWS Site-to-Site VPN connection has **two tunnels**, ending on two different AWS endpoints for redundancy. Routing across them can be:
+- **Dynamic (BGP)**: each tunnel runs a BGP session. Routes are exchanged automatically, and when a tunnel dies its BGP session drops and the routes over it are withdrawn.
+- **Static**: you enter the on-premises prefixes (for example `192.168.10.0/24`) as static routes on the VPN connection. The customer device uses static routes toward the VPC CIDR. No routes are withdrawn when a tunnel fails.
+## Failover without BGP
+With static routing, the only signal that a tunnel is gone is its **tunnel state**, which comes from IKE and **Dead Peer Detection (DPD)**. The customer device must notice the dead tunnel and move traffic to the other one, for example with route-based VPN routes tied to tunnel interfaces or with IP SLA tracking. A device that keeps sending into a dead tunnel causes an outage even though the second tunnel is up.
+W: Static routes with failover based on tunnel state: without BGP you configure static prefixes, and moving traffic between the two tunnels relies on detecting tunnel up/down status (DPD), especially on the customer device.
+X: B=Policy-based VPN because routing does not apply: AWS VPN connections still use a routing option (static or dynamic), and policy-based devices are supported with limitations; routing does not become irrelevant.
+C=Static routing with AWS BGP withdrawal: with static routing there are no BGP sessions, so there is nothing to withdraw. Failover cannot be driven by BGP here.
+D=BGP required: static routing is a fully supported option for customer gateways that cannot run BGP.
+T: No BGP → static routes, and failover relies on detecting tunnel state (DPD) rather than on BGP route withdrawal.
+
+@ Q001652 explain
+G: ## How BGP failover works on a VPN
+With dynamic routing, each of the two tunnels carries its own BGP session, and the same prefixes are usually learned over both. When the primary tunnel fails, traffic moves only after **routes over the dead tunnel are withdrawn** on both sides.
+- AWS detects the loss through IKE/DPD and the BGP hold timer, and stops using that tunnel.
+- The **customer gateway** must do the same for its outbound traffic. If its BGP hold timer is long (for example 180 seconds or more), DPD is disabled, or the firewall keeps a static or tracked route pointing at the tunnel interface, it keeps sending traffic into the dead tunnel.
+## Why "several minutes"
+A delay of minutes points at timers or route policies on the customer device: the old best path stays in its routing table until the BGP session times out, and only then does the path via the second tunnel take over.
+Typical fixes: enable DPD, lower BGP keepalive/hold timers (AWS uses a 10-second keepalive and 30-second hold time), or use BFD where supported.
+W: Customer gateway not withdrawing the dead tunnel's routes: the firewall keeps its best path via the shut-down tunnel until its own timers expire, so traffic blackholes for minutes before shifting to the healthy tunnel.
+X: A=Two BGP-active tunnels unsupported: both tunnels are designed to run BGP at the same time; that is the standard redundant setup.
+C=Both tunnels on one device: the tunnels can end on one device or on two separate customer gateway devices. The termination layout does not stop failover; route withdrawal does.
+D=Propagated routes need manual failover: route propagation to VPC route tables updates automatically from the virtual private gateway as BGP routes change, with no manual steps.
+T: Slow VPN failover with BGP usually means the customer device keeps routes on the dead tunnel; fix it with DPD and short BGP timers.
+
+@ Q001653 explain
+G: ## What dynamic routing buys you
+On a Site-to-Site VPN the routing option decides how prefixes are exchanged:
+- **Static**: every prefix is typed in by hand, on the VPN connection for on-premises ranges and on the customer device for AWS ranges. Adding a VPC CIDR such as `10.50.0.0/16` means updating both sides, and forgetting one step breaks connectivity.
+- **Dynamic (BGP)**: each side advertises its prefixes. A new CIDR attached to the virtual private gateway or transit gateway is advertised automatically, and removed prefixes are withdrawn.
+## Why it matters as a Direct Connect backup
+A backup must carry the same prefixes as the primary path at the moment of failure. With frequent CIDR changes, static routes drift out of sync. BGP keeps the backup's route set current and also lets you use normal BGP preference to keep Direct Connect as primary.
+Encryption options (AES-128/256, SHA-2) and latency are the same for both routing types.
+W: BGP propagates prefix changes automatically: frequent additions and removals of VPC CIDRs are advertised and withdrawn without manual route edits, which is the operational factor this scenario turns on.
+X: B=BGP required for AES-256: tunnel encryption algorithms are IKE/IPsec settings chosen per tunnel, independent of the routing option; static VPNs can use AES-256 too.
+C=Static has lower latency: the routing option only decides how routes are learned. Packets are forwarded the same way and encrypted the same way, so there is no meaningful per-packet latency difference.
+D=BGP the only way to get ECMP: ECMP over VPN is a transit gateway feature that does need BGP, but a VPN acting as a Direct Connect backup is about carrying current prefixes during failover, not load sharing, so this is not the deciding tradeoff for frequent CIDR changes.
+T: Prefixes that change often → BGP, so routes are advertised and withdrawn automatically instead of being edited by hand on both sides.
+
+@ Q001654 explain
+G: ## The Direct Connect resiliency models
+AWS describes resiliency levels in the Direct Connect Resiliency Toolkit:
+- **Development and Test**: one connection at one location. Any device or location failure cuts connectivity.
+- **High Resiliency**: one connection at each of **two different locations**. If a whole location fails (power, fiber cut, building event), the other location keeps traffic flowing, and BGP moves routes automatically.
+- **Maximum Resiliency**: two connections at each of two locations, on separate devices, for four connections in total. It survives a location failure and, in addition, a device failure at the remaining location.
+## Choosing the model
+Start with the failure you must survive. "Lose an entire location, automatically" is exactly what High Resiliency provides. Maximum Resiliency also meets it, but with twice the connections and cost.
+Example: connections at a location in Seoul and a second location in the same metro area, each with a private VIF and BGP; losing either location leaves the other active.
+W: High Resiliency model: one connection at each of two Direct Connect locations survives a full location failure with BGP failover, using the fewest connections that meet the requirement.
+X: A=Development and Test model: a single connection at one location is lost with that location, so it cannot tolerate a location failure.
+B=LAG of two links at one location: a LAG adds bandwidth and link redundancy, but all members terminate at the same location, so a location outage takes the whole LAG down.
+D=Maximum Resiliency model: it also survives a location failure, but it needs four connections, which exceeds the "fewest connections possible" requirement.
+T: Survive a location loss with the fewest links → High Resiliency (two locations, one connection each); Maximum Resiliency adds device-level redundancy at twice the cost.
+
+@ Q001655 explain
+G: ## What Maximum Resiliency actually requires
+The **Maximum Resiliency** model is not "two connections"; it is about removing every shared point of failure:
+- Connections at **two different Direct Connect locations**.
+- At each location, connections that terminate on **separate AWS devices**, so a device failure or maintenance affects only one of them.
+- On your side, separate routers (and ideally separate paths) for each connection.
+In total that is four connections: two locations with two devices each.
+## The trap in this scenario
+Two connections on two ports of the same AWS device at the same location only protect against a port or cable failure. A device reboot, firmware upgrade or location outage takes both down together, which is exactly what happened.
+The Direct Connect Resiliency Toolkit in the console orders connections so that they land on distinct devices and locations for the chosen model.
+W: Separate devices at separate locations: Maximum Resiliency requires connections spread across different AWS devices and different locations; two ports on one device share that device's failures.
+X: A=Combine into a LAG: a LAG still terminates on one AWS device at one location, so it would fail in exactly the same maintenance event.
+B=BGP misconfiguration: BGP cannot keep a session up when the physical device under both connections is down. The outage comes from the shared device, a design gap.
+D=Only two customer router interfaces: redundancy on the customer side alone ignores the AWS termination point; with both connections on one AWS device, customer-side diversity does not help.
+T: Resiliency comes from diversity of devices and locations, not from counting connections; two ports on one device are one failure domain.
+
+@ Q001656 explain
+G: ## Failure domains in Direct Connect
+Think of three layers that can fail:
+- A **port or link** (a cable or optic).
+- An **AWS device** at a location (maintenance, reboot, hardware fault).
+- An entire **Direct Connect location** (power, building or carrier problem).
+## How the two models compare
+- **High Resiliency**: one connection at each of two locations. A location failure is survived because the other location remains. But if the surviving location's single device then has a problem, connectivity is lost.
+- **Maximum Resiliency**: two connections at each of two locations, each on a separate device. It survives a location failure **and** a device failure at the remaining location, because a second device there still carries traffic.
+Example: during planned maintenance on one device at location 2 while location 1 is down, Maximum Resiliency still has a connection on the other device at location 2; High Resiliency would be offline.
+W: High survives a location loss; Maximum also survives device loss: both span two locations, and Maximum adds separate devices within each location, protecting against device failures on top of location failures.
+X: A=Swapped protections: both models protect against location failure because both span two locations; Maximum adds device protection, it does not drop location protection.
+B=One connection at four locations versus four at one: Maximum uses two locations with two connections each, and High uses two locations with one connection each. Four connections at one location would not survive a location failure.
+D=Just a marketing name: the models differ in connection count and in device diversity, which gives measurably different protection.
+T: High = two locations (survive a location loss); Maximum = two locations x two devices (survive a location loss plus a device loss).
+
+@ Q001657 explain
+G: ## Why stateful firewalls need symmetric traffic
+A stateful appliance tracks each connection: it sees the outbound SYN, records the flow, and allows the matching return traffic. If the return packets arrive at a **different** appliance, that appliance has no state for the flow and drops them.
+## How a transit gateway can break symmetry
+A transit gateway forwards traffic to a VPC attachment through an ENI in one Availability Zone, normally the AZ of the source when possible. For inspection flows, the request and the reply can enter the inspection VPC through different AZs, landing on different appliances behind the Gateway Load Balancer.
+## Appliance mode
+**Appliance mode** on the inspection VPC's attachment makes the transit gateway choose one AZ per flow (using a flow hash) and keep both directions of that flow in the same AZ for the life of the flow. The GWLB then keeps the flow on the same appliance.
+Example: a flow from a spoke in AZ-a to the internet uses the inspection ENI in AZ-b; with appliance mode on, the reply also enters through AZ-b.
+W: Appliance mode: it pins both directions of each flow to the same AZ of the inspection attachment, so return traffic reaches the same stateful appliance that saw the request.
+X: A=Transit Gateway Connect: Connect attachments bring SD-WAN appliances in over GRE and BGP. They do nothing to keep a flow's two directions in one AZ.
+B=Jumbo frames: the transit gateway supports an MTU of 8500 bytes for VPC traffic by default, and MTU affects packet size, not which AZ or appliance a return packet reaches.
+D=Multicast support: multicast replicates group traffic to receivers; it has no effect on unicast flow symmetry through inspection appliances.
+T: Centralized stateful inspection behind a transit gateway → enable appliance mode on the inspection VPC attachment so flows stay symmetric.
+
+@ Q001658 explain
+G: ## The two route-table steps for a transit gateway attachment
+A transit gateway has its own route tables, separate from the VPC route tables. Each attachment interacts with them in two ways:
+- **Association**: which transit gateway route table is used to look up traffic *coming from* this attachment. Each attachment is associated with exactly one route table.
+- **Propagation**: which route tables *learn* this attachment's CIDR automatically. An attachment can propagate to several route tables.
+If the default association and propagation settings are disabled, or custom route tables are used, a new attachment does neither until you configure it.
+## Reading the symptom
+The VPC route table already sends `10.0.0.0/8` to the transit gateway, so packets reach it. But the route table associated with the new attachment has no route for the second VPC's CIDR: the second VPC's attachment does not propagate there (or no static route exists), so the transit gateway has nowhere to send the traffic.
+W: Missing association or propagation: without the correct association and a propagated or static route for the other VPC's CIDR, the transit gateway route table used by the new attachment cannot forward the traffic.
+X: B=Route tables refresh every 24 hours: propagated routes appear within moments of enabling propagation; there is no daily refresh cycle.
+C=Security group blocks propagation: security groups filter packets at ENIs. They never influence which routes a transit gateway route table learns.
+D=Direct Connect gateway required: a transit gateway routes between its VPC attachments natively. A Direct Connect gateway is only for on-premises connectivity over Direct Connect.
+T: Transit gateway route missing → check which route table the attachment is associated with and whether the other VPC propagates (or has a static route) into it.
+
+@ Q001659 explain
+G: ## Multicast delivery on AWS
+Within a VPC, instances do not exchange multicast by default. **Transit Gateway multicast** fills this gap:
+- Create a transit gateway with multicast support, then a **multicast domain**.
+- **Associate subnets** from VPCs attached to that transit gateway with the domain. Only ENIs in associated subnets can be sources or members.
+- Register sources and members statically, or let instances join with **IGMPv2**.
+The transit gateway replicates the feed from one source to every member ENI in the group, across the associated VPCs.
+## Design constraints
+- Receivers must be in VPCs attached to the **same** transit gateway, in subnets associated with the domain.
+- Multicast is not forwarded over transit gateway peering, VPN or Direct Connect attachments.
+- Security groups and network ACLs must allow the multicast traffic (and IGMP, if used).
+W: Transit Gateway multicast with same-gateway, associated subnets: it is the AWS feature for multicast across VPCs, and its central constraint is that receivers must be in VPCs attached to that transit gateway, in subnets associated with the multicast domain.
+X: B=Elastic Load Balancing multicast: load balancers forward unicast connections or flows to individual targets. None of the ELB types replicate multicast packets to many receivers.
+C=Route 53 multicast routing policy: Route 53 answers DNS queries; it has no multicast routing policy and does not carry any data traffic.
+D=VPC peering multicast: the option contradicts itself; VPC peering does not forward multicast traffic, so it cannot be the capability that supports it.
+T: Multicast across VPCs → Transit Gateway multicast domain, limited to subnets associated with the domain in VPCs attached to the same gateway.
+
+@ Q001660 explain
+G: ## Connecting Regions with transit gateways
+A transit gateway is a Regional resource. To connect transit gateways in different Regions, you create an **inter-Region peering attachment**. Traffic crosses the AWS backbone, but peering attachments do **not** propagate routes: you add static routes that point remote CIDRs at the peering attachment.
+## One Direct Connect for many Regions
+A **Direct Connect gateway** is a global resource. One connection in us-east-1 carries a **transit virtual interface** to the Direct Connect gateway, and the gateway can be associated with transit gateways in other Regions (commercial Regions, except China).
+- For each association you list the "allowed prefixes" to advertise to on-premises.
+- On-premises routes learned through the Direct Connect gateway are propagated to each associated transit gateway.
+Example: DX gateway associated with the transit gateways in us-east-1, ap-northeast-2 and eu-west-1; on-premises reaches VPCs in all three without Direct Connect in Seoul or Ireland, while TGW peering links the Regions to each other.
+W: TGW peering plus a DX gateway associated with each Region's transit gateway: peering gives Region-to-Region connectivity, and associating the global DX gateway with every transit gateway lets the single us-east-1 connection reach all three Regions.
+X: B=VPC peering because TGW peering is not inter-Region: transit gateway peering does support inter-Region links, and a mesh of VPC peerings would not scale and could not carry on-premises traffic transitively.
+C=DX gateway only with same-Region transit gateway: a Direct Connect gateway is global and can be associated with transit gateways in other Regions; that is its main purpose.
+D=Peering propagates DX gateway routes: routes are not propagated across transit gateway peering attachments. On-premises traffic would need static routes, which is why associating the DX gateway directly with each transit gateway is the design.
+T: Global reach from one Direct Connect → associate the DX gateway with each Regional transit gateway; use TGW peering (with static routes) for Region-to-Region traffic.
+
+@ Q001661 explain
+G: ## Publishing a service with AWS PrivateLink
+PrivateLink lets a provider expose one service privately to other VPCs and accounts:
+- The provider puts the service behind a **Network Load Balancer** (or a Gateway Load Balancer for appliances) and creates a **VPC endpoint service** from it.
+- Each consumer creates an **interface VPC endpoint**: ENIs with private IPs from the consumer's own subnets. Applications connect to those IPs or the endpoint's DNS name.
+- Traffic stays on the AWS network; no internet gateway, NAT, peering or route changes are needed, and CIDRs may overlap.
+## Keeping control over consumers
+- The **allowed principals** list names which accounts, roles or users may create endpoints to the service.
+- With **acceptance required**, the provider must approve each endpoint connection request, and can reject or later remove connections.
+Example: the provider allows `arn:aws:iam::222233334444:root`; that account's endpoint request appears as pending until the provider accepts it.
+W: NLB-backed endpoint service with consumer interface endpoints: consumers reach only the service over private IPs in their own VPCs, traffic never touches the internet, and allowed principals plus acceptance give the provider full control over who connects.
+X: A=Gateway endpoint for the NLB shared by RAM: gateway endpoints exist only for Amazon S3 and DynamoDB and are route-table targets; they cannot front an NLB, and they are not shared through RAM.
+C=Public ALB restricted by NAT IPs: the service would be reachable over the public internet, violating the requirement, and relying on customers' NAT IPs is fragile access control.
+D=VPC peering with every consumer: the requirement rules out peering, and peering opens whole networks to each other, needs non-overlapping CIDRs and does not use BGP at all.
+T: Private, per-consumer access to one service without peering → endpoint service on an NLB, interface endpoints in consumer VPCs, allowed principals for control.
+
+@ Q001662 explain
+G: ## Interface endpoints and DNS names
+An interface endpoint always gets its own regional and zonal DNS names (like `vpce-0abc...-xyz.vpce-svc-123.us-east-1.vpce.amazonaws.com`). Applications that use a service's **own** name, such as `service.partner.com`, only reach the endpoint if **private DNS** is in place:
+- The provider configures a **private DNS name** on the endpoint service and proves ownership of the domain with a TXT record, so the name shows as **verified**.
+- The consumer enables **private DNS** on the interface endpoint.
+- The consumer VPC has `enableDnsSupport` and `enableDnsHostnames` turned on.
+AWS then creates a hidden private hosted zone for the VPC so the Route 53 Resolver answers `service.partner.com` with the endpoint's private IPs.
+## The symptom
+If any step is missing, the Resolver keeps returning the public DNS record, so clients reach the public IP and never use the endpoint, even though it shows `Available`.
+W: Private DNS not enabled or name not verified: without a verified private DNS name on the service and private DNS enabled on the endpoint, the standard name still resolves publicly and traffic bypasses the endpoint.
+X: B=Security group blocks port 53: DNS queries go to the VPC's Route 53 Resolver, not through the endpoint's ENIs, so the endpoint security group cannot affect name resolution.
+C=Endpoints never override public DNS: private DNS exists precisely to make the service's standard name resolve to the endpoint's private IPs inside the VPC, so hardcoding IPs is unnecessary.
+D=Recreate as a Gateway endpoint: gateway endpoints exist only for S3 and DynamoDB and have no private DNS feature; a partner's endpoint service is always reached through an interface endpoint.
+T: Service name still resolves publicly → the provider must verify a private DNS name and the consumer must enable private DNS on the interface endpoint.
+
+@ Q001663 explain
+G: ## Gateway Load Balancer and its endpoints
+A **Gateway Load Balancer (GWLB)** puts a fleet of third-party appliances (firewalls, IDS/IPS) behind one entry point. It works at Layer 3, forwards original packets to the appliances inside **GENEVE** encapsulation on port 6081, and keeps flows sticky to one appliance.
+The GWLB is published as a **PrivateLink endpoint service**, and each consuming VPC creates a **Gateway Load Balancer endpoint (GWLBE)**, possibly in another account.
+## How it differs from an interface endpoint
+- An **interface endpoint** is a destination: applications send traffic to its IP or DNS name, and the NLB service answers.
+- A **GWLB endpoint** is a **route-table target**: you set routes such as `0.0.0.0/0 -> vpce-...` in subnet and gateway route tables. Traffic is steered through the appliances and continues to its original destination with the same source and destination IPs.
+Applications need no changes, and one appliance fleet serves many VPCs and accounts.
+W: Gateway Load Balancer endpoint: it inserts the appliance fleet transparently through route tables, and unlike an interface endpoint to an NLB service it is a routing next hop rather than an address applications connect to, so one shared fleet can inspect traffic for many VPCs and accounts.
+X: A=GWLB cannot use PrivateLink: GWLB is designed to be shared through PrivateLink with GWLB endpoints, which is exactly how it serves many VPCs and accounts.
+C=Gateway VPC endpoint for GWLB: gateway VPC endpoints are only for S3 and DynamoDB. GWLB uses its own endpoint type, the Gateway Load Balancer endpoint.
+D=Standard interface endpoint to the GWLB: an interface endpoint requires applications to target its address, which breaks transparency. GWLB services are consumed through GWLB endpoints that act as route targets.
+T: Transparent inline inspection shared across VPCs → GWLB endpoint as a route target; an interface endpoint is a destination that apps must address.
+
+@ Q001664 explain
+G: ## VPC sharing
+**VPC sharing** lets one account (the **owner**) share subnets with other accounts (the **participants**) in the same AWS Organization, using AWS RAM.
+- The owner keeps the VPC, subnets, route tables, network ACLs, gateways and endpoints. Participants cannot change them.
+- Participants launch their own resources, such as EC2 instances, RDS databases or Lambda ENIs, directly into the shared subnets. Those resources belong to, and are billed to, the participant account.
+- Each participant manages its own security groups and IAM permissions.
+## Why teams use it
+One team designs the network once, and dozens of application accounts use it without creating their own VPCs, peering or transit gateway attachments. Fewer VPCs means fewer CIDRs to plan and fewer attachments to pay for.
+Example: the network account shares `subnet-app-a` and `subnet-app-b` with the OU `Workloads`; every account in that OU sees the subnets and can launch instances into them.
+W: Share the subnets through AWS RAM: VPC sharing lets application accounts launch EC2 instances directly into centrally owned subnets while the networking team keeps ownership and control of the VPC resources.
+X: A=VPC peering to each application VPC: peering connects separate VPCs, so instances still launch into each team's own subnets, not into the networking team's subnets.
+B=Cross-account roles into the networking account: instances would be created in the networking account, so application teams lose ownership and billing separation, and the network team inherits their workloads.
+D=Copy subnet CIDRs with StackSets: copying CIDRs creates new, separate subnets in each account, with overlapping addresses that cannot be connected, and the network team does not own them.
+T: Other accounts launch into subnets you own → share the subnets with AWS RAM (VPC sharing); peering or copies create separate networks.
+
+@ Q001665 explain
+G: ## Two separate permission layers
+When a subnet is shared through AWS RAM, access depends on two independent things:
+- **The share**: the owner's RAM resource share, accepted or automatically granted within the organization, makes the subnet visible and usable by the participant account.
+- **IAM in the participant account**: the developer's role or user still needs permissions such as `ec2:RunInstances` on the instance, the subnet, network interfaces, security groups and related resources. RAM grants access to the account, not to every identity in it.
+## Reading the symptom
+An **authorization error** (such as `UnauthorizedOperation`) means an IAM or organization policy (for example an SCP) denied the call. If the share itself were the problem, the subnet would not be visible or the call would fail as an invalid or unknown subnet instead.
+Example: the developer's role allows `ec2:RunInstances` only on resources tagged `team=a`; the shared subnet has no such tag, so the launch is denied.
+W: Check the developer's IAM permissions: the share is active, so the next gate is the participant's own IAM (and any SCPs), which must allow `ec2:RunInstances` on the shared subnet and related resources.
+X: A=Shared read-only: subnet shares are not read-only. Participants can launch resources into shared subnets; they just cannot modify the subnet itself.
+C=enableDnsSupport required for sharing: DNS attributes affect name resolution in the VPC. They are not a prerequisite for sharing subnets and would not cause an authorization error.
+D=Same Region because RAM is not cross-Region: accounts are not tied to a Region. A share is Regional, and calling the wrong Region would show the subnet as not found, not return an authorization error.
+T: An accepted share gives the account access; each identity in that account still needs IAM permissions to launch into the shared subnet.
+
+@ Q001666 explain
+G: ## AWS RAM sharing inside and outside an organization
+AWS RAM can share resources, including transit gateways, with different kinds of principals:
+- **Inside your organization**: after enabling RAM sharing with AWS Organizations, you can share with the whole organization, an OU or individual accounts. No invitation is needed, and new accounts in the OU get access automatically.
+- **Outside your organization**: you must list each **account ID**. Each account receives an **invitation** and must accept it before it can use the resource.
+Not every resource type can be shared outside the organization (for example, subnets for VPC sharing cannot), but transit gateways can.
+## After an acquisition
+With two organizations, the network account can share with its own organization or OUs in one step, and must add the acquired company's accounts by ID; each of those accounts accepts the invitation and then creates its attachment.
+W: Automatic within the org, invitations for other orgs: sharing is seamless for the owner's organization, while accounts in the other organization must be listed by account ID and accept invitations, which the design must plan for until the organizations are merged.
+X: B=Organizations must be merged first: RAM can share transit gateways with individual accounts outside the organization through invitations, so merging is not a prerequisite.
+C=Cross-organization sharing impossible: transit gateways can be shared with external accounts; the only difference is the invitation and acceptance step, so a second transit gateway is not required.
+D=Transit gateways cannot be shared: transit gateways are one of the most common RAM-shared resources, along with subnets, prefix lists and Route 53 Resolver rules.
+T: RAM inside the organization is automatic; outside it, list account IDs and wait for each account to accept the invitation.

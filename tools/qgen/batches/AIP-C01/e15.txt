@@ -1,0 +1,354 @@
+# AIP-C01 detailed explanations, e15 (explanation-only rewrites; letters are the published ones)
+
+@ Q002960 explain
+G: ## Logging GenAI interactions for legal retention
+Regulated firms often must keep records of what was asked and answered, for years, and hand them over on request (eDiscovery). That puts three demands on the log store:
+- **Durable**: records survive for the full retention period, for example by writing them to Amazon S3 with lifecycle rules that move old objects to cheaper storage classes such as S3 Glacier.
+- **Tamper-resistant**: nobody, including administrators, can change or delete records early. S3 Object Lock in compliance mode enforces this write-once-read-many (WORM) behavior.
+- **Searchable**: records carry metadata (user, timestamp, model ID, application) so a legal team can find one customer's conversations quickly, for example by querying S3 with Amazon Athena.
+## Where the data comes from
+Amazon Bedrock model invocation logging can deliver full request and response bodies plus metadata to S3 or CloudWatch Logs. AWS CloudTrail adds who called which API, but it does not record the prompt and response text.
+W: Durable, searchable, tamper-resistant storage: seven-year retention needs durable storage, legal requests need search over metadata, and evidence must be provably unaltered. Capturing full prompts, responses and metadata in immutable storage meets all three.
+X: A=Developers' laptops: laptops are not governed, backed-up or access-controlled storage. Data can be lost, altered or leaked, and nobody can prove the records are complete.
+B=In-memory session storage: memory is cleared on restart and only holds recent sessions, so nothing would exist to produce years later.
+C=Aggregate token counts: a daily token total says nothing about what was asked or answered, so it cannot satisfy a request for the actual interactions.
+T: Legal retention needs the full prompts and responses kept durably, immutably and searchably; usage metrics or temporary storage cannot reproduce a conversation.
+
+@ Q002961 explain
+G: ## Balancing cost and latency by workload
+Model choice is a trade-off between quality, cost per token and latency. When quality is equal, the deciding factor is what the workload actually needs.
+- **Interactive workloads** (chat, autocomplete) have a user waiting, so time to first token and total response time matter a lot.
+- **Offline workloads** (overnight reports, bulk summarization) only need to finish within a window, such as before 7 a.m. Doubling the per-request latency rarely matters if the batch still completes in time.
+## Example
+Generating 10,000 reports overnight: if the cheaper model takes 8 seconds per report instead of 4 but runs with enough parallelism, the job still finishes in the window and the token bill is halved. For this kind of job, Amazon Bedrock batch inference can reduce cost further for supported models.
+W: Cheaper model for overnight work: quality is equal and nobody is waiting for each response, so lower cost per token is the benefit that matters; the extra latency only has to fit the batch window.
+X: A=Latency always wins: latency is critical only when a user or downstream system is waiting. For scheduled overnight jobs, paying twice as much for speed nobody notices wastes money.
+B=Equal quality means identical models: two models can score the same on an evaluation yet differ in price, speed, context window and behavior. Equal scores do not make the choice meaningless.
+C=Send every report to both: this doubles the cost with no quality gain, because both models already score the same.
+T: Match the model to the workload: for offline batch jobs at equal quality, choose the cheaper model, and pay for low latency only when someone is waiting.
+
+@ Q002962 explain
+G: ## Ways to customize a model in Amazon Bedrock
+- **Prompt engineering**: instructions and examples in the prompt. Cheapest and fastest, but some behaviors stay inconsistent.
+- **Fine-tuning**: supervised training on labeled prompt-and-response pairs (JSONL files in S3). The model learns a specific task, format or style from the examples.
+- **Continued pre-training**: training on large amounts of unlabeled text so the model absorbs domain knowledge and vocabulary. It does not teach a particular output format.
+## When fine-tuning fits
+Fine-tuning is the next step when prompting cannot reliably produce the required behavior and good labeled examples exist. For instance, 3,000 pairs of input and correctly formatted output teach the model the exact tone and structure. The result is a custom model you invoke instead of the base model.
+W: Fine-tuning with labeled examples: the 3,000 high-quality examples show exactly the desired output for given inputs, which is what supervised fine-tuning needs to make a specific style consistent.
+X: A=Longer system prompt without examples: prompting has already failed to give reliable results, and removing examples makes the instructions even less concrete.
+B=Higher temperature: temperature adds randomness to token choice, so outputs become less consistent, the opposite of enforcing one style.
+D=Continued pre-training on web data: continued pre-training uses unlabeled text to add domain knowledge, and generic web data would not teach the organization's specific output style.
+T: Labeled examples plus a need for consistent behavior points to fine-tuning; continued pre-training on unlabeled text adds knowledge, not a specific style.
+
+@ Q002963 explain
+G: ## The Amazon Bedrock playgrounds
+The Bedrock console includes playgrounds (chat, text and image) for trying models without writing code.
+- Choose a model, type a prompt and see the response immediately.
+- Adjust inference parameters such as temperature, top P and maximum output length, then rerun the same prompt to see the effect.
+- Compare mode in the chat playground shows several models or configurations side by side.
+## Example
+A team wants to know whether temperature 0.2 or 0.8 gives better product descriptions. In the playground they run the same prompt at both settings in a minute and see the difference, before any SDK code, IAM role or pipeline exists.
+W: Console playground: it is interactive and instant, with parameter controls built in, so the team can explore many settings in minutes without deploying anything.
+X: B=Batch inference job per setting: batch inference is an asynchronous job with input files in S3 for large volumes, meant for throughput, not quick back-and-forth experiments.
+C=SageMaker endpoint per setting: inference parameters are sent with each request, so no new endpoint is needed to change them; deploying endpoints adds cost and setup time for nothing.
+D=Fine-tuned copy per setting: fine-tuning changes model weights, while temperature and top P are request-time settings. Training jobs take hours and cost money for something a request parameter controls.
+T: Inference parameters are request-time settings, so explore them interactively in the Bedrock playground rather than with jobs, endpoints or training.
+
+@ Q002964 explain
+G: ## How metadata filters work in retrieval
+Knowledge bases can store metadata with each chunk, for example from a `.metadata.json` sidecar file per document in Amazon Bedrock Knowledge Bases. At query time a filter narrows which chunks vector search may return.
+Filters compare stored values literally. If one document stores `03/14/2025`, another `2025-03-14` and a third `14 Mar 2025`, no single filter matches them all correctly, and documents are wrongly included or excluded.
+In Bedrock Knowledge Bases the range operators (`greaterThan`, `lessThan` and their "or equals" forms) compare numbers, so a date used in a range filter should be stored as a number.
+## Fix it at the source
+Normalize the values in the ingestion pipeline, before indexing:
+- Convert every date to one consistent representation, for example a number such as `20250314` or epoch seconds, so range filters compare them correctly.
+- Validate the metadata and reject or flag documents whose dates cannot be parsed.
+Then re-sync so the index contains consistent values.
+W: Normalize metadata in ingestion: the problem is inconsistent stored values, so fixing them once, before indexing, makes every later filter reliable without changing queries.
+X: A=Disable metadata filters: this hides the symptom by throwing away the feature; users then get results from any date, which is what the filters existed to prevent.
+C=Ask users to type several formats: the stored values stay inconsistent, and users cannot guess every format in the data, so matches remain incomplete.
+D=Ask the model to interpret dates: filtering happens in the retrieval step before the model sees anything, so the model cannot repair documents the filter already missed.
+T: Metadata filters compare stored values literally, so normalize formats in the ingestion pipeline instead of working around them at query or prompt time.
+
+@ Q002965 explain
+G: ## A gated ingestion pipeline
+Before documents enter a knowledge base, a pipeline can check them and only pass the good ones on.
+- Step 1: a document lands in a landing (raw) S3 bucket, which triggers an AWS Step Functions workflow.
+- Step 2: validation tasks run, for example a Lambda function that checks the schema and required metadata, and a PII scan with Amazon Comprehend `DetectPiiEntities` or Amazon Macie.
+- Step 3: a `Choice` state routes passing documents to the knowledge base source bucket and failing ones to a quarantine bucket, with a notification for reviewers.
+## Why Step Functions
+Step Functions gives each document a visible execution history, built-in retries and error handling, and clear branching. Reviewers can fix a quarantined document and resubmit it, and nothing sensitive reaches the index in the meantime.
+W: Step Functions with quarantine routing: validation runs before ingestion, only passing documents reach the knowledge base, and failures are kept in a separate bucket for human review.
+X: A=Ingest everything, email a weekly summary: documents with PII or bad schema are already indexed and retrievable for up to a week before anyone reads the summary.
+B=Direct user uploads without checks: nothing scans for PII or validates schema, so sensitive or malformed documents go straight into retrieval.
+D=Nightly deletion of failures: deleting without review loses documents that may only need a small fix, and the requirement explicitly asks for quarantine and review.
+T: Validate before indexing and route failures to quarantine for review, rather than ingesting first and fixing later or deleting outright.
+
+@ Q002966 explain
+G: ## Vector search latency
+Vector search finds the nearest neighbors of a query embedding among stored embeddings. Comparing against every vector is slow at millions of items, so engines build approximate nearest neighbor (ANN) indexes such as HNSW, which walk a graph of vectors to find close matches quickly.
+Where the index lives drives latency:
+- **In-memory engines** keep the index in RAM. Amazon MemoryDB vector search offers single-digit millisecond query latency with high recall, even as updates arrive.
+- **Disk or object storage** options trade some latency for lower cost and are fine when tens or hundreds of milliseconds are acceptable.
+## Example
+A real-time assistant with 5 million document chunks needs retrieval under 10 ms so the whole response stays fast; an in-memory HNSW index serves that, while scanning files does not.
+W: In-memory vector search such as MemoryDB: the ANN index is held in memory, which gives very low query latency over millions of vectors, matching both requirements.
+X: B=Precompute answers for every query: users can ask an effectively unlimited number of different questions, so answers cannot be precomputed, and they would go stale as data changes.
+C=Unindexed text columns: embeddings stored as text cannot be compared by vector distance without parsing and scanning every row, which is far too slow for millions of vectors.
+D=Athena over CSV files: Athena scans files in S3 per query and typically takes seconds, and it has no vector index, so it cannot provide interactive similarity search.
+T: For millisecond vector search over millions of items, use an in-memory ANN index; file scans and unindexed columns cannot meet that latency.
+
+@ Q002967 explain
+G: ## What chunk overlap does
+When a document is split into chunks, an idea can start at the end of one chunk and finish at the start of the next. Overlap repeats some text at each boundary so both chunks carry that context.
+- Example: with 300-token chunks and 20% overlap, each chunk repeats about 60 tokens of the previous one.
+- Benefit: a sentence cut at a boundary still appears whole in at least one chunk, which improves retrieval of ideas that span boundaries.
+- Cost: the repeated text is embedded and stored more than once, so the index grows and more tokens are sent to the model when overlapping chunks are both retrieved.
+## In Amazon Bedrock Knowledge Bases
+Fixed-size chunking has an `overlapPercentage` setting and hierarchical chunking an `overlapTokens` setting, while semantic chunking has no overlap setting; its `bufferSize` controls how many neighboring sentences are grouped when comparing meaning to find split points. Overlap is a tuning choice, not a rule.
+W: Context across boundaries, at a cost: overlap keeps boundary-spanning ideas retrievable, and the price is duplicated text, meaning more storage, embeddings and tokens.
+X: A=Overlap reduces storage: overlapping text is stored in every chunk that contains it, so storage increases, not decreases.
+C=Required for semantic, forbidden for fixed-size: fixed-size chunking commonly uses overlap, and semantic chunking does not require it. Overlap is optional in both.
+D=No effect on quality or size: overlap directly changes the number of stored tokens and whether boundary-spanning ideas are retrieved intact.
+T: Chunk overlap trades extra storage and tokens for better context at chunk boundaries; tune it rather than treating it as free or forbidden.
+
+@ Q002968 explain
+G: ## How to tell chunking is wrong
+Chunking decides which pieces of text become the units of retrieval. If chunk size or boundaries are poor, retrieval returns pieces that cannot answer the question even when the right document is found.
+Typical symptoms:
+- **Broken boundaries**: retrieved chunks end mid-sentence or split a table so the header row is in one chunk and the values in another.
+- **Missing context**: the relevant chunk is found, but the fact it needs (for example which product a number refers to) is in a neighboring chunk.
+## Possible fixes
+- Increase chunk size or add overlap.
+- Use semantic or hierarchical chunking so boundaries follow meaning, with small child chunks for matching and larger parent chunks for context.
+- Use advanced parsing for tables and complex layouts, or a custom Lambda transformation for special formats.
+W: D=Chunks cut sentences or tables: boundaries that split meaningful units show the splitting rule ignores the structure of the content, a direct chunking problem.
+E=Relevant chunks lack context: if the right chunk is retrieved but cannot answer on its own, chunks are too small or boundaries are badly placed.
+X: A=Small font for chunk counts: console display style has no effect on how documents are split or retrieved.
+B=Uppercase bucket name: S3 bucket names cannot contain uppercase letters anyway, and bucket naming has nothing to do with chunking quality.
+C=Created on a Monday: the creation date of a knowledge base has no influence on chunk boundaries or retrieval.
+T: Retrieved chunks that break sentences or tables, or that lack needed context, are the signals to revisit chunk size, overlap and strategy.
+
+@ Q002969 explain
+G: ## Why phrasing affects retrieval
+Retrieval embeds the user's question and searches for similar chunks. A vague, conversational or multi-part question ("what about the other one, and is it cheaper?") embeds poorly, so the best chunks may not be retrieved, and the answer suffers.
+## Query reformulation
+Before searching, a model rewrites the question into clearer search queries:
+- Resolve references from the conversation, such as turning "the other one" into the product name.
+- Expand abbreviations and add key terms.
+- Split a complex question into sub-queries and retrieve for each.
+Amazon Bedrock Knowledge Bases supports query decomposition in `RetrieveAndGenerate`, and custom pipelines can do the same with a small, fast model before calling `Retrieve`.
+W: Query reformulation: it turns differently phrased user questions into consistent, explicit search queries, so retrieval quality depends less on how the user wrote the question.
+X: A=Longer answers: answer length is decided after retrieval; if the wrong chunks were retrieved, a longer answer only adds more unsupported text.
+B=Higher temperature: temperature affects how the model generates text, not which chunks the search returns, and it makes outputs less consistent.
+C=Fewer documents in the index: removing content reduces coverage, so some questions lose their only relevant source, and phrasing still affects matching.
+T: Fix phrasing sensitivity before the search by rewriting queries, not after retrieval by changing generation settings or shrinking the index.
+
+@ Q002970 explain
+G: ## Stale versions in a knowledge base
+If a data source holds `policy_v1.pdf`, `policy_v2.pdf` and `policy_v3.pdf`, all three are chunked and indexed. They are semantically similar, so a question about the policy can retrieve the outdated versions as readily as the current one.
+Two complementary fixes:
+- **Clean the source**: remove or archive superseded files and run a sync (ingestion job). Bedrock Knowledge Bases syncs incrementally and removes chunks of deleted files from the index.
+- **Use metadata**: attach fields such as `version`, `status` or `effective_date` to each document. At query time, filter to `status = current` or rank newer documents higher.
+W: B=Remove superseded versions and re-sync: after a sync, the stale chunks are no longer in the index, so they cannot be retrieved at all.
+E=Filter or boost by version or date: metadata lets retrieval exclude old versions or prefer newer ones, which handles cases where old files must stay in the source.
+X: A=Larger generation model: the model answers from whatever chunks it is given; a larger model still receives the outdated chunks and has no reliable way to know they are stale.
+C=Increase top-k: returning more results adds newer chunks but keeps the outdated ones too, so conflicting information still reaches the model.
+D=Tell users to ignore outdated answers: users usually cannot tell which answer is outdated, and it pushes a data quality problem onto them.
+T: Stale results are fixed at the data and retrieval layers, by removing old versions and filtering or ranking with version metadata, not by a bigger model or more results.
+
+@ Q002971 explain
+G: ## Prompt templates for RAG
+A RAG prompt template is a fixed prompt with placeholders filled in per request, for example:
+- `Answer using only the passages below. If they do not contain the answer, say so.`
+- `Passages: {{retrieved_passages}}`
+- `Question: {{question}}`
+The same template receives very different inputs over time: zero passages, one short passage, ten long ones, passages that conflict, or passages in a new format after the chunking strategy changes.
+## Test with realistic, varied inputs
+Keep an evaluation set that covers these cases and run the template against it whenever retrieval or the template changes. Check faithfulness to the passages, correct refusals when passages are irrelevant, and output format. Amazon Bedrock evaluations can score RAG responses for such metrics.
+W: Test against varied retrieval results: it verifies that the template behaves correctly across the real range of inputs it will receive, and catches regressions when retrieval changes.
+X: A=Hard-coded sample passages: every request would get the same passages regardless of the question, which defeats retrieval and gives wrong answers.
+B=Assume it works without testing: templates often fail on edge cases, such as empty or conflicting passages, and without tests those failures reach users.
+D=Remove the placeholder and use web search: foundation models do not search the web by themselves, and it would drop the company's own knowledge that RAG is meant to supply.
+T: A RAG prompt template must be evaluated against the varied passages real retrieval produces, and retested whenever retrieval changes.
+
+@ Q002972 explain
+G: ## Treating prompts like code
+In production, a prompt is part of application behavior: one changed sentence can alter answers for every user. Prompts therefore need the same controls as code.
+- **Versioning**: Amazon Bedrock Prompt Management stores prompts with a working draft and immutable numbered versions, so applications can point at a tested version.
+- **Access control**: IAM policies decide who may call actions such as `bedrock:UpdatePrompt` or `bedrock:CreatePromptVersion`, and on which prompt ARNs.
+- **Approval**: a review step before promotion, such as a pull request review or a manual approval action in AWS CodePipeline, ensures someone checks and tests a new version before production uses it.
+## Example
+Teams edit drafts freely in development, but only a pipeline role can promote a version to production, and only after a reviewer approves it.
+W: A=IAM restrictions on production prompts: only authorized roles can change what production uses, so ad hoc edits by any team are blocked.
+E=Approval workflows before promotion: each new version is reviewed and tested before release, which directly stops unreviewed changes from reaching production.
+X: B=Anyone may edit production directly: this is the cause of the problem, as unreviewed changes go straight to users.
+C=Store prompts in chat messages: chat is not a controlled store, has no versions or permissions, and makes it unclear which text is actually in production.
+D=Remove versioning: without versions you cannot tell what changed, pin tested prompts or roll back a bad change.
+T: Govern shared prompts with permissions on who can change production and an approval gate before a new version is promoted.
+
+@ Q002973 explain
+G: ## Vague versus concrete instructions
+Words like "concise", "short" or "detailed" mean different things to different readers, and a model interprets them differently from one request to the next. The result is inconsistent output.
+Concrete instructions remove that ambiguity:
+- Give a measurable limit: "Answer in at most three sentences" or "use no more than 50 words".
+- Show the target format with an example (few-shot prompting), such as one sample question with a three-sentence answer.
+- Optionally set the `maxTokens` inference parameter as a hard stop, remembering it truncates text rather than making the model plan a shorter answer.
+## Example
+"Be concise" might produce one line or three paragraphs; "Reply in exactly three sentences, like this example: ..." produces answers of nearly the same length every time.
+W: Concrete limit plus an example: a specific, measurable constraint and a demonstration tell the model exactly what length is expected, which makes length consistent.
+X: A=Repeat "be concise": repeating a vague word does not make it measurable, so the model still has to guess what concise means.
+C=Remove the instruction: with no guidance, length depends entirely on the model and the question, so variation increases.
+D=Raise the temperature: higher temperature increases randomness in token choice, which makes length and wording less consistent, not more.
+T: Replace vague adjectives with measurable constraints and an example; repetition or randomness does not make output consistent.
+
+@ Q002974 explain
+G: ## Turning calls into RAG-ready text
+Audio cannot be embedded for a text knowledge base directly; it first has to become text, and customer calls often contain names, card numbers and addresses.
+- **Amazon Transcribe** converts speech to text. Its PII redaction feature finds personal data such as names, phone numbers and credit card numbers and replaces it in the transcript with a tag like `[PII]`. Transcribe Call Analytics adds speaker separation and call insights for contact center recordings.
+- The redacted transcripts are then stored in S3, chunked and embedded into a knowledge base like any other document.
+## The other language and media services
+- Amazon Polly: text to speech (the reverse direction).
+- Amazon Translate: text from one language to another text.
+- Amazon Rekognition: analysis of images and video.
+W: Transcribe with PII redaction, then chunk and embed: Transcribe is the AWS speech-to-text service and can redact PII during transcription, producing clean, searchable text ready for indexing.
+X: A=Rekognition on audio: Rekognition analyzes images and video frames, for example objects, faces and text in images; it does not transcribe speech from audio files.
+B=Polly to convert calls into text: Polly turns text into lifelike speech, the opposite direction, so it cannot produce transcripts.
+D=Translate to convert audio to text: Translate works on text input only; audio must be transcribed first, and it offers no PII redaction.
+T: Speech to text with PII removal is Amazon Transcribe; Polly is text to speech, Translate is text to text, and Rekognition is for images and video.
+
+@ Q002975 explain
+G: ## Choosing prompting, RAG or fine-tuning
+Start with the simplest option and move on only when a real requirement demands it.
+- **Prompting only**: the base model already knows enough and can already produce the behavior with good instructions and examples.
+- **RAG**: answers depend on information the model never saw or that changes often, such as internal policies, product catalogs or yesterday's tickets. Retrieval supplies it at query time, and updating the knowledge base updates answers without retraining.
+- **Fine-tuning**: the model must behave in a way prompting cannot reliably produce, such as a strict house style, a specialized output format or a narrow task.
+## Example
+A support bot that quotes current return policies needs RAG. A bot that must always answer in the company's legal drafting style may need fine-tuning. Both may be combined.
+W: A=Private or changing information: this is the key test for RAG, since fine-tuned knowledge goes stale and retrieval keeps answers current and grounded in private data.
+E=Style or behavior the base model cannot produce: this is the key test for fine-tuning, since knowledge gaps are better solved by retrieval but behavior gaps by training.
+X: B=Chat color scheme: user interface styling has no bearing on how the model gets knowledge or behavior.
+C=Engineers' personal preferences: technique choice should follow the use case's data and behavior needs, not taste.
+D=Number of blog posts: popularity does not show whether a technique fits this use case's data freshness or behavior requirements.
+T: Missing or changing knowledge points to RAG; missing behavior or style points to fine-tuning; otherwise stay with prompting.
+
+@ Q002976 explain
+G: ## Managed models versus self-hosted models
+- **Amazon Bedrock** serves models as a managed service. You call an API and AWS runs the model; your VPC can reach it privately through an interface VPC endpoint, but the model runs in AWS-managed infrastructure and you do not control or download the provider's weights.
+- **Self-hosting on Amazon SageMaker AI** means you deploy model weights you hold, such as an open-weight model, to endpoints you configure.
+## How SageMaker keeps it inside your boundary
+- Put the model's `VpcConfig` on your private subnets and security groups, so the endpoint's network interfaces live in your VPC.
+- Store the weights in your own S3 bucket encrypted with your KMS key.
+- Optionally enable network isolation so the container cannot make outbound calls.
+W: Open-weight model on SageMaker in the company VPC: the company holds the weights and the endpoint runs attached to its VPC, meeting both the network boundary and weight control requirements.
+X: A=Bedrock serverless without private networking: the model runs in AWS-managed infrastructure with no control over weights, and without a VPC endpoint the traffic leaves the VPC through public endpoints.
+B=Public third-party chatbot website: data goes to an outside provider on the internet, and the company controls neither the model nor where it runs.
+C=Another cloud's API over the internet: requests leave the VPC across the public internet to infrastructure the company does not control, and the weights stay with that provider.
+T: Full control over weights and a VPC-only boundary means self-hosting open weights on SageMaker in your VPC, not calling a managed or external API.
+
+@ Q002977 explain
+G: ## Filtering versus boosting
+- **Filtering** removes results that do not match a condition, such as `date >= 2025-01-01`. Older documents disappear completely, even when they are the only good answer.
+- **Boosting** keeps every result but adjusts the ranking score, so newer documents move up while an old but highly relevant document can still appear.
+## Example
+In Amazon OpenSearch Service, a `function_score` query with a decay function (such as `gauss`) on a `published_date` field reduces the score of older documents gradually: a two-year-old document with a strong match can still outrank a new but weakly related one. The same idea can be done in application code by reranking retrieved results with a recency weight, which needs a date stored as metadata on each document.
+W: Boost with date metadata over the whole index: recent documents rank higher, and older relevant documents remain searchable, exactly matching "favor, not exclude".
+X: A=Search only today's documents: a hard filter to one day excludes nearly all content, which contradicts the requirement not to exclude older documents.
+B=Ask the model to guess recency: the model does not know document dates unless they are provided, and guessing happens after retrieval has already ranked the results.
+C=Delete documents older than a month: deletion permanently excludes older content, the opposite of keeping it available.
+T: To prefer recent content without losing older content, boost scores by a date field instead of filtering or deleting.
+
+@ Q002978 explain
+G: ## Multi-tenant isolation for vector data
+When several business units share one platform, each unit's data must be reachable only by its own users. Isolation is strongest when the data store enforces it, not only the application.
+- **Separate index or collection per unit**: for example one Amazon OpenSearch Serverless collection or index per unit, each with its own data access policy, or one Amazon Bedrock knowledge base per unit, with IAM policies naming each resource ARN.
+- **Shared index with metadata filters**: cheaper, but a single bug that forgets the `business_unit` filter exposes everyone's data.
+## Example
+HR, Legal and Sales each get their own index. The HR application role is allowed only on the HR index, so even a faulty query cannot return Legal documents.
+W: Separate indexes or collections with access policies: each unit's vectors live in their own resource with its own permissions, so isolation is enforced by the data layer while the platform stays shared.
+X: A=Single public index for all employees: every employee could retrieve every unit's data, which breaks the different access policies.
+C=One file copied to each unit: every unit would receive all vectors, including other units' data, and copies quickly drift out of sync.
+D=Shared index with no metadata, application logic only: with no metadata, the data cannot even be told apart, and any application bug exposes all units' data.
+T: Enforce tenant isolation in the data layer with a separate index or collection and access policy per unit, not only in application code.
+
+@ Q002979 explain
+G: ## Embeddings across languages
+Retrieval works by comparing embeddings, which are vectors that place text with similar meaning close together. Whether this works across languages depends on the embeddings model.
+- A **multilingual** model maps "refund policy" and "환불 정책" to nearby vectors, so a Korean question can find an English document and the reverse.
+- An **English-only** model produces poor vectors for Korean text, so Korean documents and questions are matched badly.
+Amazon Bedrock offers embeddings models built for multilingual text, such as Cohere Embed Multilingual. Check the model's documented language support and test retrieval with real questions in both languages.
+W: Embeddings model that supports both languages: the embeddings model decides whether English and Korean text with the same meaning land near each other, which is the basis of retrieval in both languages.
+X: A=Split the index by file size: file size has nothing to do with language, so the language mismatch remains in every partition.
+B=English-only model for speed: it cannot represent Korean meaning well, so Korean questions and documents would retrieve poorly.
+D=Translate everything and discard originals: machine translation can lose nuance and terminology, and discarding originals removes the source text Korean users may need quoted.
+T: For a mixed-language corpus and mixed-language questions, choose a multilingual embeddings model so meaning matches across languages.
+
+@ Q002980 explain
+G: ## The Amazon Bedrock Converse API
+Each model provider has its own native request format for `InvokeModel`. The Converse API (`Converse` and `ConverseStream`) offers one consistent message format across the models that support it.
+- A message has a `role` and a list of **content blocks**.
+- Block types include `text`, `image` (image bytes with a format such as PNG or JPEG, or an S3 location for some models), `document` and, for some models, `video`.
+- The same request structure works when you switch between supported multimodal models, as long as that model supports image input.
+## Example
+One user message containing a `text` block ("What defects do you see?") and an `image` block with the photo bytes can be sent to different vision-capable models by changing only `modelId`.
+W: Converse API with image and text content blocks: one API and one message format carry both inputs together to any supported multimodal model, which is exactly the provider-independent single call required.
+X: B=Separate APIs per provider: this means maintaining different request formats per provider and splitting inputs the model needs to see together.
+C=Upload the image to a public website: it exposes possibly sensitive data publicly, and models called through Bedrock do not fetch images from arbitrary web URLs.
+D=Convert the image to a long text description: this loses visual detail the model could use, adds a separate captioning step and uses many more tokens.
+T: For one provider-independent multimodal call, send text and image content blocks through the Bedrock Converse API.
+
+@ Q002981 explain
+G: ## Designing for model service failures
+Any remote dependency can be slow, throttled or unavailable. Graceful degradation means the application keeps working at reduced quality instead of failing.
+- **Retries with exponential backoff and jitter**: handle brief throttling; AWS SDK retry modes `standard` and `adaptive` do this.
+- **Circuit breaker**: after repeated failures the breaker "opens" and calls stop for a cool-down period, then a few test calls check for recovery. This avoids piling load on a failing service and wasting time on requests that will fail.
+- **Fallback**: when a call fails or the breaker is open, return a cached answer, a simpler message ("Summaries are temporarily unavailable"), or route to an alternate model or Region, for example with a Bedrock cross-Region inference profile.
+W: A=Fallback response or alternate model: users still get a useful, if reduced, result when the primary model call fails.
+E=Circuit breaker: it stops sending requests to an endpoint that keeps failing, preventing cascading failures and letting the service recover.
+X: B=Crash the application: crashing turns a partial outage into a full one for every feature, the opposite of degrading gracefully.
+C=Block all requests until engineers act: this makes the whole feature unavailable and waits on manual action instead of automatic handling.
+D=Infinite retries with no delay: immediate endless retries add load to an already failing service, exhaust client resources and can worsen throttling.
+T: Degrade gracefully with a circuit breaker to stop hammering a failing service and a fallback to keep serving users.
+
+@ Q002982 explain
+G: ## Private hybrid connectivity to AWS
+On-premises applications reach a VPC privately in two main ways:
+- **AWS Direct Connect**: a dedicated network connection from your data center to AWS, with consistent bandwidth and latency.
+- **AWS Site-to-Site VPN**: IPsec tunnels over the internet to a virtual private gateway or transit gateway; quick to set up and often used as backup for Direct Connect.
+## Reaching the GenAI service
+Once traffic arrives in the VPC, it goes to the service privately: an internal load balancer or API in the VPC, or an interface VPC endpoint (AWS PrivateLink) for Amazon Bedrock such as `com.amazonaws.<region>.bedrock-runtime`. On-premises DNS can resolve the endpoint's private name through a Route 53 Resolver inbound endpoint.
+W: Direct Connect or Site-to-Site VPN into the VPC: both provide private connectivity from the data center into the VPC hosting the service, so requests do not travel as plain public internet traffic to a public endpoint.
+X: A=Public S3 bucket for requests: a public bucket exposes request data to anyone, and upload-then-poll is slow and fragile compared with a direct API call.
+C=Email requests processed manually: email is neither private application connectivity nor automated; it adds hours of delay and human handling of data.
+D=Public internet with the API key in the query string: traffic uses the public internet, and keys in URLs are logged by proxies and servers, making leaks likely.
+T: For private on-premises access to a service in AWS, connect the data center to the VPC with Direct Connect or Site-to-Site VPN.
+
+@ Q002983 explain
+G: ## Agents acting on behalf of users
+When an agent calls a SaaS API such as a calendar or CRM for a specific user, it should use that user's own delegated permission, not a shared all-powerful key. The standard mechanism is OAuth 2.0: the user consents once, and the agent receives a token limited to that user and the approved scopes.
+## Amazon Bedrock AgentCore Identity
+AgentCore Identity handles this for agents:
+- Gives each agent a workload identity and validates inbound callers, for example with JWTs from your identity provider.
+- Offers OAuth 2.0 credential providers for third-party services, including the user-consent (authorization code) flow.
+- Stores tokens and API keys in a secure token vault, per user and agent, so agent code requests a token at run time instead of handling secrets.
+W: AgentCore Identity: it manages user-delegated OAuth consent and tokens for third-party services, so each call acts with that specific user's permissions.
+X: A=Root credentials in environment variables: root user credentials are AWS account credentials, not SaaS OAuth tokens, and using them in an application breaks basic security practice.
+B=Public endpoint with no authentication: anyone could call it, and it provides no way to act as a specific user with that user's consent.
+C=Shared API key in the prompt: one key gives every user the same access regardless of their consent, and a key in the prompt can be exposed through model output or logs.
+T: For per-user OAuth access to third-party APIs from an agent, use AgentCore Identity rather than shared keys or broad credentials.
+
+@ Q002984 explain
+G: ## Troubleshooting knowledge base ingestion
+A sync in Amazon Bedrock Knowledge Bases runs as an ingestion job that reads the data source, parses and chunks documents, creates embeddings and writes them to the vector store. When some documents fail, the job itself records why.
+- `GetIngestionJob` (and the sync history in the console) shows statistics such as the number of documents scanned, indexed and failed, plus failure reasons.
+- Knowledge base logging can deliver per-document status to CloudWatch Logs, S3 or Firehose.
+## Common causes
+- Unsupported file type or a file over the size limit.
+- A malformed `.metadata.json` file.
+- Missing permissions for the service role on the S3 bucket, KMS key or vector store.
+- Embeddings model throttling or vector store errors.
+W: Ingestion job failure details and logs: they identify which documents failed and the reason, which points directly to the fix.
+X: A=Front-end code in the browser console: the chat UI only sends queries; document ingestion runs in the knowledge base service and never passes through the browser.
+B=Route 53 records for the public domain: ingestion reads from the data source over AWS service connections, not through the company's public DNS names.
+D=Generation temperature and top P: these affect how answers are written at query time and play no part in parsing or embedding documents during ingestion.
+T: When ingestion reports failed documents, start with the ingestion job's failure details and logs, not query-time or front-end settings.

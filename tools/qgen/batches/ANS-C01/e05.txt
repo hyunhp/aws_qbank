@@ -1,0 +1,367 @@
+# ANS-C01 detailed explanations, batch e05 (explanation-only rewrites; letters are the published ones)
+
+@ Q001668 explain
+G: ## What Amazon VPC IPAM does
+Amazon VPC IP Address Manager (IPAM) organizes your address space into **scopes** (private and public) and **pools**, such as a top-level `10.0.0.0/8` pool split into Regional pools like `10.1.0.0/16` for us-east-1.
+- **Allocation**: when a VPC is created with an IPAM pool ID (`Ipv4IpamPoolId`), IPAM hands out the next free block of the requested size, so two allocations from the pool can never overlap.
+- **Monitoring**: IPAM also discovers CIDRs that were typed in by hand and marks them with states such as *overlapping* or *unmanaged*. It reports them but did not choose them, so it cannot stop them.
+## Example
+Pool `10.1.0.0/16` has already allocated `10.1.0.0/20` to account A. A new account creates a VPC and types `10.1.0.0/20` in the console instead of picking the pool. The VPC is created, and IPAM later flags both CIDRs as overlapping.
+To close the gap, teams require pool allocation, for example with an SCP that denies `ec2:CreateVpc` unless the `ec2:Ipv4IpamPoolId` condition key is present.
+W: Manual CIDR, not a pool allocation: IPAM only guarantees non-overlap for blocks it allocates from its pools. A CIDR typed directly into `CreateVpc` bypasses allocation, so IPAM can only detect the overlap afterwards and report it.
+X: A=Overlaps up to /24 by design: IPAM has no "allowed overlap" size. Allocations from a pool never overlap at any prefix length; future subnetting happens inside the VPC's own range, not by overlapping another VPC.
+B=Only across separate Organizations: it is the opposite. IPAM is typically integrated with one AWS Organization and manages and checks address space across that organization's accounts.
+D=Inventory only, no overlap checks: IPAM does both. It prevents overlap for pool allocations and actively detects and flags overlapping CIDRs in its resource monitoring.
+T: IPAM prevents overlap only for CIDRs allocated from its pools; manually entered CIDRs can still overlap and are merely flagged, so enforce pool allocation.
+
+@ Q001669 explain
+G: ## BYOIP and IPAM public scope
+**Bring your own IP (BYOIP)** lets you use a public IPv4 range you own (for example `203.0.113.0/24`) on AWS. You prove ownership (for example with a Route Origin Authorization, ROA, at your regional internet registry) and AWS then advertises the range from its network.
+IPAM has two default scopes: a **private scope** for internal space and a **public scope** for public space. BYOIP ranges are managed in the public scope:
+- Provision the BYOIP CIDR into a top-level public-scope pool, then into a Regional (locale) pool.
+- Share the Regional pool with other accounts through AWS RAM.
+- Accounts allocate Elastic IP addresses from that pool, and the addresses can then be used with resources such as NLBs.
+IPAM tracks which blocks are allocated and how much of each pool is used, all centrally.
+## Limitations to remember
+- The range must be onboarded and verified; it does not appear in IPAM by itself.
+- For public IPv4 advertisement, the smallest prefix AWS advertises is `/24`, so smaller blocks are used by accounts but the range is advertised as a whole.
+W: Public-scope IPAM pool: after BYOIP onboarding, provisioning the range into a public-scope pool (and a Regional child pool shared via RAM) lets IPAM hand out addresses to accounts and track utilization in one place.
+X: A=Automatic import after BGP announcement: announcing a range does not create any IPAM pool. You must provision the CIDR into IPAM explicitly, with ownership verification.
+B=IPAM limited to RFC 1918: IPAM has a public scope specifically for public IPv4 (BYOIP and Amazon-provided) and for IPv6 space, not just private ranges.
+C=Convert to private space: a public range you own stays public; converting it would defeat its purpose (reachability from the internet via Elastic IPs and NLBs), and there is no such conversion step.
+T: BYOIP space is managed by provisioning it into an IPAM public-scope pool and sharing Regional pools, not by automatic import or by treating it as private space.
+
+@ Q001670 explain
+G: ## Route 53 Resolver endpoints: which way does the query go?
+Every VPC has the Route 53 Resolver at the `.2` address (for example `10.0.0.2`). It answers for private hosted zones and public names, but by itself it does not talk to on-premises DNS servers, and on-premises servers cannot reach it.
+- **Outbound endpoint** + **forwarding rule**: a rule such as "forward `corp.example.internal` to `172.16.0.10` and `172.16.0.11`" tells the Resolver to send those queries out through the outbound endpoint's network interfaces, over Direct Connect or VPN, to on-premises DNS.
+- **Inbound endpoint**: network interfaces with IPs in your VPC (for example `10.0.1.10`) that on-premises DNS servers forward queries to. The Resolver answers them, including names in private hosted zones associated with that VPC.
+## Example
+A VPC instance looks up `app.corp.example.internal` → matching rule → outbound endpoint → on-prem DNS.
+An on-prem server looks up `db.aws.example.internal` → on-prem conditional forwarder → inbound endpoint → private hosted zone answer.
+W: Outbound endpoint with forwarding rule, plus inbound endpoint: the outbound side covers VPC-to-on-premises lookups, and the inbound side lets on-premises resolvers query the private hosted zone. Two directions need both endpoint types.
+X: A=No endpoints, DNS flows automatically: the Resolver never forwards to on-premises servers without a rule and outbound endpoint, and on-premises servers cannot query the `.2` Resolver address across a hybrid link.
+B=Public hosted zone with NS records to on-prem: this would publish internal names on the internet and does not make the VPC Resolver send `corp.example.internal` queries to on-premises servers reachable only over Direct Connect.
+D=Inbound endpoint only: this handles only the on-premises-to-AWS direction. VPC queries for `corp.example.internal` would still have no path to on-premises DNS.
+T: AWS to on-premises lookups need an outbound endpoint and forwarding rule; on-premises to AWS lookups need an inbound endpoint, so two-way hybrid DNS uses both.
+
+@ Q001671 explain
+G: ## How the Resolver picks a forwarding rule
+Route 53 Resolver rules apply to a VPC only when they are **associated** with that VPC. For each query, the Resolver looks at the rules associated with the VPC and uses the **most specific** matching domain name.
+- Rule 1: `example.internal` → on-premises DNS
+- Rule 2: `db.example.internal` → partner DNS
+If both are associated, `app.db.example.internal` matches both, and the longer match `db.example.internal` wins, so the query goes to the partner.
+If only Rule 1 is associated with the VPC, Rule 2 does not exist from that VPC's point of view, so the query falls under `example.internal` and goes on-premises.
+## Checking it
+List the associations with `ListResolverRuleAssociations` (or the rule's VPC tab in the console). A rule can be created, and even shared through RAM, without being associated with every VPC that needs it.
+W: The specific rule is not associated with the VPC: the Resolver only considers associated rules, so the broader `example.internal` rule is the most specific match that VPC has, and answers come from on-premises.
+X: A=Alphabetical order: the Resolver does not order rules alphabetically; it chooses the most specific matching domain among the rules associated with the VPC.
+B=Single-label domains only: forwarding rules accept multi-label domain names such as `db.example.internal`; that is the normal way to write them.
+C=No parent/child overlap: parent and child rules are allowed and are a common pattern; the more specific rule takes precedence when both are associated.
+T: The most specific rule wins, but only among rules associated with the querying VPC; an unassociated rule is ignored.
+
+@ Q001672 explain
+G: ## Where DNS Firewall sits
+Route 53 Resolver DNS Firewall is attached to a VPC through rule group associations. It inspects DNS queries that the VPC sends to the Route 53 Resolver, before the Resolver answers them from a hosted zone, resolves them on the internet, or forwards them with a Resolver rule.
+- Each rule matches a **domain list** and takes an action: `ALLOW`, `BLOCK` (with a response such as `NODATA`, `NXDOMAIN` or a custom override record) or `ALERT`.
+- Forwarding rules decide *where* a query goes; DNS Firewall decides *whether* it is allowed to go anywhere.
+## Example
+A block list contains `bad.internal.example.com`. A forwarding rule sends `internal.example.com` to `172.16.0.10`. An instance queries `bad.internal.example.com`: DNS Firewall matches it and returns the configured block response, so it is never forwarded on-premises.
+Operationally, this means a block list can affect internal names too: a broad entry (or a wildcard) can break on-premises lookups, so review lists and consider `ALLOW` exceptions.
+W: DNS Firewall can still block it: DNS Firewall evaluates queries passing through the Resolver regardless of whether they would be forwarded, so a block match wins before any forwarding happens.
+X: A=Only internet-bound queries: DNS Firewall filters queries that go through the VPC's Resolver, including names in private hosted zones and forwarded domains, not just internet names.
+B=Always SERVFAIL: the result depends on the `BLOCK` response you configure (`NODATA`, `NXDOMAIN` or an override). There is no fixed SERVFAIL outcome for overlapping configurations.
+D=Forwarding rules always win: forwarding does not bypass DNS Firewall; the firewall check is applied to the query before the Resolver sends it to the on-premises target.
+T: Forwarding rules pick the destination, but DNS Firewall decides first whether the query is allowed, so a blocked name stays blocked even for forwarded domains.
+
+@ Q001673 explain
+G: ## Letting on-premises resolve private hosted zones
+A **private hosted zone** is answered only by the Route 53 Resolver for VPCs associated with the zone. On-premises DNS servers cannot query the VPC's `.2` Resolver address across Direct Connect.
+A **Resolver inbound endpoint** fixes this. It places network interfaces with private IPs (for example `10.0.1.10` and `10.0.2.10`, in two AZs) in a VPC. On-premises DNS is configured with a conditional forwarder:
+- zone `aws.example.internal` → forward to `10.0.1.10`, `10.0.2.10`
+Queries travel over Direct Connect to those IPs, and the Resolver answers from any private hosted zone associated with that VPC.
+## Direction check
+- On-premises asking AWS → **inbound** endpoint.
+- AWS asking on-premises → **outbound** endpoint + forwarding rule.
+W: Inbound endpoint with on-premises forwarding: it gives on-premises DNS servers reachable IPs inside the VPC to send queries to, and the Resolver answers them from the associated private hosted zone.
+X: A=Outbound endpoint: outbound endpoints carry queries from the VPC to external DNS servers. They do not accept queries coming in from on-premises.
+B=Directory Service required: Route 53 Resolver supports hybrid resolution natively through inbound and outbound endpoints; no directory is needed.
+C=Duplicate as a public hosted zone: copying records into a public zone exposes internal names on the internet and creates two copies that must be kept in sync, while the private zone remains unreachable.
+T: For on-premises clients to resolve a private hosted zone, deploy an inbound endpoint and forward the zone to it; outbound endpoints serve the opposite direction.
+
+@ Q001674 explain
+G: ## Sharing Resolver rules with AWS RAM
+A central networking account can share Route 53 Resolver forwarding rules with other accounts through AWS Resource Access Manager (RAM). Sharing only makes the rule *visible* to the other account. Using it is a separate step:
+- The spoke account associates the rule with its VPC (`AssociateResolverRule`).
+- The IAM principal doing this needs `route53resolver:AssociateResolverRule` and related permissions (for example to read the rule and the VPC).
+If the principal lacks that permission, the rule can appear in the account, but association is refused or the console cannot offer it.
+## Example
+The spoke's operator role has only a read-only policy. The rule `corp.internal` appears as shared in the Resolver console, but the operator cannot associate it. Adding `route53resolver:AssociateResolverRule` (and the related describe/list actions) to the role allows the association.
+Also remember that a Resolver rule and its share live in one Region, so the spoke works with it in that same Region.
+W: Missing association permission: RAM sharing grants access to the rule, but associating it with a VPC is an IAM-controlled API call in the spoke account, and without `route53resolver:AssociateResolverRule` the principal cannot perform it.
+X: A=Cross-Region sharing never possible: the rule is Regional, but the stem says the share was accepted and does not describe a Region mismatch. The "never" wording and rule targets are beside the point; permissions are the likely gap.
+C=Only inbound-endpoint rules can be shared: forwarding rules (which use outbound endpoints) are exactly what is commonly shared through RAM for centralized hybrid DNS.
+D=CLI only: shared rules can be associated in the console as well as with the CLI or API, provided the principal has permission.
+T: RAM sharing makes a Resolver rule available, but associating it with a VPC still requires IAM permission in the receiving account.
+
+@ Q001675 explain
+G: ## Centralized hybrid DNS
+Instead of building endpoints in every account, many organizations use one **DNS (shared services) account** with a VPC reachable over Transit Gateway or Direct Connect:
+- **Outbound endpoint + forwarding rules** in the DNS account (for example `corp.example.com` → on-premises DNS). The rules are shared through AWS RAM and associated with the VPCs in all other accounts. The endpoint stays in the DNS account; spoke VPCs use it through the shared rule.
+- **Inbound endpoint** in the DNS account. On-premises DNS forwards AWS zones to its IPs. Private hosted zones from other accounts are associated with the DNS VPC (cross-account association with `CreateVPCAssociationAuthorization`), so the inbound endpoint can answer for them.
+## Result for 60 accounts
+- Two endpoints (per Region) instead of 120.
+- Rules are created once and shared, so changes happen in one place.
+Route 53 Profiles can further simplify pushing shared DNS configuration to many VPCs.
+W: Central endpoints and rules shared via RAM: one pair of endpoints serves every VPC, and RAM-shared rules give all accounts consistent forwarding with minimal endpoints and management effort.
+X: A=Public hosted zones for internal names: this publishes internal names to the internet and still does not let VPCs resolve on-premises names, which need forwarding rules.
+B=Endpoints in every account: this works but multiplies endpoint cost (each endpoint uses at least two network interfaces billed hourly) and spreads rule management across 60 accounts, the opposite of the goal.
+C=Endpoints can't be centralized: forwarding rules are shareable across accounts with RAM, and an inbound endpoint can answer for any private hosted zone associated with its VPC, so centralizing is a standard design.
+T: Put the Resolver endpoints and rules in one DNS account and share the rules with RAM, rather than deploying endpoints per account.
+
+@ Q001676 explain
+G: ## Split-horizon DNS in Route 53
+Split-horizon means the same name returns different answers depending on who asks.
+- A **public hosted zone** `example.com` answers the internet: `www.example.com` → CloudFront distribution.
+- A **private hosted zone** also named `example.com`, associated with your VPCs, answers queries from those VPCs: `www.example.com` → internal ALB.
+When a VPC instance queries a name, the Route 53 Resolver uses the private zone associated with the VPC. If the private zone has no record for that name, the Resolver returns NXDOMAIN; it does **not** fall back to the public zone.
+## The operational cost
+Every name that VPC clients need must exist in the private zone, even if its value is the same as in the public zone. For example, `api.example.com` added only to the public zone becomes unresolvable from inside the VPCs. Teams keep the zones in sync with automation or infrastructure as code.
+W: Same-name private hosted zone: associating a private zone named `example.com` with the VPCs gives internal clients the ALB answer while the internet keeps the CloudFront answer; the tradeoff is maintaining shared records in both zones.
+X: A=Split-horizon impossible: Route 53 supports it directly with a public and a private hosted zone of the same name.
+B=Geolocation routing: geolocation uses the resolver's or client's geographic location, not whether the query came from inside a VPC, so it cannot reliably separate VPC clients from internet clients.
+C=VPC-only mode on a public zone: public hosted zones have no such mode; restricting answers to VPCs is exactly what a private hosted zone is for.
+T: Split-horizon in Route 53 = public zone plus a same-name private zone, with the tradeoff that records needed internally must be kept in the private zone too.
+
+@ Q001677 explain
+G: ## Route 53 Resolver DNS Firewall
+DNS Firewall filters DNS queries that instances send to the VPC's Route 53 Resolver. It uses **rule groups** associated with the VPC; each rule points to a **domain list** and has an action (`ALLOW`, `BLOCK`, `ALERT`).
+- **AWS managed domain lists** are maintained by AWS and cover categories such as malware domains and botnet command-and-control (C2) domains.
+- **Custom domain lists** hold your own entries, such as `partner.example.com`.
+Rules are evaluated in **priority order** (lowest number first), and the first matching rule's action ends evaluation for that query.
+## Example
+- Priority 100: `ALLOW` custom list `partner.example.com`
+- Priority 200: `BLOCK` AWS managed malware and C2 lists, respond `NXDOMAIN`
+A query for `partner.example.com` matches the allow rule first and resolves, even if the managed list wrongly includes it; a query for a known C2 domain hits the block rule.
+W: ALLOW rule for the partner, then managed BLOCK list: rule priority lets a specific exception be evaluated before the AWS-maintained block lists, so C2 domains are blocked while the partner stays resolvable.
+X: A=NACLs denying C2 IP ranges: NACLs work on IP addresses and ports, not domain names; C2 infrastructure changes IPs often, and a subnet NACL has a small rule limit and no AWS-managed threat lists.
+C=Security groups blocking port 53: this would block all DNS, not specific domains. Security groups also have only allow rules, and traffic to the VPC Resolver is not controlled this way anyway.
+D=GuardDuty as the blocker: GuardDuty analyzes DNS activity and generates findings about C2 lookups, but it does not block resolution by itself.
+T: Domain blocking with AWS-managed threat lists and exceptions is done in DNS Firewall, using a higher-priority ALLOW rule before the managed BLOCK rule.
+
+@ Q001678 explain
+G: ## Two layers of domain filtering
+- **Route 53 Resolver DNS Firewall** works on DNS queries. If `badsite.example` is blocked, the instance never learns its IP address through the VPC Resolver. It cannot see traffic that does not use the Resolver, such as a connection straight to a hard-coded IP or queries to an external DNS server.
+- **AWS Network Firewall** sits in the traffic path (routed through firewall endpoints) and inspects the actual connections. Its domain list rules look at the TLS **SNI** in HTTPS handshakes and the HTTP **Host** header, and its stateful rules can also filter by IP, port and protocol.
+## Why combine them
+Example: malware tries `c2.bad.example`. DNS Firewall blocks the lookup. The malware then connects directly to `198.51.100.7` with SNI `c2.bad.example`; Network Firewall sees the SNI and drops the flow. Each layer covers a gap in the other, which is defense in depth.
+W: Resolution layer plus flow layer: DNS Firewall stops disallowed names from resolving, and Network Firewall inspects the connections themselves (SNI and Host header), catching traffic that bypasses DNS; together they provide defense in depth.
+X: B=Network Firewall has no domain filtering: Network Firewall supports domain list rule groups and Suricata-compatible rules that match on SNI and HTTP Host, not only 5-tuple rules.
+C=DNS Firewall inspects TLS SNI: DNS Firewall only sees DNS queries; it never inspects TLS handshakes or other traffic, so it cannot replace flow inspection.
+D=Functionally identical: they work at different points (DNS resolution versus actual traffic flows), so each catches cases the other misses.
+T: DNS Firewall controls which names resolve; Network Firewall controls which connections flow, and using both closes each one's blind spot.
+
+@ Q001679 explain
+G: ## Declarative networking across many accounts
+**AWS CloudFormation** describes resources in a template, including Transit Gateway types such as `AWS::EC2::TransitGatewayRouteTable`, `AWS::EC2::TransitGatewayVpcAttachment`, `AWS::EC2::TransitGatewayRouteTableAssociation`, `AWS::EC2::TransitGatewayRouteTablePropagation` and `AWS::EC2::TransitGatewayRoute`.
+**StackSets** deploys one template as stack instances to many accounts and Regions in a single operation, for example 40 accounts × 3 Regions = 120 stack instances, with controls such as maximum concurrent accounts and failure tolerance.
+## Drift detection
+CloudFormation can compare a stack's resources with their actual configuration and report drift, for example an attachment option changed in the console. StackSets can run drift detection across all stack instances and show which accounts have drifted.
+A typical layout: the TGW route tables live in the network account that owns the transit gateway, while the VPC attachments are deployed into each spoke account, all from templates.
+W: CloudFormation StackSets: they deploy the same TGW templates to every account and Region consistently, update them all from one place, and support drift detection on the stack instances.
+X: A=EventBridge-scheduled API calls: custom scripts calling EC2 APIs are imperative and must handle ordering, errors and cleanup themselves, and they provide no built-in drift detection or deployment status.
+B=Manual console setup with a runbook: repeating the same steps in 40 accounts and 3 Regions is slow and error-prone, and nothing detects later drift.
+C=Config rules that create resources: AWS Config evaluates resource compliance. Remediation can run Automation documents on non-compliant resources, but Config is not a provisioning tool for building consistent TGW topologies.
+T: Deploy identical networking to many accounts and Regions with CloudFormation StackSets, which also detect drift; Config evaluates, it does not provision.
+
+@ Q001680 explain
+G: ## Out-of-band changes and CloudFormation
+CloudFormation manages only the resources it created or imported. A route added in the console is an **out-of-band** change CloudFormation knows nothing about.
+In a route table, a destination CIDR can appear only once. If a template adds `AWS::EC2::Route` for `10.20.0.0/16` and a manual route to `10.20.0.0/16` already exists, the create call fails ("route already exists") and the update rolls back. CloudFormation does not overwrite resources it does not manage.
+## Remediation
+- Find the out-of-band change: drift detection shows modified managed resources, and a check of the route table in the console or CLI shows routes that are not in the template.
+- Either **delete** the manual route and rerun the update so CloudFormation creates and owns it,
+- or **import** the existing resource into the stack where the resource type supports import, so it becomes managed.
+- Prevent repeats with IAM restrictions on manual changes to CloudFormation-managed networks.
+W: Out-of-band manual route: the console change created a conflicting route outside the stack, so the stack update fails; find the drift, then remove the manual route or bring it under stack management.
+X: A=Route tables immutable in CloudFormation: routes are added, changed and removed through stack updates all the time; immutability is not why this update failed.
+C=Too many subnet associations: subnet associations do not cause a "route already exists" error; the error points directly at the duplicate destination.
+D=CloudFormation overwrites manual resources: CloudFormation does not take over or overwrite resources it does not manage; the create call fails and the stack rolls back, which is expected behavior rather than a service failure.
+T: Manual changes to stack-managed networking cause conflicts; resolve by removing the manual change or importing it, instead of expecting CloudFormation to overwrite it.
+
+@ Q001681 explain
+G: ## Constructs: the reusable unit in AWS CDK
+In the AWS CDK, infrastructure is built from **constructs**. A custom construct is a class that wraps one or more lower-level resources behind a simple API.
+- Its **props interface** defines the inputs, for example `vpc`, `transitGatewayId` and `subnetIds`, with types that the compiler and IDE check.
+- Inside, it creates the `CfnTransitGatewayAttachment`, route entries or tags the platform team wants, with validation and defaults.
+- It is published as a library (for example to npm or a private CodeArtifact repository), so application teams install it like any package.
+## Example
+An app team writes `new TgwAttachment(this, 'Tgw', { vpc })`. They never touch CloudFormation property names; the platform team can fix bugs or add tags in a new library version.
+W: Custom construct with a typed props interface: it packages the attachment logic behind a small, validated API that other CDK stacks import and reuse, hiding the CloudFormation details.
+X: B=Raw JSON nested stack: a nested stack is still a template that consumers must understand and pass parameters to as strings; it loses the typing, validation and library packaging that CDK constructs provide.
+C=Config conformance packs: conformance packs bundle AWS Config rules and remediation for compliance checking; they are not a CDK mechanism and do not provision attachments.
+D=YAML in Parameter Store to copy and paste: copying template fragments has no versioning, typing or testing, and every copy drifts from the original.
+T: Reusable CDK infrastructure is shared as a custom construct library with typed props, not as copied templates or compliance tools.
+
+@ Q001682 explain
+G: ## StackSets with service-managed permissions
+StackSets has two permission models:
+- **Self-managed**: you create the administration and execution IAM roles in each account yourself and list target accounts.
+- **Service-managed**: StackSets uses trusted access with AWS Organizations and creates the needed roles for you. You target **organizational units (OUs)** instead of account IDs.
+With **automatic deployment** enabled, any account that joins a targeted OU gets a stack instance automatically, and removing an account can remove its stack instances too. The console and API show per-account status of each operation.
+## Tradeoffs
+- You must enable trusted access, and usually register a delegated administrator.
+- Template changes roll out organization-wide, so you manage concurrency, failure tolerance and ordering (for example TGW sharing before attachments).
+- Troubleshooting a failed instance means looking at stacks in the target account.
+W: Service-managed StackSets with auto-deployment: targeting OUs deploys the baseline to all 150 accounts and to new accounts automatically, with central status; the cost is the setup and operational complexity of organization-wide rollouts.
+X: A=Config aggregators deploy resources: aggregators collect configuration and compliance data from many accounts into one view; they are read-only and deploy nothing.
+C=StackSets can't target OUs: service-managed StackSets target OUs and can deploy automatically to accounts added to them.
+D=Manual deployment just as efficient: hand-deploying 150 stacks is slow, error-prone and gives no automatic coverage for new accounts.
+T: For an OU-wide baseline that follows new accounts automatically, use service-managed StackSets with automatic deployment, accepting some operational complexity.
+
+@ Q001683 explain
+G: ## AWS Network Manager and global networks
+AWS Network Manager gives one place to see a global network. You create a **global network** and register:
+- **Transit gateways** from multiple Regions
+- **Sites** (branch offices, data centers), **devices** (routers, SD-WAN appliances) and **links** (internet or MPLS circuits)
+- Connections such as VPN attachments and Direct Connect
+It then shows a topology map, events (for example a VPN tunnel going down) and CloudWatch metrics for the registered resources.
+## Route Analyzer
+Route Analyzer checks the routing path between a source and a destination through transit gateway route tables, for example from a VPC attachment in us-east-1 to a VPN in eu-west-1. It shows whether a route exists and which hops the traffic takes, so you can find a missing propagation or blackhole route without sending packets.
+W: Network Manager with a global network and Route Analyzer: it combines multi-Region transit gateways, on-premises sites, devices and links in one topology and health view, and Route Analyzer answers the path question between two endpoints.
+X: A=Config advanced queries: these run SQL-like queries over recorded resource configuration; they return lists of resources, not a network topology, link health or path analysis.
+C=Trusted Advisor network checks: Trusted Advisor gives best-practice and quota recommendations, not a topology view of transit gateways and on-premises sites.
+D=Synthetics canaries: canaries run scripted tests against endpoints and report availability and latency, but they do not map topology or analyze routes through transit gateway route tables.
+T: For a global topology of transit gateways and on-premises networks with route path checks, use Network Manager and Route Analyzer.
+
+@ Q001684 explain
+G: ## Modeling on-premises networks in Network Manager
+A Network Manager global network can hold both AWS resources and your on-premises topology:
+- **Site**: a physical location such as a branch office.
+- **Device**: an appliance at the site, for example an SD-WAN router.
+- **Link**: a connection at the site, such as a 500 Mbps broadband circuit from an ISP.
+You associate devices with links, and you associate a device with its AWS connection, such as a VPN or a **Transit Gateway Connect** peer (GRE tunnel with BGP). Several SD-WAN vendors integrate with Network Manager to register these objects automatically.
+## Result
+The topology view then shows branch site → device → link → Connect attachment → transit gateway. When a Connect peer's BGP session goes down, you can see which site and link it belongs to, alongside events and metrics for the AWS side.
+W: Register SD-WAN sites, links and devices: once they are in the global network and associated with the Connect attachments, Network Manager shows on-premises and AWS-side health together.
+X: A=Separate AWS SD-WAN Manager service: no such separate service is needed; SD-WAN appliances are represented as devices in Network Manager, with partner integrations optional.
+B=Connect attachments invisible: transit gateway attachments, including Connect attachments and peers, appear in Network Manager for registered transit gateways; Flow Logs show traffic records, not topology or health.
+C=No concept of sites or devices: sites, devices and links are core Network Manager objects designed for exactly this.
+T: Network Manager correlates on-premises and AWS health when you register sites, devices and links and associate them with transit gateway attachments.
+
+@ Q001685 explain
+G: ## Monitoring views versus live state
+Network Manager builds its dashboards from data it collects, such as topology change events, status updates and CloudWatch metrics. That data arrives with some delay and depends on what has been registered and associated.
+The **Direct Connect console** and your **router** show the connection's current state more directly: BGP status of each virtual interface, and whether traffic is moving.
+## Why they can disagree
+- A connection briefly went down and came back; the monitoring view still shows the last event.
+- Metrics are published at intervals, so a status can trail reality by some minutes.
+- The registered object or its association may not be the one actually carrying traffic.
+## Practical rule
+When a dashboard and the live control plane disagree, trust the live source (Direct Connect console, `DescribeVirtualInterfaces`, router `show bgp`) and then investigate why the monitoring view is stale or mismapped.
+W: Event and metric data can lag: Network Manager reflects collected events and metrics, which can trail the live BGP state, so a recovered connection may still appear down.
+X: A=Direct Connect console malfunctioning: the console agrees with what the router and traffic show; the view that is out of step is the aggregated monitoring view.
+C=BGP and physical state are the same value: a physical connection and the BGP sessions on its virtual interfaces are separate states that can differ, and a mismatch between two views is not evidence of corruption.
+D=Network Manager can't display Direct Connect: Network Manager can include Direct Connect resources in its global network views, so an absent feature is not the reason.
+T: Aggregated monitoring views can lag the live control plane; confirm status in the Direct Connect console or on the router before acting.
+
+@ Q001686 explain
+G: ## Event-driven remediation
+When someone changes a security group, the API call (`AuthorizeSecurityGroupIngress`) is recorded by **AWS CloudTrail**. Amazon **EventBridge** receives these management events as "AWS API Call via CloudTrail", so a rule can match them in near real time.
+- **EventBridge rule**: match source `aws.ec2`, event name `AuthorizeSecurityGroupIngress`.
+- **Lambda target**: reads the request parameters from the event. If a rule allows `0.0.0.0/0` on port 22, it calls `RevokeSecurityGroupIngress` for exactly that rule and can send a notification.
+## Example
+An engineer opens SSH to the world at 10:00:00. The event reaches EventBridge, the function revokes the rule shortly after, and the security team gets an alert naming who made the change.
+An AWS Config rule triggered by configuration changes, with automatic remediation, is another valid design; the key is reacting to the change rather than a periodic scan.
+W: EventBridge rule on AuthorizeSecurityGroupIngress with a revoking Lambda: it reacts to the API call itself and removes the offending rule automatically, without waiting for a scheduled scan.
+X: B=GuardDuty modifies security groups: GuardDuty produces threat findings; it does not change security groups. Remediation would still need something like EventBridge and Lambda.
+C=Inspector revokes rules: Amazon Inspector scans for software vulnerabilities and network reachability exposure; it reports findings and never modifies security groups.
+D=Daily Config rule that only reports: a daily periodic evaluation with no remediation leaves port 22 open for up to a day and fixes nothing.
+T: Immediate, automatic fixes come from event-driven automation (CloudTrail event → EventBridge → Lambda), not from detection-only services or scheduled reports.
+
+@ Q001687 explain
+G: ## Lambda execution roles and AccessDenied
+A Lambda function calls AWS APIs with the permissions of its **execution role**. The trigger (here EventBridge) only starts the function; it does not lend it any permissions.
+The AWS managed `ReadOnlyAccess` policy allows `Describe*`, `Get*` and `List*` style calls, such as `ec2:DescribeNetworkAcls`, but no changes. So:
+- `ec2:DescribeNetworkAcls` → allowed
+- `ec2:ReplaceNetworkAclEntry` → `AccessDenied` (UnauthorizedOperation)
+## Fix with least privilege
+Add a policy statement allowing only the write actions the remediation needs, such as `ec2:ReplaceNetworkAclEntry` (and `ec2:DeleteNetworkAclEntry` or `ec2:CreateNetworkAclEntry` if used), optionally limited to specific NACL ARNs or tags. Also check that no SCP or permissions boundary denies the action.
+W: Grant the needed write actions: the role only has read permissions, so adding `ec2:ReplaceNetworkAclEntry` (and any other write actions used) to the execution role removes the AccessDenied error.
+X: A=Move the function into the VPC: running in a VPC changes network placement, not IAM authorization; EC2 API calls are authorized by the role either way.
+B=Increase memory: memory affects CPU and performance, never IAM authorization; AccessDenied is returned by the EC2 API because the role lacks the action.
+D=VPC access grants EC2 write permissions: VPC access only needs permissions to manage the function's own network interfaces (for example `AWSLambdaVPCAccessExecutionRole`); it never grants NACL write actions.
+T: AccessDenied from a Lambda means its execution role lacks that action; add the specific permission rather than changing network or memory settings.
+
+@ Q001688 explain
+G: ## Two ways to enforce network rules across accounts
+**AWS Firewall Manager** is a managed policy service for AWS Organizations. From an administrator account you define policies, such as:
+- security group policies (apply common groups, audit and remediate overly permissive rules, find unused groups)
+- network ACL policies (enforce first and last NACL rules)
+Firewall Manager applies them to existing and new accounts in scope and can remediate automatically. It depends on AWS Config and Organizations and costs per policy per Region, but needs little custom code.
+**A custom pipeline** uses AWS Config custom rules (usually Lambda functions) to evaluate resources, and Config remediation with Systems Manager Automation documents to fix them. It can express any logic you want, but you write, test, deploy to 200 accounts and maintain all of it.
+## Choosing
+Standard controls, minimal code → Firewall Manager. Unusual business logic that Firewall Manager policies cannot express → custom pipeline, with the added upkeep.
+W: Managed versus custom: Firewall Manager gives centralized, organization-wide enforcement and remediation with little code, while a custom Config and Automation pipeline is more flexible but costs more development and maintenance.
+X: A=No meaningful difference: Firewall Manager uses built-in policy types and needs no remediation code, while the custom pipeline is entirely your own code, so effort and flexibility differ a lot.
+B=Config and Lambda can't be combined: custom Config rules are typically implemented as Lambda functions, and Automation documents can also invoke Lambda, so the two combine routinely.
+D=Firewall Manager can't remediate: Firewall Manager security group and network ACL policies support automatic remediation, not just findings.
+T: Pick Firewall Manager for consistent, low-code enforcement at scale, and a custom Config pipeline only when you need logic it cannot express and can maintain the code.
+
+@ Q001689 explain
+G: ## Systems Manager Automation runbooks
+An Automation **runbook** is a document of ordered steps that Systems Manager executes and records. Useful step types include:
+- `aws:executeAwsApi` or `aws:assertAwsResourceProperty` to check health first (for example a virtual interface's BGP status)
+- `aws:approve` to pause until named IAM principals approve or reject
+- `aws:executeAwsApi` or `aws:executeScript` to perform the action
+- `aws:waitForAwsResourceProperty` to verify the result
+Each execution keeps the inputs, step outputs, approver and timestamps, and actions are also in CloudTrail, which gives an audit trail.
+## Starting it
+The same runbook can be started by an operator in the console or CLI, or automatically, for example by an EventBridge rule reacting to a CloudWatch alarm state change.
+W: Automation runbook with an approval step: it encodes the check, approve, act and verify sequence as readable steps with execution history, and can be started by humans or by alarm-driven automation.
+X: B=Lambda with sleep for approval: a Lambda function runs at most 15 minutes and is billed while sleeping; it has no built-in approval or step-level audit trail.
+C=Alarm action that resets BGP: an alarm action fires a single action on a state change; it cannot run health checks, wait for approval or verify the result.
+D=Config remediation without approval: skipping the approval gate violates the requirement, and Config remediation is designed to fix non-compliant resource configuration, not to run on-demand operational procedures.
+T: Gated, auditable operational procedures belong in a Systems Manager Automation runbook with `aws:approve`, not in a Lambda sleep or a single alarm action.
+
+@ Q001690 explain
+G: ## Cross-account Automation with least privilege
+Systems Manager Automation can act in other accounts by assuming an IAM role there. Two common patterns:
+- **Multi-account and multi-Region executions**: an administration role in the central account and an execution role in each target account.
+- A runbook step that assumes a specific role in the target account for the API calls.
+In both cases the target account role decides what the automation can do. It should allow only what the task needs, for example `directconnect:DescribeVirtualInterfaces`, `directconnect:StartBgpFailoverTest` and `directconnect:StopBgpFailoverTest`, and trust only the central automation role.
+## Example
+The NOC starts the runbook with target account `111122223333` and virtual interface `dxvif-abc123`. The runbook assumes `NetOpsDxResetRole` in that account, performs the BGP action on that VIF and exits. It cannot touch EC2, IAM or anything else in the account.
+W: Scoped cross-account role: assuming a role in each account that allows only the needed Direct Connect actions gives central triggering without broad standing access.
+X: A=AdministratorAccess in all 30 accounts: this gives the automation far more power than needed; a bug or compromised credential could change anything in every account.
+C=Automation can't work across accounts: Automation supports cross-account and cross-Region execution through assumed roles.
+D=Config aggregators performing writes: aggregators only collect configuration and compliance data from other accounts; they cannot perform write actions.
+T: Central automation should reach other accounts through narrowly scoped assumed roles, never through broad administrator access.
+
+@ Q001691 explain
+G: ## Automation runbook versus Lambda function
+Both can call AWS APIs. They differ in shape:
+- **Systems Manager Automation** runbooks are YAML or JSON documents of named steps (check, `aws:approve`, act, verify). The console shows each execution step by step with inputs, outputs and status, so a non-developer can read what happened. Approval, waiting, branching and retries are built-in step features.
+- **AWS Lambda** runs code you write. It is great for custom logic and fast event handling, but approvals, pauses longer than 15 minutes and a readable step history must be built yourself, for example with Step Functions or tickets.
+## Example
+A NACL remediation: describe the NACL → if a production subnet is involved, wait for approval → replace the entry → verify. In Automation, that is four readable steps; in Lambda, the logic is inside code, and the approval must be engineered separately.
+W: Built-in approvals and auditable steps: Automation natively supports approval steps and records each step's execution in a readable form, which matches the requirement for pauses and non-developer auditability.
+X: A=Always faster than Lambda: speed is not the reason to choose Automation, and it is not generally faster; its advantage is structure, approvals and auditability.
+B=Lambda can't call AWS APIs: Lambda functions call AWS APIs routinely through the SDK using their execution role.
+C=Strict superset of Lambda: Automation and Lambda serve different purposes; Automation can even invoke Lambda functions, and Lambda remains a valid choice for many networking automations.
+T: Choose Automation runbooks when you need approval gates and a step-by-step audit trail; choose Lambda for custom code where those are not required.
+
+@ Q001692 explain
+G: ## How Direct Connect failover works
+With two Direct Connect connections at different locations, each has a private virtual interface with its own **BGP session**. BGP tells both sides which paths are available. When a session goes down, its routes are withdrawn and traffic moves to the remaining path, often in seconds (faster with BFD).
+To test failover you only need to make one BGP session go away, not break any physical link:
+- On your router, shut down the BGP neighbor for the primary VIF (for example `neighbor 169.254.10.1 shutdown`).
+- Watch routes and traffic move to the secondary connection.
+- Re-enable the neighbor and confirm traffic returns as expected.
+## Other options
+AWS also offers a Direct Connect failover test in the console and API (`StartBgpFailoverTest`) that brings BGP sessions down from the AWS side for a set period and restores them automatically, which is equally reversible.
+W: Shut down the primary BGP session on the router: it simulates the loss of the primary path cleanly and reversibly, under your control, without touching fiber or opening a case, and lets you observe real failover.
+X: B=Ask Support to disable the port: the stem rules out support cases, and self-service methods (your router or the failover test feature) already exist for this.
+C=Delete and recreate the VIF: deleting a virtual interface is destructive; the new one may get different settings and needs reconfiguration, which adds risk beyond a simple test.
+D=Change MTU to force renegotiation: an MTU change is a configuration change, not a controlled test; it may cause only a brief disruption (possibly for other VIFs on the connection) or none if the MTU is already 1500, and can create mismatches with the router.
+T: Test Direct Connect failover by disabling the primary BGP session (on your router or with the AWS failover test), not by deleting VIFs or altering configuration.

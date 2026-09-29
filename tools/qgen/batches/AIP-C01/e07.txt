@@ -1,0 +1,364 @@
+# AIP-C01 detailed explanations, e07 (explanation-only rewrites; letters are the published ones)
+
+@ Q001570 explain
+G: ## Human-in-the-loop review
+Some model outputs should be checked by a person before they are trusted or reused. A human review workflow needs three things: a rule that decides which items go to a person, a workforce and task UI, and a structured place where the reviewers' answers land.
+## How Amazon Augmented AI (A2I) provides this
+- A **flow definition** sets the review task, the instructions, the worker task template and where results are written in Amazon S3.
+- A **workforce** can be your own private team, a vendor, or Amazon Mechanical Turk (the same workforce options as SageMaker Ground Truth).
+- A **custom task type** lets any application, including one built on Amazon Bedrock, call `StartHumanLoop` for items it chooses, for example responses whose confidence score is below `0.6` or a random 5% sample.
+The reviewers' corrected labels arrive as JSON in S3, ready to be merged into an evaluation or tuning dataset.
+W: Amazon A2I human review workflows: A2I is built for exactly this pattern (route selected predictions to qualified people, collect structured corrections) and runs the task UI, worker management and result storage for you, so almost no custom infrastructure is needed.
+X: B=Guardrails with human review: Amazon Bedrock Guardrails evaluates prompts and responses against policies (content filters, denied topics, sensitive information, grounding) and blocks or masks automatically. It has no reviewer workforce, task queue or labeling output.
+C=X-Ray trace annotations: annotations are indexed key-value pairs on traces used to filter and search request paths. They record what happened in a request; they do not send items to people or collect corrected labels.
+D=AWS Config rules: Config evaluates the configuration of AWS resources (for example, whether a bucket is encrypted). It never sees model responses and cannot run a labeling task.
+T: Sending selected model outputs to people and collecting their corrections is a human-review workflow, which is A2I's job; Guardrails filters automatically and involves no humans.
+
+@ Q001571 explain
+G: ## Outcome metrics versus activity metrics for agents
+An agent turns a user request into a series of steps: it reasons, calls tools (action groups in Amazon Bedrock Agents), reads results and answers. Metrics fall into two groups:
+- **Activity or efficiency metrics** describe how the agent worked: latency per tool call, tokens used, number of steps.
+- **Outcome metrics** describe whether the user got what they came for.
+Every tool call can return HTTP `200` and the session can still fail. Example: the user asks for a refund, the agent looks up the order successfully, then answers "your order has shipped" and never starts the refund. All calls succeeded, but the goal was missed.
+## Measuring task completion
+Task completion rate is the share of sessions where the underlying goal was achieved: the status was reported correctly, the refund was actually issued, or the case was escalated when it should be. It is judged with labeled test scenarios, human review or an LLM-as-a-judge that compares the session with the expected outcome.
+W: Task completion rate: it directly measures whether the user's goal was achieved in the session, which is exactly the "did the agent actually succeed" question, independent of whether individual calls succeeded technically.
+X: A=Average tool latency: latency tells you how fast calls return, and a fast agent that issues the wrong refund or never escalates still scores well.
+C=Tokens per session: token counts track cost and verbosity. A session can use few tokens and fail, or many tokens and succeed.
+D=Number of action groups used: this reflects which tools were touched, not whether they were the right ones or whether the goal was met; using more tools is not better.
+T: Judge an agent on outcomes (was the goal achieved), not on activity metrics like latency, tokens or tool counts that can look healthy while users fail.
+
+@ Q001572 explain
+G: ## Where agent failures hide
+An Amazon Bedrock agent calls an action group, usually an AWS Lambda function, and expects a response in a specific shape: fields such as `messageVersion` and a `response` object that names the action group and the API path or function and carries the response body. If the Lambda returns malformed or unexpected content, the agent cannot use the result, may retry, and often gives up.
+Aggregate metrics such as overall task completion only show that something got worse. To find what got worse, break results down per component.
+## Per-tool metrics
+For each action group, record over a test set (and in production):
+- success rate: calls that returned a well-formed, usable result
+- error rate: exceptions, timeouts, non-success status codes
+- unparsable-output rate: responses that did not match the expected schema
+Bedrock Agents traces (the orchestration trace shows each invocation input and observation) provide the raw data. Running this per-tool evaluation before release would show the new payment action group failing while the others stay healthy.
+W: Per-action-group success versus error or unparsable-output rates: it isolates each tool, so the new payment action group's malformed responses show up as a spike in unparsable output even while tool selection is correct.
+X: A=Final response toxicity score: toxicity measures harmful language in answers. Malformed Lambda output causes abandoned tasks, not toxic text, so the score would stay flat.
+B=Tokens generated per turn: longer or shorter reasoning is at most an indirect side effect and does not tell you which tool failed or why.
+C=Increase the session timeout: the agent does not fail because the session expires; it fails because the tool response cannot be parsed. More time only gives it more time to fail, and this is not an evaluation approach at all.
+T: After adding a tool, measure success and error rates per tool; aggregate metrics show that quality dropped, per-tool metrics show where.
+
+@ Q001573 explain
+G: ## Final-answer evaluation versus trajectory evaluation
+- **Final-answer (outcome) evaluation** compares the agent's last answer with an expected answer. It says whether the result is right.
+- **Trajectory evaluation** looks at the path: which tools were called, in which order, with which arguments, and how many steps were taken. The observed path is compared with one or more expected paths, for example "look up order, then call payment once".
+## Why an agent can be right and still wrong
+An agent can reach the correct answer by an unsafe or wasteful route. Calling a payment tool twice might charge the customer twice even though the reply text looks fine. Nine tool calls instead of three add latency and cost. Trajectory checks catch both:
+- duplicate side-effecting calls (the same `payment` call with the same arguments)
+- step count above the expected path length
+- wrong arguments or wrong ordering
+The trace data from Bedrock Agents or your own tool-call logs provides the sequence to score.
+W: Trajectory evaluation of tool-call sequence and arguments: it scores the path itself, so duplicate payment calls and redundant steps are flagged even when the final answer is correct.
+X: B=End-to-end latency percentiles: extra calls may raise latency, but the percentile cannot say which calls were redundant or that a payment ran twice.
+C=Guardrail intervention counts: guardrails check content against policies. Duplicate or excessive tool calls do not violate content policies, so the count would not move.
+D=Final-answer correctness against a golden dataset: answers are already correct 95% of the time, so this metric would look healthy while duplicate payments continue.
+T: When the answer is right but the path is wrong, only trajectory evaluation (tools, order, arguments, step count) can see the problem.
+
+@ Q001574 explain
+G: ## The chunk size tradeoff
+In retrieval-augmented generation, documents are split into chunks and each chunk is embedded as one vector.
+- **Small chunks** (for example 100 tokens) produce focused vectors, so narrow questions match precisely, but a procedure may be split across several chunks.
+- **Large chunks** (for example 1,000 tokens) keep procedures intact but mix topics, so the vector is a blurred average and matches less precisely.
+## Structure-aware options in Bedrock Knowledge Bases
+- **Hierarchical chunking** creates small child chunks inside larger parent chunks. Search matches on the child chunks, and the matching parent chunk is returned to the model, so you get child-level precision with parent-level context.
+- **Semantic chunking** splits where the meaning changes, based on embedding similarity between sentences, instead of at a fixed token count.
+Example: a question about "step 4 of resetting the controller" matches the child chunk for step 4, and the model receives the parent chunk containing the whole reset procedure.
+W: Hierarchical or semantic chunking with parent context: retrieval stays precise because matching happens on small or meaning-based units, while the model still receives the surrounding section needed for complete procedures.
+X: A=Higher top-k with small chunks: more chunks add fragments from unrelated sections along with the missing steps, raising noise and prompt size without guaranteeing the pieces of one procedure are retrieved together or in order.
+B=No chunking, one embedding per document: a whole manual collapsed into one vector matches almost nothing precisely, and returning entire long documents quickly overflows the context and buries the relevant passage.
+D=Smallest possible chunks: this maximizes precision but makes the completeness problem worse, because procedures are cut into even more pieces.
+T: Hierarchical or semantic chunking gives small-chunk precision with large-chunk context; tuning only chunk size or top-k just moves along the tradeoff.
+
+@ Q001575 explain
+G: ## Why chunk boundaries matter
+Each chunk is retrieved on its own. If a five-step procedure is split so that step 3 lands in a different chunk, a query about the whole procedure may retrieve steps 1-2 and 4-5 but not step 3, and the model produces an answer with a gap or invents the missing step.
+Single-fact questions keep working because a fact usually fits inside one chunk no matter where the boundaries fall. That split symptom (facts fine, procedures broken) points straight at the chunker.
+## Chunking along structure
+- Split on headings, numbered steps or section markers instead of a raw character count.
+- Keep a procedure in one chunk where it fits, and add **overlap** (for example 10-20% of the chunk) so a boundary does not cut a step off from its context.
+- In Bedrock Knowledge Bases the chunking configuration is set when a data source is created and cannot be edited afterward, so a new strategy means a new data source and a full sync, which rebuilds every chunk and vector; the embedding model itself does not change.
+A custom Lambda chunker in Bedrock Knowledge Bases can implement these rules because it receives the parsed content and returns the chunks you define.
+W: Chunks split procedures; chunk by section with overlap: the new chunker cuts steps apart by character count, which explains why only multi-step answers degraded, and structure-aware chunking with overlap keeps each procedure retrievable as a whole.
+X: B=Retrain the embedding model: managed embedding models are not retrained when you change chunking. The documents need re-chunking and re-ingestion, and retraining would not rejoin split steps anyway.
+C=Temperature too high: temperature affects how the model phrases its answer, not which chunks retrieval returns. Missing steps come from retrieval, before generation starts.
+D=Embedding dimension too low: the migration changed only the chunker, not the embedding model, and single-fact queries still work, so vector capacity is not what broke. The chunk boundaries did.
+T: When facts still work but procedures break after a chunking change, the chunker is splitting logical units; chunk along document structure with overlap.
+
+@ Q001576 explain
+G: ## Bedrock errors carry specific types
+Amazon Bedrock runtime calls return distinct exception types, each pointing to a different cause:
+- `ThrottlingException` (HTTP 429): too many requests or tokens for the quota; retry with backoff or add capacity.
+- `ValidationException` (400): the request body or parameters are invalid; fix the payload.
+- `AccessDeniedException` (403): IAM or model access is missing.
+- `ModelTimeoutException`, `ServiceUnavailableException`, `InternalServerException`: problems on the service or model side; usually retryable.
+Every response also has a **request ID**, which AWS Support needs to trace a specific call.
+## Structured error logging
+If code catches every error and logs only "500 error", all of this is lost. Log a structured record per failure, for example: exception type, HTTP status, request ID, model ID, input and output token settings, prompt size and retry count. Then a CloudWatch Logs Insights query grouped by exception type shows at once whether failures are throttling, bad input or service-side.
+W: Log exception type, request ID and key parameters: the exception type separates throttling, validation and service errors, the request ID lets AWS trace the exact call, and the parameters let you reproduce it.
+X: A=Maximum Lambda timeout: a longer timeout only helps calls that were slowly succeeding. It gives no information about whether errors are throttling, bad requests or service faults.
+B=Switch model provider: this changes the system before you know the cause. If the errors are throttling or malformed requests, they would follow the application to the new provider.
+D=Catch and suppress all SDK exceptions: suppression discards the very error types and messages needed to diagnose the problem, and hides failures from callers and monitoring.
+T: Make failures diagnosable by logging the specific exception type, request ID and parameters; timeouts, provider switches and suppression all destroy or ignore the evidence.
+
+@ Q001577 explain
+G: ## Reading a ValidationException
+A `ValidationException` means Amazon Bedrock rejected the request before running the model because the input does not match what the model accepts. The message often names the problem, such as an unknown or extraneous key, an out-of-range value or a missing field.
+Each model family on `InvokeModel` has its own request body schema. A parameter valid for one model (for example `top_k` or a particular stop-sequence field name) can be rejected by another.
+## Why only some requests fail
+If only a subset fails after an upgrade, look at what makes that subset different: a code path that builds the body differently, a helper whose defaults changed with the SDK version, or requests sent to a model whose schema lacks the new field. Remediation:
+- capture a failing and a succeeding payload and diff them
+- validate request bodies against the target model's documented parameters before sending
+- consider the Converse API, which uses one request format with `inferenceConfig` and passes model-specific fields separately
+W: Payloads with fields incompatible with the model's schema: an unrecognized-parameter validation error on only some requests points to how those payloads are built; comparing and validating them against the model's format finds the offending field.
+X: A=Lost bedrock:InvokeModel permission: a missing permission produces `AccessDeniedException`, and it would hit every request that uses the role, not a subset with a parameter complaint.
+B=Regional outage: outages produce service-side errors such as unavailable or internal errors, not a validation message about a specific parameter, and waiting will not fix a malformed request.
+D=Retry until it succeeds: validation errors are deterministic client-side errors; the same payload is rejected every time, so retries only add load and latency.
+T: A ValidationException naming a parameter is a client-side payload problem; diff failing and succeeding requests against the model's schema instead of retrying or checking IAM.
+
+@ Q001578 explain
+G: ## Prompts need regression tests
+A small wording change in a prompt can shift behavior in ways that are hard to see from a few examples. It might improve overall accuracy but break one category, such as billing emails that start being labeled as technical issues.
+## A prompt evaluation harness
+A harness treats prompts like code under test:
+- a fixed **labeled dataset** of representative inputs with expected labels, covering every category
+- a script (for example in a CI pipeline) that runs each prompt draft through the model on the whole dataset
+- metrics per category, such as accuracy, precision and recall, compared with the current production prompt
+- a gate that blocks rollout if any category drops by more than a set threshold, for example 2 points
+Amazon Bedrock evaluation jobs can run model evaluation on your own dataset, or you can script `Converse` calls and score the outputs yourself. What matters is the same data every time and a per-category diff.
+W: Harness that runs each prompt on a labeled dataset and diffs per-category accuracy: it is repeatable, it compares every draft on the same inputs, and the per-category breakdown catches the local regressions an overall average would hide.
+X: A=Test on all production traffic: users receive the regressions before anyone measures them, and live traffic changes daily, so results are not comparable between drafts.
+B=Spelling and grammar check: correct spelling says nothing about how the model classifies inputs; a perfectly written prompt can still lower accuracy.
+D=Playground review of a few outputs: a handful of manual checks is neither repeatable nor representative, and will easily miss a drop in one category.
+T: Treat prompts like code: run every draft against a fixed labeled dataset and compare per-category metrics before rollout.
+
+@ Q001579 explain
+G: ## What Prompt Management does and does not do
+Amazon Bedrock Prompt Management stores prompt templates with their variables, model and inference settings. When you create a **version**, you get an immutable, numbered snapshot of the prompt that applications can reference by its version ARN. Several versions exist at once, so you can keep version 2 in production while you test version 3.
+Versioning records what changed; it does not measure whether the change helped.
+## Comparing versions objectively
+- Build a dataset of representative inputs, ideally with reference answers.
+- Run both versions on the same inputs, for example with an Amazon Bedrock evaluation job or your own harness, scoring correctness, helpfulness or other chosen metrics (automatic metrics, LLM-as-a-judge or human review).
+- Or, in production, send a small share of traffic to version 3 (an A/B test) and compare business metrics such as resolution rate.
+Promote version 3 only if it wins on those metrics.
+W: Evaluation job or A/B test of both versions on the same dataset: identical inputs and shared metrics give an objective comparison, which is what a promotion decision needs.
+X: A=Higher version number ranks higher: version numbers are just a sequence of snapshots. Prompt Management does not judge or rank quality, and a newer version can be worse.
+B=Compare by prompt length: length is not a quality measure. Shorter prompts sometimes drop instructions or examples the model needs, and longer ones sometimes help.
+C=Delete version 2 because only one is active: multiple versions can exist side by side, and deleting the production version would remove your rollback path without proving version 3 is better.
+T: Prompt Management versions prompts; only an evaluation or A/B test on the same data shows whether a new version is better.
+
+@ Q001580 explain
+G: ## Separating retrieval problems from generation problems
+In RAG, the answer can only be as good as the retrieved chunks. Check retrieval first:
+- If the right passage is retrieved with a high relevance score and the answer is still wrong, the problem is in generation (prompt, model, parameters).
+- If the right passage is not retrieved, or top results score low, the problem is in retrieval.
+## Vocabulary and embedding mismatch
+Semantic search compares a query vector with chunk vectors. It fails when:
+- users phrase questions differently from the docs, for example "my login is broken" versus "authentication error codes"
+- queries and documents were embedded with different models or settings
+Keyword search finding the passage easily while vector scores stay low is a classic sign. Next steps: try query rewriting or reformulation, turn on hybrid (semantic plus keyword) search where the vector store supports it, and confirm the same embedding model and configuration are used at ingestion and query time.
+W: Retrieval problem from vocabulary or embedding mismatch: low similarity scores for passages that keyword search finds easily mean retrieval is failing, so query rewriting and checking embedding consistency are the right diagnostics.
+X: B=Temperature too high: temperature only affects how the model samples its answer. It is applied after retrieval and cannot change similarity scores between the query and chunks.
+C=Guardrail content filters blocking passages: content filters act on harmful categories such as hate or violence, and a block produces a blocked message, not ordinary low-scoring retrieval of support documentation.
+D=Outdated model version: the relevant passages are not reaching the model in the first place, so a newer model would still answer from the wrong context.
+T: Low similarity scores while keyword search finds the answer point to retrieval, not generation; fix query phrasing, hybrid search and embedding consistency first.
+
+@ Q001581 explain
+G: ## Each embedding model has its own vector space
+An embedding model maps text to a vector, and similarity is meaningful only between vectors from the same model. Amazon Titan Text Embeddings V1 and V2 are different models with different training; V1 outputs 1,536 dimensions, while V2 outputs 256, 512 or 1,024. Even when two models produce vectors of the same length, "close" in one space does not mean "close" in the other.
+## What mixing does to search
+A query is embedded with one model. Its similarity to chunks embedded with the other model is effectively noise. Some documents then rank too high, others vanish, and results change depending on which half of the corpus a relevant chunk lives in.
+## The fix
+Use one embedding model for the whole index and for queries. Changing the model means re-embedding every document. In Amazon Bedrock Knowledge Bases, the embedding model is chosen when the knowledge base is created and cannot be changed afterward, so a switch means creating a new knowledge base with its own vector index, ingesting the full corpus and cutting over.
+W: Vectors from two models are not comparable; re-embed everything with one model: mixing V1 and V2 vectors makes similarity scores inconsistent across the corpus, and a single model for all documents and queries restores meaningful ranking.
+X: B=Automatic reconciliation: Knowledge Bases does not translate vectors between embedding models; there is no mathematical mapping between the two spaces to apply.
+C=Query volume overwhelming the vector store: load problems cause throttling, errors or latency, not a drop in which documents rank as relevant.
+D=Storage capacity reached: the stem describes inconsistent ranking across the whole index, including old documents, which silently dropped new vectors would not explain.
+T: One index, one embedding model: vectors from different models live in different spaces, so upgrading the model means re-embedding the entire corpus.
+
+@ Q001582 explain
+G: ## Knowledge drift
+A RAG system answers from its index, not from the live documents. The index reflects the documents as they were at the last ingestion. If pages are edited but not re-ingested, the index slowly diverges from reality: old wording, removed features and outdated steps keep being retrieved, and new content is missing. Nothing breaks at once, so quality declines gradually.
+## Catching and preventing it
+- **Keep the index in sync**: in Amazon Bedrock Knowledge Bases, a data source sync processes added, changed and deleted documents. Trigger it on change (for example an S3 event calling `StartIngestionJob`) or on a regular schedule.
+- **Track freshness**: compare document last-modified times with the last successful ingestion.
+- **Monitor relevance**: run a fixed set of reference questions regularly and alert when retrieval relevance or answer correctness drops.
+W: Knowledge drift with change detection and fixed-query relevance tracking: the documents changed while the vectors did not, so change-triggered re-ingestion removes the cause and a stable query set reveals decline long before users complain.
+X: A=Prompt injection caught by denied topics: normal documentation edits are not attacks, and denied topics block subject areas; neither explains a slow decline in relevance.
+B=Throttling fixed by a quota increase: throttling shows up as `ThrottlingException` errors and failed calls, not as calls that succeed with gradually less relevant results.
+C=Context window overflow: overflow gives errors or truncated input on long prompts; it does not make retrieval less relevant. Here the retrieved content simply became outdated.
+T: When relevance declines slowly with no config change, the index is stale; sync on document change and watch a fixed query set for drift.
+
+@ Q001583 explain
+G: ## Shared prompt templates are shared code
+A prompt template is text with placeholders, such as `{{customer_name}}`, `{{retrieved_context}}` and `{{product_category}}` (Bedrock Prompt Management uses the double-brace style). When many features share one template, a change for one feature can break another: a renamed variable renders as an empty or literal placeholder, a new required variable is missing in one caller, or added text pushes a long context past the model's limit.
+## Rendering tests per consumer
+For every feature that uses the template, keep test cases with realistic variable values and check automatically, for example in CI:
+- all placeholders are filled and none remain in the rendered text
+- the rendered prompt stays under a token budget
+- the output format the feature parses, such as JSON with specific keys, is still produced on a small sample
+A failing test blocks the template change before it reaches production.
+W: Automated rendering tests with representative variables for every dependent feature: each consumer's assumptions are checked on every change, so a template edit that breaks one feature's variable format fails before deployment instead of silently in production.
+X: A=Skip tests because failures are obvious: template breakage is often silent (the prompt renders, the answers just get worse), and relying on user reports means customers find it first.
+B=Hardcode a copy per feature: duplicating removes shared breakage but creates many drifting copies, so fixes and improvements must be repeated everywhere and inconsistencies grow.
+C=Let anyone edit shared templates in production: untested direct edits are exactly how silent breakage happens; there is no review, test or rollback step.
+T: Keep templates shared but guarded: test each template change against every feature that depends on it before it ships.
+
+@ Q001584 explain
+G: ## What model invocation logging captures
+Amazon Bedrock **model invocation logging** records each model call for your account and Region. It is off by default. Once enabled, you choose a destination (Amazon CloudWatch Logs, Amazon S3 or both) and which data types to include, such as text, image or embedding data.
+A log entry contains metadata such as timestamp, model ID, request ID and token counts, plus the request body (prompt and inference parameters) and the response body.
+## Why it matters for a cut-off answer
+A response that ends mid-sentence often has a simple cause visible only in the payload: `maxTokens` set too low, a stop reason such as `max_tokens` in the Converse API (some model-native formats report `length` instead), a stop sequence that matched early, or a guardrail intervention. Without the logged request and response you can only guess. Logging must be enabled before the incident; it cannot be turned on retroactively. Because logs may hold sensitive data, protect them with encryption and restricted access.
+W: Bedrock model invocation logging with full payloads: it stores the exact prompt, parameters and response for each call, so the truncated session can be reconstructed and its stop reason and token settings inspected.
+X: A=VPC Flow Logs: flow logs record IP addresses, ports, byte counts and accept or reject decisions. They never contain prompts or responses, and Bedrock traffic is encrypted with TLS anyway.
+C=CloudWatch billing alarms: billing alarms fire on estimated charges for the account; they store no per-session prompt or response content.
+D=Trusted Advisor checks: Trusted Advisor gives account-level best-practice recommendations on cost, security and limits; it does not record individual model calls.
+T: To troubleshoot a specific past response you need its payload, and only model invocation logging captures prompts and responses, provided it was enabled beforehand.
+
+@ Q001585 explain
+G: ## Distributed tracing
+A request that passes through several services has one total latency but many parts. **AWS X-Ray** records a trace for each request: a segment for each service and subsegments for downstream calls, each with start time, duration and errors.
+- Enable tracing on the API Gateway stage and active tracing on the Lambda function.
+- Instrument the AWS SDK clients in the function (X-Ray SDK or AWS Distro for OpenTelemetry), so calls to Bedrock Knowledge Bases (`Retrieve`), Bedrock Runtime (`InvokeModel`) and DynamoDB (`PutItem`) each appear as subsegments.
+## Reading the result
+The trace timeline shows, for example, retrieval 180 ms, generation 2.4 s, DynamoDB write 12 ms. Comparing traces from several weeks ago with today's, or using trace analytics and the service map, shows which subsegment grew. Only then do you know whether to tune retrieval, the model call or the database.
+W: X-Ray across API Gateway, Lambda and downstream calls: tracing breaks the end-to-end time into per-stage durations, so the stage whose latency crept up is identified directly instead of guessed.
+X: A=Raise reserved concurrency: concurrency controls how many invocations run at once. It does not make any single stage faster and gives no information about which stage slowed down.
+C=Assume a model update and switch models: this guesses at the cause; if retrieval or the database is the slow stage, switching models changes quality and cost without fixing latency.
+D=Reduce DynamoDB read capacity: the pipeline writes results, reading capacity is not the issue, and lowering capacity can only add throttling. It diagnoses nothing.
+T: Measure before you optimize: distributed tracing shows per-stage latency so you fix the stage that actually slowed down.
+
+@ Q001586 explain
+G: ## The context window problem in chat
+A model has no memory between calls; the application sends the conversation history with each request. History grows with every turn, so it must eventually be trimmed to fit the context window and control cost.
+Keeping only the last N messages is simple but blind: anything older is lost, however important. An account number given in message 2 is gone by message 8.
+## Memory patterns
+- **Running summary**: after each turn (or every few turns) a model call updates a short summary of key facts and decisions: account number, the problem, what has been tried. The prompt holds the summary plus the recent raw messages.
+- **Structured memory store**: extract facts into a store such as DynamoDB (for example `account_id`, `preferred_language`) and insert them into the prompt when relevant.
+- **Managed memory**: Amazon Bedrock Agents can keep session summaries across sessions, and Amazon Bedrock AgentCore Memory stores recent conversation events (short-term) and extracts long-term memories such as facts, preferences and summaries.
+All of these keep the prompt small while preserving important facts.
+W: Running summary or memory store alongside recent messages: key facts survive in compact form no matter how long the conversation runs, while recent turns stay verbatim, so the prompt fits the context window without forgetting.
+X: A=Keep the last 20 messages: a bigger fixed window only moves the cutoff; facts from message 2 of a 30-message conversation are lost the same way, and every request becomes more expensive.
+B=Disable history: treating each message as a new session removes all context, so the assistant cannot follow any multi-turn conversation.
+C=Smaller context window: less room means even more truncation; a smaller window does not make the truncation any smarter.
+T: Replace blind truncation with memory: summarize or store key facts and send them with the recent messages.
+
+@ Q001953 explain
+G: ## Cross-Region inference and data residency
+On-demand Amazon Bedrock capacity in one Region is shared and has quotas, so bursts can cause `ThrottlingException`. **Cross-Region inference** uses an inference profile whose ID you use in place of the model ID; Bedrock then routes each request to one of several Regions with available capacity.
+- **Geographic profiles** (for example IDs starting with `eu.` or `us.`) route only among Regions in that geography. An EU profile keeps processing inside EU Regions.
+- **Global profiles** (IDs starting with `global.`) can route to supported commercial Regions worldwide for maximum capacity.
+There is no commitment and pricing is per use, like on-demand. Data at rest, such as logs, stays in the source Region.
+## Other levers
+- Retries with backoff smooth short spikes but add no capacity.
+- Provisioned Throughput reserves dedicated model units in one Region, usually with a term commitment.
+W: EU geographic cross-Region inference profile: requests spread across several EU Regions, which adds burst capacity to reduce throttling, keeps processing inside the EU, and needs no commitment.
+X: A=Retries with backoff in one Region: retries help with brief, occasional throttling, but they add no capacity; during sustained peaks they turn errors into long waits and still fail.
+C=Global cross-Region profile: it can route requests to Regions outside the EU, which breaks the regulatory requirement.
+D=Provisioned Throughput with a one-month term: it is a capacity commitment, which the team wants to avoid, and sizing for peaks means paying for idle units outside the bursts.
+T: For bursts with a residency rule, use a geographic (EU) cross-Region inference profile; a global profile adds capacity but ignores borders.
+
+@ Q001954 explain
+G: ## Where should changing knowledge live?
+There are two ways to give a model product knowledge:
+- **In the weights** (fine-tuning or continued pre-training): knowledge is learned during training. Updating means retraining; removing a fact means retraining without it, and the model cannot point to the page an answer came from.
+- **In an external index** (retrieval-augmented generation): documents stay in a store, relevant chunks are retrieved per question and passed to the model with their source.
+## Knowledge Bases for changing, cited content
+Amazon Bedrock Knowledge Bases ingests documents from a data source such as Amazon S3. A sync (`StartIngestionJob`) adds new and changed documents and removes deleted ones from the index. `RetrieveAndGenerate` returns the answer with **citations** that reference the source chunks and their location, for example the S3 URI or page URL.
+Example: the legal team deletes a page at 10:00, an S3 event triggers a sync, and within minutes that content can no longer be retrieved.
+W: Knowledge base with sync on change and citations: sync keeps the index current, including deletions, well within a day, and responses carry citations to the source pages, meeting all three requirements.
+X: A=Monthly continued pre-training plus newest pages in the system prompt: monthly training cannot remove content within a day, knowledge in weights cannot be cited, and the system prompt grows without bound.
+C=Whole documentation set in every prompt: sending everything on every call is costly and slow, may not fit as the docs grow, and gives no reliable per-page citation. Caching does not change what the model attends to.
+D=Weekly fine-tuning behind an alias: a week is too slow for the one-day removal rule, fine-tuned models cannot cite sources, and removed content can persist in the weights.
+T: Frequently changing knowledge with citations and fast removal belongs in RAG with a synced knowledge base, not in model weights.
+
+@ Q001955 explain
+G: ## Three platform requirements
+A central GenAI platform for many teams usually needs:
+- **Model allow-lists**: which models each team may call.
+- **Quotas**: how many requests each team may send, so one team cannot starve the others.
+- **Cost attribution**: Bedrock spend per team in Cost Explorer.
+## A managed gateway pattern
+- **Amazon API Gateway usage plans** attach API keys to per-team throttling (requests per second, burst) and quotas (requests per day or month), with no custom counters.
+- A **Lambda function** behind the gateway checks the team's allowed models and forwards the call.
+- **Application inference profiles** in Bedrock wrap a model; you create one per team and tag it, for example `team=payments`. Activated as cost allocation tags, these tags let Cost Explorer show spend per team. IAM policies can also restrict which profiles a role may invoke.
+W: API Gateway usage plans plus per-team application inference profiles: usage plans provide quotas out of the box, the Lambda layer enforces model allow-lists, and tagged application inference profiles give per-team costs in Cost Explorer, with little custom code.
+X: B=Per-team roles with access to all models and CloudTrail: wildcard model access removes the allow-list, there are no quotas, and reconstructing cost from CloudTrail events is manual work.
+C=Account per team with Service Quotas: twelve accounts add heavy overhead, and Service Quotas manages AWS-defined limits (mostly by requesting increases); it is not a tool for setting your own per-team token budgets, and model allow-lists would still need extra controls.
+D=SageMaker endpoint per team as a proxy: you pay for and operate twelve endpoints as custom proxies, and endpoints have no built-in per-team quota or model allow-list mechanism.
+T: Central model control, quotas and cost per team: a gateway with usage plans in front of tagged application inference profiles.
+
+@ Q001956 explain
+G: ## Summarizing input larger than the context window
+The context window limits how many tokens a model can take in one call. A file three to four times larger cannot be sent at once, and no inference parameter changes that. The document must be split, and the parts combined so that every section influences the final summary.
+## Two standard patterns
+- **Map-reduce**: split the file into chunks, summarize each chunk separately (the map step, which can run in parallel), then summarize the combined chunk summaries (reduce). If the summaries are still too long, reduce again.
+- **Refine (iterative)**: summarize the first section, then send the running summary plus the next section and ask the model to update the summary; repeat to the end. It is sequential but keeps a coherent narrative.
+Example: a 400-page claim file in 10 sections becomes 10 section summaries plus one final summary (map-reduce), or 10 successive updates of one summary (refine).
+W: B=Iterative refine: each call fits in the window, and the running summary carries forward what earlier sections said, so every section shapes the final result.
+C=Map-reduce: every chunk is summarized on its own and all partial summaries feed the final step, so no section is skipped and the chunk calls can run in parallel.
+X: A=Temperature 0: temperature changes how tokens are sampled in the output. It does not compress input or raise the context limit.
+D=Increase maxTokens: `maxTokens` caps the length of the generated output, not the size of the input the model can accept.
+E=Only first and last portions: this skips the middle of the file, which breaks the requirement that summaries reflect every section.
+T: Inputs larger than the context window need splitting plus combining (map-reduce or refine); sampling and output-length parameters do not change input capacity.
+
+@ Q001957 explain
+G: ## The Converse API
+With `InvokeModel`, the request body format depends on the provider: Anthropic, Meta, Amazon, Mistral and others each expect their own JSON fields. Switching providers means rewriting request and response handling.
+The Amazon Bedrock **Converse API** (`Converse` and `ConverseStream`) uses one format for supported models: a `messages` list, an optional `system` prompt, `inferenceConfig` (such as `maxTokens` and `temperature`) and a common response structure. Changing providers becomes a change of the `modelId` value.
+## Changing the model without redeploying
+**AWS AppConfig** stores configuration such as `{"modelId": "..."}` and lets applications fetch it at runtime. Changes can roll out gradually with a deployment strategy and roll back automatically if a CloudWatch alarm fires. Together: one request format in code, the model choice in AppConfig, and a switch in minutes.
+W: Converse API with the model ID from AppConfig: Converse removes provider-specific payloads, and AppConfig changes the model ID at runtime with controlled rollout, so no redeploy or payload rewrite is needed.
+X: B=InvokeModel with provider-specific bodies and an environment variable: changing to another provider still requires new request and response code, and updating a Lambda environment variable is a function configuration change rather than a controlled runtime switch.
+C=SageMaker multi-model endpoint: multi-model endpoints host your own model artifacts on your instances. They do not serve Bedrock providers' proprietary models or unify their APIs.
+D=Custom model import per provider: custom model import brings your own supported open-weight models into Bedrock; it cannot import other providers' proprietary Bedrock models and is not a way to unify request formats.
+T: Provider-agnostic code (Converse API) plus runtime configuration (AppConfig) lets you switch models in minutes without redeploying.
+
+@ Q001958 explain
+G: ## Model distillation
+A large model is accurate but slow and expensive per call. A small model is fast and cheap but usually less accurate on a specialized task. **Distillation** transfers task skill from the large model (the teacher) to a small one (the student):
+- The teacher generates responses to many representative prompts.
+- The student is fine-tuned on those prompt and response pairs.
+- The student then serves traffic at much lower latency and cost, often keeping most of the teacher's accuracy on that task.
+## Amazon Bedrock Model Distillation
+Bedrock Model Distillation automates this. You choose a teacher and a student model from supported families and provide prompts, either as a dataset or from your model invocation logs. Bedrock generates teacher responses (and can augment the data) and fine-tunes the student. No large human-labeled set is needed, which suits this case: thousands of production prompts, few labels.
+Example: 2 million emails a day move from a large model to a distilled small model that returns one of 40 intent labels.
+W: Bedrock Model Distillation: it uses the existing production prompts and the large model's answers to train a smaller model, cutting latency and cost while keeping most of the accuracy, without needing many human labels.
+X: A=Fine-tune the large model on few examples: the model stays large, so latency and per-token cost remain high, and a small labeled set gives little to learn from; an intent label is already a short output.
+B=Prompt caching for the intent list: caching reduces cost and latency for the repeated prompt prefix, but every email is still processed by the large model, so it cannot bring the savings of a much smaller model.
+D=Smallest model with all intents as few-shot examples: small models generally lose accuracy on a 40-way classification, and long few-shot prompts add input tokens to every one of 2 million requests.
+T: To make a small model nearly as good as a large one on a specific task, distill it from the large model's outputs.
+
+@ Q001959 explain
+G: ## Throttling during short spikes
+Throttling can happen even when average usage is low, because on-demand quotas and capacity apply per minute in a Region. A daily 30-minute spike can exceed what one Region serves at that moment.
+## Cross-Region inference as a quick fix
+A **cross-Region inference profile** is called like a model: you replace the model ID with the profile ID, for example `us.<provider>.<model>` instead of `<provider>.<model>`. Bedrock then routes each request among several US Regions with available capacity, without a commitment. The request and response formats stay the same, so the code change is one string, and the IAM policy must allow the profile and the model in the destination Regions.
+## Other options
+- Batch inference processes files of requests asynchronously; results come later.
+- Provisioned Throughput reserves capacity in one Region, usually with a term commitment.
+W: US cross-Region inference profile ID: a one-string change routes spike traffic across multiple US Regions, adding capacity quickly with no commitment, and no residency rule prevents routing within the US.
+X: B=Batch inference during the spike: batch jobs run asynchronously on files of prompts and results can take hours, which a chatbot cannot wait for.
+C=Move to a less busy Region: redeploying the whole stack is not a minimal change, and a single other Region can also throttle during spikes.
+D=Provisioned Throughput: it adds dedicated capacity but typically needs a term commitment and is billed every hour, which the team wants to avoid for a 30-minute daily spike.
+T: For short bursts with no residency limits, switch to a cross-Region inference profile first; it is a one-line change with no commitment.
+
+@ Q001960 explain
+G: ## Parsing comes before chunking
+A knowledge base pipeline has stages: parse the file into text, split it into chunks, embed them, and store the vectors. If parsing loses information, no later stage can recover it.
+The default parser in Amazon Bedrock Knowledge Bases extracts text. Tables often become rows of disconnected numbers without their headers, and images such as labeled diagrams contribute nothing. A chunk from a torque table might read "M8 25 M10 49" with no column names, so retrieval and generation both struggle.
+## Advanced parsing options
+- **Foundation model as parser**: a multimodal model reads each page and produces structured text, for example tables as Markdown with headers and descriptions of figures. You can adjust the parsing prompt.
+- **Amazon Bedrock Data Automation as parser**: a managed service that extracts text, tables and figure content from documents.
+Example: after FM parsing, the table becomes rows such as "Bolt size M8 | Torque 25 N·m", which embeds and answers well.
+W: Foundation model or Bedrock Data Automation as the parser: advanced parsing keeps table structure and turns diagram content into text before chunking, which fixes the root cause of wrong answers on table and diagram pages.
+X: A=Add a reranker: a reranker reorders retrieved chunks, but the chunks from table pages still lack headers and diagram content, so ranking them higher returns the same damaged text.
+B=Increase fixed chunk size: larger chunks group more of the scrambled table text together but do not restore headers or add figure content.
+D=Higher-dimension embeddings: an embedding represents the text it receives. It cannot restore structure that parsing already removed.
+T: Wrong answers only on tables and diagrams point to parsing; use FM or Data Automation parsing, because later stages cannot recover what the parser dropped.

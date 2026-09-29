@@ -1,0 +1,380 @@
+# ANS-C01 detailed explanations, batch e06 (explanation-only rewrites; letters are the published ones)
+
+@ Q001693 explain
+G: ## Route limits on a Direct Connect virtual interface
+A virtual interface (VIF) carries one BGP session between your router and AWS. AWS protects its side by capping how many prefixes you may advertise on that session.
+- On a private VIF (and a transit VIF) the documented limit is **100 IPv4 routes** per BGP session.
+- If you advertise more, AWS does not silently drop the extra routes: it sends a BGP NOTIFICATION, closes the session and the VIF goes down until the count is back under the limit.
+## Example
+A data center migration adds 40 new `/24` networks on top of 80 existing ones. The router now sends 120 prefixes, the session is torn down, re-establishes, receives 120 again and flaps.
+- Fix: summarize, for example advertise `10.20.0.0/16` instead of many `/24`s, or filter what you export so the count stays under 100.
+W: Prefix limit exceeded: the timing (right after new routes were advertised) and the AWS-sent NOTIFICATION match the documented behavior when a VIF receives more than 100 prefixes. Summarizing or filtering the advertisements restores a stable session.
+X: A=DX gateway deleted: a Direct Connect gateway cannot be deleted while virtual interfaces are still attached to it, and removing gateway associations would not make AWS send NOTIFICATIONs triggered by newly advertised routes.
+B=Customer ASN changed: an ASN mismatch stops the session from establishing at all. Here the session was working and broke only when more routes were sent, which points to route volume, not peer identity.
+D=BFD incompatible: Direct Connect supports BFD, and AWS enables asynchronous BFD on its side of every VIF. BFD only speeds up failure detection; it does not close sessions because new prefixes appear.
+T: A VIF that drops right after you advertise more routes has hit the 100-prefix limit; summarize routes instead of suspecting ASN, BFD or gateway changes.
+
+@ Q001694 explain
+G: ## How Transit Gateway segmentation works
+Every transit gateway attachment is **associated** with exactly one route table: the table used to route traffic coming *from* that attachment. An attachment can also **propagate** its routes into any number of route tables.
+- Association decides "where can I send traffic?"
+- Propagation decides "who can find routes to me?"
+## Example layout
+- `rt-prod`: associated with the Production attachment; only Shared Services propagates into it.
+- `rt-dev`: associated with the Development attachment; only Shared Services propagates into it.
+- `rt-shared`: associated with the Shared Services attachment; Production and Development both propagate into it.
+Production looks up a Development CIDR in `rt-prod`, finds no route and the packet is dropped. Shared Services finds routes to both, so it can initiate connections, and return traffic works because each environment's table has the Shared route.
+W: Three route tables: each environment's table contains only the Shared Services routes, and the Shared Services table contains both environments. That meets all three requirements with no route between Production and Development at all.
+X: A=One shared route table: when all three attachments propagate into one table, every attachment learns every other CIDR, so Production and Development can reach each other directly.
+B=One table plus blackholes: a blackhole route for a CIDR applies to every attachment associated with that table, so blackholing Prod and Dev CIDRs would also stop Shared Services from reaching them.
+C=Two route tables with Shared in both: an attachment can be associated with only one route table, so Shared Services cannot sit in both tables; whichever table it uses would give it a path to only one environment.
+T: Isolate with separate TGW route tables (association = where you can go, propagation = who can reach you), not with a flat table plus blackholes.
+
+@ Q001695 explain
+G: ## Monitoring Site-to-Site VPN tunnels
+Each Site-to-Site VPN connection has two tunnels to different AWS endpoints. CloudWatch publishes the `TunnelState` metric in the `AWS/VPN` namespace:
+- per tunnel, with the `TunnelIpAddress` dimension: `1` means up (or BGP established), `0` means down;
+- per connection, with the `VpnId` dimension, where values between 0 and 1 mean at least one tunnel is down.
+## Combining alarms
+A **composite alarm** watches other alarms and evaluates a rule such as `ALARM("tunnel-1-down") AND ALARM("tunnel-2-down")`.
+- Alarm per tunnel: `TunnelState < 1` for 2 consecutive 1-minute periods, notifying the normal on-call page.
+- Composite alarm: both tunnel alarms in ALARM, notifying the critical page.
+This gives two severity levels without duplicate logic or custom scripts.
+W: Per-tunnel TunnelState alarms plus a composite alarm: the tunnel alarms fire when either tunnel has been down for 2 minutes, and the composite alarm with AND fires only when both are down, which is the separate critical page.
+X: B=Direct Connect ConnectionState: this metric belongs to the `AWS/DX` namespace and reports the physical Direct Connect link. It says nothing about IPsec tunnels of a Site-to-Site VPN.
+C=EC2 NetworkPacketsIn: this counts packets on an instance's network interface. It changes with application load and cannot tell which VPN tunnel is up or down.
+D=TGW BytesIn: low or zero bytes can simply mean no traffic. Traffic volume is not a reliable signal of tunnel state, and it cannot separate one tunnel from the other.
+T: VPN health comes from `TunnelState` per tunnel; use a composite AND alarm for "both tunnels down" instead of inferring state from traffic volume.
+
+@ Q001696 explain
+G: ## Why BGP alone converges slowly
+BGP notices a dead neighbor only when the **hold timer** expires without keepalives. On Direct Connect the default hold time is 90 seconds (keepalives every 30 seconds), so a fiber cut that does not bring the interface down can blackhole traffic for up to 90 seconds.
+## Bidirectional Forwarding Detection (BFD)
+BFD is a lightweight hello protocol that runs beside BGP and tells it when the path is dead.
+- AWS enables asynchronous BFD on its side of Direct Connect virtual interfaces; you configure it on your router to activate it.
+- With a typical 300 ms interval and a multiplier of 3, a failure is detected in under a second.
+- When BFD declares the neighbor down, BGP withdraws the routes immediately, so ECMP traffic moves to the surviving connection.
+W: BFD on the virtual interfaces: it replaces the 60-90 second hold-timer wait with sub-second detection, so the failed path leaves the ECMP set almost immediately and convergence fits the RTO.
+X: B=VGW instead of DX gateway: the gateway type does not change how fast a BGP neighbor failure is detected. It would also break the design, because a Transit Gateway is reached through a DX gateway with transit VIFs.
+C=Disable route propagation: without propagated Direct Connect routes the Transit Gateway route table loses the on-premises prefixes, which breaks connectivity instead of speeding up failover.
+D=Increase the hold timer: a longer hold timer means BGP waits even longer before declaring the peer dead, so convergence gets slower, the opposite of the goal.
+T: Hold timers make BGP failover slow; BFD gives sub-second detection, so enable it on the Direct Connect VIFs rather than tuning gateways or timers upward.
+
+@ Q001697 explain
+G: ## Which side controls which direction
+BGP influences traffic in the opposite direction of the advertisement:
+- What **you advertise** to AWS decides how AWS sends traffic **to** on-premises.
+- What **AWS advertises** to you (plus your local settings) decides how you send traffic **to** AWS.
+To steer VPC-to-on-premises traffic from your router alone, change the routes you send to AWS.
+## AS path prepending
+AWS prefers the shorter AS path when prefixes are equal. Prepending repeats your own ASN on the backup advertisement:
+- primary sends `10.0.0.0/8` with AS path `65001`
+- backup sends `10.0.0.0/8` with AS path `65001 65001 65001`
+AWS then chooses the primary and falls back to the backup only when the primary route is withdrawn. AWS also offers local preference communities, which take priority over AS path length.
+W: AS path prepending on the backup: it makes the backup route look longer to AWS, so the VPC's return traffic uses the 10 Gbps primary and moves to the backup only when the primary's routes disappear, all configured on the customer router.
+X: B=Higher MED on primary: in BGP a lower MED is preferred, so raising the primary's MED would make it less attractive, the opposite of the requirement.
+C=Lower local preference on primary: local preference is set on your router and only influences your own outbound choice toward AWS. It is not sent to AWS and cannot affect how the VPC routes to on-premises.
+D=More specific prefix on backup: longest-prefix match beats every other attribute, so a more specific prefix on the backup would pull all matching traffic onto the 1 Gbps link.
+T: To make AWS avoid a link, advertise a less attractive route over it (prepend or low local-preference community); a more specific prefix does the opposite.
+
+@ Q001699 explain
+G: ## What each logging source records
+- **CloudTrail** records API calls such as `CreateVpnConnection` or `ModifyVpnTunnelOptions`: who changed configuration, not what the tunnel negotiated.
+- **VPC Flow Logs** record IP traffic metadata (addresses, ports, bytes, accept/reject) on network interfaces.
+- **Site-to-Site VPN logs** are published from the AWS VPN endpoints to CloudWatch Logs and record IKE and IPsec negotiation: phase 1 and phase 2 establishment, rekeys, Dead Peer Detection events, tunnel up/down reasons and error messages.
+## Example
+A tunnel that drops every 20-30 minutes often lines up with a rekey. With tunnel logging enabled per tunnel (in the tunnel options), the engineer can see whether AWS initiated a rekey, received a delete payload from the customer gateway, or declared the peer dead through DPD, and compare timestamps with the firewall.
+W: Site-to-Site VPN tunnel logs: they expose the AWS side of IKE and IPsec negotiation, including who initiated rekeys or teardowns, which is exactly what the engineer needs to explain periodic drops.
+X: A=CloudTrail data events: CloudTrail captures API activity, and VPN connections have no data events. Tunnel negotiation happens on the data plane and never appears in CloudTrail.
+B=Traffic Mirroring on the CGW: the customer gateway is an on-premises device, not an AWS network interface, so it cannot be a mirror source. Mirroring copies packets; it does not decode IKE state changes.
+C=Flow Logs on the VGW: a virtual private gateway has no customer-visible network interface for flow logs, and flow logs only record traffic summaries, not IKE/IPsec negotiation events.
+T: For IKE and IPsec negotiation details from AWS's side, enable Site-to-Site VPN tunnel logs; CloudTrail and flow logs record API calls and traffic, not tunnel negotiation.
+
+@ Q001700 explain
+G: ## Direct Connect gateway
+A Direct Connect gateway is a global resource that sits between your virtual interfaces and your AWS gateways.
+- On one side you attach private VIFs (or transit VIFs).
+- On the other side you associate virtual private gateways or transit gateways in **any** AWS Region (except China Regions).
+## Without and with a DX gateway
+- A private VIF attached directly to a virtual private gateway reaches that single gateway only.
+- With a DX gateway, one VIF on each connection can reach VPCs in several Regions.
+## Example
+Two connections at a colocation facility in Frankfurt each carry one private VIF to `dxgw-central`. The DX gateway is associated with VGWs in `eu-central-1`, `eu-west-1` and `us-east-1`, so on-premises routes reach all three VPCs over the same physical links.
+W: DX gateway associated with gateways in all three Regions: the DX gateway is global, so one VIF per connection can reach VGWs or transit gateways in every Region, with no extra physical connections.
+X: A=Hosted VIF per Region: hosted VIFs let a connection owner provision a VIF for another account. They do not give a VIF cross-Region reach by themselves; reaching VPCs in other Regions still requires a DX gateway.
+C=One private VIF to a VGW in each Region: a private VIF attaches to exactly one gateway, either one VGW or one DX gateway, so it cannot be associated with three VGWs.
+D=Transit VIF attached directly to VPCs: a transit VIF attaches only to a DX gateway, which is then associated with transit gateways. It never attaches directly to VPCs.
+T: One set of Direct Connect links for many Regions means a Direct Connect gateway; a VIF attaches to one gateway, so multi-Region reach comes from the DX gateway's associations.
+
+@ Q001701 explain
+G: ## BGP up is not the same as routes installed
+On a Transit Gateway VPN attachment, BGP delivers on-premises prefixes to the transit gateway. Whether those prefixes appear in a given route table depends on **propagation**:
+- **Association**: the one route table used to route traffic that arrives from the attachment.
+- **Propagation**: which route tables the attachment's routes, including BGP-learned ones, are installed into.
+If the attachment was created with default propagation disabled, or the team uses custom route tables, nothing is installed until propagation is enabled for that table (or static routes are added).
+## Example
+`rt-onprem` is associated with the VPN attachment, but propagation from the attachment is enabled only into the default table. BGP shows Established and routes are received, yet `rt-onprem` has no on-premises routes.
+W: Route propagation not enabled into that route table: BGP learned the routes, but the transit gateway installs them only into the tables the attachment propagates to, so enabling propagation (or adding static routes) makes them appear.
+X: A=Attachment pending acceptance: acceptance applies to attachments shared across accounts when auto-accept is off. A VPN attachment created with its own connection needs no acceptance, and a pending attachment would not show tunnels passing BGP traffic.
+B=VGW required: a VPN connection terminates either on a virtual private gateway or on a transit gateway. With a transit gateway attachment, no virtual private gateway is involved.
+D=Private ASN unsupported: customer gateways can use private ASNs (for example `65001`), which is the most common setup; the BGP session would not be Established if the ASN were rejected.
+T: When BGP is up but routes are missing from a TGW route table, check propagation into that specific table; association alone never installs routes.
+
+@ Q001702 explain
+G: ## ECMP over VPN on a transit gateway
+One VPN tunnel carries about 1.25 Gbps. A transit gateway can spread traffic across many tunnels using **equal-cost multi-path (ECMP)** routing when it treats several routes to the same prefix as equal.
+Requirements:
+- ECMP support is enabled on the transit gateway (the `VpnEcmpSupport` option, on by default).
+- The VPN connections use **dynamic routing (BGP)**. Static routes to a prefix point to a single attachment.
+- The connections advertise the **same prefix with equal BGP attributes**, such as the same AS path length.
+## Example
+Two VPN connections to two on-premises firewalls each advertise `10.50.0.0/16` with AS path `65010`. With four tunnels up, the transit gateway can hash flows across them for roughly 4 x 1.25 Gbps aggregate.
+W: D=BGP on both connections: ECMP across VPN attachments works with dynamically learned routes; static VPN routes do not form an ECMP set.
+E=Equal-cost routes: the transit gateway uses multiple paths only when the prefixes and attributes such as AS path length match, otherwise it picks the single best route.
+X: A=Accelerated VPN required: acceleration routes tunnels through the AWS global network via Global Accelerator for better internet performance. It is optional and has nothing to do with ECMP eligibility.
+B=Same Availability Zone: VPN attachments are not placed in subnets or Availability Zones; their tunnel endpoints are public IP addresses, so AZ placement is not a condition.
+C=Same customer gateway IP: ECMP is commonly built across different customer gateway devices for redundancy, and nothing requires the connections to share one customer gateway IP.
+T: TGW VPN ECMP needs BGP plus identical prefixes and AS path lengths; Global Accelerator, AZs and shared customer gateways are irrelevant.
+
+@ Q001703 explain
+G: ## Dead Peer Detection (DPD)
+DPD is an IKE keepalive: when a peer has seen no traffic for a while, it sends an R-U-THERE message and expects an acknowledgment. If no reply arrives within its timeout, it declares the peer dead and clears the security associations (SAs).
+- AWS endpoints support DPD. The default DPD timeout is 30 seconds, and the timeout action (clear, restart or none) is a tunnel option.
+- DPD is triggered mostly during **idle periods**, because with steady traffic each side sees packets from the other.
+## Why aggressive timers hurt
+If the customer device probes every few seconds and gives up after one or two missed replies, a short delay or a lost UDP packet during a quiet period makes it tear down the tunnel. The tunnel comes back only when new traffic triggers renegotiation.
+- Fixes: set DPD interval and retries to values compatible with AWS, adjust the AWS DPD timeout action, or keep traffic flowing (for example a periodic ping across the tunnel).
+W: Aggressive customer DPD timers during idle periods: the drops happen only when traffic stops, which is exactly when DPD runs, so aligning the timers with AWS or keeping traffic flowing stops the teardowns.
+X: A=MTU fragments DPD: DPD messages are small IKE informational packets far below any normal MTU, so they are not fragmented. An MTU problem would also affect large packets during busy periods, not idle ones.
+C=PFS required for idle tunnels: perfect forward secrecy only makes each rekey use fresh Diffie-Hellman keys. AWS supports it, but it has nothing to do with keeping an idle tunnel up.
+D=AWS doesn't support DPD: AWS endpoints do support DPD and let you configure its timeout and action; disabling it on the customer gateway would also hide real failures.
+T: Tunnels that drop only when idle point to DPD mismatches; align DPD timers or keep traffic flowing instead of blaming MTU or PFS.
+
+@ Q001704 explain
+G: ## Link Aggregation Groups (LAGs)
+A LAG bundles several Direct Connect connections of the same speed, at the same Direct Connect location, into one logical link using LACP. Four 10 Gbps members give 40 Gbps of capacity, and virtual interfaces run on the LAG instead of on individual connections.
+## Minimum links
+The `minimumLinks` setting (shown as minimum links in the console) is the number of member connections that must be operational for the LAG itself to stay up.
+- With `minimumLinks = 2`, losing two of four members leaves 20 Gbps and the LAG stays up.
+- Losing a third member leaves one link (10 Gbps). The LAG goes down, BGP sessions on its VIFs drop, and routing fails over to the backup path instead of running on insufficient bandwidth.
+W: minimumLinks set to 2: it makes the LAG non-operational as soon as fewer than two members (less than 20 Gbps) are up, which forces failover exactly at the compliance threshold.
+X: B=MTU 9001: jumbo frames change the maximum packet size on virtual interfaces. They have no relationship to how many member links must be up.
+C=BFD only: BFD detects a failed BGP path quickly, but a LAG with one working member still passes BFD and BGP, so traffic would stay on 10 Gbps.
+D=Reduce to 2 connections: this removes capacity and redundancy. With the default minimum links, a single surviving member keeps the LAG up at 10 Gbps, so the threshold is still not enforced.
+T: To force a LAG down below a bandwidth floor, set `minimumLinks`; BFD and MTU settings do not act on member counts.
+
+@ Q001705 explain
+G: ## How AWS picks among your Direct Connect routes
+When several virtual interfaces advertise routes to on-premises, AWS chooses the path in this order:
+- the longest (most specific) prefix;
+- then **local preference BGP communities** that you attach;
+- then the shortest AS path.
+## Local preference communities
+AWS documents three community values for private and transit VIFs:
+- `7224:7100` low preference
+- `7224:7200` medium preference
+- `7224:7300` high preference
+Tag routes on the preferred VIF with `7224:7300` and the same routes on the backup with `7224:7100`. AWS then sends VPC-to-on-premises traffic over the preferred VIF, and because communities are evaluated before AS path length, this works regardless of prepending.
+W: Local preference communities: they are AWS's documented mechanism to mark one VIF as preferred for the same prefixes, without AS path manipulation.
+X: A=Default route only on preferred VIF: longest-prefix match comes first, so the backup's specific on-premises routes would beat a `0.0.0.0/0` on the preferred VIF and pull traffic to the backup.
+B=Lower hold timer: the hold timer only controls how fast a dead neighbor is detected. It does not change which of two healthy paths AWS prefers.
+D=Higher MED on preferred: BGP prefers the lower MED, so a higher value makes that VIF less attractive. MED is also not the documented way to set preference on Direct Connect.
+T: To choose AWS's path to on-premises without prepending, tag routes with AWS local preference communities (`7224:7300` high, `7224:7100` low).
+
+@ Q001706 explain
+G: ## Static analysis versus live testing
+**VPC Reachability Analyzer** reads the configuration and computes whether a packet could get from a source to a destination. It sends no traffic.
+- Sources and destinations include instances, network interfaces, transit gateway attachments, VPC endpoints and IP addresses.
+- It follows route tables, security groups, network ACLs, transit gateway route tables, load balancers and more.
+- The result is Reachable with the hop-by-hop path, or Not Reachable with the component that blocks it, for example `tgw-rtb-...: no route to 10.2.0.0/16`.
+## Example
+Before a change window, the engineer analyzes an instance's network interface to the RDS instance's IP on port 5432 across VPCs through the transit gateway. If a TGW route table lacks the destination CIDR, the analysis names that table.
+W: Reachability Analyzer: it proves reachability from configuration alone and pinpoints the blocking component, which fits a pre-change check where no test traffic may be sent.
+X: A=Traffic Mirroring: it copies real packets from a network interface to a monitoring target. It needs traffic to flow and does not evaluate routes or name a blocking component.
+B=Network Monitor probes: Network Monitor sends real ICMP or TCP probes to measure loss and latency on hybrid paths, so it requires live traffic and does not explain configuration blocks.
+D=VPC Flow Logs: flow logs record traffic that actually happened (with ACCEPT or REJECT). With no traffic sent there is nothing to log, and they do not identify missing routes.
+T: "Would this path work?" without sending packets is Reachability Analyzer; flow logs, mirroring and probes all need real traffic.
+
+@ Q001707 explain
+G: ## Reading a Reachability Analyzer result
+Reachability Analyzer models the whole path: route tables, security groups, network ACLs, load balancers (including Network Load Balancers), transit gateways and more. A Not Reachable result lists the first component that blocks the packet and why.
+## Network ACLs are stateless
+Unlike security groups, network ACLs do not remember connections. Subnet B's ACL must allow both:
+- inbound from the source, for example TCP 443 from Subnet A's CIDR (with NLB client IP preservation, targets see the client's IP);
+- outbound return traffic to the source on ephemeral ports, typically `1024-65535`.
+## Example
+Subnet B's ACL has `100 ALLOW TCP 443 from 10.0.1.0/24` but the outbound rules allow only `10.0.0.0/16` port 443. The return traffic to the client's ephemeral port is denied, and the analysis points to that rule.
+W: The NACL in Subnet B blocks traffic: Reachability Analyzer identified the specific rule, so the engineer should adjust Subnet B's inbound and outbound ACL entries for the flow and rerun the analysis.
+X: A=Evaluates only security groups: the tool evaluates network ACLs, route tables, gateways and load balancers as well; the result naming a NACL shows that.
+B=Can't analyze load balancer paths: Reachability Analyzer supports Application and Network Load Balancers as intermediate components, so the result is valid.
+D=Must be DNS: the tool analyzes network paths using IP-level configuration, and network ACLs are exactly what it evaluates; DNS resolution is not part of the finding.
+T: Trust the blocking component Reachability Analyzer names, and remember NACLs are stateless, so both inbound and return rules must allow the flow.
+
+@ Q001708 explain
+G: ## VPC Traffic Mirroring
+Traffic Mirroring copies packets from a source network interface and sends the copies to a mirror target, while the original packets continue on their normal path.
+- **Sources**: network interfaces of EC2 instances.
+- **Targets**: a network interface, a Network Load Balancer, or a Gateway Load Balancer endpoint.
+- **Filters**: rules that choose which traffic (protocol, ports, CIDRs, direction) is copied.
+- Copies are wrapped in VXLAN (UDP 4789) so the appliance can see the full original packet, payload included.
+## Example
+An IDS fleet sits behind a Gateway Load Balancer in a security VPC. The team creates a GWLB endpoint as the mirror target and a mirror session for each application instance's interface. The IDS inspects copies out of band; production traffic is not routed through it.
+W: VPC Traffic Mirroring to a target fronting the IDS fleet: it delivers full packet copies for deep inspection without placing the appliances in the production traffic path.
+X: A=VPC peering: peering only provides routing between two VPCs. It does not copy traffic; to inspect it you would have to route the production traffic itself through the IDS.
+B=Flow logs to IDS via Firehose: flow logs contain only metadata such as addresses, ports, bytes and action. There is no payload, so deep packet inspection is impossible.
+D=PrivateLink interface endpoint: PrivateLink lets clients open connections to a service. It carries only traffic sent to the endpoint and never duplicates other instances' traffic.
+T: Packet copies for out-of-band IDS mean Traffic Mirroring; flow logs are metadata only, and peering or PrivateLink move real traffic rather than copying it.
+
+@ Q001709 explain
+G: ## How mirrored packets arrive
+Traffic Mirroring does not deliver raw packets. Each copied packet is wrapped in a **VXLAN** header and sent as UDP to destination port `4789` on the mirror target.
+- The session's **VXLAN network identifier (VNI)** is a label you choose (or AWS assigns) to tell sessions apart; it has no link to any CIDR.
+- The target must receive UDP 4789: its security group and the subnet's network ACLs must allow it from the source.
+- The monitoring tool must understand VXLAN and strip the outer header, otherwise it sees only UDP 4789 datagrams or discards them.
+## Example
+A packet capture on the target shows `UDP 10.0.1.15 > 10.0.2.20:4789` frames, but the analysis tool, which expects plain Ethernet frames, shows "no traffic". Enabling VXLAN decapsulation reveals the mirrored sessions.
+Also check that the mirror filter has rules that accept the traffic you expect; only accepted traffic is copied.
+W: Allow UDP 4789 and decapsulate VXLAN: with the security group already open, the usual missing pieces are the network ACL path for UDP 4789 and a tool that decapsulates VXLAN to see the original packets.
+X: A=VNI must match source CIDR: the VNI is just a 24-bit session identifier. It has no relationship to subnet CIDRs, and any value works.
+B=Same subnet required: sources and targets can be in different subnets, and even different VPCs connected by peering or a transit gateway.
+C=Internet traffic only: Traffic Mirroring copies whatever the source interface sends and receives, including intra-VPC traffic, subject to the filter rules.
+T: Mirrored traffic is VXLAN on UDP 4789; the target must accept it and the tool must decapsulate it, while the VNI and subnet placement are free choices.
+
+@ Q001710 explain
+G: ## Brownouts and why BGP misses them
+A **brownout** (gray failure) is partial degradation: 2% packet loss or rising latency. BGP keepalives are tiny and infrequent, so a session stays Established even while applications suffer.
+## Amazon CloudWatch Network Monitor
+Network Monitor measures hybrid paths actively and continuously:
+- You create a monitor with probes from a VPC subnet to on-premises IP addresses, over Direct Connect or VPN, using ICMP or TCP.
+- The probes are AWS-managed, so there is no agent to install on your instances.
+- It publishes round-trip time and packet loss to CloudWatch, so you can alarm on thresholds such as loss above 1%, and it shows whether degradation is inside the AWS network.
+## Example
+Two monitors probe `192.168.10.5` from the production VPC, one path over Direct Connect, one over VPN. A 3% loss spike on the Direct Connect path with BGP still up is visible within minutes.
+W: CloudWatch Network Monitor: it continuously measures latency and packet loss on specific hybrid paths over Direct Connect and VPN, which catches brownouts that never take BGP down.
+X: A=Reachability Analyzer: it analyzes configuration statically and sends no packets, so it cannot measure loss or latency.
+C=ConnectionBpsEgress alone: this metric reports throughput leaving the AWS side of the connection. A link can carry normal volume while dropping a few percent of packets, so it does not reveal loss or latency.
+D=CloudWatch Internet Monitor: Internet Monitor measures performance between your applications and end users across the public internet by location and provider, not private hybrid paths.
+T: For latency and loss on specific Direct Connect or VPN paths, use Network Monitor probes; configuration analysis and throughput metrics cannot see brownouts.
+
+@ Q001711 explain
+G: ## Interface addresses versus packet addresses
+Flow log fields `srcaddr` and `dstaddr` describe the traffic as seen at the network interface being logged. For an intermediate interface such as a NAT gateway, one of these is often the NAT gateway's own address.
+The custom fields `pkt-srcaddr` and `pkt-dstaddr` record the addresses in the IP header of the packet itself.
+## Example at a NAT gateway interface
+An instance `10.0.1.5` calls `203.0.113.10` through a NAT gateway with private IP `10.0.0.220`. On the NAT gateway's interface, one record for this traffic shows:
+- `srcaddr 10.0.1.5`, `dstaddr 10.0.0.220` (the hop to the NAT gateway)
+- `pkt-srcaddr 10.0.1.5`, `pkt-dstaddr 203.0.113.10` (the real destination)
+Adding the pkt- fields lets the team map each instance to the internet host it talked to.
+W: B=pkt-srcaddr: it shows the original source address in the packet, identifying the instance even when the interface-level fields show the NAT gateway.
+C=pkt-dstaddr: it shows the packet's real destination, such as the internet host, instead of the NAT gateway's own address.
+X: A=dstaddr: already part of the default format, and at a NAT gateway interface it can show the NAT gateway's address instead of the final destination.
+D=srcaddr: also already in the default format; it reflects the interface-level view, which is exactly what fails to show the pre-NAT picture.
+E=flow-direction: it only says whether the record is ingress or egress for the interface. It contains no addresses.
+T: To see through a NAT gateway or other intermediate interface, add `pkt-srcaddr` and `pkt-dstaddr`; `srcaddr` and `dstaddr` describe the interface hop.
+
+@ Q001712 explain
+G: ## Where Traffic Mirroring works
+Traffic Mirroring is implemented in the AWS Nitro System, which handles networking in dedicated hardware. That hardware copies the packets, so the source must be an instance type that supports it.
+- All current-generation Nitro-based instance types can be mirror sources.
+- A limited set of older Xen-based families was added later, but many older types, for example `t2`, still cannot be sources.
+- If you try to create a mirror session for an unsupported source, the request fails.
+## Other building blocks
+A session also needs an existing mirror target (a network interface, Network Load Balancer or Gateway Load Balancer endpoint) and a filter. Sources can be in any subnet; no internet access is involved.
+W: Unsupported, non-Nitro source: the instance type cannot act as a mirror source, and moving the workload to a Nitro-based type (for example `m5` instead of `m3`) allows the session to be created.
+X: B=One session per VPC: the limits apply per network interface (a few sessions per source) and per account, not one per VPC, and nothing in the scenario points to a limit.
+C=Create the target first: a session must reference an existing target, but that applies to every session. It would not make one specific older instance fail while others work.
+D=Public subnet with IGW route: mirrored copies go to a target inside AWS over the VPC network, so the source can sit in any private subnet.
+T: When mirroring fails only for an older instance, the instance type is not a supported source; move it to a Nitro-based type.
+
+@ Q001713 explain
+G: ## Two path-analysis tools
+- **Reachability Analyzer** answers a single question: can this source reach this destination? You name both ends.
+- **Network Access Analyzer** answers a policy question: which paths exist that match this pattern? You define a **Network Access Scope** and it finds every matching path.
+## Access scopes
+A scope describes paths you do not want, for example:
+- source: internet gateways
+- destination: network interfaces in subnets tagged `tier=database`
+The analyzer reads route tables, gateways, load balancers, security groups and network ACLs and reports each finding with the full path, so the team can fix or approve it. AWS provides built-in scopes, such as all internet ingress paths, and analyses can run on a schedule.
+W: Network Access Analyzer with access scopes: it discovers every path that violates a defined posture, such as internet to databases, across VPCs without testing pairs one by one.
+X: A=Config conformance packs alone: Config rules check individual resource settings, for example a security group open to `0.0.0.0/0`. They do not combine routes, gateways, ACLs and security groups to prove an end-to-end path.
+B=Reachability Analyzer for every pair: it needs an explicit source and destination per analysis and charges per analysis, so checking all pairs across an organization is impractical.
+D=Network Monitor probes: Network Monitor measures latency and loss on hybrid paths with active probes. It performs no configuration-based path discovery.
+T: Pairwise "can A reach B?" is Reachability Analyzer; organization-wide "find any path matching this bad pattern" is Network Access Analyzer.
+
+@ Q001714 explain
+G: ## Throughput per VPN tunnel
+A standard Site-to-Site VPN tunnel supports up to about **1.25 Gbps** (with a packets-per-second limit as well). Traffic above that is dropped, even though the tunnel stays UP and BGP stays Established.
+## Spotting it in CloudWatch
+- `TunnelDataIn` and `TunnelDataOut` (`AWS/VPN`) report bytes per tunnel. Converted to bits per second, a flat ceiling near 1.2-1.25 Gbps during business hours means the tunnel is saturated.
+- `TunnelState` stays at 1, which rules out tunnel or BGP instability.
+## Scaling out
+Create several VPN connections to the transit gateway, run BGP and advertise equal routes so the transit gateway uses ECMP across all tunnels. For example, two connections with four active tunnels give up to about 5 Gbps aggregate, provided on-premises also balances across them.
+W: Per-tunnel limit reached; spread with ECMP: utilization pinned near 1.25 Gbps plus loss without state changes is the signature of a saturated tunnel, and ECMP across multiple tunnels removes the bottleneck.
+X: A=No per-tunnel limit: each VPN tunnel has a bandwidth limit of about 1.25 Gbps, and the metrics show traffic sitting at that ceiling.
+C=NACL shown by PacketDropCountNoRoute: that transit gateway metric counts packets dropped because no route matched. It is not a network ACL signal, and a NACL issue would block specific flows consistently, not cause loss at high load.
+D=BGP flapping: the scenario states BGP is stable and the tunnel is UP; flapping would appear as state changes and route withdrawals.
+T: Packet loss with a steady tunnel near 1.25 Gbps means per-tunnel saturation; scale out with more tunnels and TGW ECMP.
+
+@ Q001715 explain
+G: ## How Athena pricing and partitions interact
+Athena charges by the amount of data scanned. A table over the whole bucket without partitions reads every object for each query, even if you filter on account and date in `WHERE`.
+**Partitions** map folder levels to columns. A filter like `account_id = '111122223333' AND day BETWEEN '2026/09/01' AND '2026/09/07'` then reads only the matching prefixes.
+## Ways to maintain partitions
+- **Partition projection**: table properties describe the partition values and the S3 path template, and Athena computes the locations at query time. No crawlers or `ALTER TABLE ADD PARTITION`, which suits many accounts and daily folders.
+- **AWS Glue Data Catalog partitions** added by a crawler or by DDL.
+## Example
+Path `s3://log-archive/AWSLogs/o-abc123/111122223333/vpcflowlogs/us-east-1/2026/09/28/` maps to partitions `account_id`, `region` and `day`. Storing flow logs in Parquet reduces the data scanned further.
+W: Partition by account, Region and date: partition pruning limits each query to the relevant prefixes, cutting both cost and run time, and projection or Glue keeps the partitions current.
+X: A=Redshift Spectrum required: Athena reads nested S3 prefixes without issue and can map each prefix level to a partition column; no other engine is needed.
+B=Separate bucket per account: Athena can filter by account through a partition column, so copying data only adds storage and pipeline work.
+C=One unpartitioned table: it works functionally, but every query scans the entire bucket across 50 accounts, which is the most expensive option.
+T: Athena cost follows bytes scanned; partitions (projection or Glue) that match the S3 layout let filters on account and date skip most of the data.
+
+@ Q001716 explain
+G: ## How a Traffic Mirror filter is evaluated
+A mirror filter has separate inbound and outbound rule lists. Each rule has a number, an action (accept or reject) and match conditions: protocol, source and destination CIDR, and port ranges for TCP and UDP.
+- Rules are evaluated in ascending order of rule number.
+- The first rule that matches decides; later rules are not considered.
+- Traffic that matches no rule is not mirrored.
+This is the same first-match model that network ACLs use.
+## Walking through the example
+An SSH packet from `172.16.5.10` to port 22:
+- rule 100 (reject TCP port 22) matches, so the packet is not mirrored;
+- rule 200 (accept TCP from the corporate CIDR) is never reached.
+To mirror corporate SSH, give the accept rule a lower number (for example 50) or narrow the reject rule so it excludes the corporate range.
+W: Lowest rule number first, first match wins: rule 100 matches SSH before rule 200 is evaluated, so the reject action applies to corporate SSH too.
+X: A=Accept before reject: there is no action-based precedence. Order comes only from rule numbers, so this is expected behavior, not a bug.
+B=Rules combine with OR: rules are not merged. Evaluation stops at the first match, and the rule number sets that order.
+D=No port filtering: mirror filter rules support source and destination port ranges for TCP and UDP; rule 100 itself filters on port 22.
+T: Mirror filter rules work like NACL rules: lowest number first and first match wins, so put specific accept rules before broader rejects.
+
+@ Q001717 explain
+G: ## What Direct Connect metrics can and cannot show
+- `ConnectionState` reports whether the physical link is up (1) or down (0).
+- `ConnectionBpsEgress` and `ConnectionBpsIngress` report throughput.
+- `ConnectionErrorCount` counts MAC-level errors on the AWS side of the port.
+None of these measures the end-to-end loss or latency applications experience. A circuit dropping 2% of packets stays Up with normal throughput, and BGP stays Established.
+## Active probing
+Amazon CloudWatch Network Monitor sends ICMP or TCP probes from a VPC subnet to an on-premises IP over the specific path and publishes packet loss and round-trip time to CloudWatch.
+- Graph loss during business hours and correlate it with the application timeouts.
+- Alarm on loss above a threshold, for example 1%, to catch the next brownout.
+- Use the numbers as evidence for the circuit provider.
+W: Network Monitor probes: they directly measure loss and latency on the exact on-premises-to-VPC path, giving quantitative proof of partial loss that BGP and link state never show.
+X: A=ConnectionState and ConnectionBpsEgress: these show link status and throughput only. A brownout keeps the link Up with normal traffic volume, so they cannot confirm or deny partial loss.
+B=Raise the BGP hold timer: this only delays detection of complete failures and makes troubleshooting harder. It measures nothing and does not confirm loss.
+D=Wait for a Health Dashboard event: AWS Health reports AWS-side events, not loss on your own circuit, and brownouts are measurable today with active probes.
+T: Link state and throughput miss brownouts; confirm partial loss on a hybrid path with Network Monitor's active probes.
+
+@ Q001718 explain
+G: ## Hybrid connectivity options
+- **Site-to-Site VPN**: IPsec tunnels over the internet between your customer gateway device and AWS. It can be set up in minutes to hours, is billed per connection-hour plus data transfer, and has two tunnels per connection for redundancy.
+- **Direct Connect**: a private circuit into AWS. A dedicated connection needs a cross-connect at a Direct Connect location and often takes weeks. A hosted connection comes through a partner and also takes time. Traffic is private but not encrypted by default.
+## Fitting the requirement
+The startup needs encryption this week and about 200 Mbps. A VPN delivers both immediately.
+- Limitation: each tunnel tops out around 1.25 Gbps, and latency and jitter follow the public internet path, so performance is less predictable than Direct Connect.
+- Later, a Private IP VPN or MACsec can add encryption on top of Direct Connect if they move.
+W: Site-to-Site VPN: it provides IPsec encryption, can be running this week without a long-term commitment, and 200 Mbps is well within a tunnel's roughly 1.25 Gbps limit, which is its main constraint along with internet-dependent performance.
+X: B=VPC peering to the office: VPC peering connects two VPCs only. It cannot terminate on an on-premises network or router.
+C=Dedicated 10 Gbps DX, always cheaper: a dedicated port takes weeks to provision and its port-hour charges are not justified for 200 Mbps. It is also not encrypted by default, so it fails the timing and the claim.
+D=Hosted DX encrypts by default: Direct Connect traffic is private but not encrypted unless you add MACsec or a VPN over it, and a hosted connection still depends on partner provisioning time.
+T: For encrypted connectivity needed right away at modest bandwidth, use Site-to-Site VPN and accept the ~1.25 Gbps per-tunnel ceiling and internet variability; Direct Connect is slower to provision and not encrypted by default.

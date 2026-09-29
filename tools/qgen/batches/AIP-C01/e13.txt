@@ -1,0 +1,352 @@
+# AIP-C01 detailed explanations, e13 (explanation-only rewrites; letters are the published ones)
+
+@ Q002910 explain
+G: ## Keeping GenAI traffic off the internet
+Applications in private subnets normally reach AWS APIs through a NAT gateway and an internet gateway. The traffic is encrypted with TLS, but it still leaves the VPC through public endpoints, which many regulators do not accept.
+**Interface VPC endpoints** (AWS PrivateLink) place network interfaces with private IPs inside your subnets. With private DNS enabled, the normal service host name resolves to those private IPs, so the SDK call never needs a public route.
+- Amazon Bedrock has separate endpoint services, for example `com.amazonaws.<region>.bedrock-runtime` for model invocation and `bedrock-agent-runtime` for agents and knowledge base queries.
+- Vector stores have their own private options: Amazon OpenSearch Serverless VPC endpoints with a network policy that denies public access, or an Aurora PostgreSQL (`pgvector`) cluster in private subnets.
+- Endpoint policies and security groups on the endpoints further limit who can use them.
+W: B=Private vector store access: the retrieval path carries the same sensitive data as the model call, so the vector store must also be reached through VPC endpoints or private subnets, with public access disabled.
+E=Bedrock interface endpoints: endpoints for the runtime and agent APIs let applications call Bedrock using private IPs in the VPC, with no internet gateway or NAT in the path.
+X: A=Public IPs on instances: giving every instance a public address makes them directly reachable from the internet and sends API calls over public routes, the opposite of the requirement.
+C=Public NAT gateway route: a NAT gateway forwards traffic out through the internet gateway to the public Bedrock endpoint, so the traffic still leaves the private network.
+D=Internet gateway route in private subnets: this turns the private subnets into public ones and gives every workload a path to and from the internet.
+T: Private GenAI traffic means interface endpoints for Bedrock plus private access to the vector store; any NAT, internet gateway or public IP puts traffic back on public routes.
+
+@ Q002911 explain
+G: ## The policies inside an Amazon Bedrock guardrail
+A guardrail combines several independent policies, each aimed at a different kind of risk:
+- **Denied topics**: you describe a subject in natural language (plus optional sample phrases), and the guardrail classifies whether a prompt or response falls into it, however it is worded.
+- **Content filters**: fixed harmful categories such as hate, insults, sexual, violence and misconduct, plus prompt attacks, each with a strength level.
+- **Word filters**: exact words or phrases, and a managed profanity list.
+- **Sensitive information filters**: PII entity types and custom regex patterns to block or mask.
+- **Contextual grounding checks**: whether a response is supported by the source and relevant to the query.
+## Example
+A denied topic named "Competitor products" with the definition "Discussions, comparisons or recommendations about products from other companies" catches "Is the other brand's phone better?" and "What would you buy instead of yours?" alike, because it matches meaning, not keywords.
+W: D=Denied topic: a denied topic is matched semantically, so it blocks competitor discussions regardless of phrasing or product names, and returns your configured blocked message.
+X: A=Contextual grounding check: grounding checks whether an answer is supported by reference content and relevant to the question; it has no notion of which subjects are off limits.
+B=Word filter of product names: a word filter only matches listed words, so paraphrases, misspellings and new products slip through and the list needs constant upkeep.
+C=Violence content filter: the violence category detects violent content; a question about a competitor's product is not violent and would pass.
+T: For "never talk about subject X, however it is phrased", use a denied topic; word filters only catch exact strings.
+
+@ Q002912 explain
+G: ## Guardrails without a Bedrock model call
+Guardrails are usually attached to a Bedrock call such as `InvokeModel` or `Converse` by passing a guardrail ID and version. The **`ApplyGuardrail`** API decouples the guardrail from the model: you send any text and say whether it is an input (`source=INPUT`) or an output (`source=OUTPUT`), and the service returns whether a policy intervened plus any masked text.
+## Example flow for a self-hosted model
+- The app sends the user prompt to `ApplyGuardrail` as input; if it is blocked, the app returns the blocked message.
+- Otherwise it calls the self-hosted model on Amazon SageMaker AI or a third-party API.
+- It sends the model's answer to `ApplyGuardrail` as output and returns the (possibly masked) result.
+Because every path calls the same guardrail version, denied topics, content filters and PII rules stay identical everywhere, and changes are made once.
+W: C=ApplyGuardrail API: it evaluates text against a guardrail without invoking a Bedrock model, so the same policies can wrap self-hosted models and third-party APIs on both input and output.
+X: A=Copy the word list into code: this reproduces only one policy type, loses denied topics, content filters and PII masking, and drifts as each copy is edited separately.
+B=Attach to Bedrock agents only: a guardrail attached to an agent protects that agent's calls; traffic to other models never passes through it, so enforcement is not consistent.
+D=Provider safety filters: each provider applies its own, different rules, so the company cannot guarantee one consistent policy or audit it centrally.
+T: To enforce one guardrail across any model, call `ApplyGuardrail` around the call instead of relying on per-model or per-provider filtering.
+
+@ Q002913 explain
+G: ## Sensitive information filters
+A guardrail's sensitive information policy finds personal or confidential data in prompts and responses and applies an action per type:
+- **Block**: the whole prompt or response is replaced with the blocked message.
+- **Mask** (anonymize): only the matched text is replaced with a tag naming the type, such as `{US_BANK_ACCOUNT_NUMBER}`, and the rest of the answer is kept.
+It supports predefined PII entity types (names, email, phone, bank account numbers, credit card numbers and more) and **custom regex** patterns for company-specific formats, for example `ACCT-\d{10}`.
+## Selective masking
+Each entity type is configured separately. Masking account numbers while leaving the `NAME` type unconfigured means "Jane, your account 1234567890 is active" becomes "Jane, your account {US_BANK_ACCOUNT_NUMBER} is active".
+W: B=Sensitive information filter set to mask: an entity type or regex for account numbers with the mask action removes only those values, while names stay because that type is not configured.
+X: A=Denied topic on bank accounts: this blocks entire conversations about accounts, which a banking assistant must be able to have; it does not mask individual values.
+C=Word filter on 'account': this blocks any response containing the word, breaking normal answers, and does nothing about the numbers themselves.
+D=Insults content filter: the insults category detects abusive language, not account numbers, so the data would still be returned.
+T: To hide specific values but keep the conversation, use sensitive information filters with mask; denied topics and word filters block whole messages.
+
+@ Q002914 explain
+G: ## Automated Reasoning checks
+Most guardrail policies are probabilistic classifiers. **Automated Reasoning checks** in Amazon Bedrock Guardrails use formal logic instead:
+- You upload a source document, such as an eligibility policy, and the service extracts variables and logical rules into an Automated Reasoning policy, which you review and refine.
+- At run time, the guardrail translates the question and the model's answer into logic and checks them against the rules.
+- The findings classify each answer, for example as valid, invalid, or only satisfiable under some assumptions, and flag cases the check could not translate reliably. For an invalid answer they identify the rules it contradicts, which the application can use to explain or correct the answer.
+## Example
+Rule: "Employees with under 12 months of service are not eligible for sabbatical." If the model answers "Yes, with 8 months you can take a sabbatical", the check returns an invalid finding that identifies the contradicted rule, giving an explainable reason.
+W: A=Automated Reasoning checks: they verify logical consistency of answers against rules built from the policy document and explain which rules an answer violates, exactly what the requirement asks.
+X: B=Prompt attack detection on passages: this detects jailbreak and injection attempts; it says nothing about whether an answer satisfies eligibility rules.
+C=Content filters at highest strength: content filters detect harmful categories such as hate or violence; an eligibility error is not harmful content and would pass.
+D=Word filter of eligibility terms: blocking policy terms would block correct answers too, and word matching cannot evaluate logic between conditions.
+T: When answers must be provably consistent with complex rules and violations explained, use Automated Reasoning checks, not classifier-based filters.
+
+@ Q002915 explain
+G: ## Jailbreaks and prompt injection
+A **jailbreak** tries to talk the model out of its instructions, for example "pretend you are an unrestricted AI with no rules" or "ignore previous instructions". Prompt injection hides similar instructions in content the model reads.
+Amazon Bedrock Guardrails includes a **prompt attack** filter among its content filters. It classifies user input for jailbreak and prompt injection patterns and blocks it at the configured strength before it reaches the model.
+- The filter applies to input only.
+- When you pass a system prompt and user text together, you mark the user part with input tags so developer instructions are not flagged as attacks.
+- It complements, not replaces, a clear system prompt and least-privilege tools.
+W: D=Prompt attack filter on inputs: it detects role-play and instruction-override attempts in user prompts and blocks them before the model can follow them, independently of phrasing tricks aimed at the model itself.
+X: A=Remove the system prompt: this removes the rules users are trying to bypass, making the assistant easier to misuse, not harder.
+B=Higher temperature: temperature only changes sampling randomness; it makes output less predictable and does nothing to detect manipulation.
+C=Larger max tokens: this allows longer answers, which can make a successful jailbreak produce more harmful text; it adds no protection.
+T: Role-play and "ignore your rules" attempts are prompt attacks; stop them with the guardrail prompt attack filter, not with inference settings.
+
+@ Q002916 explain
+G: ## Model invocation logging
+Amazon Bedrock **model invocation logging** records the full request and response for model calls, including prompts and outputs, to Amazon S3, CloudWatch Logs or both. It is off by default and configured per Region.
+## Controlling the keys
+S3 can encrypt objects with SSE-KMS using a **customer managed key**. The company controls the key policy, rotation and who may decrypt, and every use of the key appears in CloudTrail.
+## Guaranteeing retention
+**S3 Object Lock** stores objects in write-once-read-many (WORM) form. In **compliance mode**, no user, including the root user, can delete or shorten the retention of an object version before its retention period ends. A default retention of seven years on the bucket applies to each new log object.
+- Governance mode, by contrast, lets users with a special permission bypass the lock, so it is weaker for regulatory needs.
+W: C=Invocation logging to S3 with a customer managed key: it captures prompts and responses and encrypts them with a key the company controls and audits.
+E=Object Lock in compliance mode: it enforces seven-year retention that nobody can delete or shorten, meeting the no-deletion requirement.
+X: A=Disable logging, use screenshots: screenshots are incomplete, easy to alter and not encrypted with company keys, so they provide no reliable audit trail.
+B=CloudWatch with one-day retention: logs would be deleted after a day, far short of seven years.
+D=Public bucket for auditors: a public bucket exposes prompts and responses to anyone; auditors should get scoped IAM access instead.
+T: Audit logs need both controlled encryption (customer managed KMS key) and enforced immutability (Object Lock compliance mode).
+
+@ Q002917 explain
+G: ## CloudWatch Logs data protection
+A **data protection policy** on a CloudWatch Logs log group uses managed data identifiers (email addresses, credit card numbers, names and many others) or custom identifiers to find sensitive data in log events as they are ingested.
+- Matching values are **masked** whenever someone views or queries the logs, for example `****` in place of the email address.
+- The original data is still stored. Principals with the `logs:Unmask` IAM permission can view the unmasked values, for example with the `unmask` command in CloudWatch Logs Insights.
+- The policy can also send audit findings about what was found to another log group, S3 or Firehose.
+## Example
+Engineers get read access to the log group without `logs:Unmask`; the security team role gets `logs:Unmask`. Both read the same logs, but only the security team sees the real addresses.
+W: D=Data protection policy with restricted unmask: it masks email addresses for everyone by default while keeping the original data, and only principals granted `logs:Unmask` can see the values.
+X: A=Metric filter: a metric filter counts matches and publishes a metric; the email addresses remain fully visible in the log events.
+B=Subscription filter to a public endpoint: this copies the sensitive data outside the account, increasing exposure, and does not mask anything.
+C=One-hour retention: deleting the logs removes them for the security team too, so nobody can unmask them later.
+T: To hide sensitive log data from most people but not all, mask with a data protection policy and grant `logs:Unmask` only to the few who need it.
+
+@ Q002918 explain
+G: ## Securing Bedrock model customization
+A fine-tuning or continued pre-training job in Amazon Bedrock reads training data from S3, trains in AWS-managed infrastructure and writes a custom model plus output artifacts such as metrics.
+- **Encryption**: you can specify a customer managed KMS key for the custom model, and use SSE-KMS on the S3 training and output buckets. Only principals allowed by the key policy can use the resulting model.
+- **Network isolation**: the job can be given a **VPC configuration** (subnets and security groups). The job then reaches your training data through your VPC, typically using an S3 gateway endpoint and bucket policies that allow access only from that VPC endpoint.
+- **Auditing**: CloudTrail records the `CreateModelCustomizationJob` call and who made it.
+W: C=VPC configuration with private S3 access: the job reads the customer records through your VPC and an S3 endpoint, so training data never travels over a public path.
+E=Customer managed KMS key: the custom model and outputs are encrypted with a key the company controls, and access to use or decrypt them follows its key policy.
+X: A=Share the model with all accounts: this spreads a model trained on customer records across the organization, violating least privilege; sharing should be explicit and limited.
+B=Public training bucket: a public bucket exposes the customer records to the internet and brings no speed benefit.
+D=Disable CloudTrail: removing the audit trail weakens governance and would not protect the data; CloudTrail does not store the training data itself.
+T: Protect customization with customer managed KMS encryption for the model and a VPC with private S3 access for the job, never with public data or less auditing.
+
+@ Q002919 explain
+G: ## Least privilege for agent tools
+An agent decides which tool to call from the conversation, so a malicious prompt or poisoned document can steer it (prompt injection). Whatever the tool's IAM role allows is what an attacker can reach through the agent.
+Instructions in a prompt are advisory; IAM is enforced by AWS on every request. The reliable limit on damage is the tool's permissions.
+## Example
+Instead of `s3:GetObject` on `arn:aws:s3:::docs-bucket/*`, grant the function's execution role only `arn:aws:s3:::docs-bucket/public-kb/*`. Even if an injected prompt asks for `hr/salaries.csv`, S3 returns `AccessDenied`.
+- Also consider separate buckets for HR data with bucket policies that deny access from other roles.
+W: B=Scope the role to needed prefixes: IAM enforces the limit regardless of what the model is tricked into requesting, so an injected request for HR files fails with access denied.
+X: A=Longer system prompt: prompt instructions can be overridden by injection; they reduce the chance of misuse but cannot guarantee it.
+C=More function memory: memory affects performance and cost, not what the function is allowed to read.
+D=Rename the HR folder: obscurity does not block access; the role can still read every object, and a renamed prefix is easily discovered.
+T: Assume the agent can be manipulated and let IAM least privilege on each tool, not prompts, bound what it can reach.
+
+@ Q002920 explain
+G: ## Traceability of GenAI answers
+The same user question can produce different answers depending on the **model version**, the **prompt template version** and the **guardrail version** in effect. To explain a past answer, you must know all three for that specific request.
+- Pin explicit identifiers: a model ID or inference profile, a guardrail ID with a numbered version (not `DRAFT`), and a prompt version, for example from Amazon Bedrock Prompt Management.
+- Record them with each request: in application logs, structured metadata alongside the answer, or request metadata in model invocation logs.
+- Correlate them with a request or conversation ID so an auditor can go from a customer complaint to the exact configuration.
+## Example log entry
+`request_id=abc123 model=anthropic.claude-... prompt=support-v7 guardrail=gr-12:v3`
+W: A=Log the three versions with each invocation: a per-request record ties every answer to the exact model, prompt and guardrail that produced it, which is what an auditor needs.
+X: B=Latest versions, no records: auto-updating without records makes it impossible to know which configuration produced a given answer.
+C=Engineers' notes: informal notes are incomplete, unverifiable and cannot map individual requests to versions.
+D=Only the final answer text: discarding metadata removes exactly the information needed to reconstruct how the answer was produced.
+T: Governance needs per-request records of model, prompt and guardrail versions, not reconstruction after the fact.
+
+@ Q002921 explain
+G: ## Documenting AI systems for governance
+Governance boards need a consistent record of what each model is for, its limits and how it was evaluated. AWS offers two kinds of documentation:
+- **AWS AI Service Cards**: published by AWS for its AI services and some models (for example Amazon Titan and Amazon Nova models, Amazon Rekognition and Amazon Textract). They describe intended use cases, limitations, responsible AI design choices and deployment best practices.
+- **Amazon SageMaker Model Cards**: documents you create in SageMaker AI for your own models. They record intended uses, risk rating, training details, evaluation results and approval information, can be versioned and exported to PDF.
+## Example
+A company that uses an AWS-provided model and hosts its own fine-tuned classifier cites the AI Service Card for the first and maintains a SageMaker Model Card for the second.
+W: B=AWS AI Service Cards: they give AWS's documentation of intended use, limitations and responsible AI considerations for AWS-provided AI services.
+E=SageMaker Model Cards: they let the company record intended use, risk rating and evaluation results for models it builds and hosts.
+X: A=Route 53 query logs: these record DNS queries, which say nothing about a model's purpose, risks or evaluation.
+C=EC2 instance metadata: this describes the host, such as instance ID and network data, not the model's governance information.
+D=CloudFront access logs: these record web requests to the frontend and contain no model documentation.
+T: For model documentation, use AI Service Cards for AWS services and SageMaker Model Cards for your own models; infrastructure logs do not document intent or risk.
+
+@ Q002922 explain
+G: ## Risk-tiered AI governance
+Many companies classify AI use cases into tiers (for example low, medium, high) based on the data used and the impact on people. The tier decides how much review is required before launch.
+Employee performance data is personal and sensitive, and outputs may influence pay, promotion or termination. That is why such use cases land in the high tier and need:
+- review by **legal** (employment and AI law), **privacy** (lawful basis, data minimization, retention) and **HR** (fairness and process);
+- documented controls such as bias evaluation, human review of decisions, access restrictions and logging;
+- a recorded approval before production, and periodic reassessment afterwards.
+Governance is about the use case, not only the model: the same well-known model can be low risk for summarizing wikis and high risk for rating employees.
+W: A=Formal review with approvals and documented controls: a high-risk tier requires cross-functional sign-off and written controls before launch, so risks are addressed before anyone is affected.
+X: B=Skip review for a well-known provider: the provider's reputation does not cover how this company uses the model or the sensitivity of its data.
+C=Demo to engineers and release: engineering alone cannot assess legal, privacy and HR risks, and the release skips the required approvals.
+D=Review only after complaints: waiting for harm reverses the purpose of a pre-launch review and exposes employees to unassessed risk.
+T: The risk tier is set by the use case and data; high-risk uses need formal cross-functional approval before launch, whatever model is used.
+
+@ Q002923 explain
+G: ## Risk-based classification of AI systems
+The EU AI Act regulates AI systems by the risk of their use:
+- **Unacceptable risk**: prohibited practices, such as social scoring.
+- **High risk**: uses in areas such as employment, credit scoring and education, with obligations such as risk management, data governance, logging, human oversight and documentation.
+- **Limited risk**: transparency duties, for example telling people they are talking to a chatbot or labeling AI-generated content.
+- **Minimal risk**: no specific obligations, such as spam filters.
+## Putting it into practice
+A company first needs an **inventory**: every AI system, its purpose, users, data and provider. Each entry is mapped to a risk category and the controls that category requires, with an owner. The inventory is updated when systems change or new ones launch.
+W: D=Inventory mapped to risk categories and controls: classification depends on each system's purpose, and the inventory makes it possible to apply and prove the controls each category requires.
+X: A=Strictest controls everywhere: this ignores the risk-based approach, wastes effort on minimal-risk systems and still does not show which obligations apply to which system.
+B=Classify by team size: the number of engineers has nothing to do with the regulatory risk of what a system does.
+C=Minimal risk until contacted: waiting for a regulator leaves high-risk systems without required controls and exposes the company to penalties.
+T: Regulatory risk classification starts with an inventory of AI systems mapped by purpose to risk categories and their required controls.
+
+@ Q002924 explain
+G: ## Counterfactual fairness testing
+To see whether a model treats groups differently, change only the attribute you care about and keep everything else the same.
+- Take a set of candidate profiles and create paired versions that differ only in gender cues: names, pronouns, or gendered terms such as "chairman" and "chairwoman".
+- Generate summaries for both versions.
+- Compare them for tone, sentiment, adjectives used (for example "assertive" versus "supportive") and recommended fit, using metrics, an LLM judge or human reviewers.
+Any systematic difference is caused by the gender cue, since that is the only thing that changed.
+Tools such as Amazon SageMaker Clarify and foundation model evaluations help measure bias, and a curated counterfactual prompt set can be rerun after every model or prompt change.
+W: C=Counterfactual gender-swap tests: by changing only gender cues and comparing the paired outputs, differences in tone can be attributed directly to gender.
+X: A=Average summary length: an overall average hides differences between groups and says nothing about tone.
+B=Count mentions of technical skills: a total across all candidates does not compare groups, and skill mentions are not a measure of tone.
+D=Ask the model if it is fair: a model's statement about itself is not evidence; it will usually claim fairness regardless of its behavior.
+T: Detect bias by controlled comparison: swap only the sensitive attribute and measure how outputs change, rather than overall statistics or self-assessment.
+
+@ Q002925 explain
+G: ## Responsible use of image generation
+Generated images can mislead people, reinforce stereotypes or misuse someone's likeness. Common safeguards are:
+- **Transparency**: label AI-generated images and use watermarks or provenance metadata. For example, Amazon Titan Image Generator and Amazon Nova Canvas add an invisible watermark to generated images, and C2PA content credentials can record how an image was made.
+- **Fairness review**: check campaigns for who is shown and how, for example whether all "engineer" images show one gender or ethnicity, and adjust prompts or reject images.
+- **Human review** before publication.
+- **Consent and rights**: avoid depicting real people without permission and respect intellectual property.
+Many jurisdictions and advertising rules increasingly expect disclosure of synthetic media, so labeling also reduces legal risk.
+W: B=Label or watermark AI images: disclosure and provenance let customers and platforms recognize synthetic content, supporting transparency and trust.
+E=Review for stereotypes and representation: human review catches biased or unfair depictions before they reach customers.
+X: A=Remove human review: without review, biased, inaccurate or harmful images go straight into campaigns.
+C=Hide AI use from customers: concealment undermines transparency and can breach disclosure rules or platform policies.
+D=Real public figures without consent: this risks misuse of likeness, defamation and misleading endorsements.
+T: Responsible image generation combines disclosure (labels, watermarks) with human review for fairness; speed or concealment is not a reason to drop either.
+
+@ Q002926 explain
+G: ## Scoping health-related assistants
+A wellness assistant can share general tips about sleep, exercise or hydration, but users may ask questions that need a clinician, such as symptoms, medications or diagnoses. A wrong answer there can cause real harm.
+Responsible controls for such an assistant include:
+- a **clear scope** in the system prompt and user interface: general wellness information only, not diagnosis or treatment;
+- **redirection**: for medical questions, the assistant recommends consulting a healthcare professional, and for emergencies, contacting emergency services;
+- guardrails such as a denied topic for diagnosis and dosing advice;
+- visible disclaimers and evaluation with medically risky test prompts.
+## Example
+"I have chest pain after running, what should I take?" should produce advice to seek medical care now, not a list of medications.
+W: C=Scope limits and referral to professionals: bounding the assistant to general wellness and directing medical questions to qualified people prevents the most serious harm.
+X: A=Remove disclaimers: disclaimers help users judge reliability; removing them encourages over-trust in advice that is not medical care.
+B=Higher temperature: more randomness makes health advice less consistent and increases the chance of incorrect content.
+D=Longer answers: more text does not mean safer or more accurate information and can bury important warnings.
+T: For health-adjacent assistants, the key control is a clear scope with referral to professionals, not more personalized or longer answers.
+
+@ Q002927 explain
+G: ## Contextual grounding checks
+In RAG, the model should answer from retrieved passages. A **contextual grounding check** in Amazon Bedrock Guardrails scores each response on two dimensions:
+- **Grounding**: is the answer supported by the reference source (the retrieved content)? Low scores indicate hallucinated or invented facts.
+- **Relevance**: does the answer address the user's query? Low scores indicate an off-topic response.
+You set a threshold for each (from 0 to 0.99). If a score falls below its threshold, the response is blocked, or only flagged if the policy is configured to detect without blocking.
+## Example
+Source: "Refunds are available within 30 days." Answer: "Refunds are available within 90 days and include shipping." The grounding score is low, so it is blocked. An accurate but unrelated answer about shipping times to a refund question fails relevance.
+W: D=Contextual grounding check with both thresholds: it measures support by the retrieved content and relevance to the question, blocking both kinds of bad answer.
+X: A=Denied topics for irrelevant subjects: you cannot list every irrelevant subject in advance, and denied topics do not check whether facts are supported by the source.
+B=Word filters for hallucination phrases: hallucinations are not marked by specific words; they read like normal answers, so word matching cannot detect them.
+C=Violence and hate filters: these detect harmful content categories, not whether an answer is grounded or relevant.
+T: Unsupported or irrelevant RAG answers are what contextual grounding checks (grounding plus relevance thresholds) are for; other guardrail policies judge content, not support.
+
+@ Q002928 explain
+G: ## Tenant isolation in RAG applications
+In a multi-tenant app, data leaks usually happen before the model: if retrieval returns another tenant's chunks, the model will happily use them. Isolation must therefore be enforced in the data layer.
+- **Tenant-scoped retrieval**: store a `tenant_id` in each chunk's metadata and apply a mandatory filter on every query (Bedrock Knowledge Bases supports metadata filters), or use separate indexes or knowledge bases per tenant (silo model).
+- **Authorization on every access**: derive the tenant from the authenticated identity, not from user input, and check it with IAM policies, session tags (for example ABAC on `aws:PrincipalTag/tenant`) or application authorization before reading data.
+- Keep conversation memory and caches per tenant too.
+W: A=Tenant-scoped retrieval: filters or separate indexes guarantee that only the tenant's own documents can be retrieved and passed to the model.
+E=Per-tenant authorization checks: verifying the caller's tenant on every data access stops one tenant from reaching another's data, even through a bug or manipulated request.
+X: B=Shared conversation memory: memory shared across tenants would feed one tenant's conversations into another's answers.
+C=Instructions not to mention other tenants: the model cannot reliably follow this if other tenants' data is in its context, and prompt injection can override it.
+D=Unfiltered single index: queries would return the most similar chunks from any tenant, directly causing cross-tenant leaks.
+T: Tenant isolation must be enforced in retrieval and authorization, not by asking the model to keep secrets it has already been given.
+
+@ Q002929 explain
+G: ## Evidence versus assertion
+Auditors want records produced by systems at the time of the event, not statements made later.
+- **Model invocation logs** in Amazon Bedrock record each request and response. When a guardrail is applied with tracing enabled, the response includes guardrail trace information such as which policies were evaluated and whether they intervened, so the logs show per-invocation guardrail activity.
+- **AWS CloudTrail** records Bedrock API calls, including who called, when and from where, and management events such as creating or updating guardrails and publishing versions.
+- Stored in S3 with retention controls (and CloudTrail log file validation), these records can be queried, for example with Amazon Athena, to show coverage across the quarter.
+Guardrail CloudWatch metrics, such as invocations and interventions, can supplement this evidence.
+W: A=Invocation logs with guardrail traces plus CloudTrail: these are system-generated records for each call during the period, showing both that guardrails ran and how they were configured.
+X: B=Written statement of intent: intention is not proof that guardrails were actually applied to every invocation.
+C=Screenshot taken today: it shows only the current configuration, not what was applied during last quarter.
+D=Provider marketing page: it describes general product features, not this company's production usage.
+T: Audit evidence comes from logs recorded at the time (invocation logs, traces, CloudTrail), not from statements or current snapshots.
+
+@ Q002930 explain
+G: ## Accountability for consequential AI decisions
+When AI output affects people's accounts, money or access, the organization, not the model vendor, remains responsible. Good practice includes:
+- **Human in the loop**: a person reviews and approves consequential decisions, especially adverse ones, before they take effect. Amazon Augmented AI (Amazon A2I) is one way to route selected predictions to human reviewers.
+- **Appeal path**: customers can contest a decision and get a human re-review, with the process documented.
+- **Records**: inputs, outputs, reviewer and reason are logged so decisions can be explained.
+- **Transparency**: customers are told that AI assists the decision.
+Some regulations also require meaningful human involvement or a right to contest certain automated decisions.
+W: D=Human review with a documented appeal path: people remain accountable for consequential outcomes, and customers have a clear way to challenge and correct mistakes.
+X: A=Vendor handles complaints: the company that deploys the assistant owns decisions about its customers and cannot hand that responsibility to a vendor.
+B=Fully automated with no contest: errors cannot be corrected and customers have no recourse, which fails accountability and may breach regulations.
+C=Hide the use of AI: concealment removes transparency and makes it harder for customers to challenge decisions.
+T: Accountability for consequential AI decisions means human oversight plus a way for affected people to appeal.
+
+@ Q002931 explain
+G: ## Permission-aware retrieval
+An enterprise assistant usually searches document stores on the user's behalf. If it retrieves with broad permissions, it can show any employee content they could never open directly.
+- **Enforce document-level permissions during retrieval**: attach access control data (users, groups) to each document, and filter results by the requesting user's identity. Amazon Q Business and Amazon Kendra honor source ACLs; with Bedrock Knowledge Bases you can filter on metadata such as allowed groups.
+- **Log and review access**: record who asked, which sensitive documents were retrieved and when, and review or alert on unusual patterns, for example with CloudTrail, application logs and CloudWatch alarms.
+- Authenticate every user so identity is known.
+W: B=Log and review sensitive retrievals: monitoring detects misuse or misconfigured permissions and provides an audit trail for investigations.
+E=Document-level permissions at retrieval: results are filtered to what each user is allowed to see, so unauthorized documents never reach the model's context.
+X: A=Remove authentication: without identity, the assistant cannot apply any per-user permissions, so anyone could get anything.
+C=Role with access to every store: broad access without per-user filtering is exactly how confidential documents leak.
+D=One shared service account: all users look the same, so per-user permissions and audit trails become impossible.
+T: Prevent leaks by filtering retrieval with each user's permissions and logging sensitive access; broad shared access defeats both.
+
+@ Q002932 explain
+G: ## Why output tokens drive cost
+On-demand foundation models on Amazon Bedrock are billed per input and output token, and for many models the output token price is higher than the input price, often several times higher (check current pricing for each model). Verbose answers therefore raise the bill quickly and also increase latency.
+Two simple controls address this:
+- **Response length guidance** in the prompt, for example "Answer in at most three sentences" or "Use a bulleted list of up to five items". The model plans a shorter answer instead of being cut off.
+- **`maxTokens`** (the inference parameter limiting output) as a hard ceiling, set with headroom above the typical desired length so answers are rarely truncated.
+## Example
+Answers averaging 800 output tokens that become 250 tokens after adding length guidance cut output cost by about two thirds, with little quality loss for concise questions.
+W: C=Length guidance plus an appropriate max tokens cap: the model writes shorter complete answers, and the cap prevents runaway outputs, directly reducing the dominant cost.
+X: A=Largest model everywhere: larger models cost more per token and do not produce shorter answers by default, so the bill grows.
+B=Retry twice and keep the shorter: this triples the number of calls and the output tokens paid for.
+D=Remove the system prompt: this saves a few input tokens but removes instructions, lowering quality and often producing longer, less controlled answers.
+T: When output tokens dominate cost, tell the model how long to be and cap `maxTokens`, rather than changing models or adding calls.
+
+@ Q002933 explain
+G: ## Semantic caching
+A normal cache returns a stored result only when the key matches exactly. Users rarely type identical text: "How do I reset my password?" and "password reset steps?" mean the same thing.
+A **semantic cache** stores past questions as embeddings along with their answers:
+- A new question is embedded and compared with cached embeddings, for example with vector search in Amazon ElastiCache, Amazon MemoryDB or Amazon OpenSearch Service.
+- If the similarity is above a threshold, the stored answer is returned without calling the foundation model.
+- Otherwise the model answers and the pair is added to the cache, with a time to live or invalidation when the FAQ changes.
+For a stable FAQ with repeated questions, most requests become cache hits, which removes model invocations and lowers latency.
+W: A=Semantic cache: it recognizes similar questions and returns stored answers, so repeated FAQ questions do not trigger model calls at all.
+X: B=Higher temperature: each answer being different does not reduce invocations; every question still calls the model.
+C=Batch inference for tomorrow: batching lowers the per-token price but still runs every question through the model, and next-day answers are unacceptable for interactive users.
+D=Larger context with past answers: every request still calls the model and now also sends more input tokens, raising cost.
+T: The way to avoid model calls for repeated questions is caching by meaning (semantic cache), not changing inference settings or batching.
+
+@ Q002934 explain
+G: ## Application inference profiles
+An **inference profile** in Amazon Bedrock defines a model (and the Regions it can run in) that you invoke by the profile's ID or ARN instead of the model ID.
+You can create your own **application inference profiles** from a foundation model or a system-defined cross-Region profile, and attach **tags** such as `app=support-bot` or `cost-center=1234`.
+- Each application invokes Bedrock with its own profile ARN.
+- After you activate the tags as **cost allocation tags** in the Billing console, AWS Cost Explorer and the Cost and Usage Report break Bedrock spend down by those tags.
+## Example
+Three apps sharing one account each get a profile, `chatbot`, `summarizer` and `search`; the monthly bill can then be split by the `app` tag.
+W: B=Application inference profiles with cost allocation tags: each application's invocations are tied to its own tagged profile, so costs are reported per application within a shared account.
+X: A=One shared IAM role: all calls look like the same principal, and IAM roles do not split Bedrock usage charges by application.
+C=Prompts in the same S3 prefix: where prompts are stored does not affect how model invocation charges are recorded.
+D=One account-wide dashboard: it shows total usage but gives no dimension to separate spending by application.
+T: To split Bedrock costs within one account, invoke through tagged application inference profiles and activate the tags for cost allocation.

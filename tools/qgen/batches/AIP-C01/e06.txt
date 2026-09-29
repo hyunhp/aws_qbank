@@ -1,0 +1,349 @@
+# AIP-C01 detailed explanations, e06 (explanation-only rewrites; letters are the published ones)
+
+@ Q001545 explain
+G: ## How sampling parameters shape output
+A foundation model produces a probability for every possible next token, then samples one. Inference parameters change that sampling step:
+- **temperature** rescales the probabilities. Low values (for example `0` to `0.2`) concentrate choice on the most likely tokens; higher values (for example `0.8` to `1.0`) flatten the distribution so less likely tokens get picked more often.
+- **top_p** (nucleus sampling) keeps only the smallest set of tokens whose probabilities add up to p, such as `0.9`.
+- **top_k** keeps only the k most likely tokens.
+## Why "deterministic" is still not guaranteed
+Even at temperature `0`, hosted inference can return slightly different text for the same prompt because of batching, floating-point effects and serving changes. So a code assistant should use low sampling values for stability and still validate results by behavior (does it compile, do the tests pass) rather than exact string matching.
+W: Low temperature/top_p for code, higher for copy: each workload gets the variability it needs, and the caveat is accurate because providers do not promise bit-identical output even at temperature `0`.
+X: A=top_k 0 disables sampling: top_k only limits how many candidate tokens are considered, and what a value of `0` means differs by model provider. It is not a switch that makes output fully reproducible, and applying the same setting to both workloads would also remove the variety the copy generator needs.
+B=Same default for both: sampling parameters are exactly the controls that decide how much output varies between runs, so one shared default cannot serve a stable code assistant and a varied copy generator at the same time.
+C=High temperature plus a fixed seed: high temperature deliberately picks less likely tokens, which is the opposite of what stable code needs, and a seed, where a model exposes one at all, still does not guarantee identical output on a hosted service.
+T: Tune temperature and top_p per workload (low for code, higher for creative copy) and never rely on exact repeatability, even at temperature 0.
+
+@ Q001546 explain
+G: ## Temperature versus truncation
+Temperature and truncation parameters do different jobs:
+- **temperature** changes how evenly probability is spread across candidate tokens. A high value makes rare tokens more likely to be chosen, which adds variety but also lets in nonsense tokens from the far tail.
+- **top_p** and **top_k** cut the tail off. With `top_p = 0.9`, only tokens that together make up 90% of the probability mass stay in the pool; with `top_k = 50`, only the 50 most likely tokens stay.
+## Using both together
+Example: a story model with temperature `1.0` and `top_p = 0.9` still chooses among many plausible words, so the writing varies, but a token with a 0.01% probability can no longer be sampled. Temperature supplies creativity; truncation keeps that creativity inside the plausible range.
+W: Pair high temperature with a top-p or top-k limit: truncation removes extremely unlikely tokens from the candidate pool, so the model keeps its creative variety without sampling the tail tokens that produce incoherent text.
+X: A=Increase max_tokens: max_tokens only limits response length. A longer response gives the model more chances to sample implausible tokens, not fewer, and it does nothing to the sampling pool.
+B=Temperature zero: this makes the model pick the most likely token almost every time, which removes the creative diversity the team explicitly wants to keep.
+C=top-p 1.0 and maximum top-k: these values keep the entire vocabulary in the candidate pool, which disables truncation and leaves exactly the rare tokens that cause nonsense.
+T: Temperature controls how adventurous sampling is; top-p/top-k decide which tokens are allowed at all, so pair them to get variety without nonsense.
+
+@ Q001547 explain
+G: ## Scaling a SageMaker endpoint
+SageMaker real-time endpoints scale through Application Auto Scaling, which supports two complementary policy styles:
+- **Target tracking** watches a metric such as `SageMakerVariantInvocationsPerInstance` and adds or removes instances to keep it near a target. It reacts to what is happening, so it always lags a sudden change by the time needed to detect load and start new instances.
+- **Scheduled actions** change `MinCapacity` and `MaxCapacity` at set times (cron expressions). They act before load arrives.
+## Combining them for a daily pattern
+Example: a scheduled action at 7:30 AM raises the minimum from 1 to 6 instances so capacity is ready for the 8 AM ramp; target tracking handles surprises during the day; another scheduled action at 7 PM lowers the minimum again so the endpoint shrinks overnight. Model-serving instances can take minutes to launch and load weights, which is why warming up ahead of a known ramp matters.
+W: Target tracking plus scheduled pre-warming: the schedule places capacity before the predictable 8 AM ramp, target tracking absorbs unexpected variation during the day, and lowering the minimum at night keeps cost close to the near-zero overnight traffic.
+X: A=Minimum count with reactive scaling only: reactive scaling starts only after load rises, and new instances need minutes to start and load the model, so the sharp 8 AM ramp would breach the SLA every morning.
+B=Manual resizing by an engineer: it depends on a person acting on time every day, adds operational toil, and cannot react to unexpected spikes; scheduled actions automate exactly this without the risk of a missed change.
+C=Fixed peak-sized fleet: it meets the SLA but pays for peak capacity during the long near-zero overnight period, which contradicts the goal of minimizing cost.
+T: For known traffic patterns, schedule capacity ahead of the ramp and let target tracking handle the rest, instead of either reacting late or paying for peak all day.
+
+@ Q001548 explain
+G: ## Where scaling lag comes from
+With target tracking on a SageMaker endpoint, a spike becomes new capacity only after several steps:
+- CloudWatch must observe the metric above the target long enough for the alarm to fire.
+- The policy's `ScaleOutCooldown` limits how soon another scale-out step can follow.
+- New instances must launch, load a large model and pass health checks, which can take minutes for foundation models.
+## Levers to shrink the gap
+- Lower the target value (for example 70% of what one instance can handle instead of 100%) so scaling starts earlier and each instance has headroom.
+- Shorten the scale-out cooldown so consecutive scale-outs are not held back.
+- Keep a higher minimum instance count as a warm baseline that absorbs the first minutes of a spike.
+- SageMaker also offers high-resolution concurrency metrics that target tracking can use to detect a spike sooner than a per-minute invocation metric.
+W: Faster, earlier scale-out with a warm baseline: a lower target and shorter scale-out cooldown trigger capacity sooner, and a warm baseline gives the endpoint headroom while new instances start and load the model.
+X: A=Move to Bedrock Provisioned Throughput: that is a platform migration for models Bedrock supports, not a fix for this endpoint's scaling configuration, and the question asks for the change that most directly reduces the lag on the existing endpoint.
+B=Longer scale-in cooldown: scale-in cooldown only slows how quickly capacity is removed. It does not block or speed up scale-out, so it does not address the delay in adding instances during a spike.
+C=One very large permanent instance: it removes elasticity, costs peak price around the clock, and still has a fixed ceiling, so a large enough spike would overwhelm it with no way to add capacity.
+T: Scaling lag is fixed by scaling out earlier and faster and keeping warm headroom, not by changing scale-in or abandoning auto scaling.
+
+@ Q001549 explain
+G: ## Three ways to serve a model
+- **Bedrock on-demand**: pay per input and output token, no commitment, shared capacity with account-level quotas. Ideal when traffic is unknown or bursty.
+- **Bedrock Provisioned Throughput**: you buy model units that give dedicated throughput, billed hourly for the units you hold, with discounted rates for a 1-month or 6-month commitment term. It pays off when usage is steady and high enough to keep the units busy.
+- **Self-managed SageMaker endpoint**: you choose instances, containers and scaling, and you pay for instances whether or not they serve requests, plus the operational work of running them.
+## Decide with data
+Example: during the first three months, on-demand bills only for tokens actually used. After usage stabilizes, the team can compare the monthly token bill against the cost of the model units that would carry the observed peak, and switch only if the numbers favor it.
+W: Start on-demand, evaluate Provisioned Throughput later: with unpredictable traffic, on-demand avoids paying for idle committed capacity, and once real usage data exists the team can size and justify Provisioned Throughput if it becomes cheaper or needs guaranteed capacity.
+X: A=Size for the largest anticipated burst: without measured traffic, the largest burst is a guess, and committing capacity to it means paying for mostly idle capacity; on-demand needs no sizing to launch.
+B=Custom SageMaker endpoint from day one: self-managed hosting adds operational work and bills for instances even when idle, so with spiky, unknown traffic it is often more expensive, not cheaper, than per-token on-demand pricing.
+D=Commit to Provisioned Throughput immediately: a term commitment locks in capacity before anyone knows how much is needed, so the team risks paying for unused model units for months.
+T: When traffic is still unknown, pay per token on-demand and commit to provisioned capacity only after usage becomes predictable.
+
+@ Q001550 explain
+G: ## Bedrock runtime metrics in CloudWatch
+Amazon Bedrock publishes invocation metrics in the `AWS/Bedrock` namespace, with a `ModelId` dimension. The ones useful for error triage:
+- `Invocations`: number of requests.
+- `InvocationThrottles`: requests rejected because they exceeded quotas or available capacity (the caller sees a throttling error).
+- `InvocationClientErrors`: requests that failed because of the caller, such as validation errors from malformed request bodies.
+- `InvocationServerErrors`: failures on the service side.
+- `InvocationLatency`, `InputTokenCount`, `OutputTokenCount`: performance and usage.
+## Reading them together
+Example: if `InvocationThrottles` jumps while `InvocationClientErrors` stays flat, the app is hitting capacity limits. If `InvocationClientErrors` jumps right after a client release, the new client is sending bad requests.
+W: InvocationThrottles versus InvocationClientErrors: throttles count requests rejected for exceeding quotas or capacity, while client errors count requests the service rejected as invalid, so comparing the two points directly to capacity or to the new client release.
+X: B=Invocations and OutputTokenCount: these measure request volume and generated output size. Neither separates rejected requests by cause, so they cannot tell capacity limits from malformed requests.
+C=InvocationServerErrors for both: server errors cover failures on the service side. Throttles and client-caused validation failures are counted in their own metrics, so this one would miss both causes.
+D=InvocationLatency and InputTokenCount: latency can rise for many reasons and does not count rejections, and input token counts describe request size, not whether the request was valid.
+T: Separate the throttle metric from the client-error metric to tell "too much traffic" apart from "bad requests".
+
+@ Q001551 explain
+G: ## Turning token usage into an alarmable metric
+Bedrock model invocation logging can deliver a record of each call to CloudWatch Logs or Amazon S3, including the input and output token counts. From there:
+- A CloudWatch Logs **metric filter** (or a small Lambda function) extracts token counts into a custom metric, with a dimension such as the application name, so each app has its own series.
+- Built-in runtime metrics such as `InputTokenCount` and `OutputTokenCount` give totals per model; per-application views need tagging or separate identifiers, such as application inference profiles.
+## Anomaly detection alarms
+CloudWatch anomaly detection learns a metric's normal pattern, including daily and weekly cycles, and builds an expected band. An alarm fires when the value leaves the band. Example: an agent stuck in a loop pushes token usage for one app to 10 times its usual Tuesday-afternoon level, and the alarm fires within minutes, without anyone having to guess a fixed threshold.
+W: Token metrics with anomaly-detection alarms: per-application token metrics derived from invocation logs are evaluated continuously, and anomaly detection flags unusual spikes within minutes even though normal usage changes through the day.
+X: B=Weekly console review: a weekly comparison is days late, so a runaway agent or injection loop could run up cost for a week before anyone notices; it is also manual and easy to skip.
+C=Monthly Cost and Usage Report: billing data arrives with delay and at a coarse level, which suits cost analysis, not near-real-time alerting on a spike happening right now.
+D=Bedrock Guardrails: guardrails filter harmful content, denied topics, sensitive information and ungrounded answers. They do not meter or cap token consumption per application.
+T: Near-real-time cost alerting needs token usage as a CloudWatch metric with an anomaly-detection alarm, not after-the-fact reports or content filters.
+
+@ Q001552 explain
+G: ## What a grounding check measures
+In a RAG application, an answer is **grounded** when its claims are supported by the retrieved passages. A hallucination is a claim that is not. Automated grounding checks compare each response with the context that was retrieved for it:
+- Bedrock Guardrails **contextual grounding checks** score each response for grounding (support in the source) and relevance (to the query) and can block or flag responses below a threshold.
+- An **LLM-as-a-judge** evaluator can score faithfulness on a sample of live traffic.
+## Turning scores into monitoring
+Publish the share of responses that fail the grounding threshold as a CloudWatch metric and alarm on it. Example: after a knowledge-base update, the ungrounded rate rises from 2% to 9%; the alarm fires the same day, long before a scheduled manual review would have noticed.
+W: Grounding scores on live responses with an alarm: every response (or a large sample) is checked automatically against its retrieved context, and alarming on the ungrounded rate detects regressions from prompt or knowledge-base changes continuously.
+X: A=Disable retrieval: without retrieved context, the model answers only from its training data, which is where most hallucinations and outdated answers come from; it also removes the source that grounding checks compare against.
+C=One pre-launch human evaluation: a single baseline cannot detect later regressions caused by prompt or knowledge-base changes, which is exactly what the team is worried about.
+D=User complaints: most users do not report wrong answers, and many cannot tell an answer is wrong, so complaints arrive late and capture only a small, biased fraction of hallucinations.
+T: Continuous hallucination monitoring means automatically scoring live answers against their retrieved context and alarming on the rate, not waiting for reviews or complaints.
+
+@ Q001553 explain
+G: ## One dashboard, several data sources
+Operational signals for a GenAI app live in different places, but they can all become metrics:
+- Health: Bedrock runtime metrics such as `InvocationLatency`, `InvocationClientErrors` and `InvocationServerErrors`.
+- Cost: token metrics such as `InputTokenCount` and `OutputTokenCount`, or custom per-application token metrics derived from invocation logs, which can be multiplied by price in metric math.
+- Compliance: Bedrock Guardrails publishes its own metrics, such as how many invocations a guardrail intervened on.
+## Where to put them
+A **CloudWatch dashboard** can show widgets from multiple namespaces, Regions and accounts on one page. **Amazon Managed Grafana** can query CloudWatch (and other sources) for teams that prefer Grafana. Example: a single page with a latency and error panel, a token-spend-by-app panel and a guardrail-interventions panel, refreshed automatically for the daily review.
+W: A unified CloudWatch or Managed Grafana dashboard: both can combine health, token cost and guardrail intervention metrics from different namespaces in one continuously updated view, which is exactly the consolidated daily view leadership asked for.
+X: A=Default Bedrock console home page: it is a service landing page for working with models, not a configurable operational dashboard, and it does not combine latency, per-application token spend and guardrail interventions in one place.
+B=Billing console, spreadsheet and logs: checking three separate sources every day is fragmented and manual, and a hand-maintained latency spreadsheet is neither current nor reliable.
+C=Quarterly static PDF: a report produced every three months cannot support a daily operational review; it is out of date almost as soon as it is published.
+T: Put health, cost and compliance metrics on one CloudWatch or Grafana dashboard instead of scattered consoles or periodic reports.
+
+@ Q001554 explain
+G: ## Capturing the content, not just the call
+Different AWS logs capture different things:
+- **Bedrock model invocation logging** records the request and response of each model call, including the prompt and completion, and delivers it to Amazon S3 and/or CloudWatch Logs. When a guardrail is applied with its trace enabled, the response carries the guardrail's assessment (what it blocked or masked and which policy acted), so the logged response holds those details too.
+- **AWS CloudTrail** records API activity: who called which API, when and from where. It does not record prompt and completion content.
+- **CloudWatch metrics** record counts, not content.
+## Making logs tamper-proof
+**S3 Object Lock** stores objects in a write-once-read-many (WORM) model. In compliance mode with a retention period of 7 years, no user, including the root user, can delete or overwrite a locked object version until retention expires. SSE-KMS encryption protects the health data at rest.
+W: Invocation logging to an Object Lock bucket: invocation logs hold the input, the output and, with guardrail tracing enabled, the guardrail's intervention details, and an encrypted bucket with Object Lock retention of 7 years keeps those records reviewable and unalterable for the full period.
+X: B=CloudTrail management events: CloudTrail records API call metadata such as caller, time and operation, not the prompt and response payloads that auditors must review.
+C=Guardrail CloudWatch metrics: metrics show how many interventions happened, but they contain no input, output or per-request detail, and they are not an immutable 7-year audit store.
+D=Browser-side logging uploaded nightly: client-side logs can be edited or lost before upload, may never see what the server-side guardrail actually did, and are not protected against alteration.
+T: For auditable guardrail records, log the full invocation server-side and store it in WORM storage (S3 Object Lock), not API metadata or counts.
+
+@ Q001555 explain
+G: ## Why end-to-end metrics are not enough for agents
+An agent completes a task in several steps: the foundation model reasons, chooses a tool, the tool runs, and the model uses the result to decide the next step. A single "task failed" signal cannot say which step broke.
+## Instrument each step
+- Record, for every tool call: the tool name, success or failure, latency and error type (timeout, authorization error, bad input, empty result).
+- Keep the end-to-end task success rate next to it.
+- Use traces (for example OpenTelemetry spans viewed in CloudWatch or AWS X-Ray, or Bedrock agent traces) to follow one task across model and tool steps.
+## Reading the result
+Example: if the database-query tool's error rate jumped from 1% to 30% while the others are stable, the tool is the problem. If all tools succeed when called but tasks fail because the model calls the search API for math problems, the model's tool selection is the problem.
+W: Per-tool metrics alongside task success: success, latency and error type for each tool show whether a specific tool is failing or the tools work and the model is choosing or using them badly, which isolates the root cause.
+X: A=Assume the model is at fault: replacing or retraining the model is expensive and slow, and if a tool is actually failing the change would not fix anything; the evidence has to come first.
+B=End-to-end success only: this is the signal that already dropped. It shows that something fails but cannot say whether it is the model's reasoning or one of three tools.
+D=Remove per-tool monitoring: this throws away exactly the signal needed for diagnosis, and model error messages do not reliably describe tool-side failures such as timeouts or bad responses.
+T: To debug an agent, instrument every tool call separately and compare it with task success, so you can tell tool failures from reasoning failures.
+
+@ Q001556 explain
+G: ## How OpenSearch Serverless capacity works
+Amazon OpenSearch Serverless measures compute in **OpenSearch Compute Units (OCUs)**, split into indexing and search capacity. It scales OCUs automatically up to a maximum you configure for the account, and data is stored durably in Amazon S3. Vector search collections hold embeddings and vector indexes.
+## What to watch as ingestion grows
+- CloudWatch metrics in the `AWS/AOSS` namespace, such as OCU usage, search and indexing latency, and storage size.
+- Alarms when OCU usage approaches the configured maximum (queries slow down or scaling stops) or latency passes the RAG application's budget.
+- Data hygiene: delete embeddings for documents that were removed or replaced, and deduplicate re-ingested content, because stale vectors cost storage and compute and can be retrieved as outdated answers.
+Example: an alarm at 80% of the OCU maximum gives the team time to raise the limit before users feel it.
+W: Monitor OCU, latency and storage with alarms, and prune stale embeddings: this catches capacity and performance problems before they cause outages and keeps the index free of outdated vectors that cost money and pollute retrieval.
+X: A=Quarterly cost review: cost is a lagging signal reviewed far too rarely, and a collection can hit its OCU maximum or slow down badly without any sharp cost change.
+B=End-user error reports: this is purely reactive; by the time users complain, retrieval is already slow or failing, which is the outage-driven approach the team wants to avoid.
+D=Unmaintained growth: automatic scaling is bounded by the configured OCU maximum and billed per OCU, and stale or duplicate embeddings keep adding cost and returning outdated passages.
+T: Proactive vector store operations means alarms on capacity, latency and storage plus regular cleanup of stale embeddings.
+
+@ Q001557 explain
+G: ## Two vector store options on AWS
+- **Amazon OpenSearch Serverless** vector search collections: a purpose-built search engine for k-NN vector search with hybrid keyword search, scaled in OCUs. Relational data lives elsewhere.
+- **Aurora PostgreSQL with `pgvector`**: an extension that adds a `vector` column type, distance operators and approximate indexes (HNSW, IVFFlat) to PostgreSQL. Vectors sit in ordinary tables.
+Both are supported vector stores for Bedrock Knowledge Bases.
+## Why joins matter
+With `pgvector`, one SQL query can find the nearest passages and join them to customer rows. Example: `SELECT p.text, c.tier FROM passages p JOIN customers c ON p.customer_id = c.id ORDER BY p.embedding <=> $1 LIMIT 5`. The team keeps its existing PostgreSQL skills, backups, monitoring and access controls instead of running and syncing a second data store.
+W: Vector search plus relational joins in one store: `pgvector` keeps embeddings in the same database as the customer records, so a single query can retrieve and join, and the team operates one familiar database instead of two systems kept in sync.
+X: A=Identical operations: the two are operated very differently (OCU-based serverless search versus a PostgreSQL cluster with instances, indexes and extensions), and licensing cost is not the deciding factor here.
+C=OpenSearch Serverless cannot store vectors: it can; vector search collections are designed for embeddings and are a common Bedrock Knowledge Bases vector store.
+D=pgvector always faster: performance depends on index type, data size, instance sizing and tuning; a purpose-built vector engine can be faster in many cases, so "always, at any size" is false.
+T: Choose pgvector when vectors must be queried together with relational data; the benefit is one store and SQL joins, not guaranteed speed.
+
+@ Q001558 explain
+G: ## Golden datasets for prompt changes
+A **golden dataset** is a fixed, curated set of inputs, ideally with reference outputs or scoring criteria, that represents the real workload, including each important document type.
+## Side-by-side comparison
+- Run the old and the new prompt template on the same golden inputs with the same model and inference settings.
+- Score both outputs automatically, for example with Bedrock evaluation jobs using LLM-as-a-judge metrics such as faithfulness and completeness, or with task-specific checks.
+- Break results down by document type, and have a person review the cases where scores diverge most.
+Example: for contracts, the new template's completeness score drops from 0.91 to 0.74 while other types stay flat, which confirms a targeted regression and supports a data-based rollback decision.
+W: Compare both templates on a golden dataset: identical inputs, automated scoring and targeted human review confirm whether quality regressed, for which document types and by how much, before deciding to roll back.
+X: B=Redeploy the same template: redeploying does not diagnose anything, and cached outputs are not the stated problem; the question is whether the template itself degrades quality.
+C=Immediate rollback on informal complaints: anecdotes may be noise, may reflect only one document type, and do not show whether the change is actually worse; a good change could be thrown away.
+D=Watch complaints for months: if a regression exists, users suffer it for months, and complaint volume is a slow, noisy and incomplete measure of quality.
+T: Verify a suspected prompt regression by running old and new templates on the same golden dataset with scoring, before rolling back or keeping it.
+
+@ Q001559 explain
+G: ## Why averages hide failures
+A composite score combines several dimensions, such as relevance, factual accuracy and consistency, into one number. Strength on one dimension can compensate for weakness on another.
+Example: the other model scores 0.85 / 0.85 / 0.85 (average 0.85), while model B scores 0.98 / 0.80 / 0.95 (average about 0.91). Model B "wins" even though its factual accuracy is lower, and on the policy subset it may be far below the accepted level.
+## Gates per dimension and per slice
+- Set a minimum threshold for each dimension; a model that misses any one of them fails the gate.
+- Set thresholds for high-risk slices, such as policy questions, because an overall number can hide a failure on a small but critical group.
+- Use the composite only to rank models that already passed every gate.
+W: Per-dimension and per-slice thresholds, composite for ranking: every requirement becomes its own pass/fail check, so model B's factual accuracy failure on policy questions blocks release even though its average is higher.
+X: A=Weekly spot check of 20 conversations: 20 random samples will rarely include enough policy questions to detect the drop, and replacing systematic scoring with a small manual check lowers rigor.
+C=Single weighted average as the gate: this is exactly how model B passed; any average lets a high score on one dimension mask an unacceptable score on another.
+D=Measure factual accuracy only: an accurate answer can still be irrelevant to the question or inconsistent across paraphrases, so dropping the other dimensions removes real requirements.
+T: Gate each dimension and each critical slice separately; use the composite only to rank models that pass every gate.
+
+@ Q001560 explain
+G: ## Faithfulness versus other metrics
+A summary has a **faithfulness** (or groundedness) problem when it states something the source does not support. For financial summaries the most dangerous version is a wrong or invented number, such as "revenue grew 12%" when the transcript says 8%.
+## How faithfulness is measured
+- The evaluator breaks the summary into individual claims.
+- It checks each claim, including every figure, against the source transcript.
+- Unsupported claims lower the score, and flagged claims can be reviewed.
+In Amazon Bedrock, evaluation jobs that use an LLM as a judge offer faithfulness-style metrics, and a team can add a custom metric that specifically checks numbers. A simple programmatic check can also extract figures from the summary and confirm each appears in the transcript.
+W: Faithfulness metric against the transcript: it checks every claim, including numeric figures, for support in the source, so an invented or altered number is flagged, which is exactly the failure mode the team must catch.
+X: A=Response latency: latency measures speed, not correctness; and factual support can be evaluated programmatically with claim-level checks and LLM-as-a-judge metrics.
+B=Toxicity metric only: toxicity detects harmful or offensive language, and earnings summaries rarely contain it; it would not notice a wrong revenue figure at all.
+D=BLEU against one reference: BLEU measures word n-gram overlap with a reference text. A summary with the wrong number can still score high, and a correct summary phrased differently can score low.
+T: To catch invented facts or numbers in a summary, measure faithfulness to the source, not overlap, toxicity or speed.
+
+@ Q001561 explain
+G: ## Two kinds of Bedrock evaluation jobs
+- **Automatic evaluation**: Bedrock runs your prompt dataset through the model and scores responses with built-in algorithmic metrics or with a judge model (LLM-as-a-judge). It is fast, repeatable and cheap per sample.
+- **Human-based evaluation**: your own work team rates responses using criteria and rating methods you define, such as thumbs up/down, Likert scales or ranking two responses side by side.
+## When humans are worth it
+Humans are the best judges of qualities that are subjective, context-dependent or brand-specific. Example: two models both write fluent, error-free copy, but only marketers can say which one sounds like the brand and would appeal to the target audience. Automatic metrics have no reliable definition of "on-brand".
+W: Subjective, hard-to-measure quality: brand voice and creative appeal depend on human judgment and brand knowledge, which is where a human-based evaluation job adds value that automatic metrics cannot provide.
+X: B=Anthropic models unsupported: Bedrock evaluation jobs can evaluate Anthropic Claude models; the model provider does not force a human-based job.
+C=Humans are faster and cheaper: the reverse is true; human evaluation needs reviewers' time and costs more per sample, so it is chosen for judgment, not for speed or cost.
+D=More than 1,000 prompts requires humans: no rule sends large datasets to human evaluation; large datasets are in fact harder for people to review, which is one reason automatic evaluation exists.
+T: Use human evaluation for subjective qualities like brand voice; use automatic evaluation for speed, scale and objectively measurable metrics.
+
+@ Q001562 explain
+G: ## Offline evaluation versus online A/B testing
+- **Offline evaluation** runs candidates on a fixed test dataset and scores responses with metrics or judges. It is fast, safe and repeatable, and good for catching quality problems before release.
+- **Online A/B testing** splits real traffic between variants and measures real user behavior, such as click-through, conversions or time on page.
+## Why both exist
+An offline metric can say which description is more accurate or fluent, but not which one makes shoppers click. Example: variant A scores slightly higher offline, yet variant B's shorter, benefit-led descriptions get 6% more clicks with live traffic. Only the A/B test observes that, because click-through exists only when real users see the page. Offline checks remain useful as a gate before any variant reaches users.
+W: Real business impact under live traffic: click-through is user behavior that exists only in production, so a live A/B test measures the outcome the business cares about, which an offline dataset cannot capture.
+X: A=Datasets limited to 100 prompts: that is not the real constraint; the reason for A/B testing is that offline datasets cannot measure live user behavior, whatever their size.
+B=Evaluation jobs cannot test templates: an evaluation dataset can contain prompts rendered from each template, so offline jobs can compare templates; they just cannot measure clicks.
+C=A/B testing replaces all other evaluation: A/B tests measure a business outcome, not safety, accuracy or regressions; offline and human evaluation still matter for future changes and as a release gate.
+T: Offline evaluation checks response quality before release; live A/B tests measure real business outcomes such as click-through.
+
+@ Q001563 explain
+G: ## Making thumbs up/down useful
+A rating alone ("thumbs-down") says little. It becomes diagnostic when it is stored with context:
+- the prompt template version and model version that produced the answer,
+- the user's question, retrieved context and the response,
+- a timestamp and the feature or use case.
+## From feedback to regression alerts
+Aggregate the thumbs-down rate per prompt version and alarm when a new version is worse than the previous one. Example: version 14 runs at 6% thumbs-down; two days after version 15 ships, it is at 11%, and an alarm fires. Because each rating is linked to its full context, the team can open the thumbs-down cases for version 15 and see what went wrong. Privacy controls on stored questions and answers still apply.
+W: Store ratings with version, context and response, and alert per version: this links each quality change to a specific prompt release, makes regressions visible soon after each biweekly update, and lets the team inspect the failing cases.
+X: A=Thumbs-down straight into denied topics: a thumbs-down usually means a poor answer, not a forbidden subject, and turning unreviewed feedback into guardrail policies would block legitimate questions.
+B=24-hour retention: comparing one prompt version with another needs history across releases; deleting ratings after a day removes the trend data needed to detect regressions.
+D=Lifetime thumbs-up percentage as the gate: a lifetime average is dominated by old data and moves very little after a new release, so a regression in the latest version would be hidden.
+T: User feedback detects regressions only when each rating is stored with its prompt version and context and tracked per version.
+
+@ Q001564 explain
+G: ## Two problems with sparse feedback
+- **Volume**: at a 2% response rate, a small regression is hard to separate from random noise.
+- **Bias**: people who rate voluntarily are often those with strong feelings, especially frustration, so the sample does not represent all traffic.
+## Fixing volume without adding bias
+- Reduce friction: show rating controls on every answer, one click, no forced comment.
+- Add **randomly sampled micro-surveys**, such as a single question shown to a random 5% of conversations. Random selection gives an unbiased sample of all traffic, and a short survey keeps response rates reasonable.
+Example: always-visible icons raise the response rate to 6%, and the random survey adds a representative sample that can be compared across prompt versions.
+W: Low-friction, always-visible ratings plus random micro-surveys: easier rating increases volume, and random sampling keeps the collected feedback representative of all conversations, so the signal becomes both larger and less biased.
+X: A=Mandatory rating before the next message: forcing a rating annoys users, and many will click anything to continue, which adds noise and bias rather than a meaningful signal.
+B=Replace user ratings with LLM-as-a-judge: judge scores are useful but measure a model's opinion, not real user satisfaction; the question asks how to make user feedback more useful, not how to remove it.
+D=Ask only after low-confidence conversations: this samples only the hardest cases, so the rate cannot represent overall quality or be compared fairly between versions.
+T: Increase feedback with low-friction controls and keep it unbiased with random sampling, not with forced or targeted prompts.
+
+@ Q001565 explain
+G: ## Treat prompts like code
+A system prompt is part of the application's behavior. Changing one sentence can change tone, formatting, refusal behavior or how the model uses retrieved context, even when the model and knowledge base stay the same.
+## A prompt regression suite
+- A curated set of questions with expected answers or scoring criteria, especially ones the bot already handles well and known tricky cases.
+- Runs automatically in the deployment pipeline for every new prompt version, scoring answers with automated checks or LLM-as-a-judge metrics such as correctness and faithfulness.
+- Blocks promotion if scores drop below thresholds or below the current production version.
+Example: version 18 of the prompt answers "How do I reset my password?" with the wrong steps; the suite catches it in the pipeline and the release stops.
+W: Automated regression suite on every prompt version: curated Q&A pairs run in the pipeline before promotion, so a prompt change that breaks previously well-handled questions is caught before users see it.
+X: A=Manual review at launch and on model changes: it misses exactly the biweekly prompt changes that are the stated risk; prompt edits can degrade quality as much as model swaps.
+B=No evaluation for prompt-only changes: prompt wording strongly affects answers, so skipping evaluation is how silent degradations reach production.
+D=Production user complaints: complaints arrive after users are already affected, are incomplete, and cannot stop a bad version from being deployed.
+T: Every prompt change should pass an automated regression suite in the pipeline, just like a code change.
+
+@ Q001566 explain
+G: ## How a flat aggregate hides a broken category
+If a category makes up 2% of the test suite, even a complete failure there barely moves the overall score.
+Example: 4 of 200 cases are refund-policy questions. If all 4 fail, accuracy drops by only 2 percentage points; any small gain in other categories can hide it, so the aggregate stays at 92%. In production, refund questions may be a much larger and more important share of traffic.
+## Stratified regression testing
+- Define categories (refund policy, billing, account access and so on) and make sure each has enough test cases to measure reliably, weighted toward importance and risk.
+- Report and gate each category separately, for example "every category must stay at or above 90% and must not drop more than 3 points".
+- Keep an overall score for trend tracking, not as the only gate.
+W: Stratify the suite and gate each category: adequate cases per category make each score reliable, and separate gates mean a collapse in one category blocks the release even when the aggregate stays flat.
+X: A=Add more easy cases: more easy cases dilute the refund category even further, making the aggregate more stable and even less sensitive to a category failure.
+B=Remove the refund-policy category: it hides a real, user-facing failure instead of detecting it; small categories can be the most important ones.
+D=Lower the aggregate threshold: any threshold on the overall average still averages away a failure in a small category; the problem is how the score is structured, not the cutoff.
+T: Regression suites need enough cases per category and a gate per category, because an overall average hides failures in small slices.
+
+@ Q001567 explain
+G: ## RAG has two stages to evaluate
+A RAG answer can go wrong in two separate places:
+- **Retrieval**: the retriever returns passages that do not match the question. Metrics such as **context relevance** (and context coverage) score whether the retrieved passages are relevant to and sufficient for the query.
+- **Generation**: the model writes an answer that goes beyond or contradicts the passages. **Faithfulness** (groundedness) scores whether every claim in the answer is supported by the retrieved context.
+Amazon Bedrock evaluation jobs for Knowledge Bases can report retrieval-only metrics and retrieve-and-generate metrics, including these.
+## Why separate them
+Example: low context relevance with high faithfulness means the model faithfully summarized the wrong passages, so fix chunking or embeddings. High context relevance with low faithfulness means retrieval is fine but the model adds unsupported claims, so fix the prompt or model.
+W: Context relevance and faithfulness: the first scores whether the retriever returned passages relevant to the query, the second whether the answer is supported by those passages, exactly the two concerns in that order.
+X: B=BLEU and token count: BLEU measures word overlap with a reference answer and token count measures length; neither looks at retrieved passages or whether the answer is supported by them.
+C=Temperature and top-p: these are generation settings chosen before inference, not evaluation metrics that report quality.
+D=Toxicity and latency: toxicity measures harmful language and latency measures speed; both are valid metrics, but neither evaluates retrieval relevance or grounding.
+T: Evaluate RAG in two parts: context relevance for the retriever and faithfulness for the generator.
+
+@ Q001568 explain
+G: ## LLM-as-a-judge
+In **LLM-as-a-judge**, a capable foundation model (the judge) reads a prompt and the response under test, applies a rubric such as "rate helpfulness from 1 to 5", and returns a score with a rationale. Amazon Bedrock evaluation jobs support this with built-in metrics such as helpfulness, correctness and coherence, and with custom metrics you define.
+## Strengths and limits
+- Strengths: scales to thousands of responses nightly, handles open-ended text that exact-match scoring cannot, explains its scores.
+- Limits: the judge has its own biases, such as favoring longer answers, answers that resemble its own style or the first of two responses, and it can be confidently wrong.
+## Keeping the judge honest
+Periodically have humans rate a sample and measure agreement with the judge. Example: if the judge and human reviewers agree on 85% of 200 sampled responses, the judge is trusted for trend tracking; if agreement falls, the rubric or judge model is revised.
+W: LLM-as-a-judge, validated against human ratings: a separate model scoring prompt-response pairs with a rationale is exactly this technique, and its key limitation is that the judge's own biases can skew scores unless they are checked against human judgments.
+X: A=A/B testing: A/B tests split live traffic between variants and measure user behavior; the described job scores stored responses with a model, not live traffic.
+B=Regression testing: regression testing compares a new version against previous results on a fixed suite; the described setup is defined by who scores (a judge model), not by comparison against past versions.
+D=Embedding similarity scoring: this measures how close a response's embedding is to a reference, without reading the response against a rubric; it does not output a quality score with a written rationale as described.
+T: A model grading responses with a rubric and rationale is LLM-as-a-judge; it scales well but must be calibrated against human ratings because the judge has biases.
+
+@ Q001569 explain
+G: ## Hybrid evaluation: automate breadth, humans for depth
+Neither pure approach works at 5,000 contracts a week under compliance pressure:
+- Human review of everything is accurate but needs a large expert team and slows delivery.
+- A judge model alone is fast but can be wrong or biased, with no one checking it.
+## How the hybrid works
+- **LLM-as-a-judge** scores every output, for example "Did the assistant flag all risky clauses? Is each flag justified?"
+- **Expert review** covers a random sample of all outputs (to measure real accuracy and calibrate the judge) plus every output the judge scores low or marks as uncertain.
+- Agreement between experts and the judge is tracked over time; disagreements update the rubric.
+Example: all 5,000 outputs are judge-scored, 3% are randomly sampled for lawyers, and every low-confidence output is escalated, so experts review a few hundred contracts per week instead of 5,000.
+W: Judge-score everything, experts for a sample and low-confidence cases: automated scoring covers the full volume, while expert review of a random sample and all uncertain cases gives compliance-grade confidence and keeps the judge calibrated.
+X: A=Judge only, no humans: a judge model is not authoritative; without human validation its errors and biases go unmeasured, which fails the high-confidence compliance requirement.
+B=Rely on Guardrails instead of evaluation: guardrails filter content by policies such as denied topics or sensitive information; they do not measure whether the assistant correctly identified risky contract clauses.
+C=100% human review: over 5,000 contracts a week makes exhaustive expert review impractical in cost and turnaround time, as the scenario itself states.
+T: At high volume with high stakes, let an LLM judge score everything and send a random sample plus low-confidence outputs to human experts.

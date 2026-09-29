@@ -1,0 +1,372 @@
+# ANS-C01 detailed explanations, e03 (explanation-only rewrites; letters are the published ones)
+
+@ Q001617 explain
+G: ## Where DNS queries from a VPC go
+Instances in a VPC send DNS queries to the Route 53 Resolver at the VPC's `.2` address (for example `10.0.0.2` in `10.0.0.0/16`), also reachable at `169.254.169.253`. That Resolver answers from private hosted zones, forwarding rules or public DNS.
+## Resolver query logging
+A **query logging configuration** records every query the Resolver handles for the VPCs associated with it. Each record includes:
+- the query name and type (for example `api.example.com`, `A`),
+- the response code and the returned answers,
+- the source IP and the source resource, such as the EC2 instance ID that asked.
+Logs go to CloudWatch Logs, an S3 bucket or a Firehose stream. The configuration can be shared through AWS RAM, so one central configuration can be associated with VPCs in many accounts and all logs land in one queryable place (for example Athena over S3 or CloudWatch Logs Insights).
+W: Resolver query logging: it is the feature built to capture each DNS query with its name, response and originating instance, and a shared configuration can send logs from many VPCs and accounts to one central destination.
+X: A=CloudTrail data events: CloudTrail records API calls to AWS services, such as changes to hosted zones. It does not record the DNS lookups that instances send to the Resolver.
+C=Flow Logs DNS fields: VPC Flow Logs record IP-level metadata (addresses, ports, bytes, action). There are no fields for the query name or answer, and traffic to the Amazon-provided DNS resolver is not captured in flow logs at all.
+D=DNS Firewall alert logs only: DNS Firewall only logs queries that match its rules, so most queries would be missing. Its matches actually appear inside Resolver query logs, which is the complete source.
+T: For "every DNS query, with name, answer and instance", use Resolver query logging shared to a central destination; flow logs and CloudTrail never see query contents.
+
+@ Q001618 explain
+G: ## AWS Network Manager and the global network
+AWS Network Manager is a central console for monitoring a network that spans Regions, accounts and on-premises sites. You create a **global network**, which is a container for your network objects, and then register:
+- **Transit gateways** from any Region (and, with AWS Organizations, from member accounts),
+- **Sites** (a data center or branch), **devices** (for example SD-WAN appliances) and **links** (the circuits at a site),
+- the Site-to-Site VPN and Direct Connect connections that join them.
+## What you get
+Network Manager draws a **topology diagram** and a geographic map of the registered objects, shows CloudWatch metrics and route changes, and raises events such as a VPN tunnel going down or a BGP route change. Some SD-WAN partners can register their devices automatically.
+Example: a team registers 12 transit gateways in 6 Regions plus 40 branch sites, and sees in one view that a VPN tunnel to the Frankfurt site is down.
+W: Network Manager global network: it is the AWS service designed to register transit gateways, sites, devices and links in one global view with topology, events and metrics.
+X: A=Reachability Analyzer per TGW: Reachability Analyzer answers point-in-time "can A reach B" questions for a chosen source and destination. It does not draw a topology or show live operational status.
+B=Manual CloudWatch dashboards: dashboards can show metrics per Region, but they have no topology model of sites, links and on-premises devices, and building and maintaining them by hand across dozens of resources is error-prone.
+C=Config aggregator: AWS Config aggregates resource configuration and compliance data. It shows whether resources follow rules, not a network diagram or real-time link and tunnel status.
+T: For a single live picture of TGWs, VPNs, Direct Connect and on-premises sites, register them in a Network Manager global network; Config, dashboards and Reachability Analyzer answer narrower questions.
+
+@ Q001619 explain
+G: ## Measuring a hybrid path without agents
+Packet loss and latency are properties of the path between two endpoints, so something must send test packets across that path. Traditional tools need software at one or both ends.
+## CloudWatch Network Monitor
+**Amazon CloudWatch Network Monitor** creates **monitors** made of **probes**. A probe is managed by AWS and sends traffic from a source subnet in your VPC to a destination IP address, for example an on-premises server `192.168.10.25`, using ICMP or TCP on a port you choose.
+- Nothing is installed on the on-premises side; it only needs to answer ICMP or accept the TCP connection.
+- Results are published as CloudWatch metrics such as round-trip time and packet loss, so you can set alarms.
+- It also shows a network health indicator that helps tell whether a degradation is inside the AWS network or outside it.
+Example: probes from two subnets in different Availability Zones to a data center gateway reveal 2% loss on the Direct Connect path.
+W: Network Monitor probes: AWS-managed probes run from subnets in the VPC toward on-premises IPs and publish latency and packet loss to CloudWatch continuously, with no agent at the remote end.
+X: A=DX connection metrics only: Direct Connect metrics show the physical link state, bit rates and optical levels of the connection. They do not measure end-to-end latency or loss between a VPC and a server.
+B=Flow Logs with Athena: flow logs record flow metadata such as bytes, packets and accept or reject. They contain no latency or packet loss measurements.
+C=Route Analyzer: Route Analyzer checks transit gateway route tables for a path between two addresses. It analyzes configuration and sends no traffic, so it cannot measure loss or latency.
+T: To measure latency and loss to on-premises without agents, use CloudWatch Network Monitor probes; metrics, flow logs and route analysis never test the live path.
+
+@ Q001620 explain
+G: ## The three scopes of a flow log
+A VPC Flow Log can be created on a **network interface**, a **subnet** or a whole **VPC**.
+- A VPC-level flow log covers every ENI in the VPC, including ENIs created later by Lambda, Elastic Load Balancing, NAT gateways or Amazon EKS.
+- A subnet-level flow log covers only ENIs in that subnet, so a new subnet is not covered.
+- An ENI-level flow log covers only that single ENI.
+## Custom formats
+The default format has fixed fields (version 2). A **custom format** lets you pick fields such as `pkt-srcaddr` and `pkt-dstaddr`, which show the original packet addresses. They matter when traffic passes through a NAT gateway or other middlebox, where `srcaddr` shows the interface address instead.
+Example: `${srcaddr} ${pkt-srcaddr} ${dstaddr} ${action} ${flow-direction}`.
+W: VPC-level flow log with custom format: one flow log on the VPC automatically covers all current and future ENIs, and the custom format adds `pkt-srcaddr` and other chosen fields.
+X: A=Existing subnets only: subnet flow logs miss any subnet created later, so ENIs placed there would not be logged, which breaks the "every ENI" requirement.
+C=CloudTrail data events: CloudTrail records API activity, not packets. It never records network flows between interfaces.
+D=Per-ENI via EventBridge: automation that reacts to ENI creation adds moving parts, can miss or lag new ENIs (short-lived Lambda ENIs, errors in the rule) and creates many flow logs to manage, while a VPC-level log already does this natively.
+T: Scope the flow log to the VPC to catch every present and future ENI, and use a custom format for fields like `pkt-srcaddr`.
+
+@ Q001621 explain
+G: ## Why VPC flow logs are not enough for a transit gateway
+VPC Flow Logs are captured on network interfaces inside a VPC. They show traffic entering or leaving the transit gateway attachment ENIs in that VPC, but not what the transit gateway itself did with a packet after it arrived.
+## Transit Gateway Flow Logs
+**Transit Gateway Flow Logs** are enabled on the transit gateway (or on individual attachments) and record the flows that pass through it. Besides addresses, ports, bytes and packets, records identify the source and destination attachments and include drop counters such as:
+- `packets-lost-no-route` and `packets-lost-blackhole` (routing problems),
+- `packets-lost-mtu-exceeded` and `packets-lost-ttl-expired`.
+Logs go to CloudWatch Logs, S3 or Firehose.
+Example: flows from the VPC A attachment to the VPC B attachment showing `packets-lost-blackhole` point at a blackhole route in a TGW route table.
+W: Transit Gateway Flow Logs: they are captured at the transit gateway, so they show which attachment traffic entered and left through and whether the TGW dropped it, which is exactly the suspected failure point.
+X: A=CloudTrail management events: these record API calls such as creating a route or attachment. They show configuration changes, not individual packets or drops.
+B=VPC Flow Logs capture TGW traffic: VPC flow logs only see the interfaces in each VPC. A packet dropped inside the transit gateway after leaving VPC A never shows up as a drop in either VPC's log.
+D=Resolver query logging: this records DNS queries, not IP traffic, and it is associated with VPCs, not with transit gateway attachments.
+T: To see what happens inside the transit gateway, log at the transit gateway; VPC flow logs only see the edges.
+
+@ Q001622 explain
+G: ## Transit gateway route tables in a chain
+A packet crossing a transit gateway is routed by the TGW route table associated with the attachment it entered from. With several route tables, and possibly peered transit gateways, a path can break in many places: a missing route, a `blackhole` route, or an association to the wrong table.
+## Route Analyzer
+**Route Analyzer** is part of AWS Network Manager. You choose a source and a destination (a transit gateway attachment and an IP address) and it walks the TGW route tables along the path, including across peered transit gateways in the global network.
+- It reports each hop and the route used.
+- It flags where the path breaks, such as "no route" or a blackhole route in a specific route table.
+- It can check the return path as well.
+Example: analyzing `10.1.0.0` to `10.2.5.10` shows that the route table for the VPN attachment has `10.2.0.0/16` as a blackhole.
+W: Route Analyzer: it analyzes transit gateway route tables along the whole path and points to the exact missing or blackhole route, which is what the engineer is asking for.
+X: A=Trusted Advisor: Trusted Advisor checks best practices such as security group openness and service limits. It does not trace routes through transit gateway route tables.
+B=Logs Insights on flow logs: flow logs show traffic that was observed. They can show that packets stopped, but not which route table entry is missing or blackholed.
+C=Reachability Analyzer only: Reachability Analyzer traces paths between specific AWS resources, but it is scoped to resource-to-resource analysis in one Region. The question is about the routing across TGW route tables, which Route Analyzer is built to analyze, including routes toward on-premises prefixes and peered transit gateways.
+T: For "which TGW route table is missing or blackholing my route", use Network Manager Route Analyzer; flow logs show symptoms, not the broken route.
+
+@ Q001623 explain
+G: ## Transit gateway attachment metrics
+A transit gateway publishes CloudWatch metrics in the `AWS/TransitGateway` namespace for the whole gateway and **per attachment**:
+- `BytesIn` and `BytesOut`, `PacketsIn` and `PacketsOut`,
+- `PacketDropCountBlackhole` and `PacketDropCountNoRoute` (plus byte variants).
+Each attachment also has a bandwidth quota, documented in the Transit Gateway quotas.
+## Turning bytes into bandwidth
+`BytesOut` is a count over the period, not a rate. To alarm near a limit, convert with metric math: `Sum(BytesOut) * 8 / period_seconds` gives bits per second.
+Example: over 60 seconds `BytesOut` sums to 600 GB, so 600,000,000,000 * 8 / 60 = 80 Gbps. An alarm at 80% of the attachment quota warns before throttling. Rising drop counts show that packets are already being lost.
+W: Per-attachment byte and drop metrics: `BytesIn`/`BytesOut` for the specific attachment show how close traffic is to its bandwidth quota, and the drop counters confirm when loss begins.
+X: A=S3 request metrics: these measure requests to the log bucket, which has nothing to do with the traffic volume through an attachment.
+C=EC2 CPUUtilization: instance CPU shows how busy servers are. A saturated attachment can occur while CPU is low, and traffic from many instances shares one attachment.
+D=Route 53 health checks: health checks test whether an endpoint answers. They say nothing about attachment throughput, and there is no health check for a TGW attachment.
+T: Watch the attachment's own `BytesIn`/`BytesOut` (converted to bits per second) and drop counts, not indirect signals like CPU or health checks.
+
+@ Q001624 explain
+G: ## Cross-account delivery of flow logs
+A flow log can publish to an S3 bucket in **another account**. Delivery is done by the log delivery service (`delivery.logs.amazonaws.com`), so the bucket owner grants that service permission in the bucket policy.
+## Allowing a whole organization
+Instead of listing 100 account IDs, the bucket policy can use a condition key such as `aws:SourceOrgID` to allow deliveries on behalf of any account in the organization. Each member account then creates a flow log whose destination is the central bucket ARN, for example `arn:aws:s3:::central-flow-logs`.
+- Account teams do not need their own trust relationships.
+- Creating the flow logs can be automated with CloudFormation StackSets or similar tooling.
+- Objects are stored under prefixes that include the source account ID and Region, so logs stay separable.
+W: Central S3 bucket with an organization-wide policy: flow logs support direct cross-account S3 delivery, and one bucket policy scoped to the organization avoids per-account permission work.
+X: A=Cannot deliver cross-account: this is false. Flow logs can be published to an S3 bucket owned by another account, and to CloudWatch Logs or Firehose in another account with the right roles.
+C=Weekly manual copy: manual CLI copies are slow, error-prone and leave logs up to a week stale, which is poor for security analysis and does not scale to 100 accounts.
+D=Per-account trust and emailing ARNs: this is the per-account manual setup the company wants to avoid, and emailing ARNs has no role in how delivery works.
+T: Point every account's flow logs at one S3 bucket whose policy trusts the organization, instead of building per-account trusts or copying logs.
+
+@ Q001625 explain
+G: ## Link aggregation groups (LAG)
+A **LAG** bundles several Direct Connect dedicated connections into one logical connection using LACP (Link Aggregation Control Protocol). Virtual interfaces are created on the LAG, not on the member connections, and traffic is spread across the members.
+## Rules to remember
+- All connections in a LAG must have the **same port speed** (for example all 10 Gbps).
+- They must terminate on the **same Direct Connect endpoint** (the same AWS device at one location).
+- The number of connections per LAG is limited by a quota, lower for the fastest port speeds.
+- **Minimum links** sets how many members must be up for the LAG to stay up.
+Example: two 10 Gbps connections give 20 Gbps. With minimum links = 1, if one fails the LAG stays up at 10 Gbps; with minimum links = 2, the whole LAG goes down, which lets traffic fail over elsewhere.
+W: LAG: it creates one 20 Gbps logical link from two 10 Gbps dedicated connections, requires same speed and same endpoint, and minimum links controls whether it stays up after a member fails.
+X: A=Transit Gateway Connect: Connect runs GRE tunnels with BGP over an existing transport. It does not combine physical Direct Connect connections into one link.
+B=Two VIFs with ECMP: two VIFs remain two separate links with separate BGP sessions. BGP weight is a local router setting that is not advertised to AWS, and ECMP spreads flows, it does not create one 20 Gbps logical link.
+C=Direct Connect gateway: a Direct Connect gateway connects VIFs to VPCs or transit gateways in many Regions. It does not bundle connections.
+T: To make one logical link from several dedicated connections, use a LAG with matching speeds on the same endpoint and set minimum links; routing constructs do not bundle links.
+
+@ Q001626 explain
+G: ## Direct Connect gateway and transit VIFs
+A **Direct Connect gateway** is a global object: it is not tied to a Region. A connection reaches it through a virtual interface.
+- A **private VIF** to a Direct Connect gateway reaches virtual private gateways, one per VPC.
+- A **transit VIF** to a Direct Connect gateway reaches **transit gateways**, and each transit gateway fronts many VPCs in its Region.
+One transit VIF has one BGP session. Associate the Direct Connect gateway with a transit gateway in each of the five Regions, and on-premises routes reach all of them through that single session. Transit gateways in another account can be associated through an association proposal.
+Example: on-premises advertises `192.168.0.0/16` once; the transit gateways in `us-east-1`, `eu-west-1` and three other Regions each learn it, and the allowed prefixes of each association are advertised back.
+W: Direct Connect gateway with a transit VIF: one BGP session over one VIF reaches transit gateways in all five Regions, including across accounts, instead of a VIF per VPC.
+X: B=Five private VIFs, one BGP session: every VIF has its own BGP session by design, so five VIFs cannot share one session, and private VIFs still reach one virtual private gateway at a time.
+C=Hosted VIF per Region: a hosted VIF is a VIF created on one account's connection for another account. It does not extend a connection to extra Regions.
+D=SiteLink to each VPC: SiteLink sends traffic between Direct Connect locations. It does not connect VPCs or reduce the number of BGP sessions to AWS.
+T: Many Regions over one BGP session means a transit VIF to a Direct Connect gateway associated with each Region's transit gateway.
+
+@ Q001627 explain
+G: ## Influencing how AWS sends traffic to you
+With two Direct Connect paths advertising the same prefix, AWS picks one route using BGP. For identical prefixes, a shorter **AS path** is preferred.
+## AS path prepending
+Prepending means adding your own ASN several times to the AS path of routes sent on the backup path.
+Example with on-premises ASN 65001 advertising `172.16.0.0/16`:
+- Over connection A: AS path `65001`.
+- Over connection B: AS path `65001 65001 65001`.
+AWS sees the shorter path through A and sends return traffic that way. If A goes down, its route is withdrawn and the longer path through B is used automatically.
+Direct Connect also supports BGP community tags for local preference, which are evaluated before AS path length and are another valid way to express the same preference.
+W: AS path prepending on B: routes over B look longer, so AWS prefers A while it is up and falls back to B when A's route is withdrawn.
+X: A=Longer keepalive on B: keepalive and hold timers only control how quickly a dead session is detected. They do not change which path is preferred.
+B=Higher MED on A: a lower MED is preferred, so a higher MED on A would make A less attractive, the opposite of the goal.
+C=Static route on the AWS side: Direct Connect virtual interfaces learn on-premises routes through BGP; you cannot set a static route on the AWS side of a VIF, and a static route would not fail over when A goes down.
+T: To make AWS prefer one Direct Connect path, make the other one look worse with AS path prepending (or use local preference communities); MED works in the opposite direction here.
+
+@ Q001628 explain
+G: ## Direct Connect with a VPN backup
+When the same prefix is learned both over Direct Connect and over a Site-to-Site VPN, the AWS gateway chooses one path.
+- A virtual private gateway and a transit gateway both prefer routes learned from Direct Connect over routes learned from a VPN for the same prefix.
+- **AS path prepending** on the routes advertised over the VPN makes that path look longer, reinforcing the preference and keeping behavior predictable where AS path length is compared.
+- On premises, the router should also prefer the Direct Connect path for traffic going to AWS (for example with higher local preference).
+## Why BGP on both paths
+With BGP, a path that fails is withdrawn automatically when the session drops, so traffic moves to the VPN without anyone acting, and moves back when Direct Connect recovers.
+Example: on-premises ASN 65010 advertises `10.50.0.0/16` over Direct Connect with path `65010` and over the VPN with `65010 65010 65010`.
+W: BGP on both paths with VPN prepending: both paths stay dynamic, Direct Connect is preferred while healthy, and the VPN takes over automatically when the Direct Connect routes are withdrawn.
+X: B=Manual VPN enablement: this makes failover depend on a person noticing the outage, which is not an automatic backup and adds long downtime.
+C=Static routes on the VPN: static VPN routes are not withdrawn by BGP, and on some gateways a static route is preferred over propagated routes, which could pull traffic onto the VPN even while Direct Connect is healthy.
+D=Same ASN for both paths: the ASN identifies your network; using the same ASN on both paths does not merge them into one path, and it gives AWS no preference between them.
+T: Keep BGP on both paths and make the VPN look worse (prepending), so failover and failback happen automatically with Direct Connect preferred.
+
+@ Q001629 explain
+G: ## Normal Direct Connect traffic flow
+Without extra features, a virtual interface connects on premises to AWS. Two offices connected at two Direct Connect locations can only exchange traffic through a VPC or transit gateway in a Region, which adds hops and cost.
+## SiteLink
+**AWS Direct Connect SiteLink** lets traffic travel between Direct Connect locations over the AWS global backbone without entering any Region.
+- You enable SiteLink on private or transit VIFs attached to the same Direct Connect gateway.
+- The Direct Connect gateway then exchanges routes between those VIFs, so each site learns the other's prefixes through BGP.
+- It is billed per hour of SiteLink-enabled VIF plus data transfer.
+Example: a site in Tokyo advertises `10.10.0.0/16` and a site in Frankfurt advertises `10.20.0.0/16`; with SiteLink both learn each other's routes and traffic flows location to location.
+W: Direct Connect SiteLink: it is the feature that sends traffic directly between Direct Connect locations over the AWS backbone without passing through a VPC or Region.
+X: A=Direct Connect gateway with private VIFs: without SiteLink a Direct Connect gateway does not route traffic between on-premises VIFs; it only connects them to AWS gateways.
+B=Global Accelerator custom routing: Global Accelerator brings internet users onto the AWS network toward AWS endpoints. It does not connect two private on-premises sites over Direct Connect.
+D=TGW inter-Region peering: this connects transit gateways in Regions, so traffic would still pass through Regions, which the requirement forbids.
+T: Site-to-site over the AWS backbone without touching a Region is SiteLink; everything else routes through a Region.
+
+@ Q001630 explain
+G: ## MACsec on Direct Connect
+**MACsec** (IEEE 802.1AE) encrypts Ethernet frames at Layer 2 between your router and the AWS Direct Connect device. Encryption is done in hardware at line rate, so there is no tunnel overhead or throughput ceiling as with IPsec.
+## Where it is available
+- It is supported on **dedicated connections** at higher port speeds (such as 10 Gbps and 100 Gbps) at Direct Connect locations that offer it, and on LAGs of such connections.
+- Your router must support MACsec, and you associate a key pair (CKN and CAK) with the connection.
+- It is not available on hosted connections from partners, because the partner owns the physical port.
+Example: a bank orders a 100 Gbps dedicated connection with MACsec capability and associates a CKN/CAK stored in Secrets Manager.
+W: MACsec on dedicated connections: MACsec provides Layer 2 encryption at line rate and is available on dedicated, high-speed Direct Connect connections.
+X: A=TLS 1.3 at the DX router: TLS is an application-layer protocol between endpoints; the Direct Connect router does not terminate TLS, and TLS is not Layer 2.
+C=IPsec on hosted connections: IPsec over Direct Connect (for example a VPN over a transit or public VIF) is Layer 3 and has tunnel overhead, which is what the customer wants to avoid.
+D=MACsec only on hosted: the support is the other way around. MACsec requires a dedicated connection; hosted connections do not offer it.
+T: Line-rate Layer 2 encryption on Direct Connect is MACsec, and it needs a dedicated connection, not a hosted one.
+
+@ Q001631 explain
+G: ## Transit Gateway Connect
+**Transit Gateway Connect** is an attachment type for SD-WAN and other third-party appliances.
+- It runs **GRE** tunnels on top of an existing transport attachment: a VPC attachment (appliance in a VPC) or a Direct Connect path through a Direct Connect gateway.
+- Each GRE tunnel is a **Connect peer** with its own **BGP** session for dynamic routing.
+- A Connect peer supports up to 5 Gbps, and one Connect attachment can have several peers, with ECMP across them.
+## Compared with a standard VPN
+A standard Site-to-Site VPN tunnel is IPsec with a bandwidth of about 1.25 Gbps, and encryption adds overhead. GRE has no encryption, so SD-WAN appliances that already encrypt their own overlays avoid double encryption.
+Example: an SD-WAN appliance in a transit VPC forms two Connect peers with inside addresses from `169.254.100.0/29` and exchanges routes over BGP.
+W: Transit Gateway Connect: it is the TGW feature that uses GRE tunnels with BGP for SD-WAN appliances and offers more bandwidth per tunnel than a standard VPN tunnel.
+X: A=Transit VIF: a transit VIF is a Direct Connect virtual interface to a Direct Connect gateway. It is a BGP session over a physical connection, not a GRE tunnel from an appliance.
+C=Standard VPN with two tunnels: a standard VPN uses IPsec, not GRE, and each tunnel keeps the lower standard tunnel bandwidth. The second tunnel is mainly for redundancy.
+D=VPC peering to the TGW VPC: VPC peering connects two VPCs, and a transit gateway is not in a VPC. Peering carries no GRE or BGP.
+T: GRE plus BGP to a transit gateway for SD-WAN is a Connect attachment; VPN means IPsec with lower per-tunnel bandwidth.
+
+@ Q001632 explain
+G: ## Why BGP alone fails over slowly
+BGP detects a dead neighbor when no keepalive arrives before the **hold timer** expires. With a common hold time of 90 seconds, a failure can go unnoticed for up to 90 seconds, which is the outage seen here.
+## Bidirectional Forwarding Detection (BFD)
+**BFD** is a lightweight protocol that sends very frequent hello packets between two routers and tells BGP immediately when they stop.
+- Direct Connect supports asynchronous BFD, and it is enabled on the AWS side. You configure it on your router for the VIF's BGP session.
+- With the AWS defaults (about 300 ms interval, multiplier 3), a failure is detected in under one second.
+- BGP then tears down the session at once and the backup path takes over.
+Example: `bfd interval 300 min_rx 300 multiplier 3` on the on-premises router interface, with `fall-over bfd` on the BGP neighbor.
+W: BFD with BGP: BFD detects the link failure in well under a second and signals BGP to drop the session, so failover no longer waits for the hold timer.
+X: A=Static routing: Direct Connect VIFs require BGP, so static routing is not an option, and static routes would not detect the failure at all.
+C=ECMP: ECMP spreads traffic across equal paths; it does not detect failures faster. Traffic on a failed path would still be lost until BGP notices.
+D=Longer hold timer: a 180-second hold timer makes detection slower, doubling the outage.
+T: Fast failover on Direct Connect comes from BFD, which detects loss in under a second; hold timers alone take tens of seconds.
+
+@ Q001633 explain
+G: ## Dedicated versus hosted connections
+- A **dedicated connection** is a physical port on an AWS device (1, 10, 100 or 400 Gbps). You order it from AWS, receive a Letter of Authorization, and arrange a cross-connect at the location.
+- A **hosted connection** is provisioned by a Direct Connect Partner on its own port. The partner offers smaller speeds such as 50, 100 or 500 Mbps, and handles the physical side.
+## What the hosted option gives up
+- A hosted connection supports only **one virtual interface**.
+- It cannot be part of a **LAG**.
+- **MACsec** is not available, because it needs a dedicated connection.
+Example: a partner provisions a 500 Mbps hosted connection in the customer's account within days; the customer accepts it and creates one private or transit VIF.
+W: Partner hosted connection: it offers sub-1 Gbps speeds like 500 Mbps with the partner managing ports and cross-connects, at the cost of LAG, MACsec and multiple VIFs.
+X: B=VPN over a public VIF: a public VIF still needs a Direct Connect connection first, so it does not remove the port and cross-connect work. It only adds encryption on top.
+C=Hosted VIF on another company's port: a hosted VIF is a VIF created by a connection owner for another account. It shares that owner's connection bandwidth and depends on their port, which is not a Direct Connect service with its own capacity.
+D=Dedicated 1 Gbps: a dedicated connection requires ordering a port and a cross-connect, which the company wants to avoid, and 1 Gbps is the smallest dedicated speed, not a 500 Mbps option.
+T: Small, fast-to-provision Direct Connect without managing ports means a partner hosted connection, which trades away LAG, MACsec and extra VIFs.
+
+@ Q001634 explain
+G: ## MTU on different paths
+The **MTU** is the largest packet a path can carry without fragmentation.
+- Direct Connect private VIFs support jumbo frames up to 9001 bytes, and transit VIFs up to 8500 bytes.
+- A transit gateway carries up to 8500 bytes for VPC, Direct Connect, Connect and peering attachments, but only 1500 bytes for VPN attachments.
+- Inside the IPsec tunnel the usable size is smaller still, because encryption headers take space (the VPN tunnel MTU is 1446 bytes).
+## What happens on failover
+When traffic moves from Direct Connect to the VPN, hosts keep sending large packets. Packets bigger than the tunnel MTU are dropped or must be fragmented, and throughput collapses. The fix is to clamp TCP MSS on the routers, rely on path MTU discovery, or set an MTU that works on both paths.
+Example: a 9001-byte replication packet that fit on Direct Connect cannot fit in a tunnel that carries about 1400 bytes of payload.
+W: VPN does not support jumbo frames: the VPN path has a much smaller MTU, so the jumbo packets the replication workload sends fail or fragment after failover.
+X: A=Manual VPN re-establishment: VPN tunnels with BGP stay up and take routes automatically. The stem says traffic did fail over and throughput dropped, so traffic was flowing.
+B=BGP cannot fail over between DX and VPN: BGP failover between Direct Connect and VPN is a standard, supported design, and the stem shows the failover happened.
+D=TGW VPN lacks BGP: transit gateway VPN attachments support dynamic BGP routing, and static routes would not cause oversize-packet errors anyway.
+T: Direct Connect supports jumbo frames but VPN does not; plan MTU or MSS for the smallest path before relying on a VPN backup.
+
+@ Q001635 explain
+G: ## Why full mesh peering does not scale
+VPC peering connects exactly two VPCs and is not transitive. For **n** VPCs to reach each other you need n(n-1)/2 peering connections.
+- 20 VPCs: 20 x 19 / 2 = 190 connections.
+- 40 VPCs: 780 connections, plus a route in every VPC to every other VPC.
+There is also a quota on active peering connections per VPC, and CIDRs cannot overlap.
+## Hub and spoke with Transit Gateway
+A **transit gateway** is a regional router. Each VPC has one attachment, so 20 VPCs need 20 attachments. Attachments can come from other accounts by sharing the transit gateway through AWS RAM. VPC route tables can point a summary route such as `10.0.0.0/8` at the transit gateway, and TGW route tables learn VPC CIDRs by propagation.
+Adding VPC number 21 means one new attachment and no changes in the other 20 VPCs.
+W: Transit Gateway hub and spoke: connections grow linearly (one attachment per VPC) instead of quadratically, and route propagation removes most per-VPC route edits.
+X: A=Direct Connect gateway per VPC: a Direct Connect gateway connects on-premises to AWS; it does not route traffic between VPCs.
+C=Full mesh peering: that is the 190-connection design the question is trying to escape, and it grows worse as VPCs are added.
+D=One shared VPC: sharing subnets through RAM merges workloads into a single network and changes account and network isolation. It removes separate VPCs instead of connecting them, which does not match the requirement.
+T: For many VPCs needing any-to-any connectivity, a transit gateway hub replaces n(n-1)/2 peerings with n attachments.
+
+@ Q001636 explain
+G: ## VPC peering facts that matter at scale
+VPC peering is a one-to-one connection between two VPCs.
+- **Not transitive**: if A peers with B and B peers with C, A cannot reach C through B. A needs its own peering with C.
+- **No edge-to-edge routing**: a VPC cannot use its peer's internet gateway, NAT gateway, VPN or Direct Connect.
+- **Quota**: each VPC has a quota on active peering connections (50 by default, adjustable).
+- Works **across accounts** and **across Regions** (inter-Region peering).
+- **Pricing**: there is no hourly charge for a peering connection; you pay only data transfer where it applies. A transit gateway charges per attachment-hour and per GB processed.
+Example: 60 VPCs in full mesh need 60 x 59 / 2 = 1,770 peerings, and each VPC would need 59 of them, above the default quota.
+W: A=Not transitive: traffic cannot pass through a middle VPC, so every pair that must talk needs its own peering.
+C=Per-VPC quota: each VPC can have only a limited number of active peering connections, which caps full mesh designs.
+X: B=No cross-account peering: peering between VPCs in different accounts is supported; the other account accepts the request.
+D=No cross-Region peering: inter-Region VPC peering is supported and traffic stays on the AWS backbone.
+E=Hourly peering fee: peering has no hourly fee; only data transfer is charged, unlike transit gateway attachments.
+T: Peering is cheap and works across accounts and Regions, but it is not transitive and each VPC has a peering quota, which is why large meshes move to a transit gateway.
+
+@ Q001637 explain
+G: ## Centralized egress with a transit gateway
+Instead of NAT gateways in every VPC, one **egress VPC** holds NAT gateways and an internet gateway, and all spokes send internet traffic there.
+- **Spoke VPC route tables**: `0.0.0.0/0` points to the transit gateway.
+- **TGW route table for spokes**: `0.0.0.0/0` points to the egress VPC attachment. Blackhole routes for spoke CIDRs can stop spokes reaching each other through this path if that is not wanted.
+- **Egress VPC**: the TGW attachment subnets route `0.0.0.0/0` to the NAT gateway; the NAT gateway subnets route to the internet gateway and route spoke CIDRs (for example `10.0.0.0/8`) back to the transit gateway.
+Example: an instance at `10.1.2.10` reaches the internet as the NAT gateway's Elastic IP, and every flow can be monitored in one place.
+W: Default route to the TGW then the egress VPC: spokes send `0.0.0.0/0` to the transit gateway, which forwards it to the shared NAT gateways, giving one place to pay for and monitor egress.
+X: A=NAT gateway in every spoke: this is the per-VPC design the company wants to replace; it multiplies NAT gateway hourly costs and spreads monitoring out.
+C=VPC endpoints instead of NAT: endpoints reach specific AWS services privately. They cannot reach arbitrary internet destinations.
+D=Peering with a default route: VPC peering does not allow edge-to-edge routing, so a spoke cannot use a NAT gateway in the peered VPC.
+T: Centralized egress means spokes default-route to the transit gateway and the TGW route table sends it to an egress VPC with NAT; peering cannot share a NAT gateway.
+
+@ Q001638 explain
+G: ## Segmentation with transit gateway route tables
+Each attachment is **associated** with exactly one TGW route table, which decides where its traffic can go. Attachments can **propagate** their CIDRs into any number of route tables.
+A common isolation design:
+- **PCI route table**: associated with PCI VPC attachments; contains only the shared services routes.
+- **General route table**: associated with general VPC attachments; contains only the shared services routes.
+- **Shared services route table**: associated with the shared services attachment; contains routes to both PCI and general VPCs so it can reply.
+Because the PCI table has no route to general VPCs (and the reverse), the transit gateway drops that traffic regardless of security group mistakes.
+Example: PCI VPC `10.10.0.0/16` and general VPC `10.20.0.0/16` both reach shared services `10.0.0.0/16`, but neither table has the other's CIDR.
+W: Separate route tables with shared services in both: routing itself makes PCI and general VPCs unreachable from each other while both can still reach shared services.
+X: A=Disable propagation, use NACLs only: turning off propagation does not segment anything by itself, and NACLs are per-subnet rules that are easy to miss across many VPCs, so a gap would allow direct connectivity.
+B=Separate TGW and copied rules: a second transit gateway adds cost and complexity for shared services, and manually copying security group rules is error-prone; the question asks for a route table design, which handles this on one gateway.
+D=One route table plus security groups: with one route table every VPC can route to every other; security groups are per-instance allow lists, so one wrong rule creates the forbidden path.
+T: Enforce "never" at the routing layer: separate TGW route tables with only shared-services routes in common, not security groups or NACLs alone.
+
+@ Q001639 explain
+G: ## Every hop needs a route
+Traffic from VPC A to VPC B through a transit gateway uses three route lookups, plus filtering:
+- **VPC A subnet route table**: VPC B's CIDR must point to the transit gateway, for example `10.2.0.0/16 -> tgw-0abc`.
+- **TGW route table** associated with VPC A's attachment: a route to VPC B's attachment (the propagated route in the question).
+- **VPC B subnet route table**: a return route to VPC A's CIDR through the transit gateway.
+- **Security groups and network ACLs** on both sides must allow the traffic.
+## Common mistake
+Seeing the route in the TGW route table and assuming the job is done. The transit gateway never receives the packet if VPC A's own subnet route table still has no route toward it.
+W: VPC A route to the TGW: the subnet route table in VPC A must send VPC B's CIDR to the transit gateway, otherwise traffic never reaches the transit gateway in the first place.
+X: A=Static routes only: propagated routes are normal, working routes in a TGW route table. There is no rule that only static routes are usable.
+B=Multicast support: multicast is for one-to-many traffic. Unicast traffic between VPCs does not need it.
+D=Same Availability Zone: VPCs attached to one transit gateway do not need to share an Availability Zone; each attachment only needs a subnet in every AZ where its resources send traffic.
+T: A transit gateway route is only one hop; also check the VPC subnet route tables on both sides, and security groups and NACLs.
+
+@ Q001640 explain
+G: ## How a transit gateway picks an Availability Zone
+A VPC attachment has an ENI in one subnet per Availability Zone. By default, a transit gateway keeps traffic in the AZ where it entered when it forwards to the next attachment. For east-west inspection this is a problem:
+- Request from spoke A in AZ-a is sent to the inspection VPC in AZ-a.
+- The reply from spoke B in AZ-b is sent to the inspection VPC in AZ-b.
+A stateful firewall in AZ-b never saw the start of the flow and drops the reply.
+## Appliance mode
+With **appliance mode** enabled on the inspection VPC attachment, the transit gateway uses a flow hash to select one AZ attachment for the whole life of the flow, for both directions. Both request and reply go through the same appliance (and the same Gateway Load Balancer endpoint).
+Example: `aws ec2 modify-transit-gateway-vpc-attachment --options ApplianceModeSupport=enable`.
+W: Appliance mode on the inspection attachment: it keeps both directions of a flow in the same Availability Zone, so the same stateful firewall sees the request and the reply.
+X: B=Multicast support: multicast is for one-to-many traffic. It has no effect on which AZ a unicast flow uses.
+C=Second TGW for return traffic: splitting directions across transit gateways makes asymmetry worse and adds cost; the problem is AZ selection, which appliance mode solves on one gateway.
+D=Cross-zone load balancing on the TGW: cross-zone load balancing is a load balancer setting, not a transit gateway option, and it would not pin a flow's two directions to one appliance.
+T: For stateful inspection through a transit gateway, enable appliance mode on the inspection VPC attachment so both directions of a flow stay symmetric.
+
+@ Q001641 explain
+G: ## Transit gateway peering across Regions
+A **transit gateway peering attachment** connects two transit gateways, in the same Region or in different Regions. Inter-Region traffic stays on the AWS global backbone and is encrypted, so it never crosses the public internet.
+## The routing rule
+Transit gateway peering does **not** support dynamic route propagation. You must add **static routes** in each TGW route table that point remote CIDRs to the peering attachment.
+Example:
+- In the `us-east-1` TGW route table: `10.20.0.0/16 -> tgw-attach-peering`.
+- In the `eu-west-1` TGW route table: `10.10.0.0/16 -> tgw-attach-peering`.
+Use summary routes where possible to limit how many static routes you maintain. (AWS Cloud WAN is the managed option when dynamic routing between Regions is needed.)
+W: TGW peering with static routes: peering connects the two transit gateways over the AWS backbone, and because routes do not propagate over peering, static routes are added on each side.
+X: A=VPC peering instead: pairwise VPC peering between every VPC in both Regions gives up the hub design and scales poorly, and it is not what "exchange routes between two transit gateways" asks for.
+B=PrivateLink between TGWs: PrivateLink exposes one service behind a Network Load Balancer to consumers. It does not connect transit gateways or exchange routes.
+C=Automatic propagation over peering: this is the common trap. Routes are not propagated across a peering attachment; without static routes the remote CIDRs are unknown.
+T: Transit gateway peering works across Regions over the AWS backbone, but you must add static routes because nothing propagates over the peering attachment.

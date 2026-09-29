@@ -14,7 +14,7 @@ EXTRA = ["exam-specs.json", "exam-domains.json"]
 
 
 def build():
-    specs = json.loads((DATA / "exam-specs.json").read_text())
+    specs = json.loads((DATA / "exam-specs.json").read_text(encoding="utf-8"))
     exams, unique, shared = {}, {}, set()
     for code in sorted(k for k in specs if not k.startswith("_")):
         path = DATA / f"{code}.json"
@@ -35,8 +35,8 @@ def build():
     }
     out = DATA / "exams-index.json"
     text = json.dumps(index, indent=1, sort_keys=True) + "\n"
-    if not out.exists() or out.read_text() != text:
-        out.write_text(text)
+    if not out.exists() or out.read_text(encoding="utf-8") != text:
+        out.write_text(text, encoding="utf-8", newline="\n")
     return index
 
 

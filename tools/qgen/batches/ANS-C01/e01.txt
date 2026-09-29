@@ -1,0 +1,108 @@
+# ANS-C01 detailed explanations, pilot (explanation-only rewrites; letters are the published ones)
+
+@ Q001698 explain
+G: ## What "overlapping CIDR" means
+A CIDR block such as `10.0.0.0/16` is the private IP range a VPC uses. `/16` fixes the first 16 bits, so the range holds 2^16 = 65,536 addresses (10.0.0.0 to 10.0.255.255).
+When two VPCs both use `10.0.0.0/16`, an address like `10.0.5.20` exists in both. A router that receives a packet for `10.0.5.20` has no way to tell which VPC you meant.
+## How a transit gateway routes
+A transit gateway forwards traffic using its route tables: each destination CIDR points to one attachment (a VPC, VPN or Direct Connect gateway). A route table holds one route per destination, so `10.0.0.0/16` can lead to only one of the two VPCs.
+- Traffic from other networks to `10.0.0.0/16` lands in whichever VPC the route points to, not necessarily the one the sender meant.
+- The existing VPC's own traffic toward "its" peers can now be answered from, or sent to, the wrong network, which looks like random, unpredictable failures.
+W: Overlapping CIDRs are not supported in one route table: that is exactly the symptom here. The fix is to give the new VPC a non-overlapping range (re-IP), keep the two VPCs in separate route tables so they never need to reach each other, or put address translation in between, such as a private NAT gateway, or expose only the needed services with PrivateLink.
+X: B=Load balancing across overlaps: a transit gateway does not balance traffic between two VPCs that share a CIDR. There is no such feature; a destination CIDR maps to a single attachment, so one VPC simply becomes unreachable for that range.
+C=MTU mismatch: an MTU problem makes large packets fail (for example, TCP sessions that connect but stall), not specific destinations that "move" after a new attachment. The timing and symptoms point to the duplicate `10.0.0.0/16`.
+D=Longest-prefix match: longest-prefix match picks the more specific of two different prefixes, such as `/24` over `/16`. Two identical `/16` routes have the same length, so there is nothing for it to pick between.
+T: One route table cannot route the same CIDR to two networks. With overlapping VPCs, re-IP, separate the route tables, translate addresses (private NAT), or expose single services with PrivateLink.
+
+@ Q001770 explain
+G: ## Two ways to reach a service in another VPC
+- **VPC peering** connects two whole networks. Once routes are added, any resource in one VPC can try to reach any IP in the other; only security groups and network ACLs limit it.
+- **AWS PrivateLink** connects to one service. The provider puts the service behind a Network Load Balancer and publishes it as an endpoint service. The customer creates an interface endpoint: a network interface with an IP from the customer's own CIDR. The customer's apps talk to that local IP, and AWS carries the traffic privately to the service.
+## Why this matters for a SaaS provider
+With peering, every customer VPC becomes routable to the provider's VPC and vice versa, so one misconfigured security group could expose other systems. Peering also requires non-overlapping CIDRs, which is hard to guarantee across hundreds of customers.
+With PrivateLink, connections can only be opened from the customer to the one published service, the provider's VPC is never routable, and overlapping CIDRs do not matter because no routing between the VPCs happens.
+W: PrivateLink exposes only the service: customers reach one endpoint, not the provider's network, so the blast radius is limited to that service and connections flow only from consumer to provider.
+X: A=Same security, just cheaper: the security model is different (one service versus a whole network), and PrivateLink is not free. It charges per endpoint-hour and per GB processed.
+B=Peering uses IPsec: VPC peering does not build IPsec tunnels, and PrivateLink traffic stays on the AWS network where applications add TLS as usual. Encryption is not what separates the two options; reachability is.
+C=Peering scales better: VPC peering is not transitive, each peering is a separate one-to-one connection with its own routes, and CIDRs must not overlap. That scales worse than one endpoint service that any number of customers can connect to.
+T: Peering connects networks (IP ranges must be unique and everything becomes routable); PrivateLink exposes one service (overlap does not matter and nothing else is reachable).
+
+@ Q001592 explain
+G: ## The two kinds of Global Accelerator
+AWS Global Accelerator gives you static anycast IP addresses at AWS edge locations and carries user traffic over the AWS backbone to your endpoints.
+- A **standard accelerator** spreads traffic across healthy endpoints (Application or Network Load Balancers, EC2 instances, Elastic IP addresses) using weights, Region traffic dials and health checks. You do not choose which endpoint a given user reaches.
+- A **custom routing accelerator** maps ranges of listener ports to specific EC2 instance IP:port destinations inside VPC subnets. Your application (for example a matchmaking service) decides which server a player should join and hands the player the static IP plus the port that maps to that server.
+## Why games use custom routing
+Multiplayer games need players of the same match on the same server. That needs a deterministic "this port goes to that server" mapping, not a load balancer that picks a server for you.
+W: Custom routing accelerator: it maps listener port ranges to individual instance IP:port destinations, so thousands of game servers sit behind a few static IPs, each client connection goes to the exact server your matchmaker chose, and no load balancer is needed.
+X: A=SOURCE_IP client affinity: affinity only keeps the same client going to the same endpoint once one has been picked. It does not let you choose which game server a player lands on.
+C=Elastic IP endpoints: a standard accelerator still distributes traffic across its endpoints by weight and health. It has no way to map a port to one particular instance, so players of one match could land on different servers.
+D=Network Load Balancer endpoint: the NLB picks the target itself, and the question explicitly rules out a load balancer in front of the fleet.
+T: Load-balance to any healthy endpoint → standard accelerator. Send each user to one specific instance and port → custom routing accelerator.
+
+@ Q001667 explain
+G: ## What Amazon VPC IPAM does
+VPC IP Address Manager (IPAM) plans, allocates and tracks IP space across Regions and accounts. You create one IPAM, choose the Regions it operates in, and carve address space into pools.
+## Pool hierarchy
+- A **top-level pool** holds the whole corporate range, for example `10.0.0.0/8`.
+- **Regional pools** below it get a slice each, for example `10.0.0.0/12` for us-east-1, and are tied to that Region (the pool's locale).
+- **Child pools** under a Regional pool can be handed to teams, and shared to their accounts with AWS RAM. Allocation rules can enforce sizes such as "VPCs get a /20".
+Because every allocation comes from the same tree, IPAM never gives out the same range twice, and it can report existing overlaps.
+W: Top-level pool with Regional child pools: one IPAM hierarchy guarantees no overlaps across all Regions, while each Regional network team manages and delegates its own part of the space.
+X: B=Single global pool only: IPAM supports nested pools; a hierarchy of top-level, Regional and team pools is its standard design. A single pool also would not give each Region's team its own range to manage.
+C=Flat pools per team with a spreadsheet: pools that do not share a parent do not know about each other, so nothing stops two teams from using the same range. A spreadsheet is exactly the manual process IPAM replaces.
+D=Separate IPAM per Region: separate IPAMs have no shared view, so overlap between Regions is avoided only by convention. One IPAM can operate in many Regions, which is the right way to do this.
+T: Organization-wide, non-overlapping addressing with delegated control → one IPAM with a top-level pool, Regional pools and team child pools.
+
+@ Q001597 explain
+G: ## Route 53 routing policies that depend on location
+- **Geolocation** routes by where the user is (continent, country, US state). A user in France always gets the record for France or Europe, all or nothing.
+- **Latency-based** routes to the Region with the lowest measured latency for the user.
+- **Geoproximity** routes by the physical distance between users and your resources. A **bias** value (from -99 to +99) grows or shrinks the area that is routed to a given Region, so you can move the boundary between Regions step by step.
+Geoproximity was originally configured in Traffic Flow policies; today it can also be set directly on records.
+## Shifting a small share of traffic
+Raising the bias for eu-west-1 slightly moves the edge of its area outward, so a small group of users near the boundary starts going to eu-west-1. You tune the value up or down to control how much traffic moves.
+W: Geoproximity routing with a bias: the bias moves the geographic boundary between the two Regions gradually, giving controlled, reversible shifts of traffic for a capacity test, which geolocation cannot do.
+X: A=Latency-based routing without health checks: latency routing chooses the fastest Region per user. There is no setting to move a chosen amount of traffic, and disabling health checks only removes failover.
+C=Fewer geolocation records: removing records moves whole countries or continents at once (or sends them to the default record). That is a large, coarse jump, not a small controlled percentage.
+D=Simple routing with two A records: simple routing returns the values in random order with no weighting or location logic, so you cannot control how much traffic goes to each Region.
+T: Gradually move the geographic line between Regions → geoproximity with bias. Split by exact percentages regardless of location → weighted routing.
+
+@ Q001598 explain
+G: ## Route 53 Resolver endpoints
+Every VPC has a built-in DNS resolver (the Route 53 Resolver). It can answer for private hosted zones associated with the VPC, but by default only resources inside the VPC can ask it.
+Resolver endpoints connect it to your on-premises DNS:
+- An **inbound endpoint** creates network interfaces with IP addresses in your VPC. On-premises DNS servers forward queries to those IPs over VPN or Direct Connect, so on-premises clients can resolve private hosted zones.
+- An **outbound endpoint** plus forwarding rules sends queries from the VPC to on-premises DNS servers, so AWS resources can resolve on-premises names.
+The direction is the key: inbound = on-premises asks AWS; outbound = AWS asks on-premises.
+W: Inbound endpoint plus conditional forwarding: on-premises DNS forwards the private zone's domain to the inbound endpoint's IPs, and the Resolver answers from the private hosted zone. The zone stays private because only networks connected to the VPC can reach those IPs.
+X: A=Public hosted zone with delegation: publishing the records in a public hosted zone makes them resolvable from the internet, which is exactly what the company wants to avoid.
+C=DNS64 on the VPN: DNS64 synthesizes IPv6 addresses for IPv4-only names so IPv6-only workloads can reach IPv4 services through NAT64. It does not let on-premises servers query private hosted zones, and it is a Resolver/subnet setting, not a VPN option.
+D=Outbound endpoint with forwarding: outbound endpoints send queries from the VPC to on-premises DNS, the opposite direction of what is needed here.
+T: On-premises needs AWS private names → inbound endpoint. AWS needs on-premises names → outbound endpoint and forwarding rules.
+
+@ Q001599 explain
+G: ## How the DNSSEC chain of trust works
+DNSSEC lets resolvers verify that DNS answers were not tampered with. Each zone signs its records, and trust flows from the root down:
+- The **zone-signing key (ZSK)** signs the records in the zone. Route 53 creates and rotates it for you.
+- The **key-signing key (KSK)** signs the ZSK. In Route 53 it is backed by an asymmetric customer managed key in AWS KMS.
+- The parent zone (for example `.com`) holds a **DS record**, a hash of your KSK. A resolver trusts your KSK only because the signed parent zone vouches for it through that DS record.
+Without the DS record in the parent, your signatures exist but nothing links them to the root, so validating resolvers treat the zone as unsigned.
+W: Add the DS record at the registrar: the registrar publishes it in the parent zone, which completes the link from the root to your KSK and lets validating resolvers verify your answers.
+X: A=Nothing more is needed: enabling signing only signs your own zone. The parent zone knows nothing about your key until you give its DS record to the registrar.
+B=Rotate the ZSK manually: Route 53 manages the ZSK and rotates it automatically, and rotation has nothing to do with establishing trust from the parent.
+C=CNAME to the KMS key ARN: DNSSEC uses DNSKEY and DS records, not CNAMEs, and a KMS key ARN is not something resolvers can look up or use.
+T: DNSSEC trust needs two halves: signing in your zone, and a DS record in the parent zone (added through the registrar).
+
+@ Q001600 explain
+G: ## Filtering at the DNS layer
+Before an application connects to `api.example.com`, it asks DNS for the IP address. Blocking that lookup stops the connection before it starts, and works for every protocol.
+**Route 53 Resolver DNS Firewall** does this for queries that resources in a VPC send to the Route 53 Resolver:
+- **Domain lists**: AWS managed lists (known malware and botnet domains) or your own lists.
+- **Rules** with priorities and actions: ALLOW, BLOCK (with a response such as NXDOMAIN) or ALERT.
+- A rule group associated with the VPC can allow approved domains first and then block the malicious lists, or block everything that is not on the allow-list.
+W: Resolver DNS Firewall domain lists on the VPC: it blocks lookups of known malicious domains and allows an explicit list of approved domains, all at the DNS layer before any connection is attempted.
+X: B=Flow Logs with Lambda: flow logs are recorded after traffic has already happened and are delivered with a delay, so a function reacting to them is too late and cannot stop the lookup or the first connection.
+C=Security groups with FQDN rules: security group rules accept CIDR ranges, prefix lists and other security groups only. They have no domain name support.
+D=Network Firewall domain filtering only: Network Firewall can filter HTTP and TLS traffic by host name, but it acts on connections, after the name has already been resolved. The question asks for enforcement at the DNS layer, which is what DNS Firewall does.
+T: Block or allow domains at resolution time for a VPC → Route 53 Resolver DNS Firewall. Filter the traffic itself by host name → AWS Network Firewall.

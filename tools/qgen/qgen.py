@@ -20,6 +20,22 @@ Batch source format (one block per question, blocks start with '@'):
     V: Amazon Bedrock, AWS Lambda            (services, optional)
     I: Q002201                               (optional: keep this id after rewriting the stem)
 
+Detailed explanations (preferred for all new questions): add a G: background block. G:, W: and X: may then
+span several lines; newlines are kept. In G: use "## Heading" lines, "- " bullets and `code`. Each X: entry
+starts on its own line as "B=Short name: why it fails". W: explains the correct option the same way.
+    G: ## What CIDR means
+       CIDR notation such as `10.0.0.0/16` describes a range of IP addresses...
+    W: PrivateLink: does not route between the two networks at all...
+    X: A=Transit gateway: also routes between VPCs by IP address...
+       B=VPC peering: AWS refuses to create a peering connection when the CIDRs overlap...
+    T: Peering and transit gateway connect networks; PrivateLink exposes one service.
+Never refer to options by letter inside the text: ingest reorders the choices.
+
+Explanation-only blocks replace the explanation of a published question and leave everything else untouched
+(letters in X: are the published letters of that question):
+    @ Q001592 explain
+    G: ...   W: ...   X: ...   T: ...
+
 Ingest is idempotent: each block is identified by a hash of its stem, so re-ingesting an edited batch
 updates the same question id instead of adding a duplicate. Choices are re-ordered so correct-answer
 positions stay balanced per exam, and the batch is rejected on schema errors, near-duplicates, or
@@ -30,8 +46,8 @@ import collections, hashlib, json, pathlib, random, re, sys
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DATA = ROOT / "data"
 STATE = ROOT / "tools/qgen/ingested.json"          # block hash -> question id
-SPECS = json.loads((DATA / "exam-specs.json").read_text())
-TASKS = json.loads((ROOT / "tools/qgen/tasks.json").read_text())
+SPECS = json.loads((DATA / "exam-specs.json").read_text(encoding="utf-8"))
+TASKS = json.loads((ROOT / "tools/qgen/tasks.json").read_text(encoding="utf-8"))
 EXAMS = [k for k in SPECS if not k.startswith("_")]
 TARGET_MULT = 5                                   # pool target = 5 full exams
 DIFFS = {"applied", "advanced"}
@@ -40,16 +56,16 @@ NUM_WORD = {2: "TWO", 3: "THREE"}
 
 
 def load_exam(code):
-    return json.loads((DATA / f"{code}.json").read_text())
+    return json.loads((DATA / f"{code}.json").read_text(encoding="utf-8"))
 
 
 def save_exam(code, qs):
-    (DATA / f"{code}.json").write_text(json.dumps(qs, indent=1, ensure_ascii=False) + "\n")
+    (DATA / f"{code}.json").write_text(json.dumps(qs, indent=1, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
 
 
 def domain_map():
     p = DATA / "exam-domains.json"
-    return json.loads(p.read_text()) if p.exists() else {}
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
 
 
 def domain_of(q, exam, dmap):
@@ -90,28 +106,96 @@ def plan(code, quiet=False):
 
 # ---------------------------------------------------------------- parse
 HEAD = re.compile(r"^@\s*(\S+)\s+(D\d)\s+(T\d\.\d)\s+(\S+)\s+(\S+)\s*(.*)$")
+EXPL_HEAD = re.compile(r"^@\s*(Q\d{6})\s+explain\s*$")
+MULTILINE = {"G", "W", "X"}                       # continuation lines keep their line break
+RICH = "## "                                      # detailed explanations start with a heading
+MIN_RICH = {"G": 250, "W": 80, "X": 60}          # minimum characters (per X entry) for detailed blocks
+LETTER_REF = re.compile(r"\b(?:[Oo]ption|[Cc]hoice|[Aa]nswer)s?\s+[A-E]\b|\([A-E]\)|\b[A-E] is (?:wrong|correct|right)\b")
 
 
 def parse(path):
-    text = pathlib.Path(path).read_text()
+    text = pathlib.Path(path).read_text(encoding="utf-8")
     blocks, cur = [], None
     for ln, line in enumerate(text.splitlines(), 1):
         if line.startswith("@"):
             cur = {"_line": ln, "_head": line, "fields": {}}
             blocks.append(cur)
             continue
-        if cur is None or not line.strip() or line.lstrip().startswith("#"):
+        stripped = line.lstrip()
+        if cur is None or not stripped or (stripped.startswith("#") and not stripped.startswith(RICH)):
             continue
         m = re.match(r"^([A-Z]):\s?(.*)$", line)
         if m:
             cur["fields"][m.group(1)] = m.group(2).strip()
             cur["_last"] = m.group(1)
         elif cur.get("_last"):                       # continuation line
-            cur["fields"][cur["_last"]] += " " + line.strip()
+            sep = "\n" if cur["_last"] in MULTILINE else " "
+            cur["fields"][cur["_last"]] += sep + line.strip()
     return blocks
 
 
+def split_x(text):
+    """X: entries, either "A=... | C=..." on one line or one "A=..." entry per line."""
+    wrong = {}
+    for part in re.split(r"\s*\|\s*(?=[A-E]\s*=)|\n(?=\s*[A-E]\s*=)", text):
+        m = re.match(r"^\s*([A-E])\s*=\s*(.+)$", part, re.S)
+        if m:
+            wrong[m.group(1)] = m.group(2).strip()
+    return wrong
+
+
+def rich_checks(f, entries, where, errors):
+    """Quality gate for detailed explanations."""
+    if len(f["G"]) < MIN_RICH["G"]:
+        errors.append(f"{where}: G: background is too short for a detailed explanation ({len(f['G'])} < {MIN_RICH['G']} chars)")
+    if len(f["W"]) < MIN_RICH["W"]:
+        errors.append(f"{where}: W: is too short for a detailed explanation")
+    for k, t in entries.items():
+        if len(t) < MIN_RICH["X"]:
+            errors.append(f"{where}: X: {k}= is too short for a detailed explanation")
+    for k in ("G", "W", "X", "T"):
+        m = LETTER_REF.search(f.get(k, ""))
+        if m:
+            errors.append(f"{where}: {k}: refers to an option by letter ({m.group(0)!r}); name the option instead")
+
+
+def build_explain(block, errors):
+    """@ Q001592 explain: replace the explanation of a published question."""
+    qid = EXPL_HEAD.match(block["_head"]).group(1)
+    where = f"line {block['_line']} ({qid})"
+    f = block["fields"]
+    for k in ("G", "W", "X", "T"):
+        if not f.get(k):
+            errors.append(f"{where}: missing {k}:")
+    q = published().get(qid)
+    if not q:
+        errors.append(f"{where}: no published question {qid}")
+    if any(e.startswith(where) for e in errors):
+        return None
+    wrong = split_x(f["X"])
+    letters = [c["key"] for c in q["choices"]]
+    missing = [k for k in letters if k not in q["correctKeys"] and k not in wrong]
+    if missing:
+        errors.append(f"{where}: X: has no reason for wrong choice(s) {missing}")
+    extra = [k for k in wrong if k not in letters or k in q["correctKeys"]]
+    if extra:
+        errors.append(f"{where}: X: covers {extra}, which are not wrong choices of {qid}")
+    rich_checks(f, wrong, where, errors)
+    return {"explain_only": True, "id": qid, "where": where, "bg": f["G"], "why": f["W"], "wrong": wrong,
+            "take": f["T"], "keys": q["correctKeys"], "choices": {c["key"]: c["text"] for c in q["choices"]}}
+
+
+_published = None
+def published():
+    global _published
+    if _published is None:
+        _published = {q["id"]: q for e in EXAMS for q in load_exam(e)}
+    return _published
+
+
 def build(block, errors):
+    if EXPL_HEAD.match(block["_head"]):
+        return build_explain(block, errors)
     h = HEAD.match(block["_head"])
     where = f"line {block['_line']}"
     if not h:
@@ -161,20 +245,18 @@ def build(block, errors):
     texts = [f[k] for k in letters]
     if len(set(t.lower() for t in texts)) != len(texts):
         errors.append(f"{where}: duplicate choice text")
-    wrong = {}
-    for part in f["X"].split("|"):
-        m = re.match(r"^\s*([A-E])\s*=\s*(.+)$", part)
-        if m:
-            wrong[m.group(1)] = m.group(2).strip()
+    wrong = split_x(f["X"])
     missing = [k for k in letters if k not in keys and k not in wrong]
     if missing:
         errors.append(f"{where}: X: has no reason for wrong choice(s) {missing}")
+    if f.get("G"):
+        rich_checks(f, {k: v for k, v in wrong.items() if k not in keys}, where, errors)
     if len(f["S"]) < 60:
         errors.append(f"{where}: stem too short to be a scenario")
     return {
         "exam": exam, "dom": dom, "task": task, "diff": diff, "scen": scen, "shared": shared,
         "stem": f["S"], "choices": {k: f[k] for k in letters}, "keys": keys, "why": f["W"],
-        "wrong": wrong, "take": f["T"], "services": [s.strip() for s in f.get("V", "").split(",") if s.strip()],
+        "wrong": wrong, "take": f["T"], "bg": f.get("G") or None, "services": [s.strip() for s in f.get("V", "").split(",") if s.strip()],
         "pin": f.get("I") or None,
         "hash": hashlib.sha1(re.sub(r"\s+", " ", f["S"].lower()).encode()).hexdigest()[:12], "where": where,
     }
@@ -185,7 +267,27 @@ def short_label(text):
     return t if len(t) <= 48 else t[:45].rsplit(" ", 1)[0] + "…"
 
 
+def rich_explanation(item, order):
+    """Detailed explanation: background, every option in display order, key idea. `order` lists the
+    batch letters in their published order, so the letters shown are the published ones."""
+    bg = item["bg"].strip()
+    if not bg.startswith(RICH):
+        bg = RICH + "Background\n" + bg
+    lines = [bg, "", RICH + "Why each option works or fails"]
+    for pos, k in enumerate(order):
+        ok = k in item["keys"]
+        text = re.sub(r"\s*\n\s*", " ", item["why"] if ok else item["wrong"][k]).strip()
+        m = re.match(r"^([^:]{2,60}):\s+(.*)$", text)          # "Short name: reason"
+        label = f"{'ABCDE'[pos]}. {m.group(1)}" if m else f"{'ABCDE'[pos]}."
+        body = m.group(2) if m else text
+        lines.append(f"- {'✓' if ok else '✗'} **{label}{' (correct)' if ok else ''}:** {body}")
+    lines += ["", RICH + "Key idea", re.sub(r"\s*\n\s*", " ", item["take"]).strip()]
+    return "\n".join(lines)
+
+
 def explanation(item, order):
+    if item.get("bg"):
+        return rich_explanation(item, order)
     lines = ["Why this is correct:", item["why"], "", "Why the other options are wrong:"]
     for k in order:
         if k not in item["keys"]:
@@ -231,10 +333,16 @@ def qtext(stem, correct_texts):
 def check(path, write=False):
     blocks = parse(path)
     errors, warns = [], []
-    items = [b for b in (build(b, errors) for b in blocks) if b]
+    built = [b for b in (build(b, errors) for b in blocks) if b]
+    explains = [b for b in built if b.get("explain_only")]
+    items = [b for b in built if not b.get("explain_only")]
+    dup = collections.Counter(e["id"] for e in explains)
+    errors += [f"{q}: more than one explain block" for q, n in dup.items() if n > 1]
+    if explains and items:
+        errors.append("keep explain-only blocks and new questions in separate batch files")
     if not blocks:
         errors.append("no question blocks found")
-    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    state = json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
     seen_hash = collections.Counter(i["hash"] for i in items)
     for i in items:
         if seen_hash[i["hash"]] > 1:
@@ -303,14 +411,21 @@ def check(path, write=False):
             warns.append(f"{i['where']}: correct answer is less than half the length of every distractor")
 
     multi = sum(1 for i in items if len(i["keys"]) > 1)
-    print(f"{path}: {len(items)} questions, {multi} multi-answer, {len(errors)} errors, {len(warns)} warnings")
+    if explains:
+        print(f"{path}: {len(explains)} explanation rewrites, {len(errors)} errors, {len(warns)} warnings")
+    else:
+        rich = sum(1 for i in items if i["bg"])
+        print(f"{path}: {len(items)} questions ({rich} detailed), {multi} multi-answer, {len(errors)} errors, {len(warns)} warnings")
     for e in errors:
         print("  ERROR", e)
     for w in warns:
         print("  warn ", w)
     if errors or not write:
         return not errors
-    ingest(items, state)
+    if explains:
+        ingest_explanations(explains)
+    else:
+        ingest(items, state)
     return True
 
 
@@ -327,6 +442,27 @@ def place(i, letters, n, pos, rng):
     it = iter(wrongs)
     layout = [k if k else next(it) for k in layout]
     return layout, {old: "ABCDE"[p] for p, old in enumerate(layout)}
+
+
+def ingest_explanations(explains):
+    """Replace only the explanation of published questions (every exam file that holds them)."""
+    files = {e: load_exam(e) for e in EXAMS}
+    done = set()
+    for x in explains:
+        letters = list(x["choices"])
+        text = rich_explanation({"bg": x["bg"], "why": x["why"], "wrong": x["wrong"], "take": x["take"],
+                                 "keys": x["keys"]}, letters)
+        for e in EXAMS:
+            for q in files[e]:
+                if q["id"] == x["id"]:
+                    q["explanation"] = text
+                    done.add(x["id"])
+    for e in EXAMS:
+        save_exam(e, files[e])
+    print(f"ingested: {len(done)} explanations rewritten")
+    sys.path.insert(0, str(ROOT / "tools"))
+    import build_data_index
+    build_data_index.build()
 
 
 def ingest(items, state):
@@ -356,6 +492,9 @@ def ingest(items, state):
         if layout is None:
             layout, newkey = place(i, letters, n, pos, rng)
         choices = [{"key": "ABCDE"[p], "text": i["choices"][old]} for p, old in enumerate(layout)]
+        # a short block never overwrites a detailed explanation written later (same choices only)
+        keep_rich = bool(prev and not i["bg"] and prev["explanation"].startswith(RICH)
+                         and [c["text"] for c in prev["choices"]] == [c["text"] for c in choices])
         correct = sorted(newkey[k] for k in i["keys"])
         if not prev:
             for k in correct:
@@ -368,7 +507,7 @@ def ingest(items, state):
         exam_codes = [i["exam"]] + sorted(i["shared"])
         q = {
             "stem": i["stem"], "choices": choices, "correctKeys": correct,
-            "explanation": explanation(i, layout), "difficulty": i["diff"], "scenarioType": i["scen"],
+            "explanation": prev["explanation"] if keep_rich else explanation(i, layout), "difficulty": i["diff"], "scenarioType": i["scen"],
             "services": i["services"], "taskId": i["task"], "domainCode": i["dom"], "examCodes": exam_codes, "id": qid,
         }
         for e in EXAMS:
@@ -390,8 +529,8 @@ def ingest(items, state):
     for e in EXAMS:
         files[e].sort(key=lambda x: x["id"])
         save_exam(e, files[e])
-    (DATA / "exam-domains.json").write_text(json.dumps(dict(sorted(dmap.items())), indent=1) + "\n")
-    STATE.write_text(json.dumps(state, indent=1, sort_keys=True) + "\n")
+    (DATA / "exam-domains.json").write_text(json.dumps(dict(sorted(dmap.items())), indent=1) + "\n", encoding="utf-8", newline="\n")
+    STATE.write_text(json.dumps(state, indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     print(f"ingested: {added} new, {updated} updated")
     # keep the site's download index (counts + cache-busting hashes) in step with data/
     sys.path.insert(0, str(ROOT / "tools"))

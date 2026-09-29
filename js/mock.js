@@ -537,7 +537,7 @@ async function renderReview() {
           const cls = want.has(k) ? "correct" : got.has(k) ? "incorrect" : "dim";
           return `<div class="choice locked ${cls}${got.has(k) ? " picked" : ""}"><span class="bubble"></span><span><span class="key">${LETTERS[j]}.</span> ${esc(c ? c.text : "")}${got.has(k) ? ' <span class="yours">· your answer</span>' : ""}</span></div>`;
         }).join("")}</div>
-        <div class="explain show ${ok ? "" : "wrong"}" id="mk-explain-${esc(id)}"><div class="ans-line">Answer: ${letters}</div><div class="exp-body">${esc(q.explanation)}</div></div>
+        <div class="explain show ${ok ? "" : "wrong"}" id="mk-explain-${esc(id)}"><div class="ans-line">Answer: ${letters}</div>${qb.explainHtml ? qb.explainHtml(q.explanation) : `<div class="exp-body">${esc(q.explanation)}</div>`}</div>
       </div>`;
     }).join("")}
     <div class="btnrow"><button class="btn ghost" data-act="results">Back to results</button></div>

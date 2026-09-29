@@ -7,5 +7,7 @@ Review one batch file as a strict AWS subject-matter expert.
 
 For each question check: the keyed answer is correct and uniquely best; each distractor is
 wrong for the stated reason; wording is unambiguous; service names and limits are current;
-no answer-giveaway wording or length bias. Fix problems directly in the batch file, then run
+no answer-giveaway wording or length bias. For detailed explanations (G:) also check that every
+statement is technically accurate, the background actually teaches what the question needs, and
+each option's reason is specific (not "unrelated" or "not supported" without saying why). Fix problems directly in the batch file, then run
 `python3 tools/qgen/qgen.py check <batch>` until clean. Report a short list of what you changed.

@@ -1,0 +1,349 @@
+# AIP-C01 detailed explanations, batch e04 (explanation-only rewrites; letters are the published ones)
+
+@ Q001495 explain
+G: ## How Bedrock model access is authorized
+Every call to a model in Amazon Bedrock is an API action checked by IAM: `bedrock:InvokeModel` (also used by the Converse API) and `bedrock:InvokeModelWithResponseStream` (also used by ConverseStream). The resource in the policy is the model's ARN, for example `arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0`.
+## Allow lists and implicit deny
+IAM denies everything by default. If the `ml-research` role's only Bedrock permission is an Allow on a short list of model ARNs, any other model is implicitly denied and the call fails with AccessDenied before a single token is generated.
+- List each approved foundation model ARN (and any inference profile ARN the role must use, since cross-Region inference calls target the profile).
+- Optionally add an explicit Deny with `NotResource` so a later, broader Allow cannot widen access.
+W: Model-scoped IAM policy: an Allow for `bedrock:InvokeModel` on only the approved model ARNs is a preventive control on the exact caller and the exact resource, so unapproved models are blocked at authorization time.
+X: B=CloudWatch alarm: a metric alarm only notifies after invocations have already run and been billed; it cannot stop the role from calling an unapproved model.
+C=Guardrail denied topics: denied topics filter the subject matter of prompts and responses (for example, "investment advice"); they have no notion of which model ID the caller chose and cannot refuse a call based on it.
+D=S3 bucket policy: Bedrock foundation models are served by Bedrock, not read from a bucket in your account, so restricting an artifacts bucket has no effect on which models can be invoked.
+T: Deciding who may call which model is an IAM authorization problem (Allow on specific model ARNs), not a content filter or an after-the-fact alarm.
+
+@ Q001496 explain
+G: ## Why bucket policies stop at the object
+An S3 bucket policy or IAM policy grants access to objects or prefixes. A Parquet file holding a table contains every column, so a principal that can read the object can read all of it, including PII columns. Giving two teams different column views with IAM alone means maintaining two copies of the data.
+## What Lake Formation adds
+AWS Lake Formation sits on top of the AWS Glue Data Catalog and grants permissions on databases, tables, columns and rows. Integrated engines such as Athena, Redshift Spectrum, EMR and Glue enforce those grants when they read the data.
+- Team A: SELECT on the table with a column filter that excludes `ssn` and `email`.
+- Team B: SELECT on all columns, granted after approval.
+- Row-level data filters (for example `region = 'EU'`) and LF-tags let permissions scale across many tables.
+W: Fine-grained grants on one copy: Lake Formation enforces column- and row-level permissions on the same catalog tables, so each team sees only what it is allowed to without duplicating or re-partitioning the data.
+X: A=Required for encryption: encryption at rest is provided by S3 server-side encryption and AWS KMS, which work with or without Lake Formation.
+C=Replaces KMS: Lake Formation controls who can query which data; it does not encrypt anything, so encryption and key policies are still needed.
+D=IAM cannot be used: IAM still governs access to cataloged S3 data and to the Glue and Lake Formation APIs; Lake Formation adds a finer layer rather than making IAM unusable.
+T: IAM and bucket policies stop at the object; Lake Formation grants columns and rows on shared tables without copying the data.
+
+@ Q001497 explain
+G: ## How a private subnet reaches AWS APIs
+Bedrock is called over HTTPS at a regional endpoint such as `bedrock-runtime.us-east-1.amazonaws.com`, which resolves to public AWS addresses. An instance in a subnet with no internet gateway and no NAT gateway has no route to those addresses, so the TCP connection never completes and the SDK reports a timeout.
+## Interface VPC endpoints (AWS PrivateLink)
+An interface endpoint places network interfaces with private IPs in your subnets. With private DNS enabled, the normal Bedrock hostname resolves to those private IPs, so SDK code works unchanged.
+- For inference, create an endpoint for `com.amazonaws.<region>.bedrock-runtime`.
+- Allow HTTPS (443) from the notebook in the endpoint's security group.
+- An endpoint policy can further restrict which principals and models may be used.
+W: Missing network path: a timeout means packets never reached the service; an interface VPC endpoint for Bedrock Runtime gives the private subnet a private route to the API without opening internet access.
+X: B=Instance too small: even the smallest notebook instance can open TLS connections; size affects CPU and memory for your code, not whether a route to the endpoint exists.
+C=Missing IAM permission: an authorization failure reaches the service and comes back quickly as an AccessDeniedException, not as a connection timeout.
+D=Guardrail blocking: a guardrail is applied only to requests that reach Bedrock and returns an intervention message; it never blocks network connections by caller.
+T: Timeouts point to networking (add a VPC endpoint), while AccessDenied points to IAM.
+
+@ Q001498 explain
+G: ## The problem with per-account bucket policies
+Sharing S3 data with several accounts through bucket policies means editing JSON for every account and prefix, with object-level granularity only. Revoking one business unit's access to one table means rewriting policies and hoping nothing else broke.
+## Lake Formation cross-account sharing
+AWS Lake Formation lets the data owner account grant permissions on Data Catalog databases, tables and columns to other accounts (or to principals in them). Sharing is carried out through AWS Resource Access Manager, and the consumer account creates a resource link to query the shared table.
+- Grants can be by named resource or by LF-tags (for example `classification=curated`), so new tables are shared automatically.
+- Grants and revokes are single API calls in the owner account.
+- Permission changes and data access are recorded in AWS CloudTrail for audit.
+W: Central catalog permissions: Lake Formation cross-account grants are defined and revoked in one place, are fine-grained down to columns, and are auditable, without copying data or maintaining policies in each account.
+X: A=Public bucket with referrer checks: a public bucket is reachable by anyone, and the `Referer` header is set by the client, so it is trivially spoofed and gives no real access control.
+B=Copied bucket policies: duplicating policy text per account is exactly the manual, error-prone approach the requirement rules out, and it still cannot restrict individual columns.
+D=Shared access keys: long-term keys shared by several teams cannot be attributed to a person, are hard to rotate, and are a leak risk; they give no fine-grained or revocable per-unit control.
+T: For governed data sharing across accounts, grant catalog permissions centrally with Lake Formation instead of multiplying bucket policies or sharing keys.
+
+@ Q001499 explain
+G: ## Sensitive data discovery in S3
+Amazon Macie is a managed service that scans objects in S3 and reports where sensitive data is stored. It uses:
+- **Managed data identifiers** for common types such as credit card numbers, bank account numbers, passport and national ID numbers.
+- **Custom data identifiers** (regex plus keywords) for organization-specific formats.
+- **Automated sensitive data discovery** that samples buckets continuously, and one-time or scheduled discovery jobs for full scans.
+Each finding names the bucket, object key, the data types found and where in the object they occur, so the team can exclude or remediate those objects.
+## A note on scanned documents
+Macie analyzes text-based formats (CSV, JSON, Parquet, text-based PDFs, Office files and more). If the scans are images only, extract the text first (for example with Amazon Textract) and let Macie scan the output.
+W: Amazon Macie: it is purpose-built to discover sensitive data such as card and national ID numbers across S3 objects at scale and to report exactly which objects contain it.
+X: A=Glue crawlers: crawlers infer schemas and partitions to populate the Data Catalog; they do not inspect values to flag card or ID numbers.
+C=Comprehend custom classification: it assigns labels you train to documents you send it; it does not inventory buckets or come with detectors for card or ID numbers across an S3 estate.
+D=Bedrock Guardrails: guardrails filter prompts and model responses at inference time; they do not scan training data stored in S3.
+T: To find which S3 objects hold sensitive data before training, use Macie; guardrails and Comprehend work on text you send at runtime.
+
+@ Q001500 explain
+G: ## Two different PII jobs
+**Inline redaction** works on one piece of text at a time inside the request path, with low latency. **Discovery** scans data at rest across many storage locations and keeps an inventory.
+## Services that fit each job
+- **Amazon Comprehend** `DetectPiiEntities` returns the type and character offsets of PII such as `NAME` and `PHONE` in a text string, so the application can replace them (for example `Hi, I'm [NAME]`) before calling the model.
+- **Amazon Bedrock Guardrails** sensitive information filters can mask or block PII in prompts and responses when the model is called through Bedrock.
+- **Amazon Macie** automated sensitive data discovery samples objects across all buckets in the account or organization, gives each bucket a sensitivity score, and keeps that picture up to date as data changes.
+W: Comprehend or guardrails, then Macie: Comprehend PII detection or guardrail filters redact each message in real time, and Macie continuously inventories PII across thousands of S3 buckets.
+X: B=Macie for both: Macie only analyzes objects stored in S3; it has no synchronous API for redacting a chat message before it is sent to a model.
+C=Comprehend for both: batch PII jobs over 3,000 buckets would have to be built, scheduled and tracked by hand, and they produce no bucket-level inventory or sensitivity scores to keep current.
+D=Swapped assignment: this puts each service on the job it is worst at, with Macie on a real-time text path it cannot serve and Comprehend on an estate-wide S3 inventory it does not provide.
+T: Real-time text redaction is Comprehend or guardrails; a continuously updated PII inventory of S3 is Macie.
+
+@ Q001501 explain
+G: ## What remediation must achieve
+A Macie finding means the sensitive values are in the data itself. Access controls and encryption change who can read the file, but a fine-tuning job is an authorized reader: it will read the SSNs and the model can learn them.
+## A remediate-then-verify workflow
+- Transform the dataset: Amazon Comprehend PII detection (`StartPiiEntitiesDetectionJob` with redaction output) or AWS Glue DataBrew PII redaction transforms replace values such as `123-45-6789` with a placeholder like `[SSN]`.
+- Write the cleaned data to a new prefix and restrict or delete the original.
+- Run a Macie sensitive data discovery job on the cleaned prefix and confirm no SSN findings remain.
+- Only then point the fine-tuning job at the verified prefix.
+W: Mask, then re-scan: redacting the SSN values removes them from what the model learns while keeping the rest of the text usable, and re-running Macie proves the remediation worked.
+X: A=Block public access: blocking public access limits outside readers but leaves every SSN in the dataset, so fine-tuning still trains on them.
+B=KMS encryption: encryption protects stored bytes, but Bedrock or SageMaker decrypts the data to train, so the model still sees the SSNs and the finding is not resolved.
+D=Accept the findings: training data is fully in scope for privacy rules, and a model trained on SSNs can memorize and reproduce them in outputs.
+T: Remove PII from the data itself and verify with Macie; access controls and encryption do not stop an authorized training job from learning it.
+
+@ Q001502 explain
+G: ## Two layers of PII protection
+- **Training-time scrubbing** removes PII from the corpus before fine-tuning, for example with Amazon Comprehend PII redaction, so the model never learns it.
+- **Inference-time filtering** with Amazon Bedrock Guardrails sensitive information filters masks or blocks PII patterns in prompts and responses.
+## Why runtime filtering alone is weak
+A fine-tuned model can memorize rare strings from its training data. It may later reproduce them in forms a pattern filter does not recognize: split across sentences (`four-one-five, five five five`), paraphrased ("the customer who lives on Elm Street and was born in 1984"), or embedded in a summary that combines details. The filter only sees output text; it cannot remove knowledge stored in the model's weights.
+W: Memorized PII leaks around filters: once a model has learned personal data, it can surface it indirectly in ways runtime pattern matching misses, so the data should be scrubbed before training.
+X: B=Only a few PII types: guardrails support dozens of built-in PII entity types (names, addresses, phone numbers, SSNs, card numbers and more) plus custom regex patterns.
+C=Comprehend only inside Bedrock: Amazon Comprehend is a standalone service with its own APIs and batch jobs, commonly used to clean data before it ever reaches Bedrock.
+D=Runtime cost: per-request cost is not what makes runtime-only masking risky; the issue is that it cannot undo memorization.
+T: Scrub PII from training data; runtime guardrails are a second layer and cannot remove what the model has already learned.
+
+@ Q001503 explain
+G: ## Direct identifiers and quasi-identifiers
+- **Direct identifiers** point to one person on their own: name, SSN, email.
+- **Quasi-identifiers** are harmless alone but identifying in combination: ZIP code, birth date, gender, job title. Research has shown that ZIP code, full birth date and gender together are unique for a large share of the US population, so joining them with a public record such as a voter list can re-identify people.
+## Techniques that address quasi-identifiers
+- **Generalization**: replace `94107` with `941**` and a birth date with a birth year or age band.
+- **Suppression**: remove fields or rare records that stay unique.
+- **k-anonymity**: ensure every combination of quasi-identifiers is shared by at least k records, so no one stands out.
+- For free text, also redact contextual details that act as quasi-identifiers.
+W: Quasi-identifiers still identify: dropping names and SSNs is only de-identification of direct fields; the remaining combinations must be generalized or suppressed (for example to reach k-anonymity) to prevent re-identification.
+X: A=Only structured tables: free text often contains ages, places, dates and job titles, so the same linkage risk applies to fine-tuning text.
+C=Fully anonymized: the audit itself shows individuals can be re-identified, so the data was not anonymized.
+D=Encryption at rest: encryption protects stored data from unauthorized readers, but training jobs and analysts read the decrypted data, where the quasi-identifier combinations are still present.
+T: Anonymization must handle combinations of quasi-identifiers, not just remove direct identifiers; encryption does not change what the data reveals.
+
+@ Q001504 explain
+G: ## Per-entity PII actions in guardrails
+Amazon Bedrock Guardrails sensitive information filters are configured per PII entity type, such as `US_SOCIAL_SECURITY_NUMBER` or `PHONE`. Each type gets its own action, separately for input and output:
+- **Block**: the guardrail stops the response and returns the configured blocked message.
+- **Mask** (anonymize): the value is replaced with a tag such as `{US_SOCIAL_SECURITY_NUMBER}`.
+- **Detect only** (no action): the entity is reported in the trace but passes through unchanged.
+## Applying it to the requirement
+Support agents need phone numbers for callbacks, so phone must pass through or be masked only where agents do not need it. SSNs must never appear, so Block is the strictest choice. Because the actions are independent, one guardrail can do both.
+W: SSN Block, phone Mask or allow: setting actions per entity type keeps the needed phone number usable while guaranteeing a full SSN never appears in a response.
+X: B=Block both: blocking phone numbers would stop responses that agents need for callbacks, removing a required capability.
+C=Disable filtering: relying on people to spot and redact SSNs by hand is error-prone and does nothing to stop the model from showing them in the first place.
+D=Mask both the same way: masking phone numbers hides the value agents need, and a single setting for both ignores that the two types have different requirements.
+T: Guardrail PII actions are set per entity type, so block what must never appear and allow or mask what users legitimately need.
+
+@ Q001505 explain
+G: ## When built-in PII types are not enough
+Bedrock Guardrails and Amazon Comprehend detect standard PII types (names, SSNs, phone numbers, card numbers). An internal patient identifier with a hospital-specific 8-digit format is not one of them, so it needs a custom detector.
+## Options for custom identifiers
+- **Amazon Comprehend custom entity recognition**: you train a recognizer with annotated examples or an entity list (for example `PATIENT_ID`). It learns from context, so it can tell a patient ID from an unrelated 8-digit number such as an invoice total.
+- **Guardrail regex filters**: sensitive information filters also accept custom regex patterns (for example `\b\d{8}\b`) with a mask or block action; this is simple but may also match other 8-digit numbers.
+The application runs the custom recognizer on generated summaries, masks its detections, and keeps guardrails for the built-in PII types.
+W: Custom entity recognizer plus guardrails: a Comprehend custom recognizer learns the hospital's identifier format and context, so those IDs are masked while guardrails keep handling standard PII.
+X: A=Wait for AWS: an identifier unique to one hospital will never be a built-in entity type, and the data is exposed in the meantime.
+B=Use the SSN entity type: the SSN detector looks for the 9-digit SSN structure and context; it will not reliably match an 8-digit internal format.
+D=Manual review: reviewing every summary by hand does not scale, adds delay and still misses values through human error.
+T: Organization-specific identifiers need custom detection (a Comprehend custom recognizer or guardrail regex), not a built-in type that does not fit.
+
+@ Q001506 explain
+G: ## SageMaker Model Cards
+A SageMaker Model Card is a structured governance record for one model. It has defined sections for:
+- Model overview and **intended uses** (and out-of-scope uses).
+- **Risk rating** (for example low, medium, high, unknown).
+- **Training details**, including a description of the training data.
+- **Evaluation results**, which can be imported from evaluation job outputs.
+- Additional information such as ethical considerations and caveats.
+## Tying it to a version and to auditors
+A model card can be associated with a specific model package version in the SageMaker Model Registry, so the documentation refers to the exact version approved for production. Cards are versioned when edited and can be exported as a PDF to share with auditors.
+W: Model Card per registry version: model cards hold intended use, risk rating, training data and evaluation results in a structured form, link to the exact Model Registry version, and export for auditors.
+X: A=CloudTrail as audit record: CloudTrail records who called which API and when; it holds no intended use, risk rating or evaluation results.
+B=Glue Data Catalog properties: table properties describe a dataset's schema and storage, not a model version's risk rating or evaluation results, and they are not tied to the model version approved for production.
+C=Registry tags: tags are short key-value strings meant for search and cost tracking; they are not suited to structured documentation with evaluation results and cannot be exported as a review document.
+T: For per-version model documentation auditors can review, use SageMaker Model Cards linked to the Model Registry version; logs, tags and catalog properties are not governance documents.
+
+@ Q001507 explain
+G: ## What data lineage is
+Data lineage is a graph of where data came from and what changed it: source tables, the jobs that read and wrote them, and the output datasets. For a training set, lineage answers "which raw tables and which transformations produced this file?"
+## Lineage for Glue pipelines
+When raw tables are cataloged in the AWS Glue Data Catalog and processed by Glue ETL jobs, lineage can be captured from those jobs and the catalog. In current AWS, lineage from Glue jobs and crawlers is collected (as OpenLineage-compatible events) and shown in the Amazon SageMaker Catalog, formerly Amazon DataZone, as a graph like:
+- `raw.transactions` + `raw.customers` -> Glue job `join_clean` -> `curated.features` -> Glue job `export_training` -> `s3://train-bucket/v7/`
+Auditors can start from the training dataset and walk back through each job to the original sources.
+W: Glue data lineage: lineage across Glue jobs and Data Catalog tables records how data flowed and was transformed, which is exactly the source-to-training-set trace auditors need.
+X: B=Logs Insights on job logs: job logs show run details and errors, not a structured record of which input tables fed which outputs; rebuilding lineage from them is manual and unreliable.
+C=Contextual grounding: grounding checks whether a model's response is supported by provided source text at inference time; it has nothing to do with how training data was produced.
+D=Model Card training section: it describes the training data in prose for governance, but it does not capture or trace the transformations between source tables and the dataset.
+T: To trace a training dataset back through ETL steps, use data lineage; logs, grounding checks and model cards do not record data flow.
+
+@ Q001508 explain
+G: ## Two complementary SageMaker governance features
+**SageMaker Model Registry** manages the model lifecycle:
+- Model package groups hold numbered versions of a model.
+- Each version has an approval status (`PendingManualApproval`, `Approved`, `Rejected`) that CI/CD pipelines use to gate deployment.
+**SageMaker Model Cards** document the model for people:
+- Intended uses and limits, risk rating, training details, evaluation results, ethical considerations.
+## How they work together
+A team registers version 12, attaches a model card that records its evaluation results and risks, and a reviewer approves the version in the registry. The registry answers "which version is approved?"; the card answers "what is this model for and how risky is it?"
+W: Lifecycle versus documentation: the Registry tracks versions and approval status for deployment, while Model Cards record intended use, risks and evaluations that governance reviewers need.
+X: B=Registry cannot register FMs: this is not accurate, since fine-tuned and JumpStart models can be registered as model packages, and it is not the reason cards are needed.
+C=Cards replace the Registry: model cards do not manage deployment approval status or act as the version source of truth for CI/CD gates.
+D=Same feature: they are separate features with different APIs and purposes, one for version and approval management and one for documentation.
+T: Model Registry manages versions and approvals; Model Cards document purpose, risk and evaluation, and governance needs both.
+
+@ Q001509 explain
+G: ## Governance metadata must be structured
+To report "how many confidential documents did business unit X ingest?", sensitivity must be stored as data you can query, set at ingestion by the data owner, not guessed later.
+## Where to record it
+- **S3 object tags** on each source document, for example `sensitivity=confidential` and `bu=finance`. Tags can also drive IAM conditions and lifecycle rules.
+- **Data Catalog metadata** (table or dataset properties, or a catalog inventory table) so the classifications can be queried with Athena for reports.
+- **Knowledge base metadata files** (`<file>.metadata.json` next to each S3 document) can carry the same attributes into the vector store, which allows retrieval filters such as excluding `confidential` for some users.
+W: Tagged source and catalog metadata: tagging each document with its sensitivity and mirroring it in catalog metadata creates an authoritative, queryable record for governance reporting.
+X: B=CloudFront cache headers: cache headers such as `Cache-Control` tell caches how long to keep a response; they are not a classification store and are not queryable for reports.
+C=Model infers sensitivity: a model's guess changes between runs, can be wrong, and is not an auditable record of the classification the document was given.
+D=System prompt notes: text in a prompt is not structured, not queryable, and grows unmanageably as documents are added.
+T: Record sensitivity as structured tags and catalog metadata at ingestion; do not rely on model guesses or prompt text for governance.
+
+@ Q001510 explain
+G: ## Management events and data events
+AWS CloudTrail records two main kinds of events:
+- **Management events**: control plane operations such as `CreateAgent` or `CreateGuardrail`. Logged by default, and the last 90 days are visible in Event history.
+- **Data events**: high-volume operations on resources. Not logged by default; you must enable them on a trail or a CloudTrail Lake event data store, choosing the resource type.
+## Where Bedrock calls land
+Bedrock runtime `InvokeModel` and `Converse` calls are logged as management events. Bedrock Agents runtime calls such as `InvokeAgent` (and knowledge base `Retrieve` / `RetrieveAndGenerate`) are data events, so they appear only if data event logging was enabled for that resource type, for example agent aliases.
+Data events cannot be recovered for past dates when logging was off.
+W: InvokeAgent is a data event: it is not in management events, so data event logging for Bedrock agent aliases must be enabled to record the calling principal going forward.
+X: A=CloudTrail ignores Bedrock: CloudTrail does record Bedrock calls; model invocation logging captures prompts and responses, which is a different purpose than recording the caller.
+C=24-hour retention: CloudTrail Event history keeps 90 days of management events, and trails or event data stores can keep them much longer.
+D=Roles not recorded: CloudTrail records the assumed-role session in `userIdentity`, including the role ARN and session name, so role callers are identifiable.
+T: InvokeAgent calls are CloudTrail data events that must be enabled explicitly; they never appear among management events.
+
+@ Q001511 explain
+G: ## Traceability starts at ingestion
+Amazon Bedrock Knowledge Bases split documents into chunks and store them with their source location. You can attach extra metadata per document with a sidecar file in S3, for example `policy.pdf.metadata.json`:
+- `{"metadataAttributes": {"source": "HR-portal", "version": "3.2", "ingested": "2026-08-14"}}`
+Every chunk from that document carries those attributes.
+## Citations at query time
+`RetrieveAndGenerate` (and the Retrieve API) returns citations: for each part of the generated answer, the retrieved chunks that supported it, with their S3 location and metadata. Storing the answer together with its citations links every statement to a specific document, version and ingestion date.
+W: Metadata plus citations: document-level source, version and date metadata captured at ingestion, combined with Knowledge Bases citations in each response, tie each answer to the exact versioned source.
+X: A=Model states its sources: a model asked to name sources can invent or misattribute them, so its self-reported sources are not reliable evidence.
+C=File names in one prefix: file names are not linked to specific answers, carry no structured version or date, and break when files are renamed or overwritten.
+D=CloudTrail data events: they record that a retrieval API was called and by whom, not which chunk and document version supported each statement in the answer.
+T: Build traceability into the data (metadata at ingestion) and the response (citations); do not trust the model to report its own sources.
+
+@ Q001512 explain
+G: ## Service control policies
+A service control policy (SCP) in AWS Organizations sets the maximum permissions for every IAM user and role in the accounts it is attached to, through the root, an OU or an account. SCPs never grant access; they only limit it. An action denied by an SCP fails even if a local IAM policy allows it, and local administrators cannot remove the SCP.
+## Restricting models org-wide
+- Attach an SCP to the OU that denies `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` with `NotResource` listing the approved model ARNs (and approved inference profile ARNs).
+- When a model passes legal review, add its ARN in one place.
+- SCPs do not apply to the management account, so keep workloads out of it.
+W: SCP on the OU: a Deny for unapproved model ARNs applies to every account and principal in the OU and overrides any local IAM Allow, giving a central preventive control.
+X: A=CloudWatch alarm: an alarm is detective only; the unapproved model has already been invoked by the time it fires.
+C=Guardrail in one account: guardrails filter content, not model choice, and a guardrail in the production account does nothing for the other accounts.
+D=IAM policy per role: pushing policies to every role across dozens of accounts is hard to keep consistent, and local administrators can change or add policies that bypass it.
+T: Organization-wide limits that local IAM cannot override belong in SCPs; alarms detect and guardrails filter content.
+
+@ Q001513 explain
+G: ## Two operating models for Bedrock access
+- **Centralized**: a shared-services account hosts Bedrock access. Teams assume a cross-account role (or call an internal API) in that account. Guardrails, invocation logging, quotas and cost reporting are set up once.
+- **Decentralized**: each of the 20 teams enables Bedrock in its own account and manages its own IAM, guardrails, logging and budgets.
+## The governance tradeoff
+Centralized gives one place for policy and audit and clear cost visibility, but the platform team can become a bottleneck for new models or quota increases, and cost per team needs extra tagging. Decentralized gives teams autonomy and natural cost separation by account, but 20 teams can drift into 20 different configurations. Organizations often blend the two, using SCPs and templates to enforce a baseline in each team account.
+W: Consistency versus autonomy: a central account makes policy, audit and cost visibility consistent but can slow teams down, while per-team access risks inconsistent controls.
+X: A=No difference: the same IAM language is used, but who writes and maintains the policies, logs and guardrails differs, which is the core of governance.
+B=Per-team always stronger: account boundaries isolate resources, but they do not guarantee each team applies guardrails, logging or least privilege consistently.
+D=No IAM needed: cross-account access itself depends on IAM roles, trust policies and permissions in both accounts.
+T: Centralizing Bedrock access trades team autonomy and speed for consistent policy, audit and cost control.
+
+@ Q001514 explain
+G: ## AWS Config for configuration compliance
+AWS Config continuously evaluates resource configurations against rules and marks each resource `COMPLIANT` or `NON_COMPLIANT`.
+- **Managed rules** cover common checks.
+- **Custom rules** (AWS Lambda or Guard) implement your own logic and can run on configuration changes or on a periodic schedule.
+- **Conformance packs** and organization rules deploy the same rules to every account, and an aggregator shows results in one place.
+## Checking agents for guardrails
+A periodic custom rule can list the Bedrock agents in each account, read each agent's configuration (the `GetAgent` response includes its guardrail configuration), and report any agent without one as non-compliant. EventBridge can then notify owners or start remediation.
+W: AWS Config rule: Config is built to evaluate resource configurations continuously across accounts, so a custom rule can flag every Bedrock agent without an attached guardrail.
+X: A=Comprehend classification: Comprehend labels natural-language text you send it; it does not read resource configurations or track compliance over time.
+B=Macie discovery: Macie scans S3 objects for sensitive data such as PII; it does not inspect Bedrock agent settings.
+D=Glue crawlers: crawlers infer data schemas to build the Data Catalog; they do not evaluate service configurations against a policy.
+T: Continuous "is every resource configured correctly?" checks are AWS Config rules, not data-analysis services.
+
+@ Q001515 explain
+G: ## SageMaker Model Monitor types
+Model Monitor compares live endpoint traffic against a baseline computed from training data or a reference set. It has four monitor types:
+- **Data quality**: statistics and constraints on incoming features (types, missing values, distributions); reports violations when the input distribution drifts.
+- **Model quality**: compares predictions with ground-truth labels.
+- **Bias drift**: uses SageMaker Clarify to recompute bias metrics (for example, difference in positive proportions between groups) on live data and alert when they move beyond the baseline.
+- **Feature attribution drift**: tracks changes in SHAP-based feature importance.
+## Mapping to the requirement
+Need (a), request distribution drift, is data quality monitoring. Need (b), fairness drift for protected groups, is bias drift monitoring. Results go to CloudWatch for alarms.
+W: D=Data quality monitoring: it baselines the training data's statistics and flags when incoming requests drift from that distribution.
+E=Bias drift monitoring: with Clarify, it recalculates bias metrics per group on production data and alerts when fairness characteristics change over time.
+X: A=Prompt attack detection: this is a Bedrock Guardrails filter that blocks jailbreak and injection attempts per request; it does not measure distribution or fairness drift.
+B=Denied topics monitoring: denied topics is a guardrail content policy for forbidden subjects, not a Model Monitor capability for statistical drift.
+C=Contextual grounding check: a guardrail check that scores whether a response is supported by source text; it does not compare traffic with training data or track group fairness.
+T: Input distribution drift is data quality monitoring and fairness drift is bias drift monitoring; guardrail filters act on single requests, not trends.
+
+@ Q001516 explain
+G: ## Detecting misuse while it happens
+When Bedrock Guardrails blocks a prompt attack, it records an intervention. Guardrail metrics are published to Amazon CloudWatch (for example invocation and intervention counts), and when model invocation logging is enabled, each request's log includes the caller identity and the guardrail result.
+## Building a per-identity alarm
+- Send invocation logs to CloudWatch Logs.
+- Use a metric filter or CloudWatch Contributor Insights to count blocked requests per identity (role, API key or source IP).
+- Alarm when an identity exceeds, for example, 20 blocked prompts in 5 minutes.
+- Route the alarm through EventBridge or SNS to page security or trigger automatic throttling, such as revoking the key or adding an AWS WAF rate rule in front of the API.
+W: Intervention metrics with per-identity alarms: counting blocked prompts per caller and alarming on spikes detects automated jailbreak probing within minutes, so the team can respond while it is happening.
+X: A=Disable the filter: turning off prompt attack protection during an active attack lets the probing succeed; the logs are the evidence, not noise.
+B=Larger context window: context size has no effect on whether attacks are detected or blocked, and it does not change how the filter classifies prompts.
+D=Quarterly log review: a review every three months finds the probing long after the attacker has had time to succeed.
+T: Active abuse needs real-time, per-identity metrics and alarms, never disabling protection or waiting for periodic reviews.
+
+@ Q001517 explain
+G: ## Detection speed decides the damage
+The time between when abuse starts and when someone notices is called time to detect. During that window, an attacker can keep probing, extract data, or run up cost.
+## Two monitoring cadences
+- **Real-time**: CloudWatch alarms on guardrail intervention rates fire within minutes of a spike and can trigger automated responses (notifications, throttling, key revocation).
+- **Periodic**: a weekly job analyzes aggregated invocation logs. It is useful for trends, reporting and tuning policies, but abuse that starts on Monday is found days later.
+Most teams use both: alarms for fast response and periodic review for deeper analysis, while keeping logs for investigation.
+W: Faster detection: real-time alarms surface active abuse within minutes so it can be stopped, whereas a weekly review only finds it after harm may already have occurred.
+X: A=Batch is more accurate: both approaches can use the same underlying data; the difference is how fast you learn about a problem, not accuracy.
+C=Periodic review cannot be automated: scheduled queries (for example with Athena or Logs Insights) can run a weekly review automatically; the limitation is its delay.
+D=No need to keep logs: alarms only signal that something happened; retained logs are still needed to investigate incidents and satisfy audits.
+T: Real-time alarms cut time to detection for active abuse; periodic reviews are for trends and reports.
+
+@ Q001518 explain
+G: ## What an agent trace contains
+Amazon Bedrock Agents can return a trace for each invocation (`enableTrace`). It shows the agent's internal workings:
+- Preprocessing and orchestration steps, including the model's rationale.
+- Action group and function names, and the parameters the agent chose.
+- Knowledge base queries and retrieved references.
+- Observations returned by tools and parts of the prompt templates.
+## Why this is sensitive
+An attacker who sees tool names like `issueRefund(orderId, amount)`, prompt instructions and data sources can craft prompt injections that target them precisely. Show customers a curated answer (and citations if useful), and keep full traces in an internal audit view or logs with restricted access.
+W: Traces reveal internals: raw traces expose tool names, prompts and data sources, which gives attackers a map for targeted prompt injection.
+X: A=Customers correct reasoning: agents do not learn from customers reading traces, and exposing internals adds risk without improving accuracy.
+B=Traces are encrypted: encryption in transit and at rest protects data from third parties, but it does nothing once the trace is deliberately displayed to the customer.
+C=Tracing only for testing: traces can be enabled on production invocations, so this is not a limitation and not the risk.
+T: Keep full agent traces internal and show customers only curated output, because traces reveal the internals attackers exploit.
+
+@ Q001519 explain
+G: ## Debugging an agent step by step
+A Bedrock agent answer comes from a chain: the model reasons, picks an action group, fills parameters, the tool (for example a Lambda function) returns data, and the model writes the answer. A wrong refund can come from any link.
+## Reading the trace
+With tracing enabled, each step shows:
+- **Rationale**: why the model chose the next action.
+- **Invocation input**: which action and parameters, for example `calculateRefund(orderId="A-1043", items=2)`.
+- **Observation**: what the tool returned, for example `{"refund": 19.99}`.
+- **Final response**: what the model told the customer.
+If the tool returned 39.98 but the answer says 19.99, the model misread the result. If the parameters were wrong, the reasoning or prompt is at fault. If the tool returned 19.99 from bad order data, the backend or data is the problem.
+W: Inspect the agent trace: stepping through reasoning, tool parameters and tool results pinpoints whether the error came from the model, the tool call or the data.
+X: A=Majority vote of reruns: repeating the prompt samples the model's output again but gives no insight into which step failed, and a consistently wrong tool result would win the vote.
+C=Disable the refund tool: this is a temporary mitigation that stops the harm but does not identify the cause.
+D=Retrain the model: retraining before knowing the cause wastes effort, and it cannot fix a bug in the tool or bad backend data.
+T: Diagnose agent errors with the trace, step by step; reruns, disabling tools or retraining do not tell you where it went wrong.

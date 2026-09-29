@@ -1,0 +1,351 @@
+# AIP-C01 detailed explanations, batch e01 (explanation-only rewrites; letters are the published ones)
+
+@ Q001420 explain
+G: ## Model-driven agents
+In a model-driven agent, the foundation model itself decides what to do next. The code supplies a system prompt, a list of tools (each with a name, a description and an input schema) and a loop: the model either answers or asks for a tool call, the framework runs the tool, feeds the result back, and the model reasons again.
+## Strands Agents SDK
+Strands Agents is an open-source Python SDK from AWS for building exactly this kind of agent with very little code.
+- Plain Python functions become tools with the `@tool` decorator; the docstring and type hints become the tool description and schema.
+- The agent loop (reason, call a tool, read the result, repeat) is built in, so there is no hand-written branching.
+- It runs anywhere Python runs: a container on Amazon ECS, AWS Lambda, EC2 or Amazon Bedrock AgentCore Runtime.
+Example: `Agent(tools=[calculator, web_search, lookup_inventory])` lets the model decide, per request, whether to compute, search or check stock, and a tool can simply call the inventory Lambda function.
+W: Strands Agents SDK: registering the three functions as tools gives a single agent whose model chooses tools at runtime inside the SDK's built-in reasoning loop, running in the team's existing ECS container with minimal orchestration code.
+X: A=Step Functions Choice states: every branch is designed in advance by the developer, so tool selection is hand-written control flow, the opposite of letting the model drive it, and it adds a separate orchestration layer to maintain.
+B=Prompt Flow in fixed order: a flow that runs all three tools in the same sequence for every request cannot decide at runtime which tool is needed, so it wastes calls and cannot adapt to intermediate results.
+C=Agent Squad routing: Agent Squad classifies a request and routes it to one of several agents. The scenario explicitly has one agent and no need for multi-agent routing, so this adds three agents and a classifier for no benefit.
+T: When one agent should let the model pick among its own tools with little code, use a model-driven agent SDK such as Strands; fixed flows and state machines hard-code the choices.
+
+@ Q001421 explain
+G: ## Model Context Protocol (MCP)
+MCP is an open protocol that standardizes how AI applications discover and call external tools and data. An **MCP server** publishes a list of tools, each with a name, description and JSON input schema; an **MCP client** inside an agent framework lists those tools and invokes them over a standard transport (for example streamable HTTP).
+- Write the integration once as an MCP server, and any MCP-capable agent framework or model client (for example Strands Agents, LangGraph and many vendor SDKs) can use it.
+- The server hides the internal API details, authentication and error handling behind stable tool definitions.
+## Hosting on AWS
+An MCP server is an ordinary service: short, stateless tools fit AWS Lambda; long-lived or stateful servers fit Amazon ECS on AWS Fargate. As a managed alternative, Amazon Bedrock AgentCore Gateway can expose existing APIs (for example from an OpenAPI specification) and Lambda functions as MCP tools.
+Example: an MCP server exposes `get_inventory(sku)` and `get_customer(id)`; a new agent built on any vendor's model connects to it and sees both tools immediately.
+W: MCP server exposing the APIs: MCP is the vendor-neutral standard for tool discovery and invocation, so one server on Lambda or ECS serves every framework and model without per-vendor glue code.
+X: A=Hardcoded Step Functions wrapper: a tool list fixed to one current agent is the opposite of standardized, discoverable tools; every new agent or vendor would need its own integration work.
+B=Indexing API docs in a Knowledge Base: retrieval lets a model read about the endpoints but gives it no way to actually call them, authenticate or get structured results back.
+C=One function URL per FM vendor: this is exactly the per-vendor translation glue the team wants to avoid, and it multiplies maintenance with every new provider.
+T: To expose APIs as tools that any agent or model can discover and call, build one MCP server instead of per-vendor adapters or documentation indexes.
+
+@ Q001422 explain
+G: ## Retries alone can make an outage worse
+A Step Functions `Retry` block retries a failed state with `IntervalSeconds`, `BackoffRate` and `MaxAttempts` (plus optional `MaxDelaySeconds` and `JitterStrategy`). A `Catch` block routes the error to a fallback state once retries are exhausted. If retries are effectively unlimited, every execution keeps calling a throttled endpoint, adding load and cost while the endpoint cannot recover.
+## The circuit breaker pattern
+A circuit breaker stops calling a dependency that keeps failing:
+- **Closed**: calls go through; failures are counted, for example in an Amazon DynamoDB item keyed by endpoint.
+- **Open**: after a threshold (say 5 failures in 60 seconds), the workflow skips the call and returns a fallback or fails fast.
+- **Half-open**: after a cool-down, one trial call checks whether the endpoint has recovered.
+In Step Functions, a first state reads the breaker status from DynamoDB, a Choice state skips the model call when the circuit is open, and bounded Retry plus Catch updates the counter.
+W: Circuit breaker plus bounded Retry/Catch: capping attempts with backoff and tripping a shared breaker after a failure threshold stops all executions from hammering the throttled endpoint, controlling cost until it recovers.
+X: A=Unlimited MaxAttempts: this is the current failure mode made explicit; endless retries keep adding load and cost and never address the throttling.
+B=Disabling CloudWatch alarms: hiding the alarms removes visibility into the problem while the runaway retries and costs continue unchanged.
+C=More Lambda memory: throttling is a quota limit on the model endpoint, so a faster Lambda function does not reduce rejections; it may even send retries sooner.
+T: Safeguard agent workflows with bounded retries and a circuit breaker that stops calling a failing dependency, not with longer or unlimited retries.
+
+@ Q001423 explain
+G: ## Plan-then-execute versus ReAct
+In **plan-and-execute**, the model writes the whole plan first and the agent runs it step by step. That is efficient when steps are predictable, but the plan was written before any tool results existed, so a surprise at step 2 cannot change steps 3 to 5 unless the agent re-plans.
+**ReAct** (Reason + Act) interleaves thinking and doing on every turn:
+- **Thought**: the model reasons about what it knows so far.
+- **Action**: it chooses one tool call with arguments.
+- **Observation**: the tool result is appended to the context, and the loop repeats until the model answers.
+Example: Thought "I need the customer record" leads to Action `lookup_customer(id=42)`; the Observation "not found" leads to the next Thought "ask for the email address instead", rather than blindly continuing with an empty record.
+W: ReAct: because the model reasons over each observation before choosing the next action, an unexpected result such as a missing record changes the course of the task immediately.
+X: B=Chain-of-thought before the plan: step-by-step thinking improves the quality of the upfront plan, but the plan is still fixed before any tool runs, so it cannot react to what step 2 returns.
+C=Self-consistency sampling: choosing the most common of several plans makes the plan more reliable on average, but all plans are still produced before execution and none reacts to observations.
+D=More detailed upfront plan: listing every possible branch in advance is brittle and cannot anticipate every real result; the design still does not reason about actual observations.
+T: When each next step depends on what the last tool returned, use ReAct's reason-act-observe loop instead of a fixed upfront plan.
+
+@ Q001424 explain
+G: ## Implementing a ReAct loop with Step Functions
+A ReAct agent repeats: the model reasons, picks a tool, the tool runs, and the result goes back to the model. Step Functions can run this loop explicitly and make every iteration visible and auditable:
+- A **Lambda** (or direct Amazon Bedrock) task sends the conversation so far to the model, which returns either a tool request or a final answer.
+- A **Choice** state branches on the returned field, for example `$.tool == "search"` or `$.tool == "calculator"`.
+- Each branch runs its tool, appends the observation to the state, and loops back to the model step.
+- A counter with a maximum number of iterations and a Choice on "final answer" end the loop.
+Example: question, then model asks for `search("GDP of Chile 2024")`, observation, then model asks for `calculator("x / y")`, observation, then final answer.
+W: ReAct loop with Choice routing: the model reasons about each intermediate result and selects the next tool, and the Choice states execute that selection, which is exactly the tool-using, iterative problem-solving pattern required.
+X: A=One chain-of-thought prompt without tools: the model can reason, but it cannot fetch search results or compute precisely, so facts and numbers may be wrong and nothing is grounded in real tool output.
+B=SageMaker batch transform: batch transform scores a dataset offline in one pass; it has no per-step reasoning, tool calls or branching on intermediate results.
+D=Daily EventBridge invocation: one scheduled call per day produces a single answer with no tool use or iterative reasoning, and it is not interactive research.
+T: Tool-using, step-by-step reasoning needs a loop where the model's tool choice drives the next step; Step Functions implements that with a model step plus Choice routing.
+
+@ Q001425 explain
+G: ## Coordinating several specialist models
+When several fine-tuned specialists each answer part of a question, something must call them and merge the results. That component is an **orchestrator**: an AWS Lambda function, a Step Functions workflow, or an agent built with a framework such as Strands Agents.
+- **Fan out**: send the request (or the relevant part) to the legal, medical and financial models, often in parallel.
+- **Score**: each specialist returns an answer plus a confidence signal, such as a self-reported score, a classifier's relevance score, or an evaluation by a judge model.
+- **Aggregate**: weight the answers by confidence, drop low-confidence ones, and have a model synthesize one coherent response.
+Example: for "Can I deduct medical expenses from a legal settlement?", the financial and legal answers score high, the medical one low, and the synthesizer builds the answer mainly from the first two.
+W: Orchestrator with confidence weighting: a server-side coordinator centralizes calling each specialist, scoring their outputs and combining them into one consistent answer, which is exactly the coordination requirement.
+X: A=Random pick among outputs: randomness ignores which specialist actually knows the domain, so answers become inconsistent and often come from the wrong expert.
+B=Client concatenates raw responses: three unmerged answers can repeat or contradict each other, nothing is weighted, and the client now holds orchestration logic and direct model access.
+C=One large general model: this discards the specialists' fine-tuned knowledge that the system was built to use, and still produces no combined, confidence-weighted answer.
+T: Combine multiple specialist models through an orchestrator that fans out, scores and synthesizes, not by random choice, raw concatenation or a single generic model.
+
+@ Q001426 explain
+G: ## Pausing Step Functions for a human
+Step Functions supports a callback pattern with the `.waitForTaskToken` suffix on a task.
+- The task sends a unique **task token** to another service, for example a Lambda function that emails the reviewer through Amazon SNS or opens an item in an approval UI.
+- The execution pauses without polling or paying for compute while it waits; a Standard workflow can wait up to a year, and you can set a `HeartbeatSeconds` or timeout.
+- The reviewer's approve or reject action calls `SendTaskSuccess` or `SendTaskFailure` with the token, usually through Amazon API Gateway and Lambda, and the execution resumes on the matching branch.
+The execution history records every state, input, output and timestamp, which provides the audit trail.
+Example: a Choice state sends refunds under $200 straight to the refund task and larger ones to the approval task first.
+W: waitForTaskToken callback: the workflow truly pauses before the refund executes, resumes only on the reviewer's explicit decision, and Step Functions keeps a complete execution history for auditing.
+X: A=Lambda polling DynamoDB every second: a function cannot wait for hours or days (Lambda stops at 15 minutes), and constant polling wastes invocations; the built-in callback makes this unnecessary.
+B=Stricter prompt threshold, no human: leadership explicitly requires human review, and a prompt instruction is not an enforceable control against model mistakes or prompt injection.
+D=Execute first, email afterward: the money has already moved, so this is after-the-fact notification, not approval before the action.
+T: For human approval inside Step Functions, pause with a task token and resume on a callback, instead of polling, prompting or notifying after the action.
+
+@ Q001427 explain
+G: ## Matching the tool host to the workload
+Where an MCP server runs depends on how long its work lasts and whether it keeps state:
+- **AWS Lambda** suits short, stateless tool calls. An invocation can run for at most 15 minutes, and memory is not guaranteed to survive between invocations.
+- **Amazon ECS on AWS Fargate** runs containers as long as you want without managing servers. A task can keep a headless browser process, cookies and page state in memory for the whole session.
+- **Step Functions** orchestrates steps but does not keep a process alive between them; an Express workflow is also limited to 5 minutes.
+Example: a Playwright-based MCP server on Fargate holds one browser context per agent session, and the agent sends "open page", "fill form", "click" tool calls over 25 minutes against the same live session.
+W: ECS on Fargate: long-running containers keep the stateful browser session alive for more than 20 minutes without server management, which Lambda and Express workflows cannot do.
+X: A=Step Functions Express Workflows: an Express execution lasts at most 5 minutes, and a live browser process cannot be carried from one state to the next.
+C=Static site on S3: S3 serves files only, so the browser would run on an end user's device, outside the agent's control and security boundary, which is not a server-side tool at all.
+D=Lambda holding the session: the 15-minute maximum invocation time ends sessions that run past 20 minutes, and state in memory is lost when the invocation ends.
+T: Long-lived, stateful tool servers belong in containers such as ECS on Fargate; Lambda and Express workflows have hard duration limits.
+
+@ Q001428 explain
+G: ## How a model chooses a tool and its arguments
+A tool-calling model only sees each tool's **name**, **description** and **input schema** (JSON Schema). It picks the tool whose description best matches the request and fills in arguments that seem to fit the schema.
+- A vague description such as "gets order info" gives the model nothing to separate `getOrderStatus` from `getShipmentLocation`.
+- A loose parameter such as `amount` with no type lets the model send "twenty dollars".
+Better specifications:
+- `amount`: `{"type": "number", "description": "Refund amount in USD, for example 20.00"}` and list it in `required`.
+- Descriptions that say when to use and when not to use: "Use getShipmentLocation for where a package is now; use getOrderStatus only for payment or processing status."
+Validating arguments against the schema in the tool code adds a second safety net.
+W: Tighter tool specs: typed, required parameters and clear when-to-use descriptions address both root causes, bad argument formats and ambiguous tool selection, at the point where the model makes those decisions.
+X: A=Denied topic guardrail: a denied topic blocks shipping questions entirely instead of routing them to the right tool, and it does not fix the argument type problem.
+B=Temperature 0: lower temperature makes output more repeatable, not more correct; the model would consistently repeat the same wrong tool choice and format.
+D=IAM policy on the amount: IAM authorizes AWS API actions on resources; it cannot inspect a tool argument's data type, and blocking the call would not produce a correct one.
+T: Tool-calling mistakes are usually fixed in the tool definitions (types, required fields, when-to-use descriptions), not with guardrails, temperature or IAM.
+
+@ Q001429 explain
+G: ## Defense in depth for agent tools
+Prompt injection means the model may be tricked into requesting harmful tool calls. Since the model cannot be fully trusted, the tool layer must limit the damage:
+- **Least privilege**: the tool's IAM role allows only the specific actions and resources it needs, for example `dynamodb:GetItem` and `dynamodb:UpdateItem` on one table ARN, instead of `s3:*` and `dynamodb:*` on `*`. An injected "delete everything" call then fails with AccessDenied.
+- **Pre-execution checks on destructive actions**: before a delete, refund or overwrite runs, validate it with deterministic rules (allowed resource prefixes, amount limits), content checks such as the Amazon Bedrock Guardrails `ApplyGuardrail` API on the request, and, for high-risk actions, human confirmation.
+Together these limit what the tool can do and verify what it is about to do.
+W: A=Least-privilege execution role: removing wildcard permissions means that even a successfully injected request cannot touch unrelated S3 or DynamoDB resources.
+E=Guardrail checks before destructive actions: validating delete-type actions before they run catches malicious or unexpected requests that are still within the role's permissions.
+X: B=Shared API key instead of IAM: a static shared secret is weaker and harder to rotate and audit, and the function still needs an execution role to reach S3 and DynamoDB, so the broad access problem stays.
+C=AdministratorAccess: this widens the blast radius to the whole account, the exact opposite of what is needed.
+D=More Step Functions retries: retrying a destructive action with the same broad role repeats the damage; retries address transient errors, not authorization.
+T: Contain prompt injection at the tool layer: least-privilege roles limit what can happen, and pre-execution checks stop what should not happen.
+
+@ Q001430 explain
+G: ## Supervisor and router patterns for multi-agent systems
+With many domains (billing, returns, technical support), one agent with one huge prompt becomes slow, expensive and error-prone. A common pattern splits the work:
+- A **classifier or supervisor** reads the user's message and conversation history and decides which specialist should handle it.
+- **Specialized agents** each have a focused prompt, their own tools and their own knowledge sources.
+- The supervisor forwards the request, and in some designs coordinates several agents and combines their replies.
+**AWS Agent Squad** (formerly Multi-Agent Orchestrator) is an open-source AWS Labs framework for this pattern: a classifier selects the best agent for each message, it keeps per-agent conversation context, and it also offers a supervisor agent for team-style coordination. Amazon Bedrock Agents supports a similar supervisor and collaborator setup.
+W: Classifier-based routing to specialized agents: interpreting intent and delegating to the right specialist is exactly the supervisor pattern that Agent Squad implements.
+X: A=One monolithic prompt: packing every domain's instructions into one prompt is the design this pattern replaces; it dilutes instructions and grows token cost with every domain added.
+B=Daily batch transform: offline batch scoring has no interactive intent detection or delegation, and cannot serve live customer conversations.
+C=Direct client-side model calls: calling one model straight from the client has no routing layer, no specialists, and exposes model access to the client.
+T: A supervisor that classifies intent and hands off to specialist agents is the router or supervisor multi-agent pattern, as in Agent Squad.
+
+@ Q001431 explain
+G: ## Chain-of-thought: benefits and costs
+Chain-of-thought (CoT) asks the model to reason through intermediate steps before answering, which improves accuracy on multi-step problems. The costs:
+- **Tokens and latency**: reasoning text is output tokens, which are billed and generated one by one.
+- **Exposure**: raw reasoning can contain internal rules, tool details, sensitive data or half-formed wrong ideas that should not reach users.
+## Keep the reasoning private
+- Ask the model to reason inside a tag such as `<thinking>` and the final reply inside `<answer>`, then return only the answer; or use a model's built-in reasoning mode, which returns reasoning content separately from the final text.
+- Pass the answer through output checks such as Amazon Bedrock Guardrails before showing it.
+- Control cost with a reasoning token budget, `max_tokens`, and CoT only for tasks that need it.
+W: Internal scratchpad, filtered final answer: the model still reasons step by step, so accuracy is kept, while users see only a checked final answer; budgets and selective use limit cost and latency.
+X: B=Show full reasoning to users: this exposes internal logic and possibly sensitive content, and still pays all the extra tokens and latency.
+C=Disable CoT, zero-shot only: this gives up the accuracy gain the team explicitly wants to keep.
+D=Remove output token limits: this lets costs and latency grow without bound and removes a safeguard against runaway generation, the opposite of managing the risk.
+T: Keep chain-of-thought as a hidden scratchpad with a token budget and return only the filtered answer, instead of exposing it or turning it off.
+
+@ Q001432 explain
+G: ## Error handling in a Parallel state
+A Step Functions `Parallel` state runs branches at the same time and waits for all of them. If any branch fails with an unhandled error, the whole Parallel state fails, the other branches are stopped, and the next state (the aggregation) never runs.
+Fix it at the branch level:
+- Add a `Retry` with backoff and a small `MaxAttempts` for short blips.
+- Add a `Catch` that goes to a **Pass** state returning a fallback such as `{"model": "financial", "status": "unavailable"}`, so the branch "succeeds" and aggregation runs with two answers.
+- Add a **circuit breaker**: count failures (for example in Amazon DynamoDB) and, past a threshold, skip calling that endpoint for a cool-down period, going straight to the fallback.
+W: Catch with fallback plus stop after repeated failures: the branch degrades gracefully so aggregation still runs, and the breaker avoids repeatedly calling an endpoint that keeps failing.
+X: A=Unbounded branch timeout: the execution hangs waiting for a dead endpoint, users get no answer, and the failing endpoint keeps being called.
+C=Sequential calls: running the calls one after another adds latency and still fails the workflow on the first unhandled error; it changes the order, not the error handling.
+D=Run branches only after sustained success: this is circular (branches cannot succeed if they are not run) and does not handle a branch failing during an execution.
+E=Fail the whole workflow on any branch error: this is the current behavior, which the team is trying to fix.
+T: In a Parallel state, catch per-branch errors with a fallback result and add a circuit breaker so one failing model does not fail the whole answer.
+
+@ Q001433 explain
+G: ## Amazon Bedrock capacity options
+- **On-demand**: pay per token with Region and account quotas on requests and tokens per minute. Capacity is shared, so throttling (`ThrottlingException`) can still occur at peaks, even after a quota increase.
+- **Cross-Region inference profiles** send requests to other Regions in a geography (or globally) to find capacity. Traffic leaves the source Region.
+- **Batch inference** processes a file of prompts asynchronously at a lower price; results come back later, not in real time.
+- **Provisioned Throughput** buys dedicated model units for one model in one Region, usually with a 1-month or 6-month commitment term (a no-commitment option exists in some cases). It gives guaranteed throughput for steady, high-volume traffic.
+Example: a claims assistant that handles 40 requests per second all day buys enough model units in `eu-central-1` and invokes the provisioned model ARN instead of the base model ID.
+W: Provisioned Throughput in that Region: dedicated model units provide guaranteed capacity for the one model, keep inference in the required Region, and match the steady 24-hour load and accepted term commitment.
+X: A=Batch inference for peaks: batch jobs return results asynchronously, which does not work for an interactive claims assistant.
+B=Higher on-demand quota: a quota increase raises the ceiling, but on-demand capacity is shared and not guaranteed, so throttling can still occur at peaks.
+C=Global cross-Region profile: it routes requests to other Regions, which breaks the single-Region regulatory requirement.
+T: For guaranteed, single-Region capacity on steady load with a term commitment, use Provisioned Throughput, not quota increases, batch jobs or cross-Region routing.
+
+@ Q001434 explain
+G: ## Hosting your own fine-tuned open-source LLM
+Amazon SageMaker AI real-time endpoints host models on instances you choose and scale them with auto scaling.
+- **Bring your own container (BYOC)**: package custom inference code, libraries and the model server in a Docker image in Amazon ECR that follows the SageMaker hosting contract (an HTTP server answering `/invocations` and `/ping` on port 8080).
+- **GPU instances** such as `ml.g5`, `ml.g6` or `ml.p4d` give the memory and compute that LLM generation needs for low latency.
+- Auto scaling adds instances (or inference component copies) as traffic grows.
+Example: model weights in S3, a vLLM-based container in ECR, and an endpoint on `ml.g5.2xlarge` with a target-tracking scaling policy.
+W: SageMaker real-time endpoint with BYOC on GPU: it supports the team's own container and inference code, low-latency synchronous requests, GPU acceleration and automatic scaling, which covers every requirement.
+X: A=Lambda with provisioned concurrency: Lambda has no GPUs, a 10 GB memory limit and a 10 GB image limit, so LLM inference on CPU would be slow and may not fit at all.
+B=Amazon Polly with a custom lexicon: Polly is a text-to-speech service; lexicons change pronunciation and cannot host an LLM.
+D=Amazon Kendra with a custom connector: Kendra is an enterprise search service; connectors bring in documents to index, not models to serve.
+E=Bedrock on-demand with the base model: this serves the original base model, not the team's fine-tuned weights, and does not run their custom inference code.
+T: Custom containers and custom weights on GPUs for real-time inference point to a SageMaker real-time endpoint with bring-your-own container.
+
+@ Q001435 explain
+G: ## Why LLM endpoints can queue while the GPU idles
+LLM generation produces tokens one at a time. If the model server handles one request at a time, each step does a small amount of math that uses a fraction of the GPU, and all other requests wait in line. The result: low utilization, long queues and high latency.
+## Batching strategies
+- **Dynamic batching**: collect requests that arrive within a short window and run them together.
+- **Continuous (rolling or in-flight) batching**: at every generation step, finished sequences leave and new requests join the running batch, so the GPU stays busy even when output lengths differ.
+LLM serving stacks such as vLLM, TensorRT-LLM and the SageMaker Large Model Inference (LMI) containers support continuous batching, often with paged KV-cache memory to fit more concurrent sequences.
+Example: moving from one request at a time to continuous batching with 32 concurrent sequences can multiply throughput on the same instance.
+W: Dynamic or continuous batching: it lets many requests share each generation step, raising GPU utilization and draining the queue, which directly fixes the under-used GPU and latency spikes.
+X: A=max_tokens of 1: responses would be a single token, so the application stops working; it hides the throughput problem by breaking the output.
+B=CPU-only instance: a 13B model on CPU is much slower per token, so latency and queues get worse, not better.
+D=Disable auto scaling: removing the ability to add capacity cannot help a queue that builds under load; the existing instance is still being used inefficiently.
+T: Low GPU utilization with growing queues on an LLM endpoint is a batching problem; enable continuous batching before adding hardware.
+
+@ Q001436 explain
+G: ## Chaining containers on one SageMaker endpoint
+A **SageMaker inference pipeline** is a model made of 2 to 15 containers that run in sequence on the same endpoint. Each container's output becomes the next one's input, and the client makes one call.
+- Container 1: validate the request and redact PII (for example with a custom library or Amazon Comprehend PII detection).
+- Container 2: the large model server.
+- Container 3: format the response (JSON schema, citations, trimming).
+A **multi-container endpoint** can host several containers too, either called directly or chained in serial mode.
+Benefits: each step is built and versioned as its own container and deployed together with the model; data stays inside the endpoint between steps; the model container stays a standard, unmodified server image.
+W: Inference pipeline or multi-container endpoint: it cleanly separates pre-processing, model and post-processing into their own containers while keeping one endpoint call and low overhead, and it guarantees PII is removed before the model sees it.
+X: B=Logic inside the forward pass: mixing validation and formatting into model code makes every change a model redeploy and complicates using an optimized LLM serving container.
+C=Redact only after the model: raw PII has already been sent to the model, where it can be logged or echoed; redaction must happen before inference.
+D=Client-called Lambda afterward: an extra synchronous call adds latency, relies on every client to remember it, and still performs no input validation or redaction before the model.
+T: For pre-processing, model and post-processing around a SageMaker model, chain containers in an inference pipeline so redaction runs before the model and each step stays separate.
+
+@ Q001437 explain
+G: ## Model cascading and routing
+Most requests in a typical application are simple, and a small model answers them well at a fraction of the price and latency of a large one. Routing strategies:
+- **Classifier routing**: a cheap classifier or rules decide which model gets the request.
+- **Cascade**: try the small model first; if a confidence or quality check fails (low score, validator rejects the output, user escalation), send the request to the larger model.
+Amazon Bedrock Intelligent Prompt Routing offers managed routing between models in the same family, sending each prompt to the model predicted to give the best cost and quality trade-off.
+Example: 85% of support questions go to a small model; the 15% flagged as complex or low-confidence go to a larger model, so the average cost is close to the small model's.
+W: Small model first, escalate when needed: the majority of simple queries get low cost and low latency, while complex cases still get the larger model's quality.
+X: A=Always the largest model: every simple request pays the highest price and latency, which contradicts the cost-conscious goal.
+C=Call two models and average: this roughly doubles cost on every request, and averaging free-text outputs does not produce a meaningful answer.
+D=Lower max_tokens for everything: truncated answers hurt the complex escalations most, and pushing users to rephrase damages quality instead of routing smartly.
+T: Get low cost and high quality together by routing simple requests to a small model and escalating only hard ones to a larger model.
+
+@ Q001438 explain
+G: ## Why GPU endpoints scale slowly
+A new SageMaker instance for an LLM must launch, pull a large container image, download many gigabytes of model weights and load them into GPU memory before it passes health checks. That can take several minutes, so reactive scaling arrives after the spike has already hit.
+Ways to reduce the impact:
+- **Warm minimum capacity**: set `MinCapacity` so enough instances are always ready for normal peaks.
+- **Scheduled pre-scaling**: raise capacity before known spikes (for example 08:45 on weekdays) with Application Auto Scaling scheduled actions.
+- **Inference components**: pack several model copies on each instance and scale copies, which is faster than adding whole instances when there is spare room.
+- For inference components, SageMaker features such as container caching and Fast Model Loader (streaming weights to the GPU) further shorten scale-out time, though startup still takes time.
+W: Warm minimum plus pre-scaling or packed copies: capacity already exists when the spike begins, so requests are served instead of dropped while new instances start.
+X: A=Move to Lambda: Lambda has no GPUs and a 10 GB memory limit, so it cannot serve this LLM with acceptable latency.
+B=Higher MaxCapacity: allowing more instances does not make each instance start faster; the 8-minute window still drops requests.
+D=Accept cold starts: startup impact can be reduced with warm capacity and scheduled scaling, so dropping requests is not necessary.
+T: When GPU instances take minutes to start, keep warm capacity and scale ahead of predictable spikes instead of only raising the maximum.
+
+@ Q001439 explain
+G: ## Choosing a model by requirements, not by size
+Start from the hard requirements, then minimize cost among the options that meet them:
+- **Accuracy floor**: at least 92%.
+- **Latency**: under 300 ms per review, in real time.
+- **Volume**: 5 million requests per day, so per-request price dominates.
+A smaller model **fine-tuned** on labeled reviews, or **distilled** from a large teacher model (Amazon Bedrock Model Distillation does this), learns a narrow task well and is typically faster and far cheaper per request.
+Example: at 1/15 of the cost, a daily bill of $1,500 on the large model would be about $100 on the smaller one, and 93% accuracy still clears the 92% bar.
+W: Smaller fine-tuned or distilled model: it meets the 92% floor and the 300 ms target at about one fifteenth of the cost; the extra 1% of the large model is not required.
+X: A=Overnight batch inference: batch results arrive hours later, which breaks the 300 ms live moderation requirement.
+B=Provisioned Throughput for the large model: reserved capacity can steady throughput and change pricing, but it keeps paying for a much larger model than the task needs and will not approach a 15x saving.
+C=Prompt caching on instructions: caching reduces the cost of the repeated prompt prefix, but each short review still needs a full large-model inference and output, so the savings are far smaller.
+T: When a smaller specialized model meets the accuracy and latency bars, serve it; optimizing the price of an oversized model saves much less.
+
+@ Q001440 explain
+G: ## Serving a Bedrock custom model
+Amazon Bedrock model customization (fine-tuning, continued pre-training, distillation) produces a **custom model** that lives inside Bedrock; you never manage its weights or servers.
+- Base models are served on-demand, paid per token.
+- A custom model has traditionally had to be served through **Provisioned Throughput**: you purchase model units for that custom model and call the provisioned model ARN.
+- For some supported base models, Bedrock now also offers on-demand deployment of custom models, billed per token, which is why this requirement only "generally" applies. For other custom models, and for guaranteed production capacity, Provisioned Throughput is the path.
+Example: after a fine-tuning job creates `my-claims-model`, you create Provisioned Throughput for it and invoke the returned ARN with the same `InvokeModel` or `Converse` APIs.
+W: Provisioned Throughput for the custom model: invoking a Bedrock-customized model has generally required purchased model units (on-demand custom model deployment covers only some supported models), whereas base models can be invoked on demand with no purchase at all.
+X: B=Containerize for ECS Fargate: Bedrock hosts custom models itself; you do not export them to containers to serve them.
+C=Host on Lambda from exported artifacts: Bedrock does not hand over the customized weights for self-hosting, and Lambda has no GPUs for model inference anyway.
+D=Query through Athena: Athena runs SQL over data in S3; it is not a model serving layer, and the custom model is not exported as a file to query.
+T: Bedrock-customized models are served inside Bedrock, generally through Provisioned Throughput, not by exporting them to other compute.
+
+@ Q001441 explain
+G: ## Sizing GPU instances for LLM inference
+A useful rule of thumb: model weights need about 2 bytes per parameter at FP16/BF16, plus room for the KV cache.
+- 7B parameters x 2 bytes is about 14 GB, which fits on a single GPU with 24 GB, such as the A10G in `ml.g5` or the L4 in `ml.g6` instances.
+- `ml.p4d.24xlarge` has 8 A100 GPUs and is priced for training and very large models, so a 7B model leaves most of it idle.
+Options:
+- **Right-size** to a smaller GPU instance, and benchmark throughput and latency.
+- **Pack models**: use inference components or multi-model hosting to run several models or copies on one instance.
+- **Quantize** (for example INT8) to fit on even smaller GPUs when quality allows.
+W: Right-size or pack multiple models: matching the instance to the model's real memory and compute needs, or filling the spare GPUs with other models, cuts cost while keeping performance.
+X: A=Keep it to future-proof: paying for unused GPUs today is waste, and SageMaker endpoints can be updated to a new instance type later without downtime.
+B=Batch size of one: smaller batches lower throughput and utilization further, and the instance price per hour does not change.
+D=CPU-only Graviton: a 7B LLM on CPU is much slower per token, which can break latency targets; the fix is a right-sized GPU, not no GPU.
+T: For an oversized GPU endpoint, right-size to the model's memory needs or pack several models on it; do not keep idle GPUs or drop to CPU.
+
+@ Q001442 explain
+G: ## Lambda limits for model hosting
+AWS Lambda is great for short, lightweight functions, but model hosting pushes several limits:
+- A .zip package, including all layers, can be at most 250 MB unzipped; a container image can be up to 10 GB.
+- Memory tops out at 10,240 MB, with no GPU.
+- Every cold start must initialize a new execution environment and load the model from the package into memory, so multi-gigabyte models add many seconds of startup. Even when a container image fits under 10 GB, this cold-start cost remains.
+Model-serving platforms handle this better:
+- **SageMaker Serverless Inference**: scales with requests and to zero; still has cold starts, but it is built for model containers.
+- **SageMaker real-time endpoints**: always-warm instances for low latency.
+- **Amazon ECS on Fargate**: long-running containers that load the model once and keep it in memory.
+W: SageMaker Serverless or real-time, or ECS/Fargate: these run the 2 GB model in a model-serving environment that loads it once per instance or container, avoiding Lambda's packaging constraints and its repeated heavy cold starts.
+X: A=15-minute timeout: the timeout limits how long one invocation may run; it does not shrink the package or make cold starts faster.
+C=gzip plus runtime decompression: model weights compress poorly, and decompressing gigabytes on every cold start makes the cold start even longer.
+D=Model in a Lambda layer: layers count toward the same 250 MB unzipped limit as the function, so a 2 GB model still does not fit.
+T: When a model is too big for Lambda's package and cold-start profile, host it on a model-serving platform such as SageMaker or ECS instead of squeezing it into Lambda.
+
+@ Q001443 explain
+G: ## SageMaker Serverless Inference
+Serverless Inference lets you deploy a model to an endpoint without choosing or managing instances.
+- You set memory (1 to 6 GB) and maximum concurrency; SageMaker AI provisions compute when requests arrive and scales to zero when idle.
+- You pay for compute time used per request and data processed, not for idle hours.
+- The trade-offs: cold starts after idle periods, CPU only (no GPUs), and memory and concurrency limits, which suit small models such as many embedding models.
+Optional provisioned concurrency keeps some capacity warm if cold starts become a problem.
+Example: an internal search tool calls an embedding model 20 times a day; with Serverless Inference, the endpoint cost is only those few seconds of compute and the data processed.
+W: SageMaker Serverless Inference: it has no always-on instances, scales to zero between the rare requests, and accepts cold-start latency, which exactly matches a low-traffic internal tool.
+X: A=Always-on ml.p4d instance: an 8-GPU instance running 24 hours a day for a few requests a day wastes almost all of its cost.
+C=Bedrock Provisioned Throughput: it is a committed, always-reserved capacity purchase for high steady traffic, which is costly for a handful of daily calls and is billed whether used or not.
+D=Fixed multi-AZ GPU Auto Scaling group: dedicated GPU instances you manage are the exact always-on infrastructure the team wants to avoid.
+T: For rare, latency-tolerant model calls without managing instances, use SageMaker Serverless Inference, which scales to zero.
+
+@ Q001444 explain
+G: ## Event-driven processing of S3 uploads
+Amazon S3 can emit an event whenever an object is created, so downstream processing starts without anyone polling the bucket.
+- Turn on **Amazon EventBridge** notifications for the bucket; each upload produces an `Object Created` event.
+- An EventBridge rule filters events, for example by bucket name and a key prefix such as `incoming/` or suffix `.pdf`.
+- The rule's target starts a **Step Functions** state machine (for multi-step work with retries) or a **Lambda** function, which reads the document and calls Amazon Bedrock to summarize it, then stores the result.
+S3 can also send notifications directly to Lambda, Amazon SQS or Amazon SNS; EventBridge adds richer filtering and many target types.
+Example: `incoming/report.pdf` is uploaded, EventBridge starts the workflow within seconds, and the summary lands in `summaries/report.json`.
+W: S3 event notification via EventBridge: S3 raises an event on each upload automatically, and the rule triggers the Bedrock pipeline immediately, with no polling and no manual step.
+X: A=Uploader publishes to SNS: this depends on every uploader remembering to publish, so missed or forgotten messages leave documents unprocessed; S3 can emit the event itself.
+B=Scheduled Lambda listing objects: listing the bucket every minute is polling, adds delay and cost, and becomes slow as the bucket grows.
+D=Browser polling every 10 seconds: it is client-side polling that only works while someone has the page open, and it exposes bucket access to the browser.
+T: To react to new S3 objects, let S3 emit events (via EventBridge) that start the pipeline; do not poll the bucket or rely on uploaders to notify.

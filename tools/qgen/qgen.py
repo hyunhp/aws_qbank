@@ -110,7 +110,7 @@ EXPL_HEAD = re.compile(r"^@\s*(Q\d{6})\s+explain\s*$")
 MULTILINE = {"G", "W", "X"}                       # continuation lines keep their line break
 RICH = "## "                                      # detailed explanations start with a heading
 MIN_RICH = {"G": 250, "W": 80, "X": 60}          # minimum characters (per X entry) for detailed blocks
-LETTER_REF = re.compile(r"\b(?:[Oo]ption|[Cc]hoice|[Aa]nswer)s?\s+[A-E]\b|\([A-E]\)|\b[A-E] is (?:wrong|correct|right)\b")
+LETTER_REF = re.compile(r"\b(?:[Oo]ption|[Cc]hoice|[Aa]nswer)s?[ \t]+[A-E]\b|\([A-E]\)|\b[A-E] is (?:wrong|correct|right)\b")
 
 
 def parse(path):

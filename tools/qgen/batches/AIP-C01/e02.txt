@@ -1,0 +1,382 @@
+# AIP-C01 detailed explanations, e02 (explanation-only rewrites; letters are the published ones)
+
+@ Q001445 explain
+G: ## Synchronous versus event-driven integration
+In a **synchronous** design the caller opens a request and waits until the work is finished. API Gateway in front of Lambda works this way: the client holds the connection, and API Gateway gives up after its integration timeout (29 seconds by default for REST APIs).
+In an **event-driven** design the producer drops a message and moves on. Consumers pick messages up when they have capacity.
+- **Amazon SQS** buffers the work: 100,000 records become 100,000 messages that wait safely until a worker is free.
+- **Worker Lambdas** poll the queue in batches; you cap their concurrency so Bedrock sees a steady request rate.
+- Failed messages become visible again and are retried; after `maxReceiveCount` attempts they move to a dead-letter queue for inspection.
+- **EventBridge** can start the job (for example a nightly schedule) and fan events out to other targets.
+## Example
+A nightly rule sends "start enrichment", a Lambda writes one message per CRM record to SQS, and workers call Bedrock and write summaries back. If Bedrock throttles, messages simply wait and retry.
+W: Event-driven design: SQS absorbs the whole batch, workers process at a controlled pace, and failures are retried or parked in a dead-letter queue, so no single connection has to stay open for the job.
+X: B=Synchronous API Gateway: every record ties up a client connection that must finish inside the integration timeout, there is no buffer when Bedrock throttles, and the caller must implement its own retries for 100,000 calls.
+C=Browser-side calls: the job would depend on users being logged in, model access would have to be exposed to the browser, and nothing coordinates or retries 100,000 calls overnight.
+D=Manual export and import: the job recurs every night, so a manual process is slow, error-prone and does not scale; it also gives no retries or audit trail for failed records.
+T: Bulk, unattended work belongs in a queue with controlled consumers; synchronous request-response only fits interactive calls that finish in seconds.
+
+@ Q001446 explain
+G: ## What a GenAI gateway is
+A **GenAI gateway** is a single internal API (for example API Gateway plus Lambda, or a container service) that every team calls instead of calling model providers directly. Because all traffic passes through it, it can apply cross-cutting policy in one place:
+- **Key custody**: provider API keys live in AWS Secrets Manager and only the gateway's role can read them; teams authenticate to the gateway, never to the provider.
+- **Quotas**: per-team limits, for example API Gateway usage plans per team API key or token counters kept in DynamoDB.
+- **Routing and fallback**: if a provider returns errors or times out, the gateway retries on another provider or model.
+- **Chargeback**: the gateway logs team, model and token counts for each call, which finance can aggregate per team.
+## Why service-native tools are not enough
+Bedrock features such as application inference profiles, and IAM or SCP controls, only see Bedrock traffic. Two of the three providers here are external APIs, so only a layer in front of all three can meet every requirement.
+W: Central GenAI gateway: it is the one component that sees every call to every provider, so it can hold the keys, enforce per-team quotas, fail over between providers and report per-team usage.
+X: A=Inference profile per team: application inference profiles tag and track Bedrock model usage for cost allocation, but they cannot represent external LLM APIs and do not route or fail over between providers.
+B=Per-team secrets with tags: teams would still hold the provider keys, which is what security wants to avoid, and tags on a secret say nothing about token spend or quotas.
+D=SCPs per account: SCPs can limit which Bedrock models an account may invoke, but they provide no quotas, no chargeback data, no fallback and no control over external providers.
+T: Requirements that span several providers (key custody, quotas, fallback, chargeback) need a gateway in the request path; Bedrock-only features cover only Bedrock.
+
+@ Q001447 explain
+G: ## Authentication versus authorization
+- **Authentication** proves who the user is (Okta checks the password and MFA).
+- **Authorization** decides what that user may do (invoke this model, query that knowledge base).
+## Federation with an existing IdP
+Instead of creating AWS identities, you trust the company IdP:
+- **IAM Identity Center** federates Okta (SAML or OIDC, with SCIM for group sync) and gives workforce users permission sets, which become IAM roles in each account.
+- **Amazon Cognito** federates Okta for application users and, through an identity pool, exchanges their tokens for temporary credentials of an IAM role.
+Either way, an Okta group such as `genai-analysts` maps to a role whose policy allows only what that group needs, for example `bedrock:InvokeModel` on two model ARNs and `bedrock:Retrieve` on one knowledge base, while `genai-admins` map to a broader role. Credentials are temporary and disappear when the user leaves Okta.
+W: Federate Okta and map groups to scoped roles: identities stay in Okta, each group gets a role limited to specific Bedrock actions and resources, and credentials are short-lived, which is least privilege without duplicate identities.
+X: A=IAM users with long-lived keys: duplicates every identity outside Okta, creates access keys that can leak and must be rotated, and offboarding in Okta would not remove AWS access.
+C=Broad access hidden by the UI: anyone who calls the API directly bypasses the UI, so the backend permissions, not the screen layout, define what users can actually reach.
+D=Login equals authorization: a successful Okta login only proves identity; without role checks an analyst would get the same model and knowledge base access as an admin.
+T: Let the existing IdP authenticate, then authorize with group-mapped roles scoped to specific Bedrock resources; never rely on the UI or on login alone.
+
+@ Q001448 explain
+G: ## AWS options outside a Region
+- **AWS Outposts**: AWS-owned racks or servers installed in your own facility. You launch EC2 instances, EBS volumes, ECS or EKS workloads on them with the same APIs, console and tooling as in the Region.
+- **AWS Wavelength**: AWS compute placed inside a telecom carrier's 5G network, for mobile devices on that network.
+- **AWS Local Zones**: AWS-run infrastructure in metro areas, still off your premises.
+- **AWS Direct Connect**: a private network link to a Region; the compute still runs in the Region.
+## How Outposts behaves when the link drops
+An Outpost is managed from its parent Region over a service link. If that link is interrupted, instances already running on the Outpost keep running and serving local traffic, although management actions such as launching new instances wait until the link returns.
+## Example
+A fine-tuned model is packaged in a container and served on a GPU instance on the Outpost; plant machines call it over the local network in milliseconds.
+W: AWS Outposts: inference runs on hardware inside the plant, so latency is local and running workloads survive Region link outages, while the team keeps the same AWS APIs and tools.
+X: A=Bedrock in the nearest Region: every uncached request needs the intermittent internet link, so inference stops or slows whenever the connection drops.
+B=Wavelength Zones: Wavelength runs inside a carrier's 5G network for mobile users, not inside a customer's factory, and still depends on the carrier network.
+C=Direct Connect: a dedicated link improves reliability but compute still runs in the Region, so a link failure still stops inference.
+T: When compute must live on your own premises but be managed like AWS, choose Outposts; a better network link to a Region is still a dependency on that link.
+
+@ Q001449 explain
+G: ## Where AWS compute can run near users
+- **Wavelength Zones** embed AWS compute and storage inside telecom carriers' 5G networks. Traffic from a phone reaches the application without leaving the carrier network, which removes the internet hops to a Region.
+- **AWS Outposts** puts AWS racks in the customer's own data center or factory.
+- **Amazon CloudFront** caches content and runs lightweight edge functions; it does not host GPU inference.
+- **AWS Direct Connect** is a private link from a corporate network to a Region.
+## Example
+An AR app on a 5G phone sends camera frames to an inference service running on EC2 in a Wavelength Zone attached to the app's VPC. The round trip stays within the carrier network, giving single-digit to low tens of milliseconds, which is suitable for AR overlays.
+W: AWS Wavelength: it is built for exactly this case, running application compute inside the 5G carrier network so mobile users get the lowest possible latency.
+X: A=Region plus CloudFront: CloudFront caches and accelerates content delivery, but inference would still run in the Region, and requests still leave the carrier network.
+C=Direct Connect with a private VIF: it connects a corporate network to a Region; mobile users on a carrier network do not use it, and the compute stays in the Region.
+D=Outposts: it places compute on the customer's own premises, not inside the telecom carrier's network where 5G users are connected.
+T: Carrier 5G edge for mobile users means Wavelength; customer-owned site means Outposts.
+
+@ Q001450 explain
+G: ## Why GenAI changes need quality gates
+A prompt template or agent change can compile, pass unit tests and deploy cleanly, yet make the model's answers worse. Traditional tests check code behavior; they do not check whether the answers are grounded and correct.
+## An evaluation gate
+- Keep a **golden dataset**: representative questions with reference answers or source documents.
+- In the pipeline, a CodeBuild stage runs the new prompt or agent against that dataset, for example with Amazon Bedrock model evaluation or an LLM-as-a-judge script, and scores metrics such as correctness, faithfulness and hallucination rate.
+- The stage fails if a score drops below a threshold or regresses versus the current version, so CodePipeline stops before production.
+- After promotion, monitor the same metrics and roll back to the previous prompt version or agent alias if they degrade.
+## Example
+A threshold of "faithfulness at least 0.9 and no drop greater than 2 points" would have blocked the change that raised hallucinations before any customer saw it.
+W: Automated evaluation gate with rollback: it measures output quality on known cases before promotion and blocks regressions, which is exactly what failed here.
+X: A=Manual deployments: removing automation makes releases slower and less consistent, and a person still would not detect a rise in hallucinations without an evaluation.
+B=Skipping staging: it guarantees customers become the test, which is how this regression was found in the first place.
+C=More infrastructure unit tests: tests on the infrastructure templates check how resources are defined, not what the model answers, so a bad prompt would still pass.
+T: GenAI pipelines need an automated output-quality evaluation on a golden dataset before promotion; code and infrastructure tests cannot catch a worse prompt.
+
+@ Q001451 explain
+G: ## API Gateway front-door features
+API Gateway has two main API types with different feature sets:
+- **REST APIs** support API keys with **usage plans** (per-key throttling and daily, weekly or monthly quotas), **request validators** that check parameters and a JSON body against a model schema before the integration runs, and direct association of an **AWS WAF** web ACL.
+- **HTTP APIs** are simpler and cheaper and support JWT authorizers, but they do not support API keys, usage plans, request validation or direct WAF association.
+## Example
+Create one API key per partner and attach all 40 to a usage plan with a quota of 10,000 requests per day. Add a request validator with a JSON schema, so a malformed body gets a `400` response without invoking Lambda. Associate a WAF web ACL with the stage for managed rule groups.
+W: REST API with usage plans, validation and WAF: every requirement is a built-in, configuration-only REST API feature, so no custom code is needed.
+X: B=Function URL with IAM auth: function URLs have no API keys or usage plans, partners would need AWS credentials, and schema validation would have to be coded inside the function, which still invokes Lambda for bad input.
+C=HTTP API with JWT authorizer: HTTP APIs do not support API keys, usage plans or request validation, and they cannot be associated with a WAF web ACL directly.
+D=ALB with WAF rate rules: rate-based rules count requests per IP or other keys, not per partner quota, and an ALB has no API keys or JSON schema validation.
+T: Per-client keys, quotas and body validation are REST API features; HTTP APIs trade them away for lower cost and simplicity.
+
+@ Q001452 explain
+G: ## Loose coupling with events
+When a job finishes, the job runner can either call every consumer itself (tight coupling) or announce "job completed" once and let interested systems react (loose coupling).
+**Amazon EventBridge** is an event bus built for the second style:
+- The producer sends one event with `PutEvents`, for example `detail-type: "BatchJobCompleted"` with the job ID and output S3 location.
+- Each consumer owns a **rule** with an event pattern and a target: an SNS topic for email, a Lambda that updates the dashboard, a Step Functions workflow that loads the data lake.
+- Adding a fourth consumer means adding a rule; the job code never changes.
+- Failed deliveries are retried and can go to a dead-letter queue.
+## Example
+Rule `source = "genai.batch"` and `detail.status = "Completed"` targets three different services, each managed by a different team.
+W: Custom EventBridge event: the job publishes one completion event and each downstream system subscribes with its own rule and target, so consumers are independent and can be added or removed without touching the job.
+X: B=One SNS email topic: email is meant for people; a dashboard and a data lake pipeline would have to parse emails, which is fragile and slow.
+C=Polling every second: every system repeatedly calls the job status API, wasting calls, risking throttling and still reacting later than an event would.
+D=Direct calls from the job: the job must know about, authenticate to and handle failures for every consumer, and each new consumer needs a code change.
+T: One event, many independent consumers: publish to EventBridge and let each consumer own its rule, instead of hardcoding calls or polling.
+
+@ Q001453 explain
+G: ## Cross-account access with roles
+The standard pattern is a role in the account that owns the resource plus `sts:AssumeRole` from the other account:
+- In the platform account, create a role such as `BedrockInvoke-Marketing`. Its **trust policy** allows principals from the marketing account to assume it.
+- Its **permissions policy** allows only the needed actions on the needed resources, for example `bedrock:InvokeModel` on `arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-...`.
+- In the marketing account, the application's own role is allowed to call `sts:AssumeRole` on that role ARN.
+- STS returns temporary credentials that expire automatically; CloudTrail in the platform account records which role made each call.
+## Why this is least privilege
+Each application account gets its own role with its own model list, so marketing cannot invoke models intended only for support, and nothing long-lived is shared.
+W: Scoped cross-account roles with AssumeRole: each account gets temporary credentials limited to specific model ARNs and actions, with a trust policy naming exactly which account may use them.
+X: A=Public resources with API keys: Bedrock model access is controlled by IAM, not by public exposure, and opening resources to everyone contradicts least privilege.
+C=Root user access: the root user has unrestricted power and should be used only for a few account-level tasks, never for routine application access.
+D=Shared long-lived key: one key used by every account cannot be scoped per account, can leak from any of them, and quarterly rotation still leaves a long exposure window.
+T: For cross-account model access, use per-account roles scoped to specific model ARNs and assumed with STS, never shared keys or broad grants.
+
+@ Q001454 explain
+G: ## The governance gap
+**Provisioned Throughput** buys a fixed amount of model capacity (model units) for one model. If several teams share it and call Bedrock directly, nothing stops one team from using most of it, and nobody sees usage per team until the bill arrives.
+## A GenAI gateway
+Put an internal API in front of Bedrock, for example API Gateway plus a Lambda proxy:
+- Each team gets its own API key or authorizer identity.
+- **Usage plans** or custom token counters give every team a request or token quota.
+- The Lambda logs team, model and input and output tokens for each call, for example to CloudWatch or DynamoDB, which supports dashboards and chargeback.
+- Teams no longer need direct `bedrock:InvokeModel` permission, so the gateway is the only path.
+## Example
+Team A has 40 percent of the shared capacity and team B 30 percent; when team A exceeds its quota it receives `429` responses while team B keeps working.
+W: GenAI gateway with quotas and attribution: it controls usage before capacity is exhausted and records who used what, instead of discovering overuse afterward.
+X: A=Single engineer submitting requests: a person becomes a bottleneck and a single point of failure, and it provides no automated quota or measurement.
+C=Disable other teams: it blocks legitimate workloads and still gives no per-team limits for when access is restored.
+D=Monthly bill review: it only reveals overuse after the other teams have already been starved, and the bill does not attribute usage to individual teams calling the same shared capacity.
+T: Shared model capacity needs proactive per-team quotas and usage attribution in the request path, not after-the-fact bill reviews.
+
+@ Q001455 explain
+G: ## Two problems: network path and protocol
+A cloud agent calling a legacy on-premises system must solve two separate problems.
+**Private connectivity**
+- **AWS Site-to-Site VPN** creates encrypted IPsec tunnels over the internet between the VPC and the data center; it is quick to set up.
+- **AWS Direct Connect** is a dedicated private link with consistent bandwidth and latency.
+Either lets a Lambda function in the VPC reach the SOAP endpoint's private IP without exposing it to the internet.
+**Protocol translation**
+Agents call tools with JSON (for example a Bedrock agent action group backed by Lambda). A SOAP service expects XML envelopes. A Lambda function, or an API Gateway integration with mapping templates, translates `{"sku":"A-100"}` into a SOAP `GetStock` request and maps the XML response back to JSON.
+## Result
+The agent gets real-time, write-capable access to inventory through a normal tool interface, while the legacy system stays private.
+W: Hybrid connectivity plus translation: VPN or Direct Connect gives a private path, and Lambda or API Gateway converts REST/JSON tool calls to SOAP, so the agent sees live inventory securely.
+X: A=Expose SOAP to the internet: AWS IP ranges are shared by many customers, so an allowlist of them does not restrict access to this account, and the legacy system becomes an internet-facing attack surface.
+B=Knowledge Base over exports: retrieval over exported files is read-only and only as fresh as the last export, so the agent cannot check live stock or place reservations.
+C=Periodic S3 copies with Athena: the snapshot is stale between copies and read-only, so order processing could promise stock that no longer exists.
+T: Legacy integration needs both a private network path and a protocol translation layer; copies or public exposure trade away freshness or security.
+
+@ Q001456 explain
+G: ## Gradual deployment for Lambda
+A Lambda **alias** (for example `live`) points to a published **version**. An alias can split traffic between two versions by weight.
+**AWS CodeDeploy** automates that shift:
+- **Canary**: move a small share first, then the rest, for example `LambdaCanary10Percent5Minutes` sends 10 percent for 5 minutes, then 100 percent.
+- **Linear**: move in equal steps, for example `LambdaLinear10PercentEvery1Minute`.
+- **All-at-once**: move 100 percent immediately.
+CodeDeploy watches **CloudWatch alarms**, for example on the function's `Errors` metric or the tool's failure rate. If an alarm fires during the shift, it moves the alias back to the old version automatically. Optional pre-traffic and post-traffic hook functions can run tests.
+## Example
+A bad release that fails 30 percent of calls affects only 10 percent of traffic for a few minutes before rollback, instead of every agent request.
+W: CodeDeploy canary or linear with alarm rollback: only a small share of traffic reaches the new version at first, and a failing release is rolled back automatically, which minimizes the blast radius.
+X: A=All-at-once: every request hits the new version immediately, so a bad release affects all agent tool calls until someone notices and reverts.
+B=Console code edits: changes are untracked, go straight to all traffic, and reverting depends on someone remembering the previous code.
+C=Manual alias switch later: keeping versions separate is good, but the eventual switch is still all-or-nothing with no automatic rollback when errors rise.
+T: For critical Lambda functions, shift traffic gradually with CodeDeploy and let CloudWatch alarms roll back automatically.
+
+@ Q001457 explain
+G: ## Two AWS identity services for different audiences
+- **IAM Identity Center** is for the **workforce accessing AWS**: users sign in through the IdP and get console, CLI or SDK access to AWS accounts through permission sets.
+- **Amazon Cognito** is for **users of your application**, in two parts:
+- A Cognito **user pool** signs users in and can federate a SAML or OIDC IdP, so employees keep corporate single sign-on.
+- A Cognito **identity pool** exchanges the user pool token for temporary AWS credentials of an IAM role.
+## Per-user scoping
+The identity pool role's policy can use the policy variable `${cognito-identity.amazonaws.com:sub}`, which is the caller's unique identity ID. For example, allow `s3:GetObject` and `s3:PutObject` on `arn:aws:s3:::app-bucket/users/${cognito-identity.amazonaws.com:sub}/*`. Every user gets the same role, but each can reach only their own prefix. No IAM users are created and the credentials expire automatically.
+W: Cognito user pool with SAML plus identity pool: employees keep SSO, the browser receives short-term credentials, and a policy variable limits each user to their own S3 prefix without any IAM users.
+X: A=IAM Identity Center permission sets: they give workforce users roles in AWS accounts for console and CLI access, not per-user, browser-delivered credentials scoped to an application's S3 prefixes.
+B=IAM user per employee via SCIM: it breaks the no-IAM-users rule and creates long-term credentials; SCIM with Identity Center provisions Identity Center users, not IAM users.
+D=Shared embedded IAM key: every browser can read the long-lived key, and all users share one identity, so per-user prefix scoping is impossible.
+T: App end users who need scoped temporary AWS credentials use Cognito user and identity pools; workforce access to AWS accounts uses IAM Identity Center.
+
+@ Q001458 explain
+G: ## Why bursts cause throttling
+Bedrock on-demand inference has per-account quotas such as requests per minute and tokens per minute for each model. If thousands of requests arrive at once, the ones above the quota receive `ThrottlingException`. Sending them faster or retrying instantly only adds more requests to the same limit.
+## Queue-based load leveling
+- The application writes each document request to an **Amazon SQS** queue instead of calling Bedrock directly.
+- A worker Lambda is triggered by the queue with **maximum concurrency** set, for example 20, so at most 20 calls run at once.
+- Throttled or failed messages return to the queue after the visibility timeout and are retried; repeated failures go to a dead-letter queue.
+- Results are stored, and the client is notified or polls for status.
+## Example
+A burst of 5,000 requests becomes a queue that drains at a steady rate within the quota over several minutes, instead of thousands of throttling errors in seconds.
+W: SQS buffer with rate-matched workers: the queue absorbs the burst and workers call Bedrock only as fast as the throughput allows, so requests wait instead of failing.
+X: B=Max Lambda concurrency without a queue: more concurrent functions send even more simultaneous calls into the same quota, which increases throttling.
+C=Synchronous WebSockets: holding clients on open connections does not reduce the number of model calls or smooth their rate; the load on Bedrock is unchanged.
+D=Immediate retries: retrying at once adds requests exactly when the quota is exhausted, which amplifies the throttling storm.
+T: Smooth bursty demand with a queue and concurrency-limited consumers; more parallelism or instant retries only push harder against the same limit.
+
+@ Q001459 explain
+G: ## Push and two-way messaging
+Plain HTTP is request-response: the client asks, the server answers once. A chat that streams tokens and accepts interruptions needs the server to push many messages and the client to send messages at any time.
+## API Gateway WebSocket APIs
+- The browser opens one persistent connection; API Gateway assigns a `connectionId`.
+- Messages from the browser are routed by a route key, for example `sendMessage` or `interrupt`, to Lambda integrations.
+- The backend calls Bedrock with a streaming API such as `ConverseStream` or `InvokeModelWithResponseStream` and pushes each chunk to the browser with the `@connections` API (`PostToConnection`).
+- When an `interrupt` message arrives, the backend marks the session as stopped (for example in DynamoDB) and the streaming loop stops sending.
+## Example
+The user sees words appear as they are generated and can press "Stop"; the stop message travels over the same open connection with no polling delay.
+W: WebSocket API with Lambda relaying chunks: one persistent, bidirectional connection lets the backend push tokens as they arrive and lets the browser send interruptions immediately.
+X: B=SQS FIFO read by the browser: SQS is a server-side queue that consumers must poll, exposing it to browsers needs AWS credentials in the client, and it adds polling delay.
+C=SES per chunk: SES sends email; delivery takes seconds or more, it is not a browser channel, and it cannot carry user interruptions back.
+D=REST polling every 500 ms: up to half a second of added delay per update, many wasted requests, and interruptions are only seen on the next poll.
+T: Real-time streaming with user interrupts needs a persistent two-way channel such as WebSockets, not polling or message queues.
+
+@ Q001460 explain
+G: ## Why tight retry loops make throttling worse
+A `ThrottlingException` means the caller is already sending more than its quota allows. Retrying immediately adds even more requests at the worst moment, so more calls get throttled.
+## Two complementary fixes
+- **Exponential backoff with jitter**: each retry waits longer (for example 0.2 s, 0.4 s, 0.8 s, up to a cap), and jitter picks a random delay within that window so clients do not retry at the same instant.
+- **Client-side rate limiting**: a token bucket limits how many requests leave the client per second, so bursts are smoothed before they ever reach Bedrock.
+The AWS SDKs implement retries with backoff and jitter in the `standard` retry mode. The `adaptive` mode adds a client-side rate limiter that slows down when throttling is detected. In boto3, for example, `Config(retries={"mode": "adaptive", "max_attempts": 5})`.
+W: B=Client-side rate limiting: it caps the outgoing request rate so bursts are spread out and fewer requests exceed the quota in the first place.
+D=Backoff with jitter: growing, randomized delays give the service time to recover and prevent retries from piling up into synchronized waves.
+X: A=Remove all retries: transient throttles become user-facing failures, even though most would succeed after a short wait.
+C=Longer connection timeout: the timeout controls how long to wait for a connection, not how often requests are sent, so the throttling rate is unchanged.
+E=Retry as fast as possible: this is the current behavior, and it keeps the request rate above the quota, worsening throttling.
+T: Fix throttling by sending less (rate limiting) and retrying smarter (backoff with jitter), which the SDK's retry modes can provide.
+
+@ Q001461 explain
+G: ## Fallback as a resilience pattern
+A **fallback** is a second path used only when the primary fails. For model calls it can be:
+- a **secondary model**, for example a different model that meets the quality bar;
+- a **secondary Region**, for example through a cross-Region inference profile, which lets Bedrock route requests to other Regions in a geography when capacity is constrained.
+## How to implement it
+- Set a client timeout on the primary call that matches the user experience, for example 8 seconds.
+- On timeout, throttling or server error, call the fallback once.
+- Log and emit a metric for each fallback, so the team sees how often it happens and can alarm on it.
+- Test fallback output quality in advance, since answers may differ slightly.
+Because the fallback runs on demand only when needed, it adds almost no cost on normal days, unlike reserving extra Provisioned Throughput.
+W: Fallback on failure with logging: requests that time out or fail are retried on a secondary model or Region, users still get answers during capacity events, and the team pays for the fallback only when it is used.
+X: B=Reduce alerting: fewer alerts hide the problem but do nothing for users whose requests are slow or failing.
+C=Fallback first on every call: it pays for the secondary model on every request, gives users the secondary model's quality most of the time, and still has no plan when that model fails.
+D=Friendly error message: users still fail to get answers during every capacity event; it improves wording, not resilience.
+T: Use a secondary model or Region only when the primary fails, and log each fallback, to gain resilience without paying for idle capacity.
+
+@ Q001462 explain
+G: ## Model routing
+**Model routing** sends each request to one of several models, usually to balance cost, latency and quality.
+- **Static (rule-based) routing** uses fixed rules decided ahead of time, for example "category = FAQ or length under 200 characters goes to the small model; everything else goes to the large model". The rules live in code or configuration and change only when someone edits them.
+- **Dynamic routing** decides at runtime using signals computed per request, for example a classifier's intent score or confidence, current latency, or cost budget, often orchestrated by a workflow such as Step Functions.
+## Example
+A support app checks the ticket category field: `billing-faq` goes to a fast, inexpensive model; `troubleshooting` goes to a capable model. No evaluation of meaning happens at runtime, only a lookup of a preset rule.
+W: Static (rule-based) routing: the model is chosen by fixed rules configured in advance, such as message length or ticket category, which is the definition of static routing.
+X: A=No routing: two different models are selected per request, so routing is clearly happening even if each rule maps to one model.
+C=Dynamic runtime routing: that would involve evaluating each request at runtime, for example with a classifier in a Step Functions workflow, not applying a fixed preconfigured rule.
+D=Random routing: requests are assigned by type, not randomly, and random assignment would send complex tickets to the small model.
+T: Fixed, preconfigured rules mean static routing; runtime evaluation of each request, such as a classifier, means dynamic routing.
+
+@ Q001463 explain
+G: ## Static versus orchestrated dynamic routing
+- **Static routing** hardcodes rules in application logic. It is fast and simple, but every policy change needs a code change and redeployment, and it has no built-in retries or review steps.
+- **Dynamic routing with AWS Step Functions** runs a workflow per request: a task calls a classifier, a **Choice** state picks a model based on the output, and states can add **Retry** and **Catch** (fallback to another model) or a human review step using a task token callback.
+## Tradeoff
+Step Functions adds state transitions, which means some extra latency, cost and complexity. In return, routing logic is visible, testable and changeable in the state machine definition without touching the application code.
+## Example
+A new rule "if classifier confidence is below 0.6, send to human review" becomes one new Choice branch in the workflow instead of a release of the application.
+W: Step Functions dynamic routing: a runtime classifier drives the model choice, and built-in retries, fallbacks and human review steps make a complex, changing policy resilient and easy to evolve.
+X: A=Functionally identical: static rules cannot use runtime classifier output or add retries, fallback and human review without new code, so the two differ in exactly the dimensions asked about.
+B=Static always superior: static routing wins on simplicity and latency for simple, stable rules, but it is inflexible for complex, evolving policies.
+D=Usage plans alone: API Gateway usage plans throttle and set quotas per API key; they do not inspect requests or choose between models.
+T: For complex, evolving routing policies, accept some latency for an orchestrated dynamic router; keep static rules for simple, stable choices.
+
+@ Q001464 explain
+G: ## How API Gateway canary releases work
+For a REST API stage, a **canary** sends a percentage of requests (for example 10 percent) to a new deployment while the rest go to the current one. Canary settings include:
+- `percentTraffic`: the share of requests that go to the canary.
+- **Stage variable overrides**: values used only by canary requests, for example `lambdaAlias = v2` while the main stage keeps `lambdaAlias = v1`.
+Integrations often reference a stage variable, such as a Lambda function ARN ending in `:${stageVariables.lambdaAlias}`. If the variable or override points to the wrong alias, or the percentage is not what the team expected, some requests reach the old backend.
+## Checklist
+- Confirm the canary percentage.
+- Confirm the canary's stage variable overrides and the main stage's variables.
+- Confirm each Lambda alias points to the intended version.
+- When the canary is healthy, promote it so all traffic uses the new deployment and variables.
+W: Check canary settings and stage variables: intermittent routing to the old backend is the signature of a canary split or stage variable mapping that still points part of the traffic to the old alias or model version.
+X: A=Wait for the release: some split is expected during a canary, but the team suspects misconfiguration; waiting leaves a possible error in place and could promote a wrong mapping.
+C=Clear browser caches: the responses come from the API backend, and the inconsistency follows how API Gateway routes requests, not what the browser stored.
+D=Delete and rebuild without canary: it is drastic, causes disruption, and removes the canary safety net instead of fixing the mapping.
+T: Inconsistent backends during a canary point first to the canary percentage and stage variable to alias mappings.
+
+@ Q001465 explain
+G: ## Reaching AWS APIs from a private VPC
+AWS service APIs such as `bedrock-runtime` are public endpoints. A subnet with no internet gateway or NAT cannot reach them, so SDK calls hang until they time out.
+## VPC endpoint types
+- **Interface endpoints** (AWS PrivateLink) create network interfaces with private IPs in your subnets for a specific service, for example `com.amazonaws.us-east-1.bedrock-runtime`. With private DNS enabled, the normal hostname resolves to those private IPs, so boto3 works without code changes.
+- **Gateway endpoints** add a route to the route table, but they exist only for Amazon S3 and DynamoDB.
+## For this case
+Create an interface endpoint for `bedrock-runtime` in the Studio subnets, allow HTTPS (port 443) from the Studio security group in the endpoint's security group, and optionally attach an endpoint policy that allows only the four models being compared.
+W: Interface endpoint for bedrock-runtime: it gives the VPC-only Studio domain a private path to the Bedrock runtime API, so boto3 calls work unchanged and no internet egress is added.
+X: B=Public internet mode: security has explicitly refused any egress change, so this breaks the stated constraint.
+C=Gateway endpoint for Bedrock: gateway endpoints are available only for S3 and DynamoDB; Bedrock is reached through interface endpoints.
+D=API Gateway and Lambda layer: notebooks can call Bedrock directly once a private path exists, and the notebook would still need a private path to reach the new API, so it adds work without solving the problem.
+T: SDK calls from a private VPC need interface endpoints (or NAT); gateway endpoints only exist for S3 and DynamoDB.
+
+@ Q001466 explain
+G: ## Two layers of limits
+- **Bedrock service quotas** apply to the whole AWS account per model. When they are hit, every caller of the application is throttled equally, including the well-behaved ones.
+- **API Gateway usage plans** apply per client. Each plan sets a **throttle** (steady rate and burst in requests per second) and a **quota** (requests per day, week or month), and API keys are attached to plans.
+## How usage plans fix fairness
+If a key exceeds its throttle or quota, API Gateway returns `429 Too Many Requests` for that key only, before the request reaches the backend. Other customers' keys keep their own allowance, so the account-level Bedrock quota is no longer consumed by a few heavy users.
+## Example
+Standard plan: 5 requests per second and 5,000 per day; premium plan: 50 per second and 100,000 per day. AWS notes that usage plan throttling is applied on a best-effort basis, so for malicious abuse it is typically combined with AWS WAF rules.
+W: Usage plans with per-key throttling and quotas: each API key is capped individually at the API layer, so a few heavy keys cannot starve everyone else of the shared backend quota.
+X: B=Rely on Bedrock throttling: it is account-wide, so throttling hits all customers together and does nothing to limit the specific abusive keys.
+C=Disable CloudWatch metrics: it removes visibility into which keys are heavy and does nothing to limit them.
+D=Remove authentication: without keys there is no per-client identity at all, so abuse becomes easier and cannot be attributed or limited.
+T: Per-client fairness comes from usage plans on API keys at the front door; an account-wide backend quota treats all clients the same.
+
+@ Q001467 explain
+G: ## Reading an X-Ray trace
+AWS X-Ray breaks one request into **segments** and **subsegments**, such as API Gateway, Lambda and the Bedrock `InvokeModel` call, each with its own duration. The rule is simple: optimize the part where the time is spent. If 90 percent is inside `InvokeModel`, tuning Lambda or API Gateway can save at most 10 percent.
+## Levers for model-side latency
+- **Model choice**: smaller or faster models generate tokens faster; test whether one meets the quality bar for support answers.
+- **Capacity**: Provisioned Throughput gives dedicated capacity for a model, which avoids contention with shared on-demand capacity during busy periods.
+- **Output length**: fewer output tokens means less generation time.
+- **Streaming** (`InvokeModelWithResponseStream` or `ConverseStream`): total generation time is similar, but the first words appear quickly, so users perceive a much faster response.
+W: A=Smaller model or Provisioned Throughput: it attacks the model call itself, the segment that holds 90 percent of the latency.
+C=Streaming invocation: users see tokens as soon as they are generated, which greatly reduces perceived latency even when total model time stays similar.
+X: B=Cache every response: support questions vary a lot, so exact-match cache hits would be rare, and cached answers risk being stale or wrong for a specific customer.
+D=More Lambda memory: it speeds up the function's own compute, which the trace shows is only a small fraction of the time; the function mostly waits on the model.
+E=More retries with longer backoff: retries repeat the slow call and add waiting, so they increase end-to-end latency rather than reduce it.
+T: Optimize where the trace shows the time is spent: reduce model latency directly, and stream to improve perceived speed.
+
+@ Q001468 explain
+G: ## The thundering herd
+When many clients hit a limit at the same moment and all wait the **same fixed delay**, they all retry at the same moment again. The retries arrive as a synchronized wave, trigger throttling again, and the cycle repeats. Making the fixed delay longer only makes the waves less frequent.
+## Backoff with jitter
+- **Exponential backoff**: the delay grows with each attempt, for example base 100 ms times 2 to the power of the attempt number, which reduces pressure on the service.
+- **Jitter**: each worker picks a random delay, for example "full jitter" chooses anywhere between 0 and the current backoff, which spreads retries across time.
+- **Cap**: a maximum delay, for example 20 seconds, keeps latency bounded.
+- **Attempt limit**: after, say, 5 attempts, fail or send the item to a dead-letter queue.
+With 200 workers, jitter turns one spike of 200 retries into a spread of a few retries at a time.
+W: Exponential backoff with jitter, capped and limited: randomized, growing delays break the synchronization among the 200 workers and reduce load, while the cap and attempt limit keep latency bounded.
+X: B=Immediate retries with more attempts: retrying at once adds load to a service that is already throttling, and more attempts just prolong the storm.
+C=Fixed 5-second delay: all workers still wait the same time, so the waves continue, just every 5 seconds instead of every second.
+D=Permanent circuit breaker: circuit breakers should open temporarily and close after a cooldown; stopping permanently after one throttle turns a transient condition into an outage.
+T: Fixed-interval retries synchronize clients; jitter breaks the synchronization and exponential backoff reduces pressure.
+
+@ Q001469 explain
+G: ## Dynamic (intelligent) model routing
+**Dynamic routing** chooses a model per request at runtime, based on something computed about that request. A typical AWS design:
+- A lightweight **Lambda classifier** (rules, a small model or a Bedrock call) labels each request, for example `simple` or `complex`, with a confidence.
+- An **AWS Step Functions** workflow uses a **Choice** state on that label: `simple` goes to a small on-demand model, `complex` to a large model on Provisioned Throughput.
+- New rules become new Choice branches in the state machine definition, deployed independently of the client and application code.
+## Why it saves money
+Most traffic is usually simple, so it runs on a cheaper, faster model, while the expensive capacity is kept for requests that need it.
+## Contrast
+Static routing uses fixed rules decided ahead of time, such as a category field, with no evaluation of the request's content at runtime.
+W: Dynamic routing via Step Functions: a runtime classifier drives a Choice state that picks the model per request, and routing rules can change in the workflow without redeploying application code.
+X: A=Hardcoded client if/else: it is static logic inside the mobile app, so every rule change needs a new app release, which the team explicitly wants to avoid.
+B=Static configuration file: it has no runtime evaluation of each request, while this design classifies every request before choosing a model.
+C=Route 53 weighted records: DNS weighting splits traffic between endpoints by percentage at name resolution time; it cannot inspect a request and choose a model for it.
+T: A runtime classifier plus an orchestrated, independently updatable decision step is dynamic routing; fixed preconfigured rules are static routing.

@@ -1,0 +1,581 @@
+# SAA-C03 batch 08: D1 secure architectures (15) + D4 cost-optimized architectures (10), detailed explanations
+
+@ SAA-C03 D1 T1.1 advanced use-case
+S: A security team must guarantee that no principal outside the company's AWS organization can read data from any S3 bucket in its 60 member accounts, even if a developer later writes a bucket policy that grants access to an external account. Which solution meets this requirement with the LEAST ongoing effort?
+A: Attach a resource control policy (RCP) to the organization root that denies S3 access when aws:PrincipalOrgID does not match the organization
+B: Attach a service control policy (SCP) to the organization root that denies S3 access when aws:PrincipalOrgID does not match the organization
+C: Enable S3 Block Public Access at the account level in every member account and turn on IAM Access Analyzer for all of those accounts
+D: Deploy an AWS Config rule that detects external principals in bucket policies and triggers a Lambda function to remove the offending statements
+K: A
+W: Resource control policy: an RCP sets the maximum permissions on the resources in member accounts, whoever the caller is. A deny for callers whose `aws:PrincipalOrgID` is not the organization therefore blocks external accounts even when a bucket policy grants them access, and it is set once at the root.
+X: B=Service control policy: SCPs only limit principals that belong to the organization's own accounts. A role in an external account is not governed by the company's SCPs, so a permissive bucket policy would still let it in.
+C=Block Public Access plus Access Analyzer: Block Public Access stops public (anonymous or everyone) grants, but a grant to one specific external account ID is not public. Access Analyzer only reports such access after the fact; it does not prevent it.
+D=Config rule with Lambda remediation: this is detective and reactive. Between the policy change and the remediation run the external account can read data, and the custom rule and function must be maintained.
+T: SCPs cap what your own principals can do; RCPs cap what anyone can do to your resources, which is how you build an organization-wide data perimeter.
+G: ## Two kinds of organization guardrails
+AWS Organizations offers two authorization policy types that set a ceiling on permissions but never grant anything:
+- **Service control policies (SCPs)** apply to IAM users and roles *in* member accounts. They answer "what may my principals do?"
+- **Resource control policies (RCPs)** apply to resources *in* member accounts, such as S3 buckets, KMS keys, SQS queues and Secrets Manager secrets. They answer "what may anyone do to my resources?"
+## Building a data perimeter
+A typical RCP statement denies `s3:*` on all resources when the caller's `aws:PrincipalOrgID` is not `o-exampleorgid`, with an exception such as `aws:PrincipalIsAWSService` so AWS services acting on your behalf keep working.
+Because the RCP is evaluated together with the bucket policy, an explicit deny in the RCP wins over any allow a developer writes later. Example: a bucket policy grants `s3:GetObject` to account `999988887777`; with the RCP in place the request from that account is still denied.
+RCPs do not apply to resources in the management account or to actions taken by service-linked roles, so keep workload data in member accounts.
+V: AWS Organizations, Amazon S3, IAM Access Analyzer
+
+@ SAA-C03 D1 T1.1 applied use-case
+S: A company with data residency rules must prevent every IAM principal in its workload accounts, including account administrators, from creating resources outside eu-west-1 and eu-central-1. Global services such as IAM, CloudFront, and Route 53 must keep working. What should a solutions architect do?
+A: Opt out of all other Regions in each account's settings page so those Regions cannot be used, and leave global service endpoints enabled for every principal
+B: Attach an SCP that denies all actions except global services when aws:RequestedRegion is not eu-west-1 or eu-central-1 to the workload OU
+C: Attach a permissions boundary to every IAM user and role in the workload accounts that allows actions only when aws:RequestedRegion is an EU Region
+D: Deploy an AWS Config rule in every Region that marks resources outside the EU as noncompliant and deletes them with an automatic remediation action
+K: B
+W: SCP with aws:RequestedRegion: a deny statement using `NotAction` for the global services and a `StringNotEquals` condition on `aws:RequestedRegion` blocks every Regional API call outside the two allowed Regions for all principals in the OU, and account administrators cannot remove an SCP.
+X: A=Opt out of Regions: only opt-in Regions (those launched after March 2019) can be disabled. Default Regions such as us-east-1 or ap-northeast-1 are always enabled and cannot be turned off, so this leaves most Regions open.
+C=Permissions boundaries: boundaries must be attached to each principal, and administrators in the account can create new roles without one or detach it. It is not a guardrail they are unable to bypass.
+D=Config rule with deletion: this detects resources after they already exist outside the EU, which may already violate residency rules, and automatic deletion of workloads is risky. It does not prevent creation.
+T: To restrict Regions for everyone in an account, including admins, use an SCP on aws:RequestedRegion with a NotAction exception for global services, not per-principal policies or detective rules.
+G: ## How Region restriction works
+Every Regional API call carries the condition key `aws:RequestedRegion`, for example `eu-west-1`. A service control policy (SCP) attached to an organizational unit (OU) can deny calls when that key is not in an approved list.
+## The global service exception
+Some services, such as IAM, CloudFront, Route 53, Organizations and Support, are global and their API calls are made against `us-east-1`. A plain Region deny would break them, so the statement uses `NotAction` to exclude them:
+- `"Effect": "Deny"`, `"NotAction": ["iam:*", "cloudfront:*", "route53:*", ...]`
+- `"Condition": {"StringNotEquals": {"aws:RequestedRegion": ["eu-west-1", "eu-central-1"]}}`
+## Why an SCP
+SCPs apply to every IAM user and role in the member accounts, including administrators, and they can be changed only from the management account (or a delegated administrator for policy management), never from the member account itself. The root user of a member account is also restricted.
+V: AWS Organizations, AWS IAM
+
+@ SAA-C03 D1 T1.1 applied use-case
+S: A SaaS monitoring vendor asks each customer to create an IAM role that the vendor's AWS account can assume to read CloudWatch metrics. The customer's security team is worried that another vendor customer could trick the vendor into using this role by supplying the customer's role ARN. What should the customer add to the role?
+A: A trust policy condition requiring sts:ExternalId to equal the unique value the vendor assigned to this customer
+B: A trust policy condition requiring aws:MultiFactorAuthPresent to be true for every AssumeRole call from the vendor
+C: A permissions boundary on the role that limits it to cloudwatch:GetMetricData and cloudwatch:ListMetrics actions only
+D: A trust policy condition limiting aws:SourceIp to the public IP address ranges the vendor publishes for its platform
+K: A
+W: External ID in the trust policy: the vendor generates a unique ID per customer and always sends it on `AssumeRole`. Another customer who enters this customer's role ARN in the vendor console gets their own external ID sent, which does not match, so the vendor cannot be used as a confused deputy.
+X: B=MFA condition: the vendor's automated service calls `AssumeRole` without a human present, so requiring MFA would break the integration. It also does not tell the vendor which customer the request is for.
+C=Permissions boundary: limiting actions reduces what can be read, but the other customer could still read these metrics through the vendor. The problem is who triggers the assumption, not how much the role can do.
+D=Source IP condition: the confused deputy attack goes through the vendor's own platform, so the calls still come from the vendor's published IP ranges and the condition would allow them.
+T: For third-party cross-account roles, the external ID stops the confused deputy problem; permissions and network conditions do not, because the vendor itself is the caller.
+G: ## The confused deputy problem
+A "deputy" is a service that acts for many clients, such as a vendor whose single AWS account assumes roles in hundreds of customer accounts. If customer X can type customer Y's role ARN into the vendor's console, the vendor would assume Y's role on X's behalf. The vendor was "confused" into misusing its own trusted identity.
+## How the external ID fixes it
+- The vendor generates a unique, non-secret identifier for each customer, for example `ext-4f1a92`.
+- The customer's role trust policy trusts the vendor account and adds `"Condition": {"StringEquals": {"sts:ExternalId": "ext-4f1a92"}}`.
+- The vendor always passes the external ID of the customer who is logged in to its console.
+When X enters Y's ARN, the vendor sends X's external ID, the condition fails, and the assumption is denied.
+V: AWS STS, AWS IAM, Amazon CloudWatch
+
+@ SAA-C03 D1 T1.1 advanced troubleshooting
+S: An application on EC2 in Account A must assume a role in Account B. The role's trust policy lists arn:aws:iam::<Account-A-ID>:root as the principal. The instance profile role in Account A has only S3 permissions. The AssumeRole call returns AccessDenied. What is the MOST likely fix?
+A: Replace the trust policy principal with the ARN of the EC2 service so that instances in any account can assume the role
+B: Add sts:AssumeRole on the Account B role ARN to the identity policy of the instance profile role in Account A
+C: Add a resource-based policy to the role in Account B that allows sts:GetSessionToken for principals in Account A
+D: Enable IAM Access Analyzer in Account B so that it can approve the cross-account trust relationship for the role
+K: B
+W: Identity policy in the caller's account: trusting `arn:aws:iam::<Account-A-ID>:root` delegates the decision to Account A's administrators. Account A must still grant `sts:AssumeRole` on the target role ARN to the instance role; without that allow, the call is denied even though the trust policy matches.
+X: A=Trust the EC2 service principal: `ec2.amazonaws.com` is used for roles that instances in the same account wear through an instance profile. It would not let a role in Account A assume the role, and trusting the service broadly would weaken security.
+C=Allow GetSessionToken: `GetSessionToken` returns temporary credentials for the caller's own identity and is not how cross-account access works. The role's trust policy is already its resource-based policy, and it already allows Account A.
+D=Access Analyzer approval: IAM Access Analyzer reports resources shared outside the account or organization. It has no approval step and does not change whether an `AssumeRole` call is allowed.
+T: Cross-account role assumption needs both sides: the target role's trust policy must trust the caller, and the caller's identity policy must allow sts:AssumeRole on that role.
+G: ## Cross-account access has two halves
+When a principal in Account A calls `sts:AssumeRole` on a role in Account B, AWS checks:
+- **Account B's side**: the role's trust policy must allow the caller. It can name a specific role ARN or the whole account, written as `arn:aws:iam::111122223333:root`.
+- **Account A's side**: the caller's own identity-based policies must allow `sts:AssumeRole` on `arn:aws:iam::444455556666:role/ReadReports`.
+## What "trusting the account root" means
+`:root` does not mean only the root user. It means "any principal in that account that its administrators have allowed". The trust policy hands the final say to Account A's IAM policies. If those policies do not allow the call, the request fails with AccessDenied, even though the trust policy looks correct.
+V: AWS STS, AWS IAM, Amazon EC2
+
+@ SAA-C03 D1 T1.1 advanced use-case
+S: A company has 200 project teams. Engineers sign in through IAM Identity Center, and each engineer's department and project are sent as attributes from the corporate IdP. The company wants engineers to manage only EC2 instances tagged with their own project, without writing a new policy for every new project. Which TWO actions meet this requirement? (Select TWO)
+A: Enable attributes for access control in IAM Identity Center so the project attribute is passed as a session tag
+B: Write one permission set policy that allows EC2 actions when aws:ResourceTag/project equals ${aws:PrincipalTag/project}
+C: Create a separate permission set per project that lists the instance ARNs belonging to that project's team
+D: Create an AWS Resource Groups group for each project and grant engineers access to their project's group
+E: Attach an SCP per project OU that allows only EC2 actions on instances in the same OU as the engineer
+K: A,B
+W: A=Attributes for access control: this passes the IdP's `project` attribute into each session as the principal tag `aws:PrincipalTag/project`, so the value is available to policies.
+B=One tag-matching policy: a single statement that compares `aws:ResourceTag/project` with `${aws:PrincipalTag/project}` works for all 200 projects and for any new project, because the match is computed at request time.
+X: C=Permission set per project: this is role-based access control. Every new project or new instance means editing or creating a permission set, which is exactly the growth problem the company wants to avoid.
+D=Resource Groups: a resource group is a way to view and act on tagged resources. It is not an authorization mechanism, so membership in a group grants no permissions.
+E=SCP per project OU: SCPs never grant permissions, so an SCP gives engineers no access by itself. It would also need a new OU and SCP for every project, which is the growth problem the company wants to avoid.
+T: ABAC scales by comparing a principal tag with a resource tag in one policy; RBAC needs a new role or permission set for every new project.
+G: ## RBAC versus ABAC
+- **Role-based access control (RBAC)** writes a policy per job or team, often listing specific resource ARNs. It grows with every new team.
+- **Attribute-based access control (ABAC)** writes one policy that compares attributes (tags) of the caller with tags on the resource.
+## How ABAC works with IAM Identity Center
+1. The IdP (for example Okta or Microsoft Entra ID) sends user attributes such as `project=atlas`.
+2. With **attributes for access control** enabled, Identity Center passes them as session tags, visible to policies as `aws:PrincipalTag/project`.
+3. The permission set contains a condition like `"StringEquals": {"aws:ResourceTag/project": "${aws:PrincipalTag/project}"}`.
+An engineer tagged `atlas` can stop an instance tagged `project=atlas` but not one tagged `project=orion`. A new project only needs new tags, not new policies.
+V: AWS IAM Identity Center, AWS IAM, Amazon EC2
+
+@ SAA-C03 D1 T1.2 advanced use-case
+S: EC2 instances in private subnets use an S3 gateway endpoint. Security is worried that a compromised instance could copy data to an S3 bucket in an attacker's personal AWS account through the endpoint. How can the company block this path while keeping access to its own buckets?
+A: Add a bucket policy on each company bucket that denies requests whose aws:SourceVpce value does not match the gateway endpoint ID
+B: Add a security group outbound rule that allows HTTPS only to the S3 managed prefix list and denies all other outbound traffic
+C: Attach a VPC endpoint policy that allows S3 actions only when aws:ResourceOrgID matches the company's organization ID
+D: Add a network ACL outbound rule that denies HTTPS to all S3 IP ranges except the ones assigned to the company's own buckets
+K: C
+W: VPC endpoint policy on the resource's organization: the endpoint policy is evaluated for every request going through the endpoint. Allowing S3 actions only when `aws:ResourceOrgID` equals the company's organization means requests to a bucket owned by any other account are denied, while company buckets keep working.
+X: A=Bucket policy with aws:SourceVpce: this controls who can reach the company's buckets, not which buckets the instances can reach. The attacker's bucket has its own policy, so this does nothing to stop uploads to it.
+B=Security group with prefix list: the S3 prefix list contains the IP ranges for all of S3 in the Region. Every bucket, including the attacker's, is served from those same addresses, so the rule cannot tell buckets apart.
+D=NACL with S3 IP ranges: S3 does not assign dedicated IP addresses per bucket or per customer, so there are no "company bucket" ranges to allow. The same endpoints serve every account.
+T: Bucket policies decide who may reach your bucket; the VPC endpoint policy decides which buckets your VPC may reach, which is what stops exfiltration.
+G: ## Two policies, two directions
+Traffic from a private subnet to S3 through a gateway endpoint can be controlled at two points:
+- **Bucket policy** (on the destination): "Which callers may use my bucket?" A condition on `aws:SourceVpce` lets the bucket accept requests only from a specific endpoint.
+- **VPC endpoint policy** (on the path): "Which S3 resources may traffic from this VPC reach?" It applies to every request through the endpoint, whatever the bucket.
+## Why network controls fail here
+S3 is a shared service. All buckets in a Region answer on the same IP ranges, published as the managed prefix list `pl-xxxxxxxx`. Security groups and NACLs see only IPs and ports, never bucket names or owners.
+## Example endpoint policy condition
+`"Condition": {"StringEquals": {"aws:ResourceOrgID": "o-a1b2c3d4e5"}}` allows S3 calls only to buckets owned by accounts in the organization. A `PutObject` to `s3://attacker-bucket` is denied at the endpoint. In practice, add explicit exceptions for any AWS-owned buckets the instances need, such as OS package repositories.
+V: Amazon VPC, Amazon S3, AWS Organizations
+
+@ SAA-C03 D1 T1.2 applied use-case
+S: A company serves a web application through Amazon CloudFront with an Application Load Balancer as the origin. Security requires that the ALB is not reachable from the internet at all, and only this CloudFront distribution may send it traffic. Which solution meets the requirement with the LEAST operational overhead?
+A: Keep the ALB internet-facing and allow inbound HTTPS only from the CloudFront origin-facing managed prefix list in its security group
+B: Keep the ALB internet-facing and add network ACL rules that allow only the CloudFront IP ranges, updated by a scheduled function
+C: Keep the ALB internet-facing and attach an AWS WAF web ACL that blocks requests from every country except the CloudFront edge countries
+D: Move the ALB to private subnets as an internal load balancer and register it as a CloudFront VPC origin for the distribution
+K: D
+W: CloudFront VPC origin: CloudFront can deliver to an internal ALB in private subnets through a VPC origin. The ALB has no public IP address, so it cannot be reached from the internet, and only CloudFront, through the VPC origin, can connect to it.
+X: A=Managed prefix list in security group: the ALB is still internet-facing, and the prefix list covers all CloudFront edge servers, including distributions owned by other AWS customers. Anyone could point their own distribution at the ALB.
+B=NACL with CloudFront ranges: NACLs have a small rule limit, CloudFront publishes many ranges that change, and the scheduled updater is extra code to run. The ALB would still be internet-facing and reachable from any distribution.
+C=WAF geo blocking: CloudFront edge locations are in most countries, so geography does not identify CloudFront traffic. Attackers in allowed countries could still reach the public ALB directly.
+T: To make an origin truly private behind CloudFront, use a VPC origin with an internal ALB; a prefix list only narrows a public ALB to all of CloudFront.
+G: ## Ways to lock an ALB behind CloudFront
+- **Public ALB + prefix list**: the security group allows `com.amazonaws.global.cloudfront.origin-facing`. This limits traffic to CloudFront servers, but every customer's distribution uses the same servers, so a custom secret header checked by the ALB is usually added too.
+- **VPC origin**: CloudFront connects to an internal ALB, NLB or EC2 instance in a private subnet. The load balancer is never exposed to the internet, and there is no header secret to rotate.
+## Example layout
+- `internal-app-alb` in two private subnets, security group allowing HTTPS from the CloudFront VPC origin.
+- The distribution uses the VPC origin as its origin; users reach `www.example.com` only through CloudFront, where WAF and caching apply.
+With no public endpoint, scanners and attackers have nothing to hit directly, which is the strongest form of "only through CloudFront".
+V: Amazon CloudFront, Elastic Load Balancing, Amazon VPC
+
+@ SAA-C03 D1 T1.2 applied use-case
+S: A company wants to remove bastion hosts and stop opening port 22. Administrators must get shell access to Amazon Linux 2023 instances in private subnets that have no NAT gateway or internet access, and all sessions must be logged. Which TWO steps are required? (Select TWO)
+A: Attach an instance profile whose role includes the AmazonSSMManagedInstanceCore managed policy to each instance
+B: Create interface VPC endpoints for Systems Manager (ssm, ssmmessages, and ec2messages) in the private subnets' VPC
+C: Allow inbound TCP port 22 in the instance security groups from the Systems Manager service IP address ranges
+D: Associate an Elastic IP address with each instance so the Session Manager service can initiate the connection
+E: Store each instance's SSH private key in AWS Secrets Manager so Session Manager can retrieve it during login
+K: A,B
+W: A=Instance profile with AmazonSSMManagedInstanceCore: the SSM Agent (preinstalled on Amazon Linux 2023) uses this role to register the instance and open the session channel.
+B=Systems Manager interface endpoints: with no NAT or internet, the agent needs private endpoints to reach the service: `ssm` and `ssmmessages`, plus `ec2messages`, which older agent versions still use. Session activity is recorded in CloudTrail, and session output can be sent to CloudWatch Logs or S3.
+X: C=Open port 22: Session Manager needs no inbound ports at all. The agent makes an outbound HTTPS connection, so opening SSH would only add attack surface.
+D=Elastic IP per instance: Session Manager never connects inbound to the instance, and a public IP does nothing in a subnet without an internet gateway route. It would expose the instances for no benefit.
+E=SSH keys in Secrets Manager: Session Manager does not use SSH keys. Access is controlled by IAM policies on the user, which removes key distribution and rotation entirely.
+T: Session Manager replaces bastions with an outbound agent connection: give the instance an SSM role and a path to the SSM endpoints; no inbound ports, public IPs or SSH keys.
+G: ## How Session Manager works
+AWS Systems Manager Session Manager gives an interactive shell without SSH. The SSM Agent on the instance opens an **outbound** HTTPS (443) connection to Systems Manager and keeps it open. When an administrator starts a session from the console or `aws ssm start-session`, traffic flows over that existing channel.
+## What an instance needs
+- **The agent**: preinstalled on Amazon Linux 2023 and many other AMIs.
+- **Permissions**: an instance profile role with `AmazonSSMManagedInstanceCore` (or the account-wide Default Host Management Configuration).
+- **Network path**: a NAT gateway, or, for isolated subnets, interface endpoints `com.amazonaws.<region>.ssm` and `.ssmmessages`, plus `.ec2messages` for older agent versions. Sending session output to CloudWatch Logs or S3 also needs a `logs` interface endpoint or an S3 gateway endpoint.
+## Why it is more secure
+- No inbound rules, no bastion host, no SSH keys.
+- Who may start a session is decided by IAM, and every session is recorded in CloudTrail; session output can be sent to CloudWatch Logs or S3.
+V: AWS Systems Manager, Amazon VPC, AWS IAM
+
+@ SAA-C03 D1 T1.2 applied troubleshooting
+S: A Lambda function was attached to private subnets so it can query an RDS database. Since then, its calls to AWS Secrets Manager to read the database password time out after 3 seconds. The VPC has no NAT gateway, and the secret's permissions have not changed. What should the solutions architect do?
+A: Create an interface VPC endpoint for Secrets Manager with private DNS and allow HTTPS from the function's security group
+B: Enable the option to assign a public IP address to the function's network interfaces and add a route to an internet gateway
+C: Add a resource policy to the secret that grants the function's execution role secretsmanager:GetSecretValue on the secret
+D: Increase the function timeout to 60 seconds and add retries with backoff to the SDK client that calls Secrets Manager
+K: A
+W: Secrets Manager interface endpoint: once a function runs in a VPC, its traffic follows the subnets' routes, and these have no path to the public Secrets Manager endpoint. An interface endpoint with private DNS makes the normal endpoint name resolve to private IPs inside the VPC, so the SDK works unchanged.
+X: B=Public IP for the function: Lambda network interfaces in a VPC never receive public IPs, even in a public subnet, so an internet gateway route does not give the function internet access.
+C=Secret resource policy: a permission problem would return AccessDenied immediately, not a timeout. The stem also states the permissions have not changed; the request is not reaching the service.
+D=Longer timeout and retries: there is no network path, so every attempt will hang until it times out. Waiting longer only increases cost and latency.
+T: A timeout from a VPC-attached Lambda means no network path; add a VPC endpoint (or NAT), since Lambda in a VPC never gets a public IP.
+G: ## What changes when Lambda joins a VPC
+By default a function runs in a Lambda-managed network with internet access. When you attach it to your subnets, Lambda creates elastic network interfaces there, and all outbound traffic follows those subnets' route tables and security groups.
+## Reaching AWS APIs from private subnets
+Services such as Secrets Manager, SQS or STS are public endpoints like `secretsmanager.us-east-1.amazonaws.com`. From a private subnet you reach them through:
+- a **NAT gateway** (per-hour and per-GB charges, traffic leaves through the internet gateway), or
+- an **interface VPC endpoint** (AWS PrivateLink), which puts private IPs for the service in your subnets.
+## Private DNS
+With private DNS enabled on the endpoint, the standard service name resolves to the endpoint's private IPs, so no code change is needed. The endpoint's security group must allow TCP 443 from the function's security group.
+## Reading the symptom
+AccessDenied means the request arrived and was refused. A timeout means it never arrived.
+V: AWS Lambda, AWS Secrets Manager, Amazon VPC
+
+@ SAA-C03 D1 T1.2 applied use-case
+S: An internal HR API built on Amazon API Gateway must be callable only by applications running in one specific VPC. It must not be reachable from the internet, even with valid credentials. Which design meets these requirements?
+A: A Regional REST API with an AWS WAF web ACL that allows only the VPC's NAT gateway Elastic IP address as the source of requests
+B: An edge-optimized REST API that requires IAM authorization and a policy allowing only roles used by applications in the VPC
+C: A private REST API reached through an execute-api interface endpoint, with a resource policy allowing only that endpoint's ID
+D: An HTTP API with a Lambda authorizer that inspects the X-Forwarded-For header and rejects addresses outside the VPC CIDR
+K: C
+W: Private REST API with execute-api endpoint: a private API has no public endpoint at all. Clients in the VPC reach it through an interface endpoint for `execute-api`, and the resource policy's `aws:SourceVpce` condition limits calls to that one endpoint, so other VPCs and the internet cannot invoke it.
+X: A=Regional API with WAF IP allowlist: the API is still public on the internet, and the allowlist depends on traffic leaving through the NAT gateway. The endpoint remains discoverable and the design fails if routing changes.
+B=Edge-optimized API with IAM auth: IAM authorization checks who calls, not where from. Anyone holding valid credentials for those roles could call the public endpoint from anywhere, which the stem forbids.
+D=HTTP API with header check: the API is public, and `X-Forwarded-For` can be spoofed by the client. HTTP APIs also do not support the private endpoint type.
+T: For an API reachable only from a VPC, use a private REST API with an execute-api interface endpoint and a resource policy on aws:SourceVpce; authentication alone does not remove the public endpoint.
+G: ## API Gateway endpoint types
+- **Edge-optimized**: public, fronted by CloudFront edge locations.
+- **Regional**: public, served from one Region.
+- **Private**: no public endpoint; reachable only through an interface VPC endpoint for `execute-api`. Only REST APIs support this type.
+## Locking a private API to one VPC
+1. Create an interface endpoint `com.amazonaws.<region>.execute-api` in the VPC.
+2. Attach a resource policy to the API, for example allow `execute-api:Invoke` only when `aws:SourceVpce` equals `vpce-0abc123`.
+3. Deploy the API so the resource policy takes effect.
+A request from another VPC, even one with its own execute-api endpoint, fails the condition and is denied. Authentication (IAM, Cognito, Lambda authorizers) can still be added on top to decide which applications in the VPC may call it.
+V: Amazon API Gateway, Amazon VPC, AWS PrivateLink
+
+@ SAA-C03 D1 T1.3 advanced use-case
+S: An application encrypts sensitive fields with AWS KMS before writing them to a DynamoDB global table replicated between us-east-1 and eu-west-1. During a regional outage of us-east-1, the application in eu-west-1 must still decrypt every item without calling us-east-1. Which approach meets this requirement?
+A: Create a single-Region customer managed key in us-east-1 and grant the eu-west-1 application role permission to call kms:Decrypt on it
+B: Create a KMS multi-Region primary key in us-east-1 with a replica key in eu-west-1 and decrypt with the local key in each Region
+C: Create single-Region customer managed keys in both Regions and import the same key material into each key so they are interchangeable
+D: Rely on the AWS owned key that DynamoDB uses for encryption at rest, because global table replicas decrypt items automatically
+K: B
+W: Multi-Region keys: a primary key and its replica share the same key ID and key material. Ciphertext produced in us-east-1 can be decrypted by the replica in eu-west-1 with a local call, so decryption does not depend on the failed Region.
+X: A=Single-Region key with cross-Region grant: decryption would always call KMS in us-east-1. During the outage those calls fail, so the eu-west-1 application cannot read any encrypted field.
+C=Imported identical key material: each KMS key has its own key ID, and ciphertext is bound to the key that created it. Even with the same material, one single-Region key cannot decrypt ciphertext from the other; only multi-Region keys are interoperable.
+D=DynamoDB encryption at rest: table encryption is transparent and handled per Region, but these fields were encrypted by the application itself with its own KMS key before being written. The table's key cannot decrypt application-level ciphertext.
+T: Multi-Region KMS keys share key ID and material, so ciphertext moves between Regions and decrypts locally; single-Region keys, even with imported copies, cannot.
+G: ## Why client-side encryption needs care across Regions
+DynamoDB already encrypts tables at rest. Some applications additionally encrypt fields such as `ssn` themselves (client-side) before writing. That ciphertext is replicated byte for byte to every global table replica, so each Region must be able to decrypt it.
+## Single-Region versus multi-Region keys
+- A **single-Region key** lives in one Region. Ciphertext it creates can be decrypted only by calling KMS in that Region.
+- A **multi-Region key** has a primary (for example `mrk-1234abcd` in us-east-1) and replicas in other Regions with the **same key ID and key material**. Each replica is an independent KMS resource with its own key policy.
+## Example
+The app in us-east-1 encrypts a field with `mrk-1234abcd`. The replicated item arrives in eu-west-1, where the app calls `Decrypt` against the local replica of `mrk-1234abcd`. No cross-Region call is needed, so an outage in us-east-1 does not block reads.
+V: AWS KMS, Amazon DynamoDB
+
+@ SAA-C03 D1 T1.3 applied use-case
+S: A company must share a manual snapshot of an RDS for PostgreSQL database with a separate audit account. The database is encrypted with the default AWS managed key aws/rds. The team already plans to share the snapshot from the RDS console. Which TWO additional steps are required? (Select TWO)
+A: Copy the snapshot and re-encrypt the copy with a customer managed KMS key, then share the copy instead of the original
+B: Update the customer managed key's key policy to allow the audit account to use the key for decrypt and create-grant
+C: Update the aws/rds AWS managed key's key policy so that the audit account's principals are allowed to decrypt with it
+D: Copy the snapshot to an unencrypted snapshot so the audit account can restore it without needing any KMS permissions
+E: Enable automated backups cross-account replication so the audit account receives snapshots without sharing them
+K: A,B
+W: A=Re-encrypt with a customer managed key: a snapshot encrypted with an AWS managed key cannot be shared, because that key's policy cannot be changed. Copying it with a customer managed key produces a shareable snapshot.
+B=Grant the audit account access in the key policy: the audit account needs permission to use the key (for example `kms:Decrypt`, `kms:DescribeKey` and `kms:CreateGrant`) to copy or restore the shared snapshot.
+X: C=Edit aws/rds key policy: AWS managed keys have policies controlled by AWS that you cannot edit, which is exactly why snapshots encrypted with them cannot be shared with other accounts.
+D=Copy to unencrypted snapshot: RDS cannot produce an unencrypted copy of an encrypted snapshot, and removing encryption would also break the data protection requirements for sensitive data.
+E=Cross-account automated backups: RDS automated backup replication copies backups to another Region, not to another account, and it does not remove the key restriction.
+T: Encrypted RDS snapshots can be shared only when they use a customer managed key whose key policy allows the target account; aws/rds-encrypted snapshots must be copied first.
+G: ## AWS managed keys versus customer managed keys
+- **AWS managed keys** (aliases like `aws/rds`, `aws/ebs`) are created by services for you. You cannot change their key policies, so they can never be used by another account.
+- **Customer managed keys** are keys you create. You control the key policy, and it can allow other accounts.
+## Sharing an encrypted snapshot
+1. If the snapshot uses `aws/rds`, run a copy and choose a customer managed key, for example `alias/rds-share`.
+2. Add the target account (for example `arn:aws:iam::222233334444:root`) to that key's policy with `kms:Decrypt`, `kms:DescribeKey` and `kms:CreateGrant`.
+3. Share the copied snapshot with the account.
+4. In the target account, copy the snapshot, usually re-encrypting it with a key the audit account owns, and restore from it.
+Shared encrypted snapshots cannot be made public, and the data stays encrypted end to end.
+V: Amazon RDS, AWS KMS
+
+@ SAA-C03 D1 T1.3 applied use-case
+S: Ransomware attackers who stole administrator credentials in another company deleted all of its backups before encrypting data. A company using AWS Backup wants its recovery points protected so that no one, including the account root user, can delete them before the 35-day retention ends. What should it configure?
+A: AWS Backup Vault Lock in compliance mode on the backup vault, with a minimum retention of 35 days
+B: A backup vault access policy that denies backup:DeleteRecoveryPoint for every IAM principal in the account
+C: S3 Versioning and MFA Delete on the bucket where AWS Backup writes the recovery points for all protected resources
+D: An SCP that denies backup:DeleteRecoveryPoint for every member account, combined with CloudTrail alerts on the vault
+K: A
+W: Vault Lock in compliance mode: once the grace period ends, the lock becomes immutable. Recovery points cannot be deleted or their retention shortened by anyone, including the root user and AWS, until the minimum retention has passed.
+X: B=Vault access policy deny: an administrator with the stolen credentials can edit or remove the access policy and then delete the backups. It raises the bar but is not immutable.
+C=S3 Versioning and MFA Delete: AWS Backup stores recovery points in its own managed storage, not in a bucket you own, so there is no bucket to configure. MFA Delete is also tied to root credentials that could be stolen.
+D=SCP with alerts: SCPs do not restrict the management account, can be changed by whoever controls the management account, and an alert only tells you after the backups are gone.
+T: For backups that even root cannot delete, use Backup Vault Lock in compliance mode; access policies and SCPs can be changed by a compromised administrator.
+G: ## Why backups need immutability
+Attackers often delete backups first, then encrypt production data, so the victim has nothing to restore. Protection must hold even if an attacker gets administrator or root credentials.
+## AWS Backup Vault Lock
+A backup vault holds recovery points. Vault Lock adds a write-once-read-many (WORM) setting:
+- `MinRetentionDays` / `MaxRetentionDays`: bounds for recovery points in the vault, for example a minimum of 35 days.
+- **Governance mode**: users with special IAM permissions can remove the lock. Good for testing.
+- **Compliance mode**: after a grace period (at least 3 days), the lock can no longer be changed or removed by anyone.
+## Example
+A daily backup plan writes to `prod-vault` with compliance-mode Vault Lock of 35 days. A stolen admin session calling `DeleteRecoveryPoint` is refused. For extra isolation, copies can also go to a vault in a separate account.
+V: AWS Backup
+
+@ SAA-C03 D1 T1.3 applied use-case
+S: An internal microservice platform uses Application Load Balancers with hostnames under the private domain corp.internal. Security requires TLS on every ALB with certificates that renew automatically and are trusted only by company clients. Which solution meets these requirements?
+A: Request public certificates for the corp.internal names from ACM and validate them by adding CNAME records to a private hosted zone
+B: Create self-signed certificates with OpenSSL, import them into ACM, and run a scheduled Lambda function that replaces them yearly
+C: Create an AWS Private CA and issue private certificates through ACM for the corp.internal names so ACM renews them automatically
+D: Buy certificates for the corp.internal names from a commercial public CA and store them in Secrets Manager with rotation enabled
+K: C
+W: AWS Private CA with ACM: ACM can issue private certificates signed by your AWS Private CA for any internal name, attach them to ALBs, and renew them automatically. Only clients that trust the company's private root CA accept them.
+X: A=ACM public certificates: public certificates can only be issued for publicly resolvable domain names that pass DNS or email validation. A private hosted zone is not visible to the public CA, so `corp.internal` cannot be validated.
+B=Self-signed certificates imported to ACM: ACM never renews imported certificates, so the custom Lambda job becomes a single point of failure, and each self-signed certificate must be trusted separately by every client.
+D=Commercial public CA: public CAs do not issue certificates for internal-only names such as `.internal`, and Secrets Manager rotation would need a custom rotation function. ALBs also take certificates from ACM, not Secrets Manager.
+T: Internal hostnames need private certificates: AWS Private CA plus ACM gives auto-renewing certs; ACM public certs only work for publicly validated domains.
+G: ## Public versus private certificates
+- A **public certificate** is signed by a CA that browsers trust by default. The CA must verify you control the domain, so the name must exist in public DNS, for example `shop.example.com`.
+- A **private certificate** is signed by your own CA. Only machines that have your root CA in their trust store accept it, which suits internal names like `payments.corp.internal`.
+## AWS Private CA with ACM
+1. Create a root or subordinate CA in AWS Private CA.
+2. Distribute its root certificate to company clients (for example through MDM or a golden AMI).
+3. In ACM, request a private certificate for `*.corp.internal`, choosing the Private CA.
+4. Attach it to the ALB listener.
+ACM tracks expiry and renews private certificates it issued, then deploys them to the ALB automatically. Imported certificates, in contrast, must be renewed and reimported by you.
+V: AWS Private Certificate Authority, AWS Certificate Manager, Elastic Load Balancing
+
+@ SAA-C03 D1 T1.3 applied use-case
+S: An audit found that some clients upload and download objects from a company S3 bucket over plain HTTP. The company must reject every request to the bucket that is not encrypted in transit, whatever IAM permissions the caller has. What should a solutions architect do?
+A: Enable default encryption with SSE-KMS on the bucket so that all objects are encrypted with a customer managed key when stored
+B: Add a bucket policy statement that denies all S3 actions on the bucket when the aws:SecureTransport condition is false
+C: Enable S3 Block Public Access on the bucket so that anonymous HTTP requests are rejected before they reach the objects
+D: Turn on S3 server access logging and use Amazon Athena to find callers that use HTTP so they can be contacted and fixed
+K: B
+W: Deny when aws:SecureTransport is false: the condition key is `false` for any request sent over plain HTTP. An explicit deny in the bucket policy overrides every allow, so HTTP requests are rejected even from callers with full S3 permissions.
+X: A=Default SSE-KMS: this encrypts data at rest after it arrives. The request itself can still travel over HTTP, so data in transit remains unprotected.
+C=Block Public Access: it stops public grants through policies and ACLs. Authenticated callers using HTTP are not public, so their requests still succeed.
+D=Access logging with Athena: this finds offenders after the fact but does not reject any request, so the requirement to block unencrypted traffic is not met.
+T: Encryption at rest and encryption in transit are separate controls; enforce TLS for S3 with a bucket policy deny on aws:SecureTransport = false.
+G: ## At rest versus in transit
+- **At rest**: how objects are stored on disk (SSE-S3, SSE-KMS, DSSE-KMS). This does not affect how requests travel.
+- **In transit**: whether the request uses TLS (HTTPS). S3 still accepts HTTP unless you forbid it.
+## The aws:SecureTransport key
+Every request to S3 carries the global condition key `aws:SecureTransport`, `true` for HTTPS and `false` for HTTP. A bucket policy statement like:
+- `"Effect": "Deny"`, `"Principal": "*"`, `"Action": "s3:*"`
+- `"Resource": ["arn:aws:s3:::reports-bucket", "arn:aws:s3:::reports-bucket/*"]`
+- `"Condition": {"Bool": {"aws:SecureTransport": "false"}}`
+rejects any HTTP request. Because an explicit deny always wins, this holds for administrators too. The condition `aws:SecureTransport` is also used for SNS topics and SQS queues in the same way. S3 can additionally require a minimum TLS version with `s3:TlsVersion`.
+V: Amazon S3
+
+@ SAA-C03 D4 T4.1 advanced tradeoff
+S: An IoT platform writes 50 million log objects per month to S3, each about 8 KB. Logs are never read after 7 days but must be kept for 5 years. A lifecycle rule that transitions each object to S3 Glacier Deep Archive after 7 days is costing more than expected. Which change lowers the total cost the MOST?
+A: Transition the individual objects to S3 Glacier Flexible Retrieval instead of Deep Archive so each transition request is billed at a lower rate
+B: Transition the individual objects to S3 Standard-IA after 7 days and to Glacier Deep Archive after 30 days to spread transition charges
+C: Periodically combine the small logs into large compressed archive objects and apply the Deep Archive lifecycle rule only to those archives
+D: Move each log object into S3 Intelligent-Tiering with archive access tiers enabled so S3 moves the objects between tiers automatically
+K: C
+W: Aggregate before archiving: Deep Archive charges a per-object transition request and adds about 40 KB of metadata overhead to every object, which is five times the size of each log. Packing thousands of logs into one compressed object removes almost all of those per-object charges and also shrinks the stored data.
+X: A=Glacier Flexible Retrieval instead: it still charges per-object transitions and the same per-object metadata overhead, and its storage price is higher than Deep Archive for 5 years of data.
+B=Standard-IA first: this adds a second transition per object. Standard-IA also bills each object as at least 128 KB, so 8 KB logs cost far more there, and lifecycle rules cannot move objects to Standard-IA until they are at least 30 days old.
+D=Intelligent-Tiering: objects under 128 KB are never moved to cheaper tiers and are always billed at the Frequent Access rate, so archive tiers never apply to them. For 8 KB logs it saves nothing.
+T: For millions of tiny objects, per-object request fees and minimum sizes dominate, so aggregate them into larger objects before archiving instead of just picking a colder class.
+G: ## Costs that scale with object count
+S3 bills some things per object, not per GB:
+- **Lifecycle transition requests**: each object moved to a colder class is one request, with Deep Archive among the highest rates.
+- **Archive metadata overhead**: every object in Glacier Flexible Retrieval or Deep Archive carries about 32 KB billed at the archive rate plus 8 KB billed at the Standard rate.
+- **Minimum billable size**: Standard-IA, One Zone-IA and Glacier Instant Retrieval bill at least 128 KB per object.
+## Worked example
+50 million 8 KB objects are about 400 GB of data, but in Deep Archive they add about 2 TB of metadata overhead every month (50 million x 40 KB), plus 50 million transition requests.
+Combining each hour's logs into one `.tar.gz` of a few hundred MB turns that into a few dozen objects per day.
+Note that since September 2024, lifecycle rules by default do not transition objects smaller than 128 KB, because moving tiny objects one by one rarely pays off. A rule like the one in this scenario moves 8 KB logs only because an object size filter overrides that default.
+V: Amazon S3, Amazon S3 Glacier Deep Archive
+
+@ SAA-C03 D4 T4.1 applied use-case
+S: A company stores 40 TB of project files on an Amazon EFS Standard file system mounted by EC2 instances in three Availability Zones. Analysis shows that about 85% of the files have not been opened in over 90 days, but any file may be needed again without notice. The file system must stay Multi-AZ. What is the MOST cost-effective change?
+A: Replace the file system with EFS One Zone and turn on its automatic backups so that files can be restored after an AZ failure
+B: Configure EFS lifecycle management to move unused files to Infrequent Access and then Archive, and back to Standard on access
+C: Copy files not opened for 90 days to S3 Glacier Deep Archive with DataSync and delete them from the file system afterwards
+D: Switch the file system from Elastic throughput to Provisioned throughput sized for the peak, so storage is billed at a lower rate
+K: B
+W: EFS lifecycle management with IA and Archive: files not accessed for the chosen period move automatically to the cheaper Infrequent Access and Archive storage classes, while staying in the same Multi-AZ file system and path. With "transition into Standard on first access", a file that is opened again returns to Standard.
+X: A=EFS One Zone: data is stored in only one Availability Zone, which breaks the Multi-AZ requirement. Backups help recovery but do not keep the file system available when that AZ fails.
+C=DataSync to Deep Archive: files would leave the file system, and restoring from Deep Archive takes up to 12 hours or more. That does not meet "needed again without notice" and adds a manual process.
+D=Provisioned throughput: throughput mode changes how performance is billed, not the price of stored data. Provisioning for the peak would usually raise the bill, and the Archive storage class requires Elastic throughput.
+T: For a mostly cold EFS file system that must stay Multi-AZ and online, use lifecycle management to IA and Archive; One Zone or moving data out trades away availability.
+G: ## EFS storage classes
+Amazon EFS offers three storage classes inside one file system:
+- **Standard**: SSD-backed, for active data.
+- **Infrequent Access (IA)**: much lower storage price, with a per-GB charge when data is read.
+- **Archive**: lowest price, for data accessed a few times a year or less.
+Regional (Multi-AZ) file systems keep data in all classes across multiple AZs, and the file path does not change. The Archive class is available only on file systems that use Elastic throughput, and files smaller than 128 KiB are not moved out of Standard.
+## Lifecycle management
+You set policies such as:
+- `TransitionToIA`: `AFTER_30_DAYS`
+- `TransitionToArchive`: `AFTER_90_DAYS`
+- `TransitionToPrimaryStorageClass`: `AFTER_1_ACCESS`
+EFS then moves each file based on when it was last accessed. For 40 TB with 85% cold data, most of the bill moves to the cheaper classes with no application change.
+V: Amazon EFS
+
+@ SAA-C03 D4 T4.1 applied troubleshooting
+S: A media company's upload service uses S3 multipart uploads for large video files. The bucket does not use versioning, and a listing of all objects shows about 3 TB, but the monthly bill charges for about 11 TB of S3 Standard storage in that bucket. What is the MOST likely cause and fix?
+A: Deleted objects are kept as noncurrent versions; add a lifecycle rule that expires noncurrent object versions after a few days
+B: S3 bills Standard storage at a 128 KB minimum per object; transition the smaller objects to S3 Intelligent-Tiering right away
+C: Failed and abandoned multipart uploads leave stored parts; add a lifecycle rule that aborts incomplete multipart uploads after 7 days
+D: Server access logs are being delivered into the same bucket; move log delivery to another bucket and delete the older log files
+K: C
+W: Incomplete multipart uploads: parts of uploads that were never completed or aborted remain stored and billed, but they do not appear in normal object listings. A lifecycle rule with `AbortIncompleteMultipartUpload` removes them automatically after the chosen number of days.
+X: A=Noncurrent versions: the bucket has never been versioned, so deletes and overwrites remove data immediately and there are no noncurrent versions to expire.
+B=128 KB minimum on Standard: S3 Standard has no minimum billable object size; that minimum applies to the Infrequent Access classes. Video files are also far larger than 128 KB.
+D=Access logs in the same bucket: log objects are ordinary objects and would appear in the listing, so they are already part of the 3 TB. They would not explain 8 TB of hidden storage.
+T: Storage billed but invisible in listings points to incomplete multipart uploads; clean them up with an AbortIncompleteMultipartUpload lifecycle rule.
+G: ## How multipart upload is billed
+A multipart upload has three steps: `CreateMultipartUpload`, many `UploadPart` calls, then `CompleteMultipartUpload`. Only the complete step turns the parts into a visible object. If a client crashes or gives up, the parts stay in the bucket, billed as storage, until the upload is completed or aborted.
+## Why they are hard to see
+`ListObjectsV2` and the console object list show only completed objects. Uploaded parts appear only through `ListMultipartUploads`, or in S3 Storage Lens, which reports incomplete multipart upload bytes per bucket.
+## The fix
+Add a lifecycle rule to the bucket, for example:
+- Scope: whole bucket
+- `AbortIncompleteMultipartUpload`: `DaysAfterInitiation = 7`
+S3 then aborts any upload still open after 7 days and deletes its parts. Many companies add this rule to every bucket by default.
+V: Amazon S3, Amazon S3 Storage Lens
+
+@ SAA-C03 D4 T4.2 applied use-case
+S: A CPU-bound image processing Lambda function written in Python runs 30 million times per month with 512 MB of memory and an average duration of 4 seconds. The code has no native x86-only dependencies. Which TWO changes are MOST likely to reduce the function's cost? (Select TWO)
+A: Change the function architecture to arm64 so it runs on AWS Graviton processors at a lower price per GB-second
+B: Test higher memory settings with a tool such as AWS Lambda Power Tuning and choose the one with the lowest cost
+C: Enable provisioned concurrency for the peak concurrency level so that invocations avoid cold start charges
+D: Reduce the memory setting to 128 MB, because Lambda bills only for memory size and not for invocation duration
+E: Move the function into a VPC so that it can use private subnets and avoid Lambda request charges on invocations
+K: A,B
+W: A=arm64 architecture: Lambda on Graviton costs about 20% less per GB-second and often runs compute-heavy code as fast or faster, so pure Python code can switch with a configuration change.
+B=Memory right-sizing with Power Tuning: Lambda allocates CPU in proportion to memory. For CPU-bound code, more memory can cut duration by more than it raises the per-ms price, so measuring several settings finds the cheapest one.
+X: C=Provisioned concurrency: it keeps environments initialized to cut latency, but environments configured for the peak are billed every second whether busy or idle, so off-peak hours pay for unused capacity. Lambda now bills the init phase of on-demand functions, but for 4-second invocations init is a tiny share of the cost.
+D=128 MB memory: Lambda bills GB-seconds, memory multiplied by duration. At 128 MB the function gets a fraction of the CPU, so a CPU-bound job runs much longer and may cost more or time out.
+E=Move into a VPC: VPC attachment does not change request or duration pricing. It adds networking to manage and may need NAT gateway or endpoint charges for any AWS API calls.
+T: Lambda cost is GB-seconds times price: Graviton lowers the price, and right-sizing memory (sometimes upward for CPU-bound code) lowers GB-seconds.
+G: ## How Lambda is billed
+- **Requests**: a small charge per million invocations.
+- **Duration**: memory (GB) x run time (seconds), billed per millisecond. This is the "GB-second".
+## Memory also sets CPU
+Lambda gives CPU in proportion to memory; at about 1,769 MB a function gets the equivalent of one full vCPU. A CPU-bound function at 512 MB may be starved.
+Example: 512 MB x 4 s = 2 GB-s. At 1,536 MB the same job might take 1.2 s, which is 1.8 GB-s, cheaper and faster.
+## Graviton (arm64)
+Setting `Architectures: ["arm64"]` runs the function on Graviton with about a 20% lower GB-second price. Pure Python or Node.js code usually runs unchanged; native x86 libraries would need arm64 builds.
+Tools: AWS Lambda Power Tuning runs the function at several memory sizes and charts cost and speed; AWS Compute Optimizer also gives Lambda memory recommendations.
+V: AWS Lambda, AWS Compute Optimizer
+
+@ SAA-C03 D4 T4.2 applied tradeoff
+S: A retailer needs 40 m7i.2xlarge instances guaranteed in one specific Availability Zone for a three-week sales event starting next month. After the event the instances will be terminated, and the company does not want any commitment that lasts beyond the event. Which option meets these needs MOST cost-effectively?
+A: Purchase a one-year Compute Savings Plan that covers the hourly cost of the 40 instances for the event period
+B: Purchase 40 Regional Reserved Instances with a one-year term and sell them in the Reserved Instance Marketplace later
+C: Request 40 Spot Instances in that Availability Zone with the capacity-optimized strategy and a maximum price set high
+D: Create an On-Demand Capacity Reservation for the 40 instances in that Availability Zone with an end date after the event
+K: D
+W: On-Demand Capacity Reservation with an end date: it reserves the exact instance type and count in the chosen AZ, can be scheduled for a future date, has no 1- or 3-year term, and releases automatically at the end date, so billing stops when the event ends.
+X: A=One-year Compute Savings Plan: a Savings Plan only lowers the price; it does not reserve capacity in an AZ. The one-year commitment also continues long after the three-week event.
+B=Regional Reserved Instances: Regional RIs give a discount but do not reserve capacity. The one-year term outlasts the event, and resale on the Marketplace is not guaranteed.
+C=Spot Instances with a high max price: Spot capacity can be reclaimed at any time with a two-minute warning, whatever the maximum price, so capacity is not guaranteed during the event.
+T: Discounts (Savings Plans, Regional RIs) do not reserve capacity; an On-Demand Capacity Reservation guarantees capacity in one AZ without a long-term commitment.
+G: ## Price versus capacity
+Two different problems are often confused:
+- **Price**: Savings Plans and Reserved Instances lower the hourly rate in exchange for a 1- or 3-year commitment.
+- **Capacity**: an **On-Demand Capacity Reservation (ODCR)** guarantees that a specific instance type is available in one AZ.
+## How an ODCR is billed
+- You pay the On-Demand rate for the reserved instances whether you run them or not, so unused reservations cost money.
+- There is no 1- or 3-year term; you can set an end date or cancel.
+- It can be requested for a future start date. A future-dated reservation includes a short commitment period that you choose when requesting it, during which it cannot be cancelled.
+- If you already have Savings Plans or Regional RIs, their discount also applies to matching ODCR usage.
+## Example
+An ODCR for 40 `m7i.2xlarge` in `us-east-1b`, starting on the event date and ending three weeks later, guarantees the fleet and stops billing automatically after the event.
+V: Amazon EC2
+
+@ SAA-C03 D4 T4.2 applied tradeoff
+S: A company's EC2 and Fargate usage across all accounts, priced at Compute Savings Plan rates, ranges from $40 per hour at night to $100 per hour at weekday peaks and has not dropped below $40 per hour in the past year. It wants to buy a Compute Savings Plan to lower costs without paying for unused commitment. Which commitment should it choose?
+A: About $100 per hour, the peak usage, so that every hour of compute is fully covered at the discounted Savings Plan rate
+B: About $70 per hour, the daily average, so that unused commitment at night is balanced by extra coverage at peaks
+C: About $40 per hour, the steady baseline, with usage above it billed at On-Demand rates or covered by Spot later
+D: No commitment, and instead buy Standard Reserved Instances for the peak hours only, since RIs can be scheduled
+K: C
+W: Commit to the steady baseline: a Savings Plan commitment applies hour by hour. Usage never falls below $40 per hour, so every committed dollar is used every hour, and anything above it is simply billed On-Demand.
+X: A=Commit to the peak: at night only $40 of the $100 commitment would be used, and unused commitment in an hour is lost, not carried forward. The company would pay for idle commitment most nights and weekends.
+B=Commit to the average: commitment does not average across the day. Each night hour wastes $30 of commitment, and peak hours above $70 still pay On-Demand, so savings are much lower than they look.
+D=Scheduled Standard RIs: Standard Reserved Instances are not scheduled; they apply every hour for a 1- or 3-year term. Scheduled RIs are no longer offered, and RIs also do not cover Fargate.
+T: Savings Plan commitments are use-it-or-lose-it every hour, so size them to the steady baseline, not the peak or the average.
+G: ## How a Savings Plan commitment works
+You commit to spending a fixed amount per hour (for example `$40/hour`) on eligible compute for 1 or 3 years. The commitment is measured at the discounted Savings Plan rates, not at On-Demand prices, so usage must be converted before sizing it.
+- Each hour, eligible usage is charged at the discounted Savings Plan rates until the commitment is used up.
+- Usage beyond the commitment in that hour is billed at normal On-Demand rates.
+- If usage is below the commitment in an hour, the unused part is lost; it does not roll over.
+## Sizing example
+Usage by hour: night $40, day $70, peak $100.
+- Commit $40: fully used every hour.
+- Commit $100: $60 wasted every night hour.
+Cost Explorer's Savings Plans recommendations use past usage to suggest a commitment, and many companies start near the baseline and add more later. A Compute Savings Plan covers EC2 in any Region and family, Fargate and Lambda.
+V: AWS Savings Plans, AWS Cost Explorer, Amazon EC2, AWS Fargate
+
+@ SAA-C03 D4 T4.3 applied use-case
+S: An Aurora PostgreSQL cluster runs an I/O-heavy transaction workload. Cost Explorer shows that I/O request charges make up about 55% of the cluster's monthly Aurora bill, and the traffic will stay at this level. Which change reduces the database cost the MOST without changing the application?
+A: Add two Aurora Replicas and point read queries at the reader endpoint so the writer handles fewer I/O operations
+B: Migrate the cluster to Aurora Serverless v2 so that compute scales down and I/O is billed only when queries run
+C: Change the instances to a smaller class and add an ElastiCache cluster that caches every write before it reaches Aurora
+D: Change the cluster storage configuration from Aurora Standard to Aurora I/O-Optimized so that I/O requests are not billed
+K: D
+W: Aurora I/O-Optimized: this storage configuration has no per-request I/O charges in exchange for higher instance and storage prices. AWS positions it for clusters where I/O is more than about 25% of the Aurora bill, and here it is 55%, so it gives large savings with no application change.
+X: A=Aurora Replicas for reads: replicas add instance cost and share the same cluster volume. Writes and any reads that miss the replicas' caches still generate billed storage I/O, so the per-request charges remain.
+B=Aurora Serverless v2: Serverless v2 scales compute, but with Aurora Standard storage it still bills every I/O request the same way. For steady heavy traffic it can also cost more than provisioned instances.
+C=Smaller instances plus ElastiCache for writes: a cache does not absorb writes, which must still reach the database. It adds a cluster to run and changes how the application writes data.
+T: When I/O charges are a large share of an Aurora bill, switch to Aurora I/O-Optimized; adding replicas or caches does not remove per-request I/O pricing.
+G: ## Aurora storage configurations
+- **Aurora Standard**: lower instance and storage prices, plus a charge for every million I/O requests. Good for low to moderate I/O.
+- **Aurora I/O-Optimized**: no I/O charges at all; instance and storage prices are higher. Predictable pricing for I/O-intensive work.
+## When to switch
+AWS guidance: if I/O spending is more than about 25% of the total Aurora database cost, I/O-Optimized is usually cheaper, with savings of up to about 40% reported for I/O-heavy workloads.
+## Example
+Monthly bill $10,000: instances $3,500, storage $1,000, I/O $5,500. With I/O-Optimized, I/O drops to $0 while instance prices rise by about 30% and storage by a bit more than double: about $4,550 + $2,250 = $6,800 total. (These ratios are approximate list-price relationships; exact prices vary by Region.)
+The change is a cluster setting, applies to Provisioned and Serverless v2 instances, and needs no code change. You can switch from I/O-Optimized back to Standard once every 30 days.
+V: Amazon Aurora, AWS Cost Explorer
+
+@ SAA-C03 D4 T4.3 applied use-case
+S: A DynamoDB table stores 30 TB of order history. Only orders from the last few weeks are read or updated regularly, and older items are read a few times a year for customer inquiries with the same single-digit millisecond latency. Storage now accounts for most of the table's cost. What is the MOST cost-effective change?
+A: Switch the table to the DynamoDB Standard-Infrequent Access table class, which lowers storage price for the same latency
+B: Switch the table from on-demand to provisioned capacity with auto scaling so that the storage portion of the bill falls
+C: Export items older than 90 days to S3 Glacier Deep Archive with a nightly job and delete them from the table afterwards
+D: Enable DynamoDB Accelerator (DAX) in front of the table so that reads of older order items are served from the cache
+K: A
+W: Standard-IA table class: it keeps the same performance, durability and API but charges a much lower storage price in exchange for higher read and write request prices. For a storage-dominated table with little traffic per GB, the total bill drops substantially.
+X: B=Provisioned capacity: capacity mode affects the cost of reads and writes only. Storage is billed per GB-month in both modes, so the largest part of this bill would not change.
+C=Export to Glacier Deep Archive: restores from Deep Archive take up to 12 hours or more, which fails the requirement that older orders are read with millisecond latency, and it adds a pipeline to maintain.
+D=DynamoDB Accelerator: DAX caches reads to lower latency and read cost, but it adds cluster charges and does nothing to the stored 30 TB, which is where the cost is.
+T: When storage dominates a DynamoDB bill and latency must stay the same, use the Standard-IA table class; capacity modes and caches only change request costs.
+G: ## DynamoDB table classes
+Each table has a table class that sets how storage and requests are priced:
+- **DynamoDB Standard**: default; balanced storage and request prices.
+- **DynamoDB Standard-Infrequent Access (Standard-IA)**: storage costs about 60% less per GB, while read and write requests cost more.
+Both classes have the same single-digit millisecond performance, durability, and features such as global tables and point-in-time recovery.
+## When Standard-IA wins
+It is aimed at tables where storage is the largest part of the bill, such as logs, order history or old social posts that are kept but rarely touched.
+## Example
+A 30 TB table where storage is 80% of cost: cutting the storage price by about 60% lowers the total by roughly 40%, even after the higher request prices. The class can be changed on an existing table with no downtime, and you can switch back later (a limited number of times per 30 days).
+V: Amazon DynamoDB
+
+@ SAA-C03 D4 T4.4 applied use-case
+S: An Amazon ECS cluster on Fargate runs in private subnets and pulls large container images from Amazon ECR many times a day. The NAT gateway's data processing charges have become the largest networking cost. Which TWO changes remove image pull traffic from the NAT gateway? (Select TWO)
+A: Create an S3 gateway VPC endpoint and add it to the private subnets' route tables, because ECR stores image layers in S3
+B: Create interface VPC endpoints for ECR (ecr.api and ecr.dkr) in the VPC so the ECR API calls stay on private addresses
+C: Add a second NAT gateway in each Availability Zone so each task uses the NAT gateway closest to it for image downloads
+D: Move the tasks to public subnets with public IP addresses and keep the NAT gateway in place for all other outbound traffic
+E: Create a VPC peering connection to the AWS account that hosts ECR so image pulls take a private path through the peering
+K: A,B
+W: A=S3 gateway endpoint: the image layers themselves are downloaded from Amazon S3. A gateway endpoint has no hourly or per-GB charge, so the bulk of the pull traffic stops flowing through the NAT gateway.
+B=ECR interface endpoints: `ecr.api` serves ECR API calls such as getting the authorization token, and `ecr.dkr` serves the Docker registry calls such as fetching manifests. With both in place, a task in a private subnet can complete the whole image pull without the NAT gateway.
+X: C=More NAT gateways: extra NAT gateways add hourly charges and still bill every GB processed. They can reduce cross-AZ transfer, but image traffic still goes through NAT.
+D=Public subnets with public IPs: each public IPv4 address has an hourly charge, the tasks become reachable from the internet, and it abandons the private-subnet design just to avoid NAT fees.
+E=VPC peering to ECR: ECR is a managed regional service, not a VPC in another account that you can peer with, so there is nothing to connect to.
+T: Private-subnet image pulls need an S3 gateway endpoint for the layers and ECR interface endpoints for the registry API; both take traffic off the NAT gateway.
+G: ## What happens during an image pull
+Pulling an image from Amazon ECR involves three services:
+1. `ecr.api`: ECR API calls, such as getting an authorization token.
+2. `ecr.dkr`: the Docker registry API, such as fetching the image manifest.
+3. **Amazon S3**: the image layers, usually most of the bytes, are downloaded from S3.
+## Why NAT gets expensive
+A NAT gateway charges per hour and per GB processed (approximately $0.045/GB in many Regions; check current pricing). A 1 GB image pulled 500 times a day is 500 GB/day through NAT.
+## The endpoint setup
+- **S3 gateway endpoint**: a route table entry, with no hourly or data charge.
+- **Interface endpoints** `com.amazonaws.<region>.ecr.api` and `.ecr.dkr`: small hourly and per-GB charges, much lower than NAT for this traffic.
+- For Fargate tasks that send logs, a `logs` interface endpoint lets CloudWatch Logs traffic skip NAT too.
+V: Amazon ECR, Amazon VPC, AWS Fargate, Amazon ECS
+
+@ SAA-C03 D4 T4.4 applied troubleshooting
+S: Two EC2 instances in the same VPC and the same Availability Zone exchange about 50 TB of data per month. The bill shows unexpected data transfer charges for this traffic. The application is configured to reach its peer using the peer's Elastic IP address. What change removes these charges?
+A: Place both instances in a cluster placement group so that traffic between them uses a faster network path within the AZ
+B: Enable enhanced networking with ENA on both instances so that data transfer between them is billed at a lower rate
+C: Configure the application to use the peer's private IP address or private DNS name so traffic stays on the private network
+D: Replace the Elastic IP addresses with new auto-assigned public IP addresses, because Elastic IP traffic is billed at a premium
+K: C
+W: Private IP addressing: traffic between instances in the same AZ over private IPv4 addresses is free. When the application sends to the Elastic IP, AWS bills it as public-address traffic in each direction, even though both instances sit in the same AZ.
+X: A=Cluster placement group: it improves latency and throughput between instances, but billing depends on the addresses used. Traffic sent to the Elastic IP is still charged.
+B=Enhanced networking: ENA raises bandwidth and packet rates; it does not change data transfer pricing at all.
+D=Auto-assigned public IPs: public IPv4 traffic is billed the same whether the address is an Elastic IP or auto-assigned. The charge comes from using a public address, not from the Elastic IP type.
+T: Within an AZ, traffic is free only over private IPs; talking to a peer's public or Elastic IP makes the same traffic billable.
+G: ## How EC2 data transfer is priced inside a Region
+- Same AZ, **private IPv4** addresses: free.
+- Different AZs in the same Region: charged per GB in each direction.
+- To or from a **public IPv4 or Elastic IP** address in the same Region: charged per GB in each direction (approximately $0.01/GB), even if both instances are in the same AZ.
+## Why this happens
+When an application uses a peer's public address, traffic is handled as public-address traffic, which AWS bills.
+## Example
+50 TB/month through Elastic IPs is about 50,000 GB x $0.01 x 2 directions = about $1,000/month. Using `10.0.1.25` instead, or the instance's private DNS name such as `ip-10-0-1-25.ec2.internal`, makes it $0.
+Inside a VPC that uses the Amazon-provided DNS with DNS hostnames enabled, the public DNS name of an instance resolves to its private IP, which is another safe option.
+V: Amazon EC2, Amazon VPC

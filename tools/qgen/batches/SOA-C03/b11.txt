@@ -1,0 +1,614 @@
+# SOA-C03 batch 11: detailed explanations (D3, D4, D5)
+
+@ SOA-C03 D3 T3.1 advanced troubleshooting
+S: A CloudFormation stack uses a Lambda-backed custom resource to seed a DynamoDB table. After a code change, the function sometimes throws an exception while parsing input. When that happens, the stack sits in CREATE_IN_PROGRESS for about an hour before failing, and the rollback then hangs in DELETE_IN_PROGRESS as well. What should the CloudOps engineer change?
+A: Raise the Lambda function timeout to 15 minutes so that the handler has enough time to finish the seeding work before CloudFormation stops waiting on it
+B: Wrap the handler so that every request type, including Delete, always sends a SUCCESS or FAILED response to the pre-signed ResponseURL, even after an exception
+C: Add a CreationPolicy with a ResourceSignal count of 1 to the custom resource and call cfn-signal from the function after the table has been seeded
+D: Add a DependsOn attribute that points the custom resource at the DynamoDB table so that CloudFormation invokes the function only after the table exists
+K: B
+W: Always send a response: CloudFormation does not watch the Lambda invocation itself. It waits for a JSON response uploaded to the pre-signed S3 `ResponseURL` in the request. If the function crashes before sending it, CloudFormation waits until the custom resource times out, and the same happens for the Delete request during rollback. A try/except (or finally) that always reports SUCCESS or FAILED, for Create, Update and Delete, makes failures show up in seconds.
+X: A=Longer Lambda timeout: the function is not running out of time; it fails fast with an exception. A longer timeout does not produce the missing response, so the stack still waits.
+C=CreationPolicy with cfn-signal: CreationPolicy applies to resources such as EC2 instances and Auto Scaling groups, not to custom resources, and signals are not how a custom resource reports its result.
+D=DependsOn the table: ordering is not the issue. The function is invoked and fails; without a response CloudFormation keeps waiting no matter when it was invoked.
+T: A custom resource finishes only when the function reports to the ResponseURL; unhandled exceptions and ignored Delete requests leave the stack waiting until timeout.
+G: ## How a Lambda-backed custom resource works
+For `Custom::Something` resources CloudFormation invokes your function with a request that contains:
+- `RequestType`: `Create`, `Update` or `Delete`
+- `ResponseURL`: a pre-signed S3 URL
+- IDs such as `StackId`, `RequestId` and `LogicalResourceId`
+The function does its work and then uploads a small JSON document to `ResponseURL` with `"Status": "SUCCESS"` or `"FAILED"` and a `PhysicalResourceId`. Only this upload tells CloudFormation the resource is done.
+## Why stacks hang
+If the code throws before the upload, CloudFormation hears nothing and waits until the custom resource timeout (one hour by default; the `ServiceTimeout` property can shorten it). A rollback then sends a `Delete` request, and if the code only handles `Create`, that waits too.
+## The fix pattern
+Put the logic in `try`, send `FAILED` with a reason in `except`, and treat `Delete` as a success when there is nothing to clean up. The `cfn-response` module or a helper library does the upload for you.
+V: AWS CloudFormation, AWS Lambda
+
+@ SOA-C03 D3 T3.1 applied use-case
+S: A team updates a production CloudFormation stack that changes an Auto Scaling group's launch template and an ALB listener rule. Twice, an update completed successfully but the new version immediately raised the 5XX error rate, and engineers had to roll back by hand. The team wants CloudFormation to undo an update automatically if the existing HTTPCode_Target_5XX_Count alarm fires during or shortly after the update. What should they configure?
+A: A stack policy that denies Update:Replace on the Auto Scaling group and listener rule whenever the HTTPCode_Target_5XX_Count alarm is in the ALARM state
+B: A rollback configuration on the stack with the 5XX alarm as a rollback trigger and a monitoring time of about 15 minutes after resources are deployed
+C: Termination protection on the stack together with an EventBridge rule that calls CancelUpdateStack whenever the 5XX alarm changes to the ALARM state
+D: A DeletionPolicy of Retain on the launch template and listener rule so that the previous versions remain available for a manual rollback afterward
+K: B
+W: Rollback triggers: a stack's rollback configuration lists CloudWatch alarms and a monitoring time (0 to 180 minutes). CloudFormation watches those alarms while it creates or updates the stack and for the monitoring period after the last resource is deployed. If any alarm goes to ALARM, it rolls the whole operation back to the previous known-good state.
+X: A=Stack policy on alarm state: stack policies control which resources may be updated or replaced; they cannot reference alarm states and would not roll anything back.
+C=Termination protection with CancelUpdateStack: termination protection only blocks stack deletion. CancelUpdateStack works only while an update is still in progress, so it cannot undo an update that already completed, which is exactly what happened here.
+D=DeletionPolicy Retain: this keeps a physical resource when it is removed from the stack. It does not detect a bad deployment or roll the stack back, and the rollback would still be manual.
+T: Let CloudFormation roll back on a health signal with rollback triggers (alarms plus a monitoring window); stack policies and deletion policies only protect resources.
+G: ## Rollback triggers
+Every stack create or update can include a **rollback configuration**:
+- `RollbackTriggers`: up to five CloudWatch alarms (or composite alarms) to watch
+- `MonitoringTimeInMinutes`: how long to keep watching after the last resource is deployed, 0 to 180
+## What happens during an update
+1. CloudFormation starts the update and begins watching the alarms.
+2. Resources are updated, for example a new launch template version rolls out.
+3. For the monitoring time CloudFormation keeps watching the alarms; the operation is not finished until the window ends.
+4. If an alarm enters `ALARM` at any point, CloudFormation rolls back to the previous template and parameters.
+Example: alarm on `HTTPCode_Target_5XX_Count > 50` for 2 minutes, monitoring time 15 minutes.
+## Good to know
+Set a monitoring time of 0 and CloudFormation still checks the alarms during the deployment itself. Make sure the alarm is in `OK` before the update starts, or it can trigger a rollback immediately.
+V: AWS CloudFormation, Amazon CloudWatch, Elastic Load Balancing
+
+@ SOA-C03 D3 T3.1 applied use-case
+S: A CloudFormation template creates an Amazon RDS for PostgreSQL instance. The master password already exists in an AWS Secrets Manager secret that other systems read and that a rotation function updates. The password must never appear in the template, in stack parameters, or in the CloudFormation console. How should the template set MasterUserPassword?
+A: Use a dynamic reference such as {{resolve:secretsmanager:prod/db:SecretString:password}} in the MasterUserPassword property of the DB instance
+B: Declare a String parameter with NoEcho set to true and have the deployment pipeline read the secret and pass its value in when it creates the stack
+C: Store the password in the Mappings section of the template and keep the template in a private repository that only the database team can read
+D: Import the password with Fn::ImportValue from a separate stack that reads the secret and exports it as a stack output named DbMasterPassword
+K: A
+W: Secrets Manager dynamic reference: CloudFormation resolves `{{resolve:secretsmanager:...}}` itself at deployment time, passes the value to RDS, and never shows the resolved value in the template, stack parameters or stack events. The template only contains the name of the secret, so the existing secret stays the single source of truth.
+X: B=NoEcho parameter: the value is masked in the console, but the pipeline still has to fetch and handle the plain password, where it can leak through pipeline logs or variables. It adds another copy of the secret instead of referencing the existing one.
+C=Mappings in a private repository: the password would be in plain text inside the template, which the requirement forbids, and anyone who can view the stack template in CloudFormation could read it.
+D=Export via Fn::ImportValue: stack outputs and exports are visible in plain text in the console and through the API, so the password would be exposed to anyone who can list exports.
+T: Reference secrets in templates with dynamic references so CloudFormation resolves them; parameters, mappings and exports all put a copy of the value somewhere visible.
+G: ## Dynamic references
+A dynamic reference is a placeholder that CloudFormation replaces with a value from another service during a stack operation:
+- `{{resolve:ssm:/app/ami}}` for plain Parameter Store values
+- `{{resolve:ssm-secure:/app/pw}}` for SecureString parameters (only for properties that support it)
+- `{{resolve:secretsmanager:secret-id:SecretString:json-key}}` for Secrets Manager
+Example:
+`MasterUserPassword: '{{resolve:secretsmanager:prod/db:SecretString:password}}'`
+## What CloudFormation keeps
+The template, change sets and stack events show only the reference string, never the resolved password.
+## Rotation caveat
+CloudFormation reads the secret only during a stack operation. If rotation changes the secret, the database is updated by the rotation function itself, not by CloudFormation. For a brand new database, RDS can also create and manage its own secret with `ManageMasterUserPassword`, but here an existing shared secret must be reused.
+V: AWS CloudFormation, AWS Secrets Manager, Amazon RDS
+
+@ SOA-C03 D3 T3.1 advanced troubleshooting
+S: A CloudFormation stack manages an Auto Scaling group that uses a launch template. An engineer changes the AMI ID, which creates a new launch template version referenced by the group, and the stack update completes successfully. Days later, every running instance still uses the old AMI and only newly scaled-out instances use the new one. The team wants future stack updates to replace instances in batches while keeping capacity. What should they add?
+A: A CreationPolicy on the Auto Scaling group with a ResourceSignal count equal to the desired capacity, so that each update waits for every new instance
+B: An UpdatePolicy with AutoScalingRollingUpdate on the Auto Scaling group, setting MinInstancesInService, MaxBatchSize, and WaitOnResourceSignals
+C: A DeletionPolicy of Snapshot on the launch template resource, so that every new template version forces CloudFormation to recreate the instances
+D: A DependsOn attribute from the Auto Scaling group to the launch template, so that the group is always updated after the new template version exists
+K: B
+W: AutoScalingRollingUpdate: without an `UpdatePolicy`, CloudFormation only updates the group's configuration and leaves existing instances alone. With `AutoScalingRollingUpdate`, a launch template change makes CloudFormation replace instances in batches of `MaxBatchSize`, keep at least `MinInstancesInService` running, and optionally wait for `cfn-signal` from each new instance before continuing.
+X: A=CreationPolicy only: a CreationPolicy defines how many success signals to wait for when instances are created, but by itself it does not make CloudFormation replace existing instances when the launch template changes.
+C=DeletionPolicy Snapshot: launch templates do not support the Snapshot deletion policy, and deletion policies only apply when a resource is removed from the stack, not when it is updated.
+D=DependsOn the launch template: the group already references the template, so ordering is implicit. The update order was never the problem; the missing replacement behavior is.
+T: A CloudFormation-managed Auto Scaling group replaces instances on a template change only if it has an UpdatePolicy such as AutoScalingRollingUpdate.
+G: ## Updating an Auto Scaling group in CloudFormation
+When a launch template version changes, an Auto Scaling group uses the new version only for instances it launches from then on. Existing instances keep running the old AMI.
+## UpdatePolicy options
+- **AutoScalingRollingUpdate**: replaces instances in batches inside the same group. Key settings: `MaxBatchSize`, `MinInstancesInService`, `PauseTime`, `WaitOnResourceSignals`, `SuspendProcesses`.
+- **AutoScalingReplacingUpdate** with `WillReplace: true`: creates a whole new group, waits for it, then deletes the old one.
+Example: 6 instances, `MaxBatchSize: 2`, `MinInstancesInService: 4`, `WaitOnResourceSignals: true`, `PauseTime: PT10M`. CloudFormation replaces two at a time and waits for each new pair to signal healthy.
+## Outside CloudFormation
+The Auto Scaling **instance refresh** feature does a similar batch replacement when you manage the group directly.
+V: AWS CloudFormation, Amazon EC2 Auto Scaling
+
+@ SOA-C03 D3 T3.1 advanced tradeoff
+S: Many teams deploy CloudFormation stacks in 40 accounts, some from pipelines and some directly from engineers' laptops. Security requires that no RDS DB instance is ever created unless StorageEncrypted is true and DeletionProtection is enabled. Noncompliant resources must be blocked before they are provisioned, whichever way the stack is deployed. Which approach fits best?
+A: An AWS Config managed rule for RDS storage encryption with automatic remediation that stops and flags any DB instance that is found unencrypted
+B: CloudFormation Hooks, using Guard rules that check those properties and set to fail, activated in all accounts so noncompliant stack operations stop
+C: A cfn-lint and cfn-guard validation stage in the central CI/CD pipeline that rejects any template with an unencrypted or unprotected RDS instance
+D: A stack policy on every stack that denies Update actions for AWS::RDS::DBInstance resources unless the encryption properties are already set
+K: B
+W: CloudFormation Hooks: a hook runs inside the CloudFormation service before a resource is created or updated, evaluating the resource properties, for example with AWS CloudFormation Guard rules. With the failure mode set to fail, a noncompliant RDS instance stops the stack operation before anything is provisioned, regardless of whether the stack came from a pipeline, the console or the CLI.
+X: A=Config rule with remediation: Config is detective and evaluates resources after they exist. The unencrypted database would already be created, and RDS storage encryption cannot simply be switched on in place.
+C=Pipeline-only validation: linting and Guard checks in CI are useful, but engineers deploying from their laptops bypass the pipeline, so they do not enforce the rule for every deployment.
+D=Stack policy: stack policies only allow or deny updates to existing resources in a stack. They cannot inspect property values and do nothing during stack creation.
+T: To block noncompliant resources in any CloudFormation deployment path, use Hooks inside the service; pipelines can be bypassed and Config only detects after creation.
+G: ## Preventive, proactive and detective controls
+- **Detective**: find a problem after the resource exists, for example an AWS Config rule.
+- **Proactive**: check the resource definition before it is provisioned, for example a CloudFormation Hook.
+- **Preventive**: block the API call itself, for example an SCP.
+## CloudFormation Hooks
+A hook is registered and activated in an account and Region, and CloudFormation calls it before provisioning resources of the targeted types.
+- **Guard hooks** evaluate AWS CloudFormation Guard rules, for example a rule that requires `StorageEncrypted` and `DeletionProtection` to be `true` on every `AWS::RDS::DBInstance`.
+- **Lambda hooks** call your own function for custom logic.
+- `FailureMode: FAIL` stops the operation; `WARN` only logs.
+Because the check runs in the service, it applies to the console, CLI, SDK and every pipeline. StackSets can activate the same hook in all accounts. AWS Control Tower proactive controls are built on hooks.
+V: AWS CloudFormation, Amazon RDS, AWS Config
+
+@ SOA-C03 D3 T3.1 applied use-case
+S: Years ago, an engineer created a DynamoDB table and an S3 bucket by hand in the console. Both now hold production data. The team wants these resources managed by a new CloudFormation stack without deleting, recreating or copying them, and without any downtime. What should the CloudOps engineer do?
+A: Write a template that declares both resources with their exact names, then run a normal stack creation so CloudFormation adopts the existing resources automatically
+B: Run drift detection on a new empty stack so that CloudFormation discovers the two resources and adds them to the stack in the state it finds them in
+C: Create a change set of type IMPORT with a template that describes both resources, gives each a DeletionPolicy, and supplies the table name and bucket name
+D: Back up the table and bucket, delete them, then let a new stack recreate both with the same names and restore the data after the stack creation finishes
+K: C
+W: Resource import: an IMPORT change set brings existing resources under stack management without touching them. The template describes each resource, every imported resource must have a `DeletionPolicy`, and you supply the identifiers (here `TableName` and `BucketName`). After import, run drift detection to confirm the template matches reality.
+X: A=Normal stack creation: CloudFormation tries to create new resources, so the call fails because a table and a bucket with those names already exist. It never adopts resources implicitly.
+B=Drift detection on an empty stack: drift detection only compares resources that already belong to a stack with the template. It does not discover or add unmanaged resources.
+D=Delete and recreate: this causes downtime and risk of data loss, which the team explicitly wants to avoid, and bucket names may not be immediately reusable.
+T: Bring existing resources into CloudFormation with an IMPORT change set (DeletionPolicy plus identifiers); a normal create fails and drift detection never adopts anything.
+G: ## Importing resources into a stack
+CloudFormation can adopt resources created elsewhere (console, CLI, another tool) if the resource type supports import. The resources are not modified.
+## Steps
+1. Write a template that describes the resources as they are now. The IaC generator in the CloudFormation console can scan the account and draft this template for you.
+2. Add `DeletionPolicy` (for example `Retain`) to every resource being imported. Import requires it.
+3. Create a change set with `--change-set-type IMPORT` and a `resources-to-import` list, for example `{"ResourceType":"AWS::DynamoDB::Table","LogicalResourceId":"Orders","ResourceIdentifier":{"TableName":"orders"}}`.
+4. Execute the change set, then run drift detection.
+## Why the DeletionPolicy rule exists
+It prevents a later stack delete or rollback from destroying production resources that the stack did not originally create.
+V: AWS CloudFormation, Amazon DynamoDB, Amazon S3
+
+@ SOA-C03 D3 T3.2 advanced use-case
+S: A central operations account must run the same Systems Manager Automation runbook, which stops idle development instances, across 20 member accounts in three Regions from one execution. Engineers must not have to sign in to each account or Region. How should the CloudOps engineer set this up?
+A: Share the runbook with every member account and create a separate EventBridge schedule in each account and Region that starts its own local execution
+B: Create a resource data sync from each member account to the operations account and start the runbook against the aggregated inventory from there
+C: Grant the operations account's engineers IAM users in every member account and run one AWS CLI loop that starts the runbook with each set of keys
+D: Create the Automation administration role in the operations account and the execution role in each member account, then start it with target locations
+K: D
+W: Multi-account, multi-Region Automation: from the central account you call `StartAutomationExecution` with `TargetLocations` listing accounts (or OUs) and Regions. Systems Manager uses the `AWS-SystemsManager-AutomationAdministrationRole` in the central account to assume `AWS-SystemsManager-AutomationExecutionRole` in each target account, and runs the runbook there, all tracked as one parent execution.
+X: A=Local schedules everywhere: this works but means 60 separate schedules and executions to deploy and monitor, which is exactly the per-account effort the team wants to avoid.
+B=Resource data sync: data sync aggregates inventory data into an S3 bucket for reporting. It does not let a runbook act on instances in other accounts.
+C=IAM users with keys in every account: long-term access keys in 20 accounts are a security risk and the loop is fragile. Cross-account roles are the supported and safer way.
+T: Run one Automation across accounts and Regions with the administration and execution roles plus TargetLocations, not per-account schedules or IAM users.
+G: ## Automation across accounts and Regions
+Systems Manager Automation can fan out one execution from a central (management or delegated administrator) account.
+## Two IAM roles
+- **Administration role** in the central account: `AWS-SystemsManager-AutomationAdministrationRole`. It is allowed to assume the execution role in the targets.
+- **Execution role** in every target account: `AWS-SystemsManager-AutomationExecutionRole`. It trusts the administration role and holds the permissions the runbook needs, such as `ec2:StopInstances`.
+Deploy the execution role to all accounts with CloudFormation StackSets.
+## Starting the execution
+`TargetLocations=[{Accounts=[ou-ab12-dev],Regions=[us-east-1,eu-west-1,ap-northeast-2],TargetLocationMaxConcurrency=5}]`
+plus normal targets inside each account, such as a tag `Environment=dev`. Rate controls (max concurrency, max errors) apply at the location and target level, and the parent execution shows the status of every child.
+V: AWS Systems Manager, AWS IAM, AWS CloudFormation
+
+@ SOA-C03 D3 T3.2 applied troubleshooting
+S: An EventBridge rule matches EC2 Instance State-change Notification events with state running and targets a custom Systems Manager Automation runbook that installs a monitoring agent. The runbook requires an InstanceId parameter. The rule matches correctly, but every execution fails immediately because InstanceId has no value. What should the CloudOps engineer fix?
+A: Add an input transformer to the target that maps $.detail.instance-id to a variable and builds the input {"InstanceId":["<instance>"]} for the runbook
+B: Change the event pattern so that it filters on the detail-type Instance State-change Notification and includes the instance ID as a matching field
+C: Add an AutomationAssumeRole parameter to the runbook so that the execution has permissions to read the instance ID from the EC2 describe APIs
+D: Configure a dead-letter queue and a retry policy on the target so that failed executions are retried after the instance finishes initializing
+K: A
+W: Input transformer: EventBridge passes the whole event to the target unless you tell it otherwise, and an Automation target expects a JSON object of runbook parameters. An input transformer extracts `detail.instance-id` from the event and builds `{"InstanceId":["i-0abc..."]}`, so each execution receives the instance that triggered it.
+X: B=Change the event pattern: the pattern only decides which events match. It already matches, and it never changes what input the target receives.
+C=AutomationAssumeRole: a missing role causes permission errors on API calls. Here the parameter itself is empty, which is an input mapping problem, not a permissions problem.
+D=DLQ and retries: retries send the same unmapped input again, so every retry fails the same way. A DLQ only collects the failures.
+T: The event pattern decides when a rule fires; an input transformer decides what the target receives, such as mapping the instance ID into a runbook parameter.
+G: ## Event pattern versus target input
+An EventBridge rule has two separate jobs:
+- **Event pattern**: which events match, for example `"source":["aws.ec2"]` and `"detail":{"state":["running"]}`.
+- **Target input**: what is sent to the target. Options are the matched event, a part of it (input path), constant JSON, or an **input transformer**.
+## Input transformer
+It has two parts:
+- `InputPathsMap`: `{"instance":"$.detail.instance-id"}` pulls values out of the event.
+- `InputTemplate`: `{"InstanceId":["<instance>"]}` builds the new input.
+## Why the list brackets
+Systems Manager document parameters are passed as lists of strings, so the value goes inside `[ ]`. The rule's target also needs an IAM role that allows `ssm:StartAutomationExecution` (and `iam:PassRole` for the runbook's assume role).
+V: Amazon EventBridge, AWS Systems Manager, Amazon EC2
+
+@ SOA-C03 D3 T3.2 applied tradeoff
+S: A Step Functions workflow that prepares daily reports must start at 09:00 local time in New York every weekday, all year, including after daylight saving time changes. An existing EventBridge rule with the cron expression cron(0 14 ? * MON-FRI *) starts it an hour late for part of the year. Which change fixes this with the least ongoing effort?
+A: Keep the rule and create a second EventBridge rule with cron(0 13 ? * MON-FRI *), then enable and disable the two rules each time the clocks change
+B: Replace the rule with an EventBridge Scheduler schedule that uses the same weekday cron expression at 09:00 with its time zone set to America/New_York
+C: Change the rule to run every hour on weekdays and add a Lambda function that converts the time to New York time and starts the workflow only at 09:00
+D: Change the rule's cron expression to cron(0 9 ? * MON-FRI *) and add the TZ=America/New_York variable to the state machine's execution input
+K: B
+W: EventBridge Scheduler with a time zone: Scheduler cron and rate schedules accept a time zone, and they follow daylight saving time automatically. A schedule `cron(0 9 ? * MON-FRI *)` in `America/New_York` fires at 09:00 local time all year and can target Step Functions directly.
+X: A=Two rules switched by hand: this depends on someone toggling rules twice a year, which is easy to forget and is exactly the ongoing effort the team wants to avoid.
+C=Hourly rule plus Lambda: it works but adds a function to build, secure and maintain, and it invokes 24 times more often than needed just to compensate for a missing feature.
+D=Time zone in the input: scheduled rules on an event bus always evaluate cron in UTC. Passing a time zone to the workflow does not change when the rule fires, so it would start at 09:00 UTC.
+T: EventBridge rules schedule in UTC only; EventBridge Scheduler supports time zones and handles daylight saving time for you.
+G: ## Two ways to schedule in EventBridge
+- **Scheduled rules** on an event bus: cron or rate expressions, always evaluated in **UTC**.
+- **EventBridge Scheduler**: a separate service built for schedules. It supports cron, rate and one-time schedules, a **time zone** per schedule, flexible time windows, retries and a dead-letter queue.
+## Daylight saving time example
+New York is UTC-5 in winter and UTC-4 in summer. A UTC rule at `14:00` means 09:00 in winter but 10:00 in summer. A Scheduler schedule with `ScheduleExpressionTimezone: America/New_York` and `cron(0 9 ? * MON-FRI *)` always means 09:00 local.
+## Targets
+Scheduler can call many AWS APIs directly, including `states:StartExecution` for Step Functions, using an execution role you provide. New scheduling work is usually easier on Scheduler than on scheduled rules.
+V: Amazon EventBridge, AWS Step Functions
+
+@ SOA-C03 D3 T3.2 advanced use-case
+S: An account has hundreds of EC2 instances launched by different teams. Some have no instance profile, and others use instance profiles owned by application teams that do not include Systems Manager permissions. Operations must make every instance in the Region a managed node without creating or editing any instance profile. The instances run a recent SSM Agent and use IMDSv2. What should the CloudOps engineer do?
+A: Use an AWS Config rule with automatic remediation that attaches the AmazonSSMManagedInstanceCore policy to every instance profile role in the account
+B: Create a hybrid activation and register every EC2 instance with the activation code and ID so that the instances do not need an instance profile
+C: Enable the Default Host Management Configuration in Systems Manager so that it uses an account-level IAM role to manage every EC2 instance
+D: Create interface VPC endpoints for ssm, ssmmessages and ec2messages in every VPC so that the agents can register without any IAM credentials
+K: C
+W: Default Host Management Configuration: DHMC is an account and Region setting. Systems Manager then provides credentials from one IAM role (by default `AWSSystemsManagerDefaultEC2InstanceManagementRole`) to the SSM Agent on every EC2 instance, independent of the instance profile, so no instance profile has to be created or changed.
+X: A=Config remediation on instance profiles: this edits roles that application teams own, which the requirement forbids, and it still does nothing for instances that have no instance profile at all.
+B=Hybrid activation: activations are meant for on-premises servers and other non-EC2 machines. Using them for an EC2 fleet is not the intended pattern and would require registering each instance by hand with activation codes.
+D=VPC endpoints alone: endpoints give network paths for instances without internet access, but the agent still needs IAM credentials to call Systems Manager, so instances without permissions stay unmanaged.
+T: Manage all EC2 instances without touching instance profiles by enabling Default Host Management Configuration; endpoints fix the network path, not the credentials.
+G: ## What makes an instance a managed node
+Three things must be true:
+- The **SSM Agent** is installed and running.
+- The agent can **reach** Systems Manager endpoints (internet, NAT, or VPC endpoints).
+- The agent has **IAM credentials** allowed to talk to Systems Manager.
+## The classic way
+Attach an instance profile with `AmazonSSMManagedInstanceCore`. With many teams and existing profiles this means editing roles you may not own.
+## Default Host Management Configuration (DHMC)
+Turned on per account and Region in Fleet Manager (or Quick Setup). Systems Manager gives the agent credentials from an account-level role with the `AmazonSSMManagedEC2InstanceDefaultPolicy` policy.
+- Works for instances with or without an instance profile.
+- Requires a recent SSM Agent and IMDSv2.
+- Application permissions stay in the teams' own instance profiles.
+V: AWS Systems Manager, Amazon EC2, AWS IAM
+
+@ SOA-C03 D3 T3.2 applied use-case
+S: Operations uses Systems Manager Run Command to run a long diagnostic script on 150 instances. The console shows only part of each instance's output, and nobody notices when the command fails on a few instances. The team needs the complete output of every invocation kept for later review and a notification when any invocation fails or times out. Which TWO actions meet these requirements? (Select TWO)
+A: Specify an S3 bucket and key prefix for command output when sending the command so the full output of every instance is stored
+B: Enable Session Manager logging to an S3 bucket so that the output of each Run Command invocation is written to the session logs
+C: Configure the command's SNS notification settings with a topic, a service role, and the Failed and TimedOut status events selected
+D: Enable CloudTrail data events for Systems Manager so that the command output of every instance is recorded along with the API call
+E: Increase the command's execution timeout and set the rate control's maximum errors to zero so that failures always stop the command
+K: A,C
+W: A=S3 output location: sending the command with an `OutputS3BucketName` (and prefix) stores the complete stdout and stderr of every invocation, while the console only shows a truncated portion.
+C=SNS notifications: Run Command publishes status changes to an SNS topic, using a service role that allows `sns:Publish`, for the statuses you select such as `Failed` and `TimedOut`, so failures on a few instances are no longer missed.
+X: B=Session Manager logging: this records interactive Session Manager sessions. Run Command invocations are not sessions, so their output is not written there.
+D=CloudTrail data events: CloudTrail records who called SendCommand and with which parameters, not the stdout of the script on each instance.
+E=Timeout and max errors: a longer timeout and a max errors of zero change how the command runs and when it stops, but neither keeps the output nor notifies anyone about failures.
+T: Keep full Run Command output in S3 (or CloudWatch Logs) and alert with the command's SNS notifications; session logs and CloudTrail do not hold command output.
+G: ## Where Run Command output goes
+By default the console and `GetCommandInvocation` show only a truncated part of each instance's output. For complete results choose an output destination when you send the command:
+- **Amazon S3**: `OutputS3BucketName` and `OutputS3KeyPrefix`; one object per instance and step, for stdout and stderr.
+- **CloudWatch Logs**: a log group for streaming the output.
+The instance's IAM role needs permission to write there, because the agent uploads the output.
+## Notifications
+Run Command can send SNS notifications per command or per invocation. You provide:
+- `NotificationArn` (the SNS topic)
+- `ServiceRoleArn` (a role Systems Manager assumes to publish)
+- the events you care about, for example `Failed`, `TimedOut`, `Cancelled`
+Command status changes are also emitted as EventBridge events, which suit more complex routing.
+V: AWS Systems Manager, Amazon S3, Amazon SNS
+
+@ SOA-C03 D4 T4.1 advanced use-case
+S: Developers must be able to create IAM roles for their own Lambda functions without asking the platform team. Security is concerned that a developer could create a role more powerful than their own and use it to escalate privileges. Which approach lets developers create roles while capping what any role they create can do?
+A: Attach an SCP that denies iam:CreateRole in the developer accounts and have the platform team create every Lambda execution role on request
+B: Allow iam:CreateRole only when the iam:PermissionsBoundary condition equals an approved boundary policy, and deny changing or removing that boundary
+C: Require MFA for iam:CreateRole and iam:AttachRolePolicy calls and enable IAM Access Analyzer so that overly permissive roles are reported
+D: Give developers the managed PowerUserAccess policy, which grants every service action except IAM, and let Lambda create the execution roles
+K: B
+W: Permissions boundary enforced by condition: the developers' policy allows `iam:CreateRole` and attaching policies only if the request sets `iam:PermissionsBoundary` to the approved boundary ARN. Effective permissions of any role they create are the intersection of its policies and that boundary, so no created role can exceed it. Denying `iam:DeleteRolePermissionsBoundary` and changes to the boundary policy closes the obvious bypass.
+X: A=SCP denying CreateRole: this removes the escalation risk by removing self-service altogether, which contradicts the requirement that developers create their own roles.
+C=MFA plus Access Analyzer: MFA proves who made the call but does not limit what the role can do, and Access Analyzer reports problems after the role exists instead of capping it.
+D=PowerUserAccess: it excludes IAM apart from a few actions such as managing service-linked roles, so developers could not create execution roles at all. Lambda also does not create roles on your behalf unless the caller has IAM permissions.
+T: Safe delegated role creation = allow CreateRole only with a mandatory permissions boundary; SCPs and MFA either block the feature or do not cap the role.
+G: ## What a permissions boundary does
+A permissions boundary is a managed policy attached to a user or role that sets the **maximum** permissions it can have. Effective permissions are the intersection of the identity policies and the boundary.
+Example: the boundary allows `logs:*`, `dynamodb:*` on `app-*` tables and `s3:GetObject`. Even if someone attaches `AdministratorAccess` to the role, it can only do what the boundary allows.
+## Delegating role creation safely
+Give developers a policy like:
+- Allow `iam:CreateRole`, `iam:AttachRolePolicy`, `iam:PutRolePolicy` with condition `"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/DevBoundary"`
+- Deny `iam:DeleteRolePermissionsBoundary` and any change to the `DevBoundary` policy itself
+- Allow `iam:PassRole` only for roles on a path such as `/dev-lambda/`
+Developers stay self-sufficient, and security controls the ceiling in one policy.
+V: AWS IAM, AWS Lambda
+
+@ SOA-C03 D4 T4.1 applied troubleshooting
+S: An organization attached an SCP to its workload OU that denies all actions when aws:RequestedRegion is not eu-west-1 or eu-central-1. Workloads there run fine, but administrators now get access denied errors in IAM, Route 53, CloudFront, and AWS Support. Services must stay blocked in all other Regions. How should the CloudOps engineer fix the SCP?
+A: Add us-east-1 to the list of allowed Regions in the condition, because the global services are all hosted from the us-east-1 Region endpoints
+B: Attach an IAM policy that allows iam:*, route53:*, cloudfront:* and support:* to the administrator roles in each account of the workload OU
+C: Change the deny statement to use NotAction listing the global services, such as iam:*, route53:*, cloudfront:* and support:*, so they are exempt
+D: Move the Region condition from the SCP into a permissions boundary on the administrator roles so that global service calls are no longer evaluated
+K: C
+W: NotAction exemption: global services such as IAM, Route 53, CloudFront and Support are served from a single Region endpoint (usually us-east-1), so a Region deny blocks them. Writing the statement as `Deny` with `NotAction` for those services leaves them usable while every other action outside the two approved Regions stays denied.
+X: A=Allow us-east-1: this unblocks the global services but also allows every other service in us-east-1, which breaks the requirement that other Regions stay blocked.
+B=IAM allow policy: an explicit deny in an SCP always wins over any allow in IAM policies, so adding allows in the accounts changes nothing.
+D=Permissions boundary instead: boundaries must be attached to every principal and can be bypassed by principals without one, so the organization loses its central guardrail. Global calls would still need an exemption.
+T: Region-restriction SCPs must exempt global services with NotAction; allowing their Region opens everything there, and IAM allows never beat an SCP deny.
+G: ## How a Region-restriction SCP works
+A common guardrail:
+`{"Effect":"Deny","NotAction":["iam:*","organizations:*","route53:*","cloudfront:*","support:*","sts:*", ...],"Resource":"*","Condition":{"StringNotEquals":{"aws:RequestedRegion":["eu-west-1","eu-central-1"]}}}`
+`aws:RequestedRegion` is the Region of the endpoint that receives the API call.
+## Why global services break
+Global services have one control plane endpoint, usually in `us-east-1`. A console action in IAM therefore arrives with `aws:RequestedRegion = us-east-1` and matches the deny.
+## Fixing it properly
+- Use `NotAction` to list services that must work globally.
+- Everything not listed is denied outside the approved Regions.
+- An exception for a break-glass role can be added with a condition on `aws:PrincipalARN`.
+AWS Control Tower's Region deny control uses the same pattern.
+V: AWS Organizations, AWS IAM
+
+@ SOA-C03 D4 T4.1 advanced troubleshooting
+S: An S3 bucket in account A stores reports encrypted with SSE-KMS using a customer managed key in account A. An analytics role in account B has an identity policy allowing s3:GetObject on the bucket and kms:Decrypt on the key ARN, but its GetObject requests fail with AccessDenied. The key type must not change. Which TWO changes in account A are required? (Select TWO)
+A: Add a statement to the bucket policy that allows s3:GetObject on the report objects for the analytics role ARN in account B
+B: Add a statement to the key policy of the customer managed key that allows kms:Decrypt for the analytics role or account B
+C: Change the bucket's default encryption to the AWS managed key aws/s3 so that the analytics role can decrypt the objects
+D: Turn off S3 Block Public Access on the bucket so that requests from principals in another account are no longer rejected
+E: Create an S3 gateway endpoint in account A so that requests from account B reach the bucket through a private network path
+K: A,B
+W: A=Bucket policy grant: cross-account access needs permission on both sides. Account B's identity policy is already in place, so the bucket owner must also allow the role for `s3:GetObject` in the bucket policy.
+B=Key policy grant: S3 decrypts SSE-KMS objects with the caller's permissions on the key, and a KMS key only accepts cross-account use if its key policy allows it, so the key policy must allow `kms:Decrypt` for the role or account B.
+X: C=AWS managed key: the key policy of an AWS managed key such as `aws/s3` cannot be edited and only trusts the owning account, so cross-account reads would fail entirely. The requirement also forbids changing the key type.
+D=Block Public Access: granting a specific principal ARN in another account is not public access, so Block Public Access does not block it and does not need to be turned off.
+E=Gateway endpoint in account A: an endpoint in account A does not carry account B's traffic and does not add permissions. The problem is authorization, not network path.
+T: Cross-account SSE-KMS reads need three allows: the caller's identity policy, the bucket policy, and the customer managed key's key policy.
+G: ## Cross-account access needs both sides
+When a principal in account B calls a resource in account A, AWS requires an allow in **both** accounts:
+- Account B: an identity policy on the role.
+- Account A: a resource policy that trusts the role or account B.
+## SSE-KMS adds a second resource
+For an object encrypted with SSE-KMS, `GetObject` makes S3 call KMS `Decrypt` on behalf of the caller. So the caller also needs:
+- `kms:Decrypt` in its identity policy (already there in this case), and
+- a statement in the **key policy** in account A, for example principal `arn:aws:iam::222233334444:role/analytics`.
+## Troubleshooting order
+1. Bucket policy allows the principal?
+2. Key policy allows the principal?
+3. Identity policy allows both?
+AWS managed keys cannot be shared across accounts, which is one reason to use customer managed keys for shared data.
+V: Amazon S3, AWS KMS, AWS IAM
+
+@ SOA-C03 D4 T4.1 applied use-case
+S: A security team wants to reduce standing permissions across the 50 accounts of its organization. It needs a continuously updated list of IAM roles that have not been used for 90 days, and of roles that were granted services or actions they have never called, without building its own analysis. What should the CloudOps engineer set up?
+A: Download the IAM credential report from every account each week and compare the password and access key last-used columns against the 90-day limit
+B: Create an IAM Access Analyzer external access analyzer with the organization as the zone of trust and review its findings for unused roles
+C: Enable AWS Trusted Advisor checks in every account and filter the IAM checks for roles that have been inactive for more than 90 days
+D: Create an IAM Access Analyzer unused access analyzer for the organization with a tracking period of 90 days and review its findings
+K: D
+W: Unused access analyzer: an organization-level unused access analyzer continuously reports unused roles, unused access keys and passwords, and unused service- and action-level permissions for all member accounts, using the tracking period you set, such as 90 days. Findings appear in one place and update as activity changes.
+X: A=Credential report: it covers IAM users' passwords and access keys only, one account at a time. It lists no roles and says nothing about unused permissions.
+B=External access analyzer: this analyzer finds resources shared with principals outside the zone of trust. It does not analyze whether roles or permissions are used.
+C=Trusted Advisor: Trusted Advisor has checks such as root MFA and exposed keys, but it does not produce per-role unused permission findings across an organization.
+T: Unused roles and permissions → Access Analyzer unused access analyzer; external access analyzers and credential reports answer different questions.
+G: ## Two kinds of IAM Access Analyzer
+- **External access analyzer**: finds resources (buckets, keys, roles, queues) that grant access to principals outside a zone of trust such as the organization.
+- **Unused access analyzer**: finds access that is granted but not used.
+## What unused access findings cover
+- Unused roles: no activity within the tracking period
+- Unused access keys and console passwords of IAM users
+- Unused permissions: services and, for many services, actions the role is allowed but never called
+Example finding: role `etl-legacy` allows `s3:*`, `dynamodb:*` and `sqs:*`, but only `s3:GetObject` was used in 90 days.
+## How to use it
+Create it in the management account or a delegated administrator account with the organization as its scope. Findings can go to Security Hub or EventBridge, and Access Analyzer can also generate a policy from CloudTrail activity to replace a broad one. Unused access analysis is billed per role or user analyzed per month.
+V: AWS IAM Access Analyzer, AWS Organizations, AWS IAM
+
+@ SOA-C03 D4 T4.2 advanced tradeoff
+S: An application in us-east-1 encrypts records client side with AWS KMS before writing the ciphertext to S3, which replicates it to eu-west-1. During a Regional outage, the recovery stack in eu-west-1 must decrypt that data without calling us-east-1. The current key is a single-Region customer managed key. What should the CloudOps engineer do?
+A: Keep the current key and create a KMS grant for the recovery role in eu-west-1 so that it can call Decrypt on the us-east-1 key during an outage
+B: Create a new customer managed key in eu-west-1 and have the application encrypt every record twice, once with each key, and store both ciphertexts
+C: Create a multi-Region primary key in us-east-1 and a replica in eu-west-1, and switch the application to encrypt new data with the primary key
+D: Convert the existing single-Region key into a multi-Region key and create a replica in eu-west-1 that shares its key material and its key ID
+K: C
+W: Multi-Region keys: a multi-Region primary and its replica share the same key material and key ID, so ciphertext produced in us-east-1 can be decrypted by the replica in eu-west-1 with a local API call. Existing single-Region keys cannot be converted, so the team creates a new multi-Region key, uses it for new data, and re-encrypts older data if it must be recoverable too.
+X: A=Grant on the existing key: a grant adds permissions but the key still lives only in us-east-1, so every decrypt call still has to reach us-east-1, which is unavailable during the outage.
+B=Encrypt twice with two keys: it can work but doubles storage and KMS calls and complicates the application, while multi-Region keys solve the problem natively.
+D=Convert the existing key: KMS does not allow converting a single-Region key to a multi-Region key; the multi-Region property is fixed when the key is created.
+T: Decrypt in another Region without cross-Region calls → multi-Region primary and replica keys, created new because single-Region keys cannot be converted.
+G: ## Single-Region versus multi-Region KMS keys
+A normal KMS key exists in one Region, and its key material never leaves that Region. Ciphertext it produces can only be decrypted by calling KMS in that Region.
+## Multi-Region keys
+- You create a **primary** key with `MultiRegion=true`, then **replica** keys in other Regions.
+- Primary and replicas share key material and the same key ID (`mrk-...`), with different Region in the ARN.
+- Each has its own key policy, grants and aliases.
+- Ciphertext from one can be decrypted by any related key, locally.
+## Limits to remember
+- The multi-Region property is chosen at creation and cannot be changed later.
+- Data encrypted with the old single-Region key must be re-encrypted to become decryptable in the other Region.
+Common uses: DR for client-side encryption, DynamoDB global tables with client-side encryption, and signing across Regions.
+V: AWS KMS, Amazon S3
+
+@ SOA-C03 D4 T4.2 applied tradeoff
+S: A financial firm stores trade confirmations in S3 and must keep each object unchangeable and undeletable for 7 years. Regulators require that no one, including administrators and the account root user, can shorten this period or delete an object early. Which configuration fits?
+A: Enable S3 Object Lock on the bucket with a default retention of 7 years in governance mode and remove s3:BypassGovernanceRetention from all IAM policies
+B: Enable S3 Object Lock on the bucket with a default retention of 7 years in compliance mode so that the retention cannot be shortened by any user
+C: Enable versioning with MFA delete on the bucket and add a bucket policy that denies s3:DeleteObject and s3:PutObject for every principal
+D: Apply a legal hold to each object at upload time and add an S3 Lifecycle rule that removes the legal hold after the 7-year period has passed
+K: B
+W: Object Lock compliance mode: while the retention period runs, no user, including the root user, can delete the protected object version, overwrite it or shorten its retention. That is the write-once-read-many guarantee regulators ask for.
+X: A=Governance mode: users with `s3:BypassGovernanceRetention` can still delete or shorten retention, and an administrator can grant that permission to themselves again, so it does not meet a "no one" requirement.
+C=MFA delete and deny policy: the root user can remove the bucket policy and, holding the MFA device, can disable MFA delete, so the data is not protected against administrators.
+D=Legal hold with lifecycle: a legal hold has no expiry and can be removed by anyone with `s3:PutObjectLegalHold`, and lifecycle rules cannot remove legal holds. It is meant for litigation, not fixed retention.
+T: Retention that even root cannot bypass → Object Lock compliance mode; governance mode and deny policies can be undone by administrators.
+G: ## S3 Object Lock basics
+Object Lock stores object versions in a write-once-read-many (WORM) model. It requires versioning and can be enabled on new or existing buckets.
+## Retention modes
+- **Governance**: protects against most users. Principals with `s3:BypassGovernanceRetention` can delete or shorten retention with a special header. Useful for testing retention settings.
+- **Compliance**: nobody can delete the version or shorten its retention until it expires, including the root user. Only extending the period is allowed.
+## Legal hold
+A separate on/off flag without an end date, used for litigation. It can be combined with either mode.
+## Example
+Default bucket retention: compliance mode, 7 years. A confirmation uploaded on 2026-03-01 cannot be deleted before 2033-03-01. Choose compliance mode carefully: the only way to remove such data early is to close the account.
+V: Amazon S3
+
+@ SOA-C03 D4 T4.2 applied use-case
+S: An internet-facing Application Load Balancer created several years ago still uses the ELBSecurityPolicy-2016-08 security policy on its HTTPS listener. An audit requires that clients can connect only with TLS 1.2 or TLS 1.3 and strong ciphers. What should the CloudOps engineer change?
+A: Replace the ACM certificate on the listener with a new certificate that uses a 4096-bit RSA key so that older TLS versions are no longer negotiated
+B: Add an AWS WAF rule to the web ACL on the ALB that blocks every request whose TLS protocol version is lower than 1.2 before it reaches the targets
+C: Change the HTTPS listener's security policy to a TLS 1.3 policy such as ELBSecurityPolicy-TLS13-1-2-2021-06, which accepts only TLS 1.2 and 1.3
+D: Add a listener rule that redirects every HTTP request on port 80 to HTTPS on port 443 so that all clients are forced to use a secure TLS connection
+K: C
+W: Listener security policy: the ALB security policy decides which TLS protocol versions and ciphers the listener negotiates. `ELBSecurityPolicy-2016-08` still allows TLS 1.0 and 1.1; switching to `ELBSecurityPolicy-TLS13-1-2-2021-06` (or a stricter TLS13 variant) limits handshakes to TLS 1.2 and 1.3 with modern ciphers, with no downtime.
+X: A=Bigger certificate key: the key size affects the certificate, not which protocol versions the listener allows, so TLS 1.0 and 1.1 handshakes would still succeed.
+B=WAF rule on TLS version: WAF inspects HTTP requests only after the TLS handshake has completed, so clients could still negotiate TLS 1.0 or 1.1 with the listener. Only the security policy controls which versions are offered.
+D=HTTP to HTTPS redirect: this moves plain HTTP clients to HTTPS but does not change which TLS versions the HTTPS listener negotiates.
+T: TLS versions and ciphers on an ALB are set by the listener's security policy; certificates, redirects and WAF do not control the handshake.
+G: ## What an ELB security policy is
+A security policy is a named set of TLS protocol versions and cipher suites that an HTTPS (ALB) or TLS (NLB) listener offers during the handshake.
+## Old versus current policies
+- `ELBSecurityPolicy-2016-08`: allows TLS 1.0, 1.1 and 1.2. It was the default for many years.
+- `ELBSecurityPolicy-TLS13-1-2-2021-06`: TLS 1.2 and 1.3 with modern ciphers; a recommended general-purpose policy.
+- `ELBSecurityPolicy-TLS13-1-2-Res-2021-06`: a more restricted cipher set. FIPS variants exist for workloads that need FIPS-validated cryptography.
+## Checking the result
+Change it with `aws elbv2 modify-listener --ssl-policy ...`. Test with `openssl s_client -tls1_1 -connect host:443`; the handshake should now fail. Before switching, check ALB access logs, which record the TLS protocol of each request, to find clients that still use TLS 1.0 or 1.1.
+V: Elastic Load Balancing, AWS Certificate Manager
+
+@ SOA-C03 D4 T4.2 advanced use-case
+S: After a penetration test showed that a server-side request forgery flaw could read instance role credentials through IMDSv1, security requires that no new EC2 instance in the organization can be launched with IMDSv1 enabled and that the existing instances are switched to IMDSv2. Which TWO actions meet these requirements? (Select TWO)
+A: Attach an SCP that denies ec2:RunInstances unless the ec2:MetadataHttpTokens condition key equals required for the instance being launched
+B: Add an outbound security group rule on every instance that denies traffic to 169.254.169.254 unless the request contains a session token
+C: Run modify-instance-metadata-options with http-tokens set to required on existing instances after confirming that they no longer make IMDSv1 calls
+D: Enable Amazon GuardDuty in every account so that instance credentials used from outside AWS are detected and the instance is automatically stopped
+E: Set HttpTokens to required in every team's launch templates so that each instance launched in the organization accepts only IMDSv2 requests
+K: A,C
+W: A=SCP on MetadataHttpTokens: the SCP denies `ec2:RunInstances` whenever `ec2:MetadataHttpTokens` is not `required`, so nobody in the organization can launch an instance that accepts IMDSv1.
+C=modify-instance-metadata-options: for running instances, `--http-tokens required` switches them to IMDSv2 without a restart, once the `MetadataNoTokenRequests` metric shows no remaining IMDSv1 callers.
+X: B=Security group rule: security groups only have allow rules and do not filter traffic to the link-local metadata service, so they cannot enforce tokens.
+D=GuardDuty: GuardDuty detects credential exfiltration after it happens and does not stop instances by itself. It neither prevents IMDSv1 launches nor converts existing instances.
+E=Launch template settings: a launch template only affects launches that use it. Anyone can call RunInstances without a template or override the metadata options, so it is a default, not an enforcement.
+T: Enforce IMDSv2 with an SCP on the MetadataHttpTokens condition key for new launches and modify-instance-metadata-options for running instances; templates and detection do not enforce.
+G: ## IMDSv1 versus IMDSv2
+The instance metadata service at `169.254.169.254` hands out role credentials.
+- **IMDSv1**: a simple GET returns data. An SSRF bug that makes the server fetch a URL can leak credentials.
+- **IMDSv2**: the caller must first `PUT /latest/api/token`, then send the token in a header. Most SSRF bugs cannot do a PUT with custom headers.
+The setting `HttpTokens=required` means IMDSv2 only.
+## Enforcing it
+- New launches: an SCP or IAM policy denying `ec2:RunInstances` when `ec2:MetadataHttpTokens` is not `required`.
+- Existing instances: `aws ec2 modify-instance-metadata-options --instance-id i-0abc --http-tokens required`.
+- Launch templates, AMI settings (`ImdsSupport=v2.0`) and account-level defaults make IMDSv2 the default for new launches; the SCP is what makes it mandatory across the organization.
+## Before switching
+Check the CloudWatch metric `MetadataNoTokenRequests` per instance and update old SDKs or agents that still use IMDSv1.
+V: Amazon EC2, AWS Organizations, AWS IAM
+
+@ SOA-C03 D5 T5.1 applied use-case
+S: A company has one 10 Gbps Direct Connect connection at a location associated with us-east-1. Application VPCs in us-east-1 and us-west-2 each have a virtual private gateway, and on-premises servers must reach all of them privately over this connection. No transit gateway is used. What should the network engineer configure?
+A: One private virtual interface to each virtual private gateway, created from the Direct Connect location directly to the gateways in both Regions
+B: A private virtual interface to a Direct Connect gateway, with each VPC's virtual private gateway associated with that Direct Connect gateway
+C: A public virtual interface on the connection with Site-to-Site VPN tunnels over it to the virtual private gateway of every application VPC
+D: A transit virtual interface attached directly to the virtual private gateways in both Regions so that one interface serves every VPC at once
+K: B
+W: Direct Connect gateway: a Direct Connect gateway is a global object. One private VIF to it can reach virtual private gateways in any Region (except China) that are associated with it, so on-premises servers reach VPCs in both us-east-1 and us-west-2 over the single connection.
+X: A=Private VIF directly to each VGW: a private VIF attached directly to a virtual private gateway can only reach a gateway in the Region associated with the Direct Connect location, so the us-west-2 VPC would be unreachable this way.
+C=Public VIF with VPN tunnels: this works technically but adds VPN tunnels, encryption overhead and per-tunnel throughput limits for a need that private VIFs meet directly.
+D=Transit VIF to VGWs: a transit VIF attaches to a Direct Connect gateway that is associated with transit gateways, not to virtual private gateways, and the company does not use a transit gateway.
+T: Reach VPCs in several Regions over one Direct Connect link with a private VIF to a Direct Connect gateway; a VIF attached directly to a VGW is limited to one Region.
+G: ## Direct Connect building blocks
+- **Connection**: the physical port at a Direct Connect location.
+- **Virtual interface (VIF)**: a VLAN with BGP on that connection. Types: **private** (VPCs), **public** (AWS public endpoints), **transit** (transit gateways).
+- **Direct Connect gateway (DXGW)**: a global router object you attach VIFs to.
+## Private VIF options
+- Private VIF → virtual private gateway directly: only a VGW in the Region associated with the Direct Connect location.
+- Private VIF → DXGW → many VGWs: VPCs in multiple Regions and even multiple accounts (association proposals).
+Example: DX in Ashburn, one private VIF to a DXGW, VGWs from `us-east-1` and `us-west-2` associated. On-premises advertises `10.0.0.0/8`; each VPC CIDR is advertised back.
+## Things a DXGW does not do
+It does not route traffic from one associated VPC to another. Use a transit gateway (with a transit VIF) for VPC-to-VPC routing.
+V: AWS Direct Connect, Amazon VPC
+
+@ SOA-C03 D5 T5.1 applied use-case
+S: One account has 25 security groups, across several VPCs in the same Region, that each allow HTTPS from the same 30 partner CIDR ranges. Partners change their ranges every few weeks, and updating each rule by hand has caused outages. The team wants to maintain the list in one place and have every security group follow it automatically. What should the CloudOps engineer do?
+A: Create an AWS-managed prefix list for the partners and reference it from every security group, then ask AWS Support to update it when a range changes
+B: Replace the security group rules with network ACL rules in each subnet that list the 30 CIDRs, because network ACLs apply to the whole subnet
+C: Create a customer-managed prefix list with the 30 CIDRs and reference it in each security group's HTTPS rule, then edit only the prefix list
+D: Create one security group that contains the 30 CIDR rules and reference that security group as the source in the other 25 security groups
+K: C
+W: Customer-managed prefix list: a prefix list is a named set of CIDR blocks. A security group rule can use the prefix list ID as its source, and any change to the list is applied to every rule that references it, so partner updates happen once.
+X: A=AWS-managed prefix list: AWS-managed prefix lists describe AWS service ranges such as S3 or CloudFront, and customers cannot create or edit them.
+B=Network ACL rules: network ACLs are stateless, need return-traffic rules, have a small default rule limit per ACL, and would still need editing in every subnet, so they add work instead of centralizing it.
+D=Security group as source: referencing a security group allows traffic from the network interfaces that belong to that group, not from the CIDR rules inside it, so partner traffic would not be allowed.
+T: One reusable list of CIDRs for many security group rules → customer-managed prefix list; a referenced security group means its members, not its rules.
+G: ## Managed prefix lists
+A **prefix list** is a set of CIDR blocks with an ID like `pl-0abc123`.
+- **AWS-managed**: maintained by AWS for services, for example S3 or the CloudFront origin-facing ranges.
+- **Customer-managed**: yours to create and edit, IPv4 or IPv6, with a **max entries** value you choose.
+## Using one in security groups
+Rule: `HTTPS 443 from pl-0abc123`. Editing the list updates every rule that references it; each edit creates a new list version that you can roll back to.
+## Quota detail
+A referenced prefix list counts against the security group's rules quota by its **max entries**, not by the number of entries in use. A list with max entries 40 uses 40 rules in each group that references it.
+## Sharing
+Prefix lists can be shared with other accounts through AWS RAM when the same partner list is needed elsewhere.
+V: Amazon VPC, Amazon EC2
+
+@ SOA-C03 D5 T5.1 advanced use-case
+S: Instances in private subnets reach Amazon S3 through a gateway VPC endpoint. Security worries that an insider could use their own personal AWS access keys on an instance to copy data to a bucket in an account outside the company's AWS Organization. Instances must still reach the company's buckets and the Amazon Linux package repositories hosted in S3. What should the CloudOps engineer configure?
+A: A bucket policy on each company bucket that denies s3:PutObject unless the request arrives through the gateway endpoint by checking aws:SourceVpce
+B: An SCP that denies s3:PutObject unless the aws:ResourceOrgID condition key matches the organization ID for every principal in the organization
+C: An outbound security group rule that allows HTTPS only to the AWS-managed prefix list for S3 in the Region, removing the default outbound rule
+D: A gateway endpoint policy that allows access only to buckets whose aws:ResourceOrgID matches the organization, plus the Amazon Linux repository buckets
+K: D
+W: Endpoint policy on the gateway endpoint: every S3 request from the VPC goes through the endpoint, whatever credentials are used, and the endpoint policy is evaluated for each request. Allowing only resources in the company's organization (`aws:ResourceOrgID`) plus the named Amazon Linux repository buckets blocks uploads to outside buckets even with personal keys.
+X: A=Bucket policies on company buckets: they control who can use the company's buckets, but the risk is writes to a bucket the company does not own, where these policies do not apply.
+B=SCP on principals: SCPs only restrict principals inside the organization. Personal access keys belong to an outside account, so the SCP never applies to those requests.
+C=Security group to the S3 prefix list: the prefix list covers all of S3 in the Region, including every outside bucket, so it restricts nothing at bucket level.
+T: Stop data leaving through S3 regardless of whose credentials are used with an endpoint policy scoped by aws:ResourceOrgID; SCPs only cover your own principals.
+G: ## Where each S3 control applies
+- **Identity policies and SCPs**: limit what principals in your accounts can do.
+- **Bucket policies**: limit who can use a given bucket.
+- **VPC endpoint policies**: limit what can be done through that endpoint, for any principal.
+Data exfiltration with foreign credentials from inside your network is only caught by the network-side control: the endpoint policy.
+## Example endpoint policy
+Allow `s3:*` on `*` with condition `"StringEquals": {"aws:ResourceOrgID": "o-abc123"}`, plus a second statement allowing `s3:GetObject` on `arn:aws:s3:::al2023-repos-us-east-1-*/*` for Amazon Linux 2023 packages.
+## Other pieces
+- Every private subnet's route table must have the gateway endpoint route; otherwise S3 traffic leaves through the NAT gateway and the endpoint policy does not apply.
+- A gateway endpoint only carries requests to S3 in its own Region. If instances also have a NAT path, requests to buckets in other Regions bypass the endpoint, so control that path too.
+- Some AWS services also use AWS-owned buckets, so test before enforcing.
+V: Amazon VPC, Amazon S3, AWS Organizations
+
+@ SOA-C03 D5 T5.2 applied comparison
+S: A training company streams HLS video through CloudFront from a private S3 origin. Each lesson is a manifest plus hundreds of segment files, and only paying subscribers may watch. The player requests segments by the relative URLs in the manifest, and the team does not want to rewrite manifests for each viewer. How should CloudFront restrict access?
+A: Issue CloudFront signed cookies, from a trusted key group, when a subscriber signs in, with a custom policy that covers the lesson path and an expiry time
+B: Issue a CloudFront signed URL for the manifest file only, so that the player inherits access to every segment of the lesson from the signed manifest
+C: Configure origin access control on the distribution so that only subscribers who are signed in to the website can fetch objects from the private bucket
+D: Add a CloudFront geographic restriction allow list for the countries where subscribers live, and block every request that comes from other countries
+K: A
+W: Signed cookies: one set of cookies with a custom policy such as `https://cdn.example.com/lessons/42/*` and an expiry grants access to every file under that path. The player keeps using the unmodified relative URLs, and CloudFront validates the cookies on each segment request against the public keys in the trusted key group.
+X: B=Signed URL for the manifest only: each signed URL authorizes only that one object. The segments referenced by relative URLs would be requested unsigned and rejected.
+C=Origin access control: OAC lets CloudFront, and only CloudFront, read the private bucket. It says nothing about which viewers may request content from CloudFront.
+D=Geographic restriction: it filters by country, not by subscription, so non-paying users in allowed countries could still watch.
+T: Many protected files per viewer → signed cookies; signed URLs protect single objects, and OAC protects the origin, not viewers.
+G: ## Two layers of protection in CloudFront
+- **Origin side**: origin access control (OAC) makes the S3 bucket accept requests only from your distribution.
+- **Viewer side**: signed URLs or signed cookies decide which viewers CloudFront serves.
+## Signed URLs versus signed cookies
+- **Signed URL**: the signature is in the query string of one URL. Good for a single download, or when clients cannot handle cookies.
+- **Signed cookies**: `CloudFront-Policy`, `CloudFront-Signature`, `CloudFront-Key-Pair-Id`. They cover many files, for example all segments of an HLS stream, without changing the URLs.
+## Policies
+A custom policy can use wildcards in the resource (`/lessons/42/*`), an expiry time, and optionally a start time and IP range.
+## Keys
+Your application signs with a private key; the matching public key is placed in a **trusted key group** on the cache behavior. The older root-account CloudFront key pairs are no longer recommended.
+V: Amazon CloudFront, Amazon S3
+
+@ SOA-C03 D5 T5.2 advanced troubleshooting
+S: A CloudFront distribution in front of an ALB serves product images and CSS. The cache hit ratio is below 10 percent, and the origin is overloaded. The cache behavior was configured to include all viewer headers, all cookies, and all query strings in the cache key. The origin needs only the Accept-Language header to pick translated CSS, and needs the session cookie for logging only. What should the CloudOps engineer do?
+A: Increase the default and maximum TTL in the current cache policy to one year so that CloudFront keeps each cached object much longer before it expires
+B: Enable Origin Shield in the Region closest to the ALB so that the regional edge caches collapse duplicate requests before they reach the origin
+C: Use a cache policy whose cache key contains only Accept-Language, and an origin request policy that forwards the session cookie without caching on it
+D: Add a CloudFront Function on viewer request that removes the session cookie, and keep the current cache behavior that includes all values in the key
+K: C
+W: Cache policy plus origin request policy: every header, cookie and query string in the cache key splits the cache, so with all of them included almost every request is unique. Keeping only `Accept-Language` in the cache key lets identical images and CSS be shared across viewers, while the origin request policy still passes the session cookie to the ALB for logging without creating extra cache entries.
+X: A=Longer TTLs: objects are not expiring too fast; they are cached under keys that almost never repeat. Longer TTLs keep those unique entries longer but do not make them match.
+B=Origin Shield: it adds a central caching layer, but it uses the same cache key, so requests with different cookies and headers still miss and reach the origin.
+D=Remove only the cookie: headers such as `User-Agent` and all query strings would still be in the cache key, so the hit ratio stays low, and the origin would lose the cookie it needs for logging.
+T: Put only what changes the response into the cache key (cache policy) and send everything else to the origin with an origin request policy.
+G: ## The cache key decides sharing
+CloudFront stores one object per unique cache key: the URL path plus any headers, cookies and query strings you include.
+Example: with all headers included, `User-Agent`, `Accept` and `Cookie` differ between browsers, so `/img/logo.png` is stored hundreds of times and most requests miss.
+## Two separate policies
+- **Cache policy**: TTLs and what goes into the cache key. Anything included here is also forwarded to the origin.
+- **Origin request policy**: extra values forwarded to the origin **without** being part of the cache key.
+## Good practice
+- Static assets: cache key with nothing extra, or only values that really change the response, such as `Accept-Language`.
+- Use managed policies such as `CachingOptimized` where they fit.
+- Watch the `CacheHitRate` metric (with additional distribution metrics enabled) after the change.
+V: Amazon CloudFront, Elastic Load Balancing
+
+@ SOA-C03 D5 T5.3 applied troubleshooting
+S: A team created a Route 53 private hosted zone, corp.internal, and a new VPC built with a third-party IaC module. Instances in the new VPC get NXDOMAIN or no answer for db.corp.internal, while instances in an older VPC resolve it correctly. Security groups and network ACLs allow DNS. Which TWO items should the CloudOps engineer check and fix? (Select TWO)
+A: The private hosted zone is associated with the new VPC, so that the Route 53 Resolver in that VPC answers queries for corp.internal
+B: A Route 53 Resolver inbound endpoint exists in the new VPC, so that its instances can send their DNS queries to the private zone
+C: The VPC attributes enableDnsSupport and enableDnsHostnames are both set to true on the new VPC so that private zones are resolved
+D: The private hosted zone has DNSSEC signing enabled, so that the Route 53 Resolver in the new VPC trusts the answers for corp.internal
+E: The public hosted zone for the parent domain has an NS record that delegates corp.internal to the name servers of the private hosted zone
+K: A,C
+W: A=Zone associated with the VPC: the Route 53 Resolver in a VPC answers from a private hosted zone only if that zone is associated with the VPC. A zone created for the older VPC is invisible to a new one until it is associated.
+C=DNS attributes enabled: private hosted zones require both `enableDnsSupport` and `enableDnsHostnames` set to true on the VPC. IaC modules sometimes leave `enableDnsHostnames` false, which matches the symptoms.
+X: B=Inbound endpoint: inbound endpoints let on-premises networks send queries into a VPC. Instances inside the VPC already use the Resolver at the VPC base +2 address and do not need one.
+D=DNSSEC signing: Route 53 does not support DNSSEC signing for private hosted zones, and signing is not what decides whether a VPC can see a zone.
+E=NS delegation: private hosted zones are not delegated from public DNS. Their visibility comes only from VPC associations, so an NS record would at most leak the name publicly.
+T: A private hosted zone resolves in a VPC only when it is associated with that VPC and the VPC has DNS support and DNS hostnames enabled.
+G: ## How private hosted zones are resolved
+Every VPC has the Route 53 Resolver at the VPC CIDR base plus two, for example `10.20.0.2`, also reachable at `169.254.169.253`. When an instance queries `db.corp.internal`, the Resolver answers from:
+- Resolver forwarding rules associated with the VPC
+- Private hosted zones **associated with this VPC**
+- Public DNS
+The most specific matching domain name wins, and a forwarding rule wins a tie with a private zone.
+## Two requirements for private zones
+- **Association**: the zone must be associated with the VPC. Cross-account VPCs need an authorization first and then an association.
+- **VPC attributes**: `enableDnsSupport=true` (the Resolver answers queries at all) and `enableDnsHostnames=true`.
+## Quick checks
+- `aws route53 get-hosted-zone --id Z123` lists associated VPCs.
+- `aws ec2 describe-vpc-attribute --vpc-id vpc-0abc --attribute enableDnsHostnames`.
+- Custom DHCP option sets that point to other DNS servers also bypass the Resolver.
+V: Amazon Route 53, Amazon VPC

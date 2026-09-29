@@ -1,0 +1,550 @@
+# ANS-C01 batch 04: Domain 1 (network design) and Domain 3 (management and operation), detailed explanations
+
+@ ANS-C01 D1 T1.1 applied use-case
+S: A company runs a web application on an Application Load Balancer that must stay internal, with no public IP addresses and no internet gateway route to its subnets. The company now wants to put Amazon CloudFront in front of the application for caching and AWS WAF protection. Which design meets these requirements with the least operational effort?
+A: Create a CloudFront VPC origin that points to the internal ALB, so CloudFront reaches it privately through the VPC without making the load balancer internet-facing
+B: Make the ALB internet-facing, then restrict its security group to the CloudFront origin-facing managed prefix list and require a secret custom origin header
+C: Configure origin access control (OAC) on the distribution for the internal ALB so that CloudFront signs every origin request with SigV4 credentials
+D: Place an internet-facing Network Load Balancer with IP targets in front of the internal ALB and use the NLB DNS name as the CloudFront custom origin
+K: A
+G: ## How CloudFront normally reaches a custom origin
+A classic custom origin (ALB, EC2, on-premises server) is reached over the public internet: CloudFront resolves the origin's DNS name and connects to a public IP. To keep others out, teams lock the origin down with the `com.amazonaws.global.cloudfront.origin-facing` managed prefix list and a secret header, but the origin is still internet-facing.
+## CloudFront VPC origins
+A **VPC origin** lets CloudFront deliver from an ALB, NLB or EC2 instance that sits in a **private subnet**. CloudFront creates service-managed network interfaces in your VPC and connects to the origin privately, so:
+- the origin needs no public IP and its subnets need no route to an internet gateway (the VPC itself must still have an internet gateway attached);
+- the only way in is through the distribution, where AWS WAF, caching and geo rules apply;
+- there is no prefix list or shared-secret header to maintain.
+Example: `internal-app-123.eu-west-1.elb.amazonaws.com` becomes a VPC origin, and the security group on the ALB allows the CloudFront VPC origin traffic only.
+W: CloudFront VPC origin: it is built for exactly this case, delivering from an internal ALB in private subnets, so the load balancer never becomes internet-facing and all traffic is forced through CloudFront and AWS WAF.
+X: B=Internet-facing ALB with prefix list: this is the older lockdown pattern, but it breaks the stated requirement that the ALB have no public addresses, and the secret header must be rotated and managed.
+C=Origin access control: OAC signs requests to AWS origins such as Amazon S3, MediaStore or Lambda function URLs. It does not give CloudFront a network path into a VPC, so an internal ALB would still be unreachable.
+D=Public NLB in front of the ALB: this reintroduces an internet-facing entry point with public IPs, adds a second load balancer to operate, and anyone who finds the NLB name can bypass CloudFront and WAF.
+T: To front a private ALB, NLB or EC2 origin with CloudFront, use a VPC origin; prefix lists and secret headers only harden an origin that is still public.
+V: Amazon CloudFront, Elastic Load Balancing, AWS WAF, Amazon VPC
+
+@ ANS-C01 D1 T1.1 advanced tradeoff
+S: A retailer wants to test a new CloudFront configuration (different cache policy and a new origin request policy) on a small share of real production traffic before promoting it, and must be able to roll back in seconds without changing DNS. QA engineers must also be able to force their own requests onto the new configuration. Which approach fits best?
+A: Create a second distribution with the new settings and use Route 53 weighted records to send 5 percent of viewers to its domain name, lowering the weight to zero to roll back
+B: Use CloudFront continuous deployment with a staging distribution and a continuous deployment policy, using weight-based routing for users and a header-based policy for QA requests
+C: Deploy a Lambda@Edge viewer request function that randomly rewrites 5 percent of requests to a second cache behavior that carries the new policies and origin settings
+D: Add a new cache behavior with the new policies to the existing distribution and let CloudFront shift traffic to it gradually using the behavior precedence order
+K: B
+G: ## Why testing CloudFront changes is hard
+A distribution change propagates to every edge location and applies to all viewers. A bad cache policy can hurt the cache hit ratio or break an application for everyone at once.
+## Continuous deployment
+CloudFront **continuous deployment** pairs a **primary distribution** with a **staging distribution** that holds the candidate configuration. A **continuous deployment policy** on the primary decides which requests go to staging:
+- **Weight-based**: a small percentage of viewer requests (up to 15 percent) goes to staging, optionally with session stickiness so one user stays on one configuration.
+- **Header-based**: requests that carry a specific header (the name must start with `aws-cf-cd-`, for example `aws-cf-cd-qa: true`) always go to staging.
+Viewers keep using the same domain name. When the test succeeds you **promote** the staging configuration into the primary; to roll back you disable or change the policy, and no DNS change is needed.
+W: Continuous deployment with a staging distribution: the policy splits a small weight of production traffic onto the new configuration with no DNS change, a header-based rule lets QA force requests onto staging, and promotion or rollback is a policy action.
+X: A=Route 53 weights across two distributions: this changes DNS, so rollback waits on resolver and client caching of the records, and QA cannot pin their requests to the new configuration by header.
+C=Random rewrite in Lambda@Edge: the cache behavior is matched before its viewer request function runs, so rewriting the URI does not move the request onto another behavior's policies; the custom code also adds latency and cost to every request.
+D=Behavior precedence: cache behaviors are matched by path pattern in a fixed order. CloudFront never shifts a percentage of traffic between behaviors, so this cannot run a gradual test.
+T: Canary-test CloudFront settings with continuous deployment (staging distribution + weight or header policy), not with DNS weights or edge code.
+V: Amazon CloudFront
+
+@ ANS-C01 D1 T1.1 applied use-case
+S: A CloudFront distribution in front of an ALB serves a product catalog. The origin needs the CloudFront-Viewer-Country header and a session cookie to build personalized logs, but responses are identical for all viewers. After the team added these values to the cache policy, the cache hit ratio fell sharply. What should the team change?
+A: Keep the header and cookie in the cache policy but raise the minimum TTL so that cached objects stay at edge locations longer and fewer requests reach the ALB
+B: Enable Origin Shield in the Region closest to the ALB so that the extra cache variations are consolidated in one regional layer before reaching the origin
+C: Remove the values from the cache policy and add them to an origin request policy, so CloudFront forwards them to the origin without including them in the cache key
+D: Move the personalization logic into a CloudFront Function that strips the header and cookie from viewer requests before the cache lookup happens
+K: C
+G: ## Cache key versus origin request
+CloudFront uses two separate policies on each cache behavior:
+- A **cache policy** defines the **cache key**: the URL plus any headers, cookies and query strings you list. Every distinct combination is stored as a separate object. Values in the cache key are also forwarded to the origin automatically.
+- An **origin request policy** lists values CloudFront should **send to the origin on a cache miss** without adding them to the cache key.
+## Why the hit ratio dropped
+A session cookie is unique per user and `CloudFront-Viewer-Country` has many values. Putting them in the cache key splits one catalog page into thousands of cache entries, so almost every request misses.
+Example: `/catalog/shoes` with 50,000 active sessions becomes 50,000 separate cached objects, although the content is the same.
+W: Origin request policy: it sends the country header and cookie to the ALB on cache misses while keeping the cache key to the URL, so identical responses are shared by all viewers again.
+X: A=Longer minimum TTL: each cache entry lives longer, but there are still thousands of entries per page because every session value is a separate key, so most requests keep missing.
+B=Origin Shield: it adds a central caching layer, but it uses the same cache key, so every unique cookie still creates a separate object and the hit ratio stays low.
+D=Strip values in a CloudFront Function: removing the header and cookie before the cache lookup also removes them from the origin request, so the origin would lose the data it needs for its logs.
+T: Values the origin needs but that do not change the response belong in the origin request policy; only values that change the response belong in the cache policy.
+V: Amazon CloudFront, Elastic Load Balancing
+
+@ ANS-C01 D1 T1.2 applied use-case
+S: A streaming company partners with three internet service providers. Subscribers on each ISP's network must be sent to a cache cluster hosted inside that ISP, identified by the ISP's published IP ranges, while everyone else uses the default CloudFront endpoint. Which Route 53 configuration fits?
+A: Geolocation routing records with one record per country served by each ISP, plus a default location record that points to the CloudFront distribution
+B: Latency-based routing records with health checks, so that each subscriber reaches whichever ISP cache cluster answers fastest from its resolver
+C: Geoproximity routing with a positive bias for each ISP cluster location, so that its area of influence covers the ISP's subscriber regions
+D: IP-based routing with a CIDR collection holding each ISP's ranges as locations, plus a default record for all other clients pointing to CloudFront
+K: D
+G: ## Routing by who is asking
+Most Route 53 policies route by **where** the resolver or client appears to be: geolocation (country or continent), geoproximity (distance with bias) or latency (measured to AWS Regions). None of them knows which network a client belongs to.
+## IP-based routing
+**IP-based routing** routes by the client's IP address, using the resolver IP or, when the resolver sends it, the EDNS Client Subnet.
+- You create a **CIDR collection** and add **CIDR locations**, for example `isp-a` holding `198.51.100.0/22` and `203.0.113.0/24`.
+- Each record set references a location, so `isp-a` answers with the IP of the cache inside ISP A.
+- A record for the default location (`*`) answers everyone who matches no CIDR block.
+This is the standard way to steer users of a known network, such as an ISP or a corporate range, to specific endpoints.
+W: IP-based routing with a CIDR collection: it matches the source address against each ISP's published ranges and answers with that ISP's cache, while the default location sends every other client to CloudFront.
+X: A=Geolocation per country: all three ISPs can serve the same country, so a country-level rule cannot tell their subscribers apart and would send every ISP's users to one cluster.
+B=Latency-based routing: latency records must be tied to AWS Regions and measure latency to those Regions, not to caches hosted inside ISP networks, and they ignore which ISP the user belongs to.
+C=Geoproximity with bias: bias moves geographic boundaries between locations; ISPs overlap in the same areas, so distance-based regions cannot separate subscribers by their provider's IP ranges.
+T: Route by the client's network (known CIDR ranges) with IP-based routing and CIDR collections; geolocation, geoproximity and latency only know location.
+V: Amazon Route 53
+
+@ ANS-C01 D1 T1.2 applied troubleshooting
+S: A team enables query logging for a public hosted zone to measure how many DNS queries each record receives. The log group was created in eu-west-1, where the application runs, and nothing is logged. After fixing that, the query counts are far lower than the number of client requests the application sees. Which explanation covers both observations?
+A: Query logs for public hosted zones must go to a CloudWatch Logs log group in us-east-1, and only queries that reach Route 53 are logged, because DNS resolvers cache answers for the record TTL
+B: Query logs for public hosted zones are delivered only to Amazon S3 buckets in the application's own Region, and Route 53 samples about one query in ten to keep the log volume under control
+C: Public hosted zone query logging requires Route 53 Resolver query logging to be enabled in each client VPC, and queries answered from Resolver endpoints are counted separately
+D: The log group needs a KMS key shared with Route 53 in the application Region, and queries for alias records are never logged because alias targets are resolved internally
+K: A
+G: ## Two different DNS logs
+- **Resolver query logging** records queries made by resources inside your VPCs to the Route 53 Resolver.
+- **Public DNS query logging** records queries that the Route 53 authoritative name servers receive for a **public hosted zone** from resolvers on the internet.
+## Rules for public query logging
+- Logs go only to **CloudWatch Logs**, and the log group must be in **us-east-1**. You also add a resource policy that lets Route 53 write to it.
+- Each entry shows the query name, type, response code, the edge location that answered and the resolver IP.
+## Why counts look low
+Clients do not ask Route 53 directly. They ask a recursive resolver (an ISP or public resolver), which **caches** the answer for the record's TTL. With a TTL of 300 seconds, one resolver may send one query to Route 53 while thousands of its users connect to your app. Query logs therefore show resolver queries, not user visits.
+W: us-east-1 log group plus resolver caching: public query logging only writes to a CloudWatch Logs group in us-east-1, and it records only queries that reach Route 53, so answers served from resolver caches never appear.
+X: B=S3 delivery and sampling: public DNS query logging writes to CloudWatch Logs, not S3, and it logs every query Route 53 receives rather than a sample; the low count comes from caching instead.
+C=Requires Resolver logging per VPC: Resolver query logging is a separate feature for queries from inside VPCs. Internet clients never pass through your VPC Resolver, so it cannot explain either observation.
+D=KMS key and alias records: the missing logs are caused by the log group Region, not encryption, and queries for alias records are logged like any other record because Route 53 answers them authoritatively.
+T: Public zone query logs go to CloudWatch Logs in us-east-1 and count resolver queries, not users; resolver query logging is the separate VPC-side log.
+V: Amazon Route 53, Amazon CloudWatch Logs
+
+@ ANS-C01 D1 T1.3 applied use-case
+S: A company runs a web shop behind an Application Load Balancer and wants to move 10 percent of users to a new application version in a second target group, then increase the share over several days. A user who lands on a version must stay on it for the rest of the session. Which ALB configuration fits?
+A: Two listener rules with host-header conditions that match on the new and old version names, with duration-based stickiness enabled on each of the target groups
+B: A forward action with the two target groups and weights of 90 and 10, with target group stickiness enabled on the forward action for the session duration
+C: A single target group containing both old and new instances, using the least outstanding requests algorithm and application-based cookie stickiness
+D: A redirect action that sends 10 percent of requests to a new path, plus load balancer generated cookie stickiness configured on the listener default rule
+K: B
+G: ## Weighted target groups on an ALB
+A listener rule's **forward** action can list several target groups, each with a **weight**. With weights 90 and 10, about 90 percent of requests go to `tg-v1` and 10 percent to `tg-v2`. You change the weights on the rule to shift traffic further, with no DNS change and near-immediate effect.
+## Two levels of stickiness
+- **Target stickiness** (on a target group) keeps a client on the same target inside that group.
+- **Target group stickiness** (on the forward action) keeps a client on the same **target group** for a set duration, using an ALB cookie. Without it, each request is weighted independently, so one user could bounce between v1 and v2 pages.
+Example: forward action `{tg-v1: 90, tg-v2: 10}` with target group stickiness of 1 hour gives a canary where each user sees one version per session.
+W: Weighted forward action with target group stickiness: weights control the share sent to the new version and can be raised over time, and target group stickiness keeps each user on the version they first reached.
+X: A=Host-header rules: these split traffic by the name a user types, not by percentage, so the company cannot send a controlled 10 percent of the same site's users to the new version.
+C=Mixed target group: the routing algorithm only balances load among targets and cannot guarantee any 10 percent share, and adding more new instances is the only way to change the ratio.
+D=Redirect by percentage: redirect actions have no percentage split, and a redirect changes the URL the user sees, which the shop does not want for a version rollout.
+T: Canary on an ALB = weighted forward action across target groups; add target group stickiness so each user stays on one version.
+V: Elastic Load Balancing
+
+@ ANS-C01 D1 T1.3 applied use-case
+S: A company is moving a fleet of authoritative DNS servers to EC2. The servers answer on port 53 over both UDP and TCP (TCP for large responses and zone transfers), and clients must reach both protocols through a single load balancer address and port. Which load balancer design fits?
+A: An Application Load Balancer with one HTTP listener on port 53 and a target group that uses the gRPC protocol version for binary DNS messages
+B: A Network Load Balancer with two separate listeners on port 53, one for UDP and one for TCP, each forwarding to its own separate target group
+C: A Gateway Load Balancer with a GENEVE listener on port 6081 that forwards DNS packets transparently to the DNS servers as appliance targets
+D: A Network Load Balancer with one TCP_UDP listener on port 53 that forwards to a TCP_UDP target group containing the DNS server instances
+K: D
+G: ## Layer 4 protocols on a Network Load Balancer
+A Network Load Balancer listener has a protocol and a port. The supported protocols are `TCP`, `UDP`, `TLS` and `TCP_UDP`.
+- Listener ports must be unique per load balancer, so you cannot create a TCP listener and a separate UDP listener that both use port 53.
+- The combined **`TCP_UDP`** protocol exists exactly for services such as DNS, SIP or some game servers that listen on the same port with both protocols.
+## How it works
+Create a target group with protocol `TCP_UDP` and port `53`, register the DNS instances, then add one listener `TCP_UDP:53` that forwards to it. UDP queries and TCP queries (large responses, zone transfers) now share one address and one port. Health checks run on TCP, HTTP or HTTPS, since UDP has no handshake to check.
+W: TCP_UDP listener: one Network Load Balancer listener on port 53 carries both protocols to one target group, which is the only way to serve DNS over UDP and TCP on the same port behind a single load balancer.
+X: A=ALB with HTTP listener: an Application Load Balancer only handles HTTP and HTTPS at Layer 7, so it cannot carry raw DNS over UDP or TCP at all, whatever the target group protocol version.
+B=Two listeners on port 53: listener ports must be unique on a Network Load Balancer, so separate TCP and UDP listeners on the same port are rejected; the combined protocol is required instead.
+C=Gateway Load Balancer: it is designed to insert inspection appliances into a traffic path using GENEVE encapsulation, not to publish a service address that DNS clients connect to directly.
+T: Same service on the same port over UDP and TCP → one NLB listener with the TCP_UDP protocol, not two listeners.
+V: Elastic Load Balancing, Amazon EC2
+
+@ ANS-C01 D1 T1.3 advanced use-case
+S: An IoT platform receives HTTPS requests from 200,000 devices, each holding an X.509 client certificate issued by the company's private CA. Requests from devices without a valid certificate must be rejected before they reach the application, and the application must know which device sent each request. The team wants to keep path-based routing on an Application Load Balancer. Which configuration fits?
+A: Enable mutual TLS in passthrough mode so that the ALB forwards the client certificate chain to the targets, which then reject unknown devices themselves
+B: Enable mutual TLS in verify mode with a trust store holding the private CA bundle, so the ALB rejects invalid certificates and passes certificate details to targets
+C: Import the private CA certificate into ACM as the listener's default certificate so that the ALB can validate every client certificate against that CA
+D: Associate an AWS WAF web ACL with the ALB that inspects the TLS client certificate and blocks requests whose certificate issuer is not the private CA
+K: B
+G: ## Mutual TLS on an ALB
+In normal TLS only the server proves its identity. With **mutual TLS (mTLS)** the client also presents a certificate. An Application Load Balancer supports two mTLS modes on HTTPS listeners:
+- **Passthrough**: the ALB accepts any client certificate and forwards the whole chain to targets in the `X-Amzn-Mtls-Clientcert` header. The application must do all validation.
+- **Verify**: the ALB validates the client certificate against a **trust store**, a CA bundle you upload from Amazon S3 (optionally with certificate revocation lists). Connections with missing, expired or untrusted certificates fail at the load balancer.
+## What the targets see in verify mode
+After a successful handshake, the ALB adds headers such as `X-Amzn-Mtls-Clientcert-Subject`, `-Serial-Number` and `-Issuer`, so the application can map the request to a device ID without doing TLS itself. Normal listener rules, including path-based routing, still apply.
+W: mTLS verify mode with a trust store: the ALB validates each device certificate against the private CA and drops invalid clients before any target is touched, then passes subject and serial headers so the application can identify the device.
+X: A=Passthrough mode: the ALB does no validation in this mode, so requests without a valid certificate still reach the application, which breaks the requirement to reject them before the targets.
+C=CA in ACM as server certificate: the listener certificate is what the ALB presents to clients. It does not make the ALB request or check client certificates; that needs mTLS with a trust store.
+D=AWS WAF certificate inspection: WAF inspects HTTP request components such as headers, body, IP and at most a TLS fingerprint; it has no trust store and cannot validate a client certificate chain against the private CA.
+T: Reject bad client certificates at the ALB → mTLS verify mode with a trust store; passthrough only forwards the certificate for the app to check.
+V: Elastic Load Balancing, Amazon S3
+
+@ ANS-C01 D1 T1.4 applied troubleshooting
+S: A security team relies on VPC Flow Logs as its only record of network activity. During an audit, it finds that some traffic types generated by EC2 instances never appear in the logs, even though the flow log captures ALL traffic on every ENI. Which TWO kinds of traffic are not recorded by VPC Flow Logs? (Select TWO)
+A: DNS queries that instances send to the Amazon-provided DNS server through the Route 53 Resolver at the VPC base address plus two
+B: Requests from instances to the instance metadata service at 169.254.169.254 and to Amazon Time Sync at 169.254.169.123
+C: TCP connections from instances to an interface VPC endpoint for Amazon S3 that is located in the same subnet as the instances
+D: Traffic between two instances in the same subnet that is rejected by the security group attached to the receiving instance
+E: Outbound HTTPS connections from instances in a private subnet to the internet that pass through a NAT gateway in a public subnet
+K: A,B
+G: ## What flow logs capture
+VPC Flow Logs record IP traffic metadata (addresses, ports, protocol, packets, bytes, `ACCEPT` or `REJECT`) for network interfaces. They capture traffic to other instances, load balancers, endpoints, NAT gateways and the internet, including traffic rejected by security groups or network ACLs.
+## What they never capture
+Some traffic stays between the instance and AWS-provided link-local or infrastructure services:
+- queries to the **Amazon DNS server** (Route 53 Resolver at `VPC base + 2`, for example `10.0.0.2`); if you run your own DNS servers, that traffic is logged;
+- traffic to the **instance metadata service** `169.254.169.254` and **Amazon Time Sync** `169.254.169.123`;
+- DHCP traffic, Windows license activation traffic, traffic to the reserved IP of the default VPC router, and mirrored traffic.
+If an audit needs DNS visibility, turn on **Route 53 Resolver query logging**.
+W: A=Amazon DNS queries: flow logs deliberately exclude traffic to the Amazon-provided DNS server at the VPC base plus two, so these queries are missing whatever ENIs are logged.
+B=Metadata and Time Sync traffic: traffic to link-local services such as instance metadata at 169.254.169.254 and Amazon Time Sync at 169.254.169.123 is never recorded in flow logs.
+X: C=Interface endpoint traffic: an interface endpoint is an ordinary ENI in the subnet, so flows between instances and the endpoint appear in the instances' and the endpoint's flow logs.
+D=Security group rejections: rejected traffic is recorded with the action `REJECT`; showing blocked connections is one of the main reasons teams use flow logs.
+E=NAT gateway traffic: flows through a NAT gateway are logged on the instance ENI and on the NAT gateway ENI, which is how teams find the instances behind NAT traffic.
+T: Flow logs miss Amazon DNS, metadata, Time Sync, DHCP and license traffic; use Resolver query logging for DNS, and expect normal, rejected, endpoint and NAT flows to be logged.
+V: Amazon VPC, Amazon Route 53
+
+@ ANS-C01 D1 T1.4 advanced use-case
+S: A company runs two dedicated 10 Gbps Direct Connect connections. Last quarter a slowly degrading optic caused hours of packet loss before the connection finally went down. The network team wants CloudWatch alarms that warn about physical-layer degradation before an outage. Which TWO metrics should the alarms use? (Select TWO)
+A: ConnectionBpsEgress and ConnectionBpsIngress, alarming when either value drops below the usual daily traffic baseline for the connection
+B: ConnectionState, alarming as soon as the connection reports a value of 0 for one or more consecutive one-minute periods
+C: ConnectionLightLevelRx and ConnectionLightLevelTx, alarming when the optical signal strength in dBm drifts outside the normal range
+D: VirtualInterfaceBpsEgress for each private virtual interface, alarming when throughput on the busiest VIF rises above 80 percent of capacity
+E: ConnectionErrorCount, alarming when the number of MAC-level errors reported by the AWS device rises above zero over several periods
+K: C,E
+G: ## Direct Connect metrics in CloudWatch
+AWS Direct Connect publishes metrics for each dedicated connection and virtual interface in the `AWS/DX` namespace. They fall into three groups:
+- **State**: `ConnectionState` is 1 when the connection is up and 0 when it is down.
+- **Traffic**: `ConnectionBpsEgress/Ingress`, `ConnectionPpsEgress/Ingress`, and the same per virtual interface.
+- **Physical health**: `ConnectionLightLevelTx` and `ConnectionLightLevelRx` report the optical signal level in dBm, and `ConnectionErrorCount` counts MAC-level errors (such as CRC errors) on the AWS device.
+## Early warning versus outage alert
+A failing optic or dirty fiber shows up first as a falling receive light level and a growing error count, while the link is still up and carrying traffic with loss. `ConnectionState` only changes after the link has already failed.
+Example: alarm when `ConnectionLightLevelRx` drops a few dB below its baseline, or when `ConnectionErrorCount` is above 0 for 3 of 5 periods.
+W: C=Light levels: ConnectionLightLevelRx and ConnectionLightLevelTx report the optical signal in dBm, which drifts while a failing optic or dirty fiber still keeps the link up.
+E=Error count: ConnectionErrorCount counts MAC-level errors such as CRC errors on the AWS device, which grow during degradation well before ConnectionState changes.
+X: A=Connection throughput: traffic volume changes with business demand, and a degrading optic can keep carrying similar volume with retransmissions, so throughput is a poor signal for physical faults.
+B=ConnectionState: this metric only moves to 0 once the connection is down, which is the outage itself, not a warning before it.
+D=VIF throughput: capacity alarms help plan bandwidth, but a physical-layer fault on the fiber does not show up as high utilization on a virtual interface.
+T: For early warning of Direct Connect physical problems, alarm on light levels and ConnectionErrorCount; ConnectionState only tells you after the link is down.
+V: AWS Direct Connect, Amazon CloudWatch
+
+@ ANS-C01 D1 T1.4 applied use-case
+S: A security operations team wants an alert within about ten minutes whenever the number of rejected connections to a payment subnet exceeds a threshold. Flow logs are currently delivered to Amazon S3 with the default settings and analyzed with Athena once a day. Which logging design meets the new requirement?
+A: Keep the S3 flow log and schedule an Athena query every five minutes that counts REJECT records, publishing the result as a custom metric
+B: Enable Traffic Mirroring on all ENIs in the payment subnet and send mirrored packets to a Network Load Balancer that feeds a packet-counting appliance
+C: Add a flow log to CloudWatch Logs with a 1-minute maximum aggregation interval, then create a metric filter on REJECT records and a CloudWatch alarm
+D: Enable Reachability Analyzer on a schedule for the payment subnet and trigger an alarm when an analysis finds a path that is not reachable
+K: C
+G: ## How fast flow log data arrives
+Flow logs aggregate packets into records over an **aggregation interval**: 10 minutes by default or **1 minute** if you choose it. (On Nitro-based instances records are aggregated at 1 minute or less regardless.) Publishing then adds more time on a best-effort basis: typically about 5 minutes to CloudWatch Logs and about 10 minutes to Amazon S3.
+## Choosing the destination
+- **Amazon S3**: cheap long-term storage, queried later with Athena. Good for forensics and daily reports.
+- **CloudWatch Logs**: records can be turned into metrics with a **metric filter**, for example counting records where `action = REJECT`, and a **CloudWatch alarm** can fire on that metric.
+- **Amazon Data Firehose**: streams to a third-party SIEM or other tools.
+You can create more than one flow log on the same subnet, each with its own destination and interval, so the existing S3 archive can stay.
+W: CloudWatch Logs with a metric filter: a second flow log with a 1-minute interval to CloudWatch Logs lets a metric filter count REJECT records and an alarm fire within minutes, while the S3 flow log keeps serving the daily analysis.
+X: A=Frequent Athena queries: the S3 flow log keeps the default 10-minute aggregation interval and S3 delivery typically takes about 10 more minutes, so polling Athena cannot meet the target and adds query cost.
+B=Traffic Mirroring: mirroring copies full packets for deep inspection, which is expensive and complex, and the appliance would need custom logic to infer which connections were rejected; flow logs already record that action.
+D=Reachability Analyzer: it analyzes configuration to see if a path could exist; it never observes live traffic, so it cannot count real rejected connections.
+T: Near-real-time alerts on flow logs → CloudWatch Logs destination, 1-minute aggregation, metric filter and alarm; S3 plus Athena is for later analysis.
+V: Amazon VPC, Amazon CloudWatch, Amazon S3
+
+@ ANS-C01 D1 T1.5 advanced tradeoff
+S: An on-premises data center connects to a VPC in us-east-1 through a Direct Connect transit VIF and a transit gateway. Compliance forbids public VIFs and any path over the internet, but on-premises servers must upload data to Amazon S3 in us-east-1. Which design fits?
+A: Create an S3 gateway endpoint in the VPC and add the on-premises prefixes to its endpoint policy so on-premises traffic is routed through it
+B: Create an S3 interface endpoint in the VPC and point the on-premises applications at its endpoint-specific DNS names, reached over the transit VIF
+C: Advertise the S3 prefix list from the transit gateway to on-premises over BGP so that traffic to S3 public IPs is drawn onto the transit VIF
+D: Enable S3 Transfer Acceleration on the bucket so that uploads enter the AWS network at the nearest edge location instead of the internet
+K: B
+G: ## Two kinds of S3 endpoints
+- A **gateway endpoint** is a route table target (`pl-xxxx` prefix list to `vpce-xxxx`). It works only for traffic that starts inside the VPC; packets that arrive from on-premises through a VPN, Direct Connect or transit gateway cannot use it.
+- An **interface endpoint** (AWS PrivateLink) is a set of ENIs with private IPs from your subnets. Anything that can route to those IPs, including on-premises networks over Direct Connect, can reach S3 through them.
+## Making on-premises use it
+Applications use the endpoint-specific DNS name, for example `bucket.vpce-0abc123-xyz.s3.us-east-1.vpce.amazonaws.com`, or on-premises DNS forwards S3 names to a Route 53 Resolver inbound endpoint that returns the endpoint's private IPs. Traffic then flows over the transit VIF and the transit gateway to the endpoint ENIs, never over a public VIF or the internet.
+Trade-off: interface endpoints cost per hour and per GB, while gateway endpoints are free, but only the interface endpoint serves on-premises clients.
+W: S3 interface endpoint over the transit VIF: its ENIs have private IPs that on-premises routes can reach through the transit gateway, so uploads stay on Direct Connect with no public VIF or internet path.
+X: A=Gateway endpoint: gateway endpoints are only usable from inside the VPC through its route tables, so traffic arriving from on-premises through the transit gateway cannot be sent to S3 through them.
+C=Advertising the S3 prefix list: a transit VIF only carries routes to private networks attached to the transit gateway; S3 public IP ranges are reached through a public VIF, which compliance forbids.
+D=Transfer Acceleration: it speeds uploads by entering at an edge location over the internet, so data still crosses the public internet from the data center, which violates the requirement.
+T: On-premises access to S3 over private Direct Connect needs an S3 interface endpoint; gateway endpoints only serve traffic that originates in the VPC.
+V: Amazon S3, AWS PrivateLink, AWS Direct Connect, AWS Transit Gateway
+
+@ ANS-C01 D1 T1.5 applied use-case
+S: A company in Europe connects a branch office in Australia to its AWS network in eu-west-1 over a Site-to-Site VPN on the internet. Users complain about jitter and variable latency. The company wants to keep using VPN but send traffic over the AWS global network from a nearby edge location. Which TWO statements describe what is required? (Select TWO)
+A: The VPN connection must terminate on a transit gateway, because acceleration is not supported for VPN connections on a virtual private gateway
+B: The company must order a hosted Direct Connect connection in Sydney, because accelerated VPN tunnels run on top of a public virtual interface
+C: Acceleration must be enabled when a new VPN connection is created; an existing VPN connection cannot be switched to accelerated in place
+D: The customer gateway must disable NAT traversal, because accelerated VPN tunnels only carry native ESP packets across the AWS edge network
+E: The company must place a Global Accelerator in front of the virtual private gateway and point the customer gateway at the static anycast IPs
+K: A,C
+G: ## What an accelerated VPN is
+A standard Site-to-Site VPN tunnel runs over the public internet all the way from the customer gateway to the AWS VPN endpoint in the Region. Long internet paths add jitter and loss.
+With **accelerated Site-to-Site VPN**, the tunnels enter AWS at a nearby edge location through AWS Global Accelerator and travel the AWS global network to the Region. You do not create or manage the accelerator yourself.
+## Requirements to remember
+- Acceleration is available only for VPN connections attached to a **transit gateway**, not a virtual private gateway.
+- It is a setting chosen **at creation**; to accelerate an existing connection you create a new accelerated one and move traffic.
+- **NAT traversal (NAT-T)** is required and enabled by default, so tunnels use UDP 4500.
+Example: branch in Sydney → edge location in Sydney → AWS backbone → transit gateway in eu-west-1.
+W: A=Transit gateway termination: accelerated Site-to-Site VPN is supported only for VPN connections attached to a transit gateway, not to a virtual private gateway.
+C=Acceleration set at creation: an existing VPN connection cannot be switched to accelerated, so a new accelerated connection must be created and traffic moved to it.
+X: B=Hosted Direct Connect: accelerated VPN runs over the internet to the nearest edge location, not over a Direct Connect public VIF, so no Direct Connect order is involved.
+D=Disable NAT traversal: the opposite is true; NAT-T is required for accelerated VPN and enabled by default, and the tunnels are encapsulated in UDP 4500.
+E=Self-managed Global Accelerator: the service creates and manages the acceleration itself when the option is chosen, and a customer-built accelerator cannot front a virtual private gateway's VPN endpoints.
+T: Accelerated VPN = new VPN connection on a transit gateway with acceleration enabled at creation (NAT-T on); virtual private gateways cannot be accelerated.
+V: AWS Site-to-Site VPN, AWS Transit Gateway, AWS Global Accelerator
+
+@ ANS-C01 D1 T1.6 advanced tradeoff
+S: A company has 40 application accounts in one Region. Each team currently has its own VPC attached to a transit gateway, and most traffic is between application tiers owned by different teams, which creates high transit gateway data processing charges. The central network team wants to keep control of routing and subnets while teams keep separate accounts for their resources. Which design best fits?
+A: Replace the transit gateway with a full mesh of VPC peering connections between all 40 VPCs so that inter-team traffic avoids data processing charges
+B: Expose each team's application tier through AWS PrivateLink endpoint services and have the consuming teams create interface endpoints in their VPCs
+C: Create a shared VPC owned by the network account and share its subnets with the application accounts through AWS RAM, so teams deploy into shared subnets
+D: Move all teams into one AWS account with a single VPC and use IAM policies with resource tags to separate each team's resources and permissions
+K: C
+G: ## VPC sharing
+With **VPC sharing**, the account that owns a VPC shares one or more **subnets** with other accounts in the same AWS Organization using **AWS Resource Access Manager (RAM)**.
+- The **owner** (the central network team) manages the VPC, subnets, route tables, gateways and network ACLs.
+- **Participants** launch their own EC2 instances, databases and load balancers into the shared subnets. They own and pay for those resources and cannot change the owner's network resources.
+## Why it helps here
+Instances in the same VPC talk over the local route, so tier-to-tier traffic between teams no longer passes through a transit gateway and incurs no data processing charge (normal inter-AZ transfer rates still apply). It also cuts the number of VPCs, attachments and CIDR blocks to manage, while account separation for billing and IAM stays intact.
+Example: network account owns `vpc-shared` with `app-subnet-a/b/c`; accounts `team-1` to `team-40` deploy into those subnets.
+W: VPC sharing with RAM: the network team keeps full control of the VPC and routing, teams keep their own accounts, and traffic between their tiers stays inside one VPC with no transit gateway processing charges.
+X: A=Full mesh of peering: 40 VPCs need 780 peering connections with routes in every table, which is hard to operate and moves routing control away from a central design.
+B=PrivateLink per tier: interface endpoints charge per hour and per GB processed, and every tier-to-tier dependency becomes a separate endpoint service to build and maintain.
+D=Single shared account: it removes account boundaries the teams want to keep for billing, quotas and blast radius, and IAM tag rules are harder to govern than separate accounts.
+T: Many accounts that need to share one network with central control → VPC sharing through RAM, not more peering or more transit gateway traffic.
+V: Amazon VPC, AWS Resource Access Manager, AWS Transit Gateway
+
+@ ANS-C01 D1 T1.6 advanced use-case
+S: After several acquisitions, 12 VPCs attached to a transit gateway all use 10.0.0.0/16 for their workloads. Workloads in each VPC must open connections to hundreds of hosts on a routable on-premises network reached over Direct Connect, and re-addressing the workloads is not possible this year. Which design allows this traffic?
+A: Create an AWS PrivateLink endpoint service in each VPC in front of its workloads and connect the on-premises network to it with interface endpoints
+B: Add a unique routable secondary CIDR to each VPC, deploy a private NAT gateway in it, and route on-premises-bound traffic through the NAT gateway to the transit gateway
+C: Put each overlapping VPC in its own transit gateway route table and rely on longest-prefix matching of the propagated routes to return on-premises traffic to the correct VPC
+D: Enable appliance mode on each VPC attachment so the transit gateway keeps each flow symmetric and returns replies to the VPC that sent them
+K: B
+G: ## Why overlapping VPCs cannot route to shared networks
+When 12 VPCs all use `10.0.0.0/16`, an on-premises host replying to `10.0.4.7` has no idea which VPC that address belongs to, and the transit gateway route table can point `10.0.0.0/16` to only one attachment.
+## Private NAT gateway pattern
+A **private NAT gateway** performs source NAT to its own private IP, without internet access.
+1. Add a secondary CIDR that is unique across the company to each VPC, for example `100.64.1.0/28` for VPC 1 and `100.64.2.0/28` for VPC 2.
+2. Create a routable subnet in that range and place a private NAT gateway there.
+3. Route the on-premises prefixes from the workload subnets to the NAT gateway, and from the routable subnet to the transit gateway.
+On-premises now sees each VPC as its own unique range, so replies return correctly, while workloads keep their overlapping addresses.
+W: Routable secondary CIDR with a private NAT gateway: each VPC translates outbound connections to a unique routable address, so the transit gateway and on-premises routers can return traffic to the right VPC without re-IP.
+X: A=PrivateLink endpoint services: PrivateLink lets consumers connect in to a service; here the workloads initiate connections out to hundreds of on-premises hosts, which PrivateLink does not provide.
+C=Separate route tables: separate tables stop the VPCs from reaching each other, but return traffic from on-premises still arrives for one `10.0.0.0/16` destination that can map to only one attachment.
+D=Appliance mode: it keeps flows pinned to one AZ for stateful appliances in an inspection VPC; it does nothing about identical source addresses from different VPCs.
+T: Overlapping VPCs that must initiate traffic to a shared network → translate through a private NAT gateway in a unique routable CIDR.
+V: Amazon VPC, AWS Transit Gateway, AWS Direct Connect
+
+@ ANS-C01 D3 T3.1 advanced troubleshooting
+S: During a Direct Connect outage, an engineer added a static route for 10.50.0.0/16 pointing to a Site-to-Site VPN attachment in the transit gateway route table. The Direct Connect gateway attachment is back and propagating 10.50.0.0/16 again, but traffic still leaves over the VPN. What is the cause?
+A: For the same prefix, the transit gateway prefers routes propagated from VPN attachments over routes propagated from a Direct Connect gateway attachment
+B: The Direct Connect gateway advertises the prefix with a longer AS path than the VPN, so the transit gateway selects the shorter AS path of the VPN
+C: A static route in a transit gateway route table takes precedence over a propagated route for the same destination, so the VPN route stays active
+D: The transit gateway keeps the previous best path until the BGP hold timer of the Direct Connect session has expired twice after it recovered
+K: C
+G: ## How a transit gateway picks a route
+For each packet the transit gateway looks up its attachment's route table:
+1. **Longest prefix match**: a `/24` wins over a `/16`.
+2. For identical prefixes, **static routes beat propagated routes**.
+3. Among propagated routes for the same prefix: VPC routes, then Direct Connect gateway, then Transit Gateway Connect, then Site-to-Site VPN.
+## Why the traffic is stuck
+The static route `10.50.0.0/16 → vpn-attachment` was a good emergency fix. But once Direct Connect recovers, its propagated `10.50.0.0/16` loses to the static route of the same length, so the transit gateway keeps using the VPN.
+Fix: delete the static route (or, for a lasting design, rely on BGP propagation for both paths, where Direct Connect is preferred over VPN automatically).
+W: Static beats propagated: the manual static route for the same /16 outranks the route propagated from the Direct Connect gateway, so the transit gateway keeps forwarding to the VPN until the static route is removed.
+X: A=VPN preferred over Direct Connect: the order is the reverse; among propagated routes for the same prefix, the Direct Connect gateway route is preferred over the VPN route.
+B=AS path length: AS path is only compared between dynamic routes, and here the static route wins before any BGP attributes are considered.
+D=Hold timer delay: BGP hold timers detect a dead neighbor; they do not delay using a route that has been learned again, and the route table shows the propagated route present.
+T: In a transit gateway, a static route for the same prefix always wins over propagated routes; remove emergency static routes when dynamic paths recover.
+V: AWS Transit Gateway, AWS Direct Connect, AWS Site-to-Site VPN
+
+@ ANS-C01 D3 T3.1 applied use-case
+S: A dedicated Direct Connect connection carries four private VIFs for production VPCs. The team wants to raise the MTU of one VIF to 9001 for a replication workload. The connection has never been used with jumbo frames. What should the team plan for this change?
+A: Only the VIF being changed renegotiates BGP, so the change can be made during business hours without affecting the other three VIFs
+B: A new VIF must be created with jumbo frames enabled, because the MTU of an existing private VIF cannot be changed after creation
+C: The change is applied by AWS during the next scheduled maintenance of the Direct Connect location, so no maintenance window is required
+D: Updating the connection can briefly disrupt all VIFs on it for up to about 30 seconds, so the change belongs in a maintenance window
+K: D
+G: ## Jumbo frames on Direct Connect
+Direct Connect virtual interfaces support larger MTUs:
+- **Private VIF**: 1500 or **9001** bytes.
+- **Transit VIF**: 1500 or **8500** bytes.
+You can change the MTU of an existing VIF in the console or API. The on-premises router interface and the VPC side must also support the larger size end to end, otherwise large packets are dropped or fragmented.
+## The hidden side effect
+Changing the MTU of one VIF can also trigger an **update of the underlying connection**. AWS warns that this update can interrupt **all** virtual interfaces on the connection, for up to about 30 seconds.
+Example: `dxcon-abc` carries VIFs for prod-a, prod-b, prod-c and prod-d. Raising prod-a to 9001 can briefly drop BGP for all four, so traffic without a redundant path would be interrupted.
+W: Plan for connection-wide disruption: a VIF MTU change can trigger an update of the physical connection that interrupts every VIF on it for up to about 30 seconds, so it needs a maintenance window or traffic drained to another connection.
+X: A=Only one VIF affected: this ignores the connection update that an MTU change can trigger, which can interrupt all VIFs on the connection, not only the one being changed.
+B=Recreate the VIF: the MTU of an existing private VIF can be modified in place; recreating it would cause a longer outage and new BGP configuration for no benefit.
+C=AWS applies it later: the MTU update is applied when you make the change, not deferred to a location maintenance event, so the disruption happens at the time you choose.
+T: Changing a VIF MTU can reset the whole Direct Connect connection for up to 30 seconds; treat it as a maintenance event for every VIF on that connection.
+V: AWS Direct Connect
+
+@ ANS-C01 D3 T3.2 applied use-case
+S: A network team sends VPC Flow Logs for a shared services VPC to CloudWatch Logs. The team wants a continuously updated view of the top 10 source IP addresses by rejected packets and by bytes, without running ad hoc queries or building a separate analytics pipeline. Which solution fits?
+A: Run a CloudWatch Logs Insights query every hour from an EventBridge schedule and store the top 10 results as JSON objects in an S3 bucket
+B: Create a CloudWatch Contributor Insights rule on the flow log group, keyed on source address and filtered on the REJECT action, and add it to a dashboard
+C: Create a metric filter for each known source IP address in the flow log group and plot the resulting metrics together on one CloudWatch dashboard
+D: Export the flow log group to Amazon S3 each day and use Athena with a GROUP BY query on source address to produce the top 10 table
+K: B
+G: ## Finding "top talkers"
+A flow log group can hold millions of records per hour. The usual question is "who is sending the most traffic, or the most rejected traffic?" That is a top-N ranking by a field, updated all the time.
+## CloudWatch Contributor Insights
+**Contributor Insights** evaluates rules against log events as they arrive and keeps a ranking of the top contributors.
+- A rule names the log group, the **keys** to group by (for example `srcAddr`, or `srcAddr` plus `dstPort`), an optional **filter** (such as `action = REJECT`) and what to aggregate (count of records or sum of `bytes`).
+- AWS provides sample rules for VPC Flow Logs, so you do not start from scratch.
+- Results appear as a time-series graph and a top-N table and can be added to CloudWatch dashboards; alarms can use the rule's metrics too.
+Example: rule `TopRejectedSources` keyed on `srcAddr` with filter `action = REJECT`.
+W: Contributor Insights rule: it ranks source addresses continuously as flow log events arrive, with a filter for REJECT and aggregation by bytes, and shows the top 10 on a dashboard without separate queries or pipelines.
+X: A=Hourly Logs Insights query: the result is at most an hourly snapshot and requires scheduling, storage and custom code, which is the kind of pipeline the team wants to avoid.
+C=Metric filter per IP: metric filters need known values in advance, so new attackers or clients would never appear, and one filter per address does not scale or rank.
+D=Daily export to Athena: this gives a report once a day after export, not a continuously updated view, and it adds an analytics pipeline to run.
+T: Continuous top-N ranking from logs → CloudWatch Contributor Insights; Logs Insights and Athena answer ad hoc questions after the fact.
+V: Amazon CloudWatch, Amazon VPC
+
+@ ANS-C01 D3 T3.2 applied use-case
+S: A network account owns a transit gateway with 60 VPC attachments from 25 application accounts plus two VPN attachments. The network team wants to analyze traffic volume between attachments and see packets dropped because of missing routes, without asking every application team to enable anything in their accounts. Which option fits best?
+A: Create Transit Gateway Flow Logs on the transit gateway in the network account and publish them to Amazon S3 for analysis with Athena
+B: Use an AWS Config rule that requires every application account to enable VPC Flow Logs on all VPC attachment ENIs of the transit gateway
+C: Enable Traffic Mirroring on the transit gateway attachments and send the mirrored packets to an analysis appliance in the network account
+D: Use Reachability Analyzer from the network account to test every pair of attachments and export each analysis result to Amazon S3
+K: A
+G: ## Where to capture transit gateway traffic
+VPC Flow Logs are created per VPC, subnet or ENI in the account that owns them. For a hub shared by 25 accounts, that means coordinating 25 teams, and VPC-level logs still do not show what happened **inside** the transit gateway.
+## Transit Gateway Flow Logs
+**Transit Gateway Flow Logs** are created on the transit gateway itself, by the account that owns it. Each record describes a flow through the transit gateway and includes fields such as:
+- `tgw-attachment-id`, `tgw-src-vpc-account-id`, `tgw-dst-vpc-account-id` and the source and destination addresses;
+- packet and byte counts;
+- drop counters such as `packets-lost-no-route`, `packets-lost-blackhole` and `packets-lost-mtu-exceeded`.
+Logs can go to S3, CloudWatch Logs or Amazon Data Firehose. With S3 and Athena you can sum bytes per attachment pair and list flows dropped for lack of a route.
+W: Transit Gateway Flow Logs: the network account enables them once on its own transit gateway, and the records show traffic per attachment plus packets lost to missing or blackhole routes, with no work in application accounts.
+X: B=Config rule for VPC Flow Logs: this still needs every application account to create logs, and VPC Flow Logs cannot show packets dropped inside the transit gateway for lack of a route.
+C=Traffic Mirroring: mirroring is configured on ENIs of supported instances, not on transit gateway attachments, and full packet copies are far more than needed for volume and drop analysis.
+D=Reachability Analyzer: it checks whether configuration allows a path; it does not observe real traffic, so it cannot report traffic volume or actual dropped packets.
+T: For traffic inside a central transit gateway, enable Transit Gateway Flow Logs once in the owner account instead of VPC Flow Logs in every spoke.
+V: AWS Transit Gateway, Amazon S3, Amazon Athena
+
+@ ANS-C01 D3 T3.2 advanced troubleshooting
+S: An Application Load Balancer in front of Node.js targets returns occasional HTTP 502 errors under light load. ALB access logs show elb_status_code 502 with target_status_code "-" for these requests. The ALB idle timeout is 60 seconds, and the Node.js HTTP server uses its default keep-alive timeout of 5 seconds. What is the most likely cause and fix?
+A: The targets are running out of memory and returning 502 themselves; add instances to the target group and enable slow start mode
+B: The target group health check interval is too long, so unhealthy targets receive traffic; shorten the interval and lower the unhealthy threshold
+C: Targets close idle keep-alive connections before the ALB does, so the ALB reuses a closed connection; set target keep-alive above the ALB idle timeout
+D: The ALB idle timeout is too short for slow requests, so it closes connections mid-response; increase the ALB idle timeout to 300 seconds
+K: C
+G: ## Where a 502 comes from
+ALB access logs record two status codes:
+- `elb_status_code`: what the load balancer sent to the client.
+- `target_status_code`: what the target returned. A value of `-` means the target never sent a valid response.
+So `502` with target `-` means the ALB itself generated the error, usually because the connection to the target failed or closed unexpectedly.
+## Keep-alive race
+The ALB reuses back-end connections to targets. It keeps an idle connection for up to its **idle timeout** (60 seconds here). The Node.js server closes idle connections after **5 seconds**. When the ALB sends a new request on a connection the target has just closed, the target answers with a TCP reset or FIN, and the ALB returns 502.
+AWS guidance: set the target's keep-alive timeout **greater than** the ALB idle timeout, for example `server.keepAliveTimeout = 65000` in Node.js.
+W: Keep-alive shorter than ALB idle timeout: targets drop idle connections after 5 seconds while the ALB expects to reuse them for 60, so some requests hit closed connections and get a load-balancer-generated 502; raising the target keep-alive above 60 seconds fixes it.
+X: A=Target memory errors: a 502 returned by the target would show a target status code of 502, but the logs show `-`, and the errors occur under light load rather than stress.
+B=Health check interval: a slow health check would cause failures on truly unhealthy targets, typically with 502 or 504 bursts during outages, not random single errors on healthy targets at light load.
+D=Increase ALB idle timeout: a longer ALB idle timeout widens the gap to the 5-second target keep-alive and makes the race more likely, not less.
+T: ALB 502 with target status "-" at low load usually means targets close keep-alive connections first; keep the target keep-alive longer than the ALB idle timeout.
+V: Elastic Load Balancing
+
+@ ANS-C01 D3 T3.2 advanced troubleshooting
+S: Application servers keep idle TCP connections to a database fleet behind a Network Load Balancer. After about six minutes without traffic, the next query on a connection fails, and CloudWatch shows TCP_ELB_Reset_Count increasing. Which TWO actions resolve the problem? (Select TWO)
+A: Enable TCP keepalives on the application servers with an interval shorter than the NLB TCP idle timeout so connections never look idle
+B: Enable cross-zone load balancing on the NLB so that idle connections can be moved to a target in another Availability Zone
+C: Increase the TCP idle timeout on the NLB listener to a value longer than the longest expected idle period of the connections
+D: Enable connection draining with a longer deregistration delay on the target group so idle connections are kept open for longer
+E: Switch the target group health check to HTTP so the NLB can detect idle connections and refresh them before they time out
+K: A,C
+G: ## NLB idle timeout
+A Network Load Balancer tracks each TCP flow. If no packets pass for the **TCP idle timeout** (350 seconds by default, about six minutes), the NLB removes the flow. When either side later sends a packet on that connection, the NLB answers with a **TCP reset** and counts it in `TCP_ELB_Reset_Count`.
+## Two ways to fix it
+- **Keep the flow alive**: enable TCP keepalive on clients or targets with an interval below the timeout, for example `net.ipv4.tcp_keepalive_time = 120` on Linux, or keepalive settings in the database driver or pool.
+- **Raise the timeout**: the NLB TCP listener idle timeout is configurable (from 60 up to 6,000 seconds), so it can be set above the longest idle period of the pool.
+Connection pools with a maximum idle time below the timeout are another common fix.
+W: A=TCP keepalives: keepalive packets sent at an interval shorter than the 350-second default idle timeout stop the flow from ever looking idle, so the NLB keeps it.
+C=Longer NLB idle timeout: raising the listener's TCP idle timeout above the longest idle period keeps the flow entry until the application reuses the connection.
+X: B=Cross-zone load balancing: it only changes how new connections are spread across zones; it does not keep existing idle flows alive or move them to other targets.
+D=Deregistration delay: it controls how long in-flight connections are allowed to finish when a target is deregistered, not how long idle flows stay in the NLB's tracking table.
+E=HTTP health checks: health checks test target health on separate connections; they neither see nor refresh the application's idle database connections.
+T: Idle TCP flows through an NLB are reset after the idle timeout (350 seconds by default); send keepalives more often or raise the listener idle timeout.
+V: Elastic Load Balancing, Amazon CloudWatch
+
+@ ANS-C01 D3 T3.3 applied use-case
+S: A software company lets customers worldwide download installers of 200 MB to 2 GB directly from public S3 bucket URLs. Data transfer out is now the largest line on the bill, and customers far from the bucket's Region report slow downloads. Which TWO changes lower cost and improve download speed? (Select TWO)
+A: Enable S3 Transfer Acceleration on the bucket and publish the accelerated endpoint URLs to customers for all installer downloads
+B: Serve the downloads through a CloudFront distribution with the bucket as an origin, because transfer from S3 to CloudFront is not charged
+C: Enable Requester Pays on the bucket so that download charges move from the company to the customers who download the files
+D: Use a CloudFront cache policy with long TTLs for the versioned installers so repeat downloads are served from edge caches near customers
+E: Replicate the bucket to every Region with S3 Cross-Region Replication and let customers choose the nearest regional bucket URL
+K: B,D
+G: ## Where download cost comes from
+Serving files straight from S3 to the internet is billed as **S3 data transfer out** per GB, and every download travels from one Region to the user over the public internet.
+## What CloudFront changes
+- **Origin fetches are free**: data transfer from S3 (or any AWS origin) to CloudFront edge locations is not charged.
+- **Edge caching**: a popular installer is fetched once per edge location (or once per regional edge cache) and then served locally to many users, so origin traffic drops and users get lower latency.
+- **Price classes** let you limit edge locations to the cheaper regions if customers are concentrated there, trading a little latency for lower rates.
+- CloudFront data transfer out rates are generally at or below S3 internet rates, with volume discounts.
+- Installer files that are versioned in their names never change, so they can use long TTLs and stay cached.
+Example: 50,000 downloads of a 1 GB installer become a handful of origin fetches plus edge deliveries, instead of 50 TB leaving S3 directly.
+W: B=CloudFront with the S3 origin: data transfer from S3 to CloudFront is not charged, and edge locations deliver the installers close to users over the AWS network.
+D=Long TTLs for versioned installers: files that never change stay in edge caches, so repeat downloads are served locally instead of from the bucket, lowering cost and latency.
+X: A=Transfer Acceleration: it can speed long-distance transfers, but it adds a per-GB acceleration charge on top of normal data transfer out and caches nothing, so the bill goes up instead of down.
+C=Requester Pays: requesters must be authenticated AWS accounts, so anonymous customers downloading from public URLs could no longer download the installers at all.
+E=Replicate to every Region: replication adds storage and inter-Region transfer charges and complex URL handling, while each download is still billed as S3 data transfer out.
+T: Global public downloads from S3 → put CloudFront in front: free origin fetch plus edge caching lowers cost and latency; Transfer Acceleration adds cost and does not cache.
+V: Amazon CloudFront, Amazon S3
+
+@ ANS-C01 D3 T3.3 advanced troubleshooting
+S: On-premises DNS servers forward queries for AWS private zones to a Route 53 Resolver inbound endpoint with two IP addresses. During nightly batch jobs, some queries time out, and the endpoint's CloudWatch metrics show query volume near the documented per-address capacity. Which change improves reliability?
+A: Convert the inbound endpoint into an outbound endpoint and create forwarding rules so that the on-premises queries are resolved from inside the VPC
+B: Enable DNSSEC validation on the Route 53 Resolver for the VPC so that malformed queries are rejected earlier and reduce the load on the endpoint
+C: Add more IP addresses to the inbound endpoint across Availability Zones and configure the on-premises forwarders to spread queries across all of them
+D: Increase the TTL of the records in the private hosted zones to 24 hours so that the Route 53 Resolver caches answers and handles more queries
+K: C
+G: ## How Resolver endpoints scale
+A Route 53 Resolver **inbound endpoint** is a set of ENIs, one per IP address you specify, in subnets you choose. On-premises DNS servers forward queries to these IPs over Direct Connect or VPN.
+- Each IP address (ENI) can handle about **10,000 queries per second**.
+- Capacity grows by **adding IP addresses** to the endpoint; placing them in different Availability Zones also protects against an AZ failure.
+## Spreading the load
+Adding addresses only helps if on-premises forwarders use them. Configure every forwarder with all endpoint IPs so queries are distributed, instead of all forwarders sending to the first IP in the list.
+Example: grow from `10.0.1.10` and `10.0.2.10` to four addresses in three AZs, and list all four as forwarders on each on-premises DNS server.
+The `InboundQueryVolume` metric per endpoint helps you see when you are approaching capacity.
+W: Add endpoint IP addresses and spread queries: each address has a fixed query capacity, so more ENIs across AZs, used by all forwarders, raise throughput and remove the timeouts during batch peaks.
+X: A=Switch to outbound endpoint: outbound endpoints forward queries from the VPC to other resolvers; they cannot receive queries from on-premises, so resolution of private zones from the data center would stop.
+B=DNSSEC validation: validation adds checks on signed responses from public zones; it does not reduce query volume or add capacity to the inbound endpoint.
+D=24-hour TTLs: the Resolver endpoint still receives every query that on-premises caches do not answer, and very long TTLs make record changes slow to take effect; the bottleneck is endpoint capacity.
+T: Resolver endpoint throughput scales per IP address (about 10,000 QPS each); add ENIs across AZs and make forwarders use them all.
+V: Amazon Route 53, Amazon CloudWatch
+
+@ ANS-C01 D3 T3.3 advanced tradeoff
+S: A company uses a centralized egress VPC with NAT gateways behind a transit gateway for 30 spoke VPCs. One analytics VPC now downloads about 400 TB per month from internet data providers, and its egress costs are much higher than expected. Which change most reduces cost while keeping the other spokes centralized?
+A: Enable appliance mode on the analytics VPC attachment so that its flows stay in one Availability Zone and avoid cross-AZ transfer inside the egress VPC
+B: Replace the NAT gateways in the egress VPC with larger NAT instances so that the per-GB NAT gateway processing charge disappears for all spoke traffic
+C: Add a second transit gateway dedicated to the analytics VPC and connect it to the same egress VPC so its traffic uses a separate attachment
+D: Give the analytics VPC its own NAT gateways and internet gateway, so its internet traffic no longer passes through the transit gateway at all
+K: D
+G: ## What centralized egress costs
+In a centralized egress design, a packet from a spoke to the internet pays:
+- **Transit gateway data processing** per GB sent into the transit gateway, both for requests from the spoke and for downloaded data returning from the egress VPC attachment;
+- **NAT gateway data processing** per GB in the egress VPC;
+- normal internet data transfer charges (downloads from the internet into AWS are free to receive, but they still pass through the transit gateway and NAT gateway).
+Centralizing saves money when many spokes have little traffic, because you pay for fewer NAT gateway hours.
+## When decentralizing wins
+For a spoke with very high volume, the per-GB transit gateway charge dominates. Giving that VPC its own NAT gateways removes the transit gateway hop for its internet traffic; it still pays NAT gateway processing, but not transit gateway processing on 400 TB.
+Example: at a few cents per GB, 400 TB through the transit gateway alone costs thousands of dollars per month, which far exceeds the hourly cost of a few extra NAT gateways.
+W: Local NAT for the heavy VPC: removing the transit gateway hop for the analytics VPC's internet traffic eliminates the per-GB transit gateway processing on 400 TB, while the other 29 spokes keep the centralized design.
+X: A=Appliance mode: it keeps flows symmetric for stateful appliances; it does not remove any per-GB charge, and NAT gateways do not need it.
+B=NAT instances for everything: this shifts cost to instances you must patch, scale and make highly available, and the transit gateway processing charge on 400 TB remains.
+C=Second transit gateway: traffic through any transit gateway is still charged per GB processed, so a dedicated one adds attachment hours without lowering the data processing cost.
+T: Centralized egress saves on NAT hours for many small spokes; a very high-volume spoke is cheaper with its own NAT gateway to avoid transit gateway per-GB charges.
+V: AWS Transit Gateway, Amazon VPC
+
+@ ANS-C01 D3 T3.3 advanced troubleshooting
+S: A fleet of EC2 instances runs a forward proxy that opens hundreds of thousands of short-lived connections. Under peak load, clients see sporadic packet loss although CPU and bandwidth are well below limits. The ENA driver statistics show conntrack_allowance_exceeded increasing on the proxy instances. What should the team do?
+A: Increase the MTU on the proxy instances to 9001 so that each packet carries more data and fewer packets need to be tracked
+B: Move the proxies to a larger instance size, or make the flows untracked by using security group rules that avoid connection tracking
+C: Place the proxy instances in a cluster placement group so that all traffic stays within one rack and bypasses connection limits
+D: Enable Enhanced Networking with the Intel 82599 VF driver instead of ENA to remove the per-instance connection limit completely
+K: B
+G: ## Allowances beyond bandwidth
+Every EC2 instance has network **allowances** besides bandwidth. When one is exceeded, packets are queued or dropped even though CPU and bandwidth look fine. The ENA driver exposes counters through `ethtool -S` (and the CloudWatch agent can publish them):
+- `bw_in_allowance_exceeded`, `bw_out_allowance_exceeded`: bandwidth;
+- `pps_allowance_exceeded`: packets per second;
+- `conntrack_allowance_exceeded`: packets dropped because the instance tracks too many connections;
+- `linklocal_allowance_exceeded`: traffic to DNS, metadata or Time Sync services.
+## Connection tracking
+Security groups are stateful, so the instance tracks each flow. The number of tracked connections allowed grows with **instance size**. Some flows are **untracked**: a TCP or UDP flow is not tracked when a rule allows it from or to `0.0.0.0/0` (or `::/0`) and a rule in the other direction allows all response traffic to `0.0.0.0/0` (or `::/0`) on all ports. ICMP is always tracked, and traffic through some services (for example NAT gateways or Network Load Balancers) is tracked automatically.
+Fix: use a larger instance size, spread load across more instances, or design security group rules so that high-volume flows are untracked.
+W: Larger instance or untracked flows: `conntrack_allowance_exceeded` means the instance hit its connection tracking allowance, which scales with instance size, so more headroom or fewer tracked flows stops the drops.
+X: A=Jumbo frames: a larger MTU reduces packet count for bulk transfers, but it does not reduce the number of connections, and internet traffic uses 1500 bytes anyway.
+C=Cluster placement group: placement improves latency and throughput between instances in the group; it does not raise the connection tracking allowance of each instance.
+D=Intel 82599 VF driver: that older interface offers lower performance than ENA, and connection tracking is enforced by the instance's security group, not by the choice of driver.
+T: Drops with low CPU and bandwidth plus conntrack_allowance_exceeded → too many tracked connections; scale instance size or make flows untracked, not tune MTU or placement.
+V: Amazon EC2, Amazon VPC

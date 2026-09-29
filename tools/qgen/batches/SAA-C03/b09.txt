@@ -1,0 +1,580 @@
+# SAA-C03 batch 09: D2 resilient architectures (13) + D3 high-performing architectures (12), detailed explanations
+
+@ SAA-C03 D2 T2.1 advanced troubleshooting
+S: A Lambda function consumes an SQS standard queue with a batch size of 10. Each message triggers a charge to a customer's card through an idempotent-unaware payment API. When one message in a batch fails validation, the function throws an exception, and customers in the other nine messages are charged again on the retry. What is the MOST efficient fix?
+A: Enable ReportBatchItemFailures on the event source mapping and return the IDs of only the failed messages in the batchItemFailures list
+B: Reduce the batch size on the event source mapping to 1 so that each invocation handles one message and a failure affects only that message
+C: Increase the queue's visibility timeout to six times the function timeout so that failed batches are not delivered again as quickly
+D: Replace the standard queue with a FIFO queue and set a deduplication ID on each message so that already-charged messages are dropped
+K: A
+W: Partial batch response: with `ReportBatchItemFailures` turned on, the function catches per-message errors and returns `batchItemFailures` containing only the failed message IDs. Lambda deletes the nine successful messages and makes only the failed one visible again, so no customer is charged twice and batching efficiency is kept.
+X: B=Batch size of 1: this does stop the duplicate charges, but it multiplies invocations and polling cost by up to ten and lowers throughput. The partial batch response solves the same problem while keeping batches.
+C=Longer visibility timeout: this only delays the retry. When the timeout expires the whole batch is delivered again and the nine good messages are still charged a second time.
+D=FIFO with deduplication ID: deduplication applies to messages sent within a 5-minute window, not to redeliveries after a failed batch. A failed FIFO batch is also returned as a whole, so the successful messages would still be processed again.
+T: When one bad message should not replay a whole SQS batch, report partial batch failures; shrinking the batch works but throws away throughput.
+G: ## How Lambda processes an SQS batch
+The Lambda event source mapping polls the queue and invokes the function with up to `BatchSize` messages. By default the batch succeeds or fails as a unit:
+- If the function returns normally, Lambda deletes every message in the batch.
+- If the function throws, no message is deleted. After the visibility timeout all of them become visible again and are retried.
+With side effects such as payments, that means the successful messages are processed twice.
+## Partial batch responses
+Set `FunctionResponseTypes` to `ReportBatchItemFailures` on the mapping. The function then catches errors per message and returns, for example:
+`{"batchItemFailures": [{"itemIdentifier": "msg-7"}]}`
+Lambda deletes the other nine messages and retries only `msg-7`. After `maxReceiveCount` attempts the redrive policy moves it to the dead-letter queue.
+V: AWS Lambda, Amazon SQS
+
+@ SAA-C03 D2 T2.1 applied tradeoff
+S: An IoT platform receives about 40,000 device events per second. Each event starts a short workflow of three steps (validate, enrich, store) that finishes in under 2 seconds, and every step is idempotent. The team wants AWS Step Functions for visual orchestration at the lowest cost. Which workflow type should they use?
+A: Standard workflows, because they guarantee exactly-once execution of every step and keep a detailed execution history for 90 days
+B: Express workflows, because they support very high start rates for short runs and are billed by request count and duration
+C: Standard workflows started through an SQS queue, so that the queue absorbs the event rate and smooths out the execution starts
+D: Express workflows invoked synchronously, because only synchronous runs are allowed to call other AWS services from a step
+K: B
+W: Express workflows: they are designed for high-volume, short-lived event processing that runs for up to 5 minutes. They accept very high start rates and are priced per request and by duration and memory, which is far cheaper than per-state-transition pricing at 40,000 events per second. At-least-once semantics are fine because every step is idempotent.
+X: A=Standard for exactly-once: Standard workflows are priced per state transition and have much lower start-rate quotas. Exactly-once and long history are valuable for long-running business processes, not for millions of 2-second idempotent runs.
+C=Standard behind SQS: a queue can smooth bursts, but the sustained rate of 40,000 starts per second remains, and every transition is still billed at the Standard price. It adds latency and cost without changing the mismatch.
+D=Synchronous-only service calls: both synchronous and asynchronous Express workflows can call AWS services from their steps. The choice between sync and async depends on whether the caller waits for the result.
+T: Short, high-volume, idempotent workflows fit Express (per-request pricing, at-least-once); long-running, exactly-once business processes fit Standard (per-transition pricing).
+G: ## Two workflow types in Step Functions
+- **Standard workflows** can run for up to one year, execute each step exactly once, and keep an execution history you can inspect for 90 days. They are billed per state transition and have moderate start-rate quotas. Typical use: order fulfilment, human approvals.
+- **Express workflows** run for up to 5 minutes and are built for event rates of tens of thousands of starts per second. Asynchronous Express runs have at-least-once semantics, synchronous ones at-most-once. They are billed by number of requests and by duration and memory, and logs go to CloudWatch Logs.
+## Choosing
+Example: 40,000 events per second with 4 state transitions each is 160,000 transitions per second on Standard pricing. The same load on Express is billed per execution and for 2 seconds of duration each, which is far cheaper. Because every step is idempotent, an occasional duplicate run does no harm.
+V: AWS Step Functions
+
+@ SAA-C03 D2 T2.1 applied use-case
+S: A retailer publishes price changes for each product. Three independent services (pricing cache, search index, and audit) must each receive every price change for a given product in the exact order it was published, process at their own pace, and retry failures separately. Which design meets these requirements?
+A: An Amazon SNS standard topic with three Amazon SQS FIFO queues subscribed to it, using the product ID as the message group ID on each queue
+B: An Amazon EventBridge custom event bus with three rules, each targeting a separate Amazon SQS FIFO queue that uses the product ID as group ID
+C: An Amazon SNS FIFO topic with three subscribed Amazon SQS FIFO queues, publishing each change with the product ID as the message group ID
+D: A single Amazon SQS FIFO queue shared by all three services, publishing each change with the product ID as the message group ID for ordering
+K: C
+W: SNS FIFO fan-out to SQS FIFO: the FIFO topic keeps messages with the same message group ID (the product ID) in order and delivers each one to every subscribed FIFO queue. Each service reads its own queue in order, at its own pace, with its own retries and dead-letter queue.
+X: A=Standard topic with FIFO queues: a standard SNS topic uses best-effort ordering and can deliver messages out of order, so FIFO queues behind it cannot restore the publish order. Ordered fan-out to SQS FIFO queues requires an SNS FIFO topic.
+B=EventBridge rules to FIFO queues: EventBridge does not guarantee the order in which events are delivered to targets, so two quick price changes could arrive in a FIFO queue in the wrong order.
+D=One shared FIFO queue: consumers of one queue compete for messages, so each change is processed by only one of the three services. Fan-out needs one queue per service.
+T: Ordered fan-out is SNS FIFO plus one SQS FIFO queue per consumer; a single queue load-balances instead of fanning out, and a standard topic or EventBridge does not keep order.
+G: ## Fan-out versus competing consumers
+- **Fan-out**: one message is copied to several subscribers, and each processes every message. With SNS and SQS, each service gets its own queue subscribed to the topic.
+- **Competing consumers**: several workers read the same queue and each message goes to only one of them.
+## Keeping order in a fan-out
+An **SNS FIFO topic** orders messages per **message group ID** and deduplicates them. It delivers to **SQS FIFO queues**, which keep that order for their consumer.
+Example: `price-changed` messages for product `p-123` are published with `MessageGroupId=p-123`. The search, cache and audit queues each receive them in publish order. Different products use different group IDs, so they are processed in parallel and a slow product does not block others.
+Each queue has its own redrive policy, so a failure in the audit service is retried there without affecting the other two services.
+V: Amazon SNS, Amazon SQS
+
+@ SAA-C03 D2 T2.1 applied use-case
+S: A web application runs in an EC2 Auto Scaling group. New instances take about 12 minutes to become ready because they download a large machine-learning model and warm local caches. Traffic spikes are sudden and do not follow a daily pattern, and users see errors while new instances initialize. What should a solutions architect do?
+A: Configure a predictive scaling policy so that the Auto Scaling group forecasts the load and launches instances before the spikes arrive
+B: Add a warm pool to the Auto Scaling group that keeps pre-initialized instances in the Stopped state, ready to move into service quickly
+C: Add a lifecycle hook for launching instances so that each new instance stays in Pending:Wait until its model download has completed
+D: Create a scheduled scaling action that raises the group's minimum capacity every morning and lowers it again every evening after peak
+K: B
+W: Warm pool: the group keeps instances that have already run their startup work (model download, cache warm-up) and are then stopped. At scale-out they only need to start, which takes seconds to a few minutes instead of 12, and stopped instances incur only EBS storage charges while waiting.
+X: A=Predictive scaling: it learns from daily and weekly patterns in historical load. Sudden spikes with no recurring pattern cannot be forecast, so instances would still launch late.
+C=Launch lifecycle hook: a hook keeps an instance out of service until it is ready, which prevents traffic to half-initialized instances, but it does not make initialization any faster. Users still wait 12 minutes for new capacity.
+D=Scheduled scaling: it helps only when load follows a known timetable. The spikes are unpredictable, and keeping extra running capacity all day costs more than a pool of stopped instances.
+T: Slow boot plus unpredictable spikes calls for a warm pool of pre-initialized instances; predictive and scheduled scaling need a pattern, and lifecycle hooks only gate readiness.
+G: ## Why scale-out can be too slow
+Auto Scaling reacts to a metric, launches instances, and then waits for them to boot and run user data. If an application needs 12 minutes to initialize, capacity arrives 12 minutes after the spike started.
+## What a warm pool is
+A **warm pool** is a set of instances that sit next to the Auto Scaling group, already launched and initialized. You choose the state they wait in:
+- `Stopped`: you pay only for EBS volumes; startup takes seconds to a few minutes.
+- `Hibernated`: memory contents are saved to EBS, so warm caches survive.
+- `Running`: fastest, but billed like normal instances.
+When the group scales out, it takes instances from the pool first. Lifecycle hooks can still run a final check before an instance enters service.
+Example: the model download runs once when an instance joins the pool, not on every scale-out.
+V: Amazon EC2 Auto Scaling
+
+@ SAA-C03 D2 T2.1 applied use-case
+S: Orders flow through an Amazon EventBridge custom event bus to several consumers. A bug in the invoicing consumer caused it to discard events for 6 hours before it was fixed. The team must reprocess those 6 hours of order events for the invoicing consumer only, and wants the same capability for future incidents. What should the team do?
+A: Enable an archive on the event bus, and after a fix start a replay for the affected time window targeting only the invoicing rule
+B: Add an Amazon SQS dead-letter queue to the invoicing rule's target, and redrive the dead-letter queue after deploying each fix
+C: Turn on CloudTrail data events for the event bus, and resubmit the logged PutEvents calls for the time window with a script
+D: Configure the rule's retry policy with a maximum event age of 24 hours so that failed events are delivered again automatically
+K: A
+W: Archive and replay: an archive stores events from the bus (optionally filtered) for a retention period you choose. A replay sends archived events from a chosen time window back to the bus, and you can limit it to specific rules, so only the invoicing consumer processes them again.
+X: B=Target dead-letter queue: a DLQ captures events that EventBridge could not deliver to the target. Here delivery succeeded and the consumer itself discarded the events, so nothing reached the DLQ.
+C=CloudTrail and a script: CloudTrail is an audit log of API calls, not a message store designed for reprocessing, and a custom resubmission script would reach every rule on the bus, not only invoicing.
+D=Retry policy with maximum age: retries apply only when delivery to the target fails. Events that were delivered and then dropped by buggy code are never retried.
+T: To reprocess events that were delivered but mishandled, archive the bus and replay a time window to chosen rules; DLQs and retries only cover delivery failures.
+G: ## Delivery failure versus processing failure
+EventBridge guarantees delivery to targets with retries and an optional dead-letter queue. That covers cases where the target is unreachable or throttling. It cannot help when the target accepted the event and then mishandled it.
+## Archive and replay
+- An **archive** is attached to an event bus. It can capture all events or only those that match an event pattern, and keeps them for a retention period (or indefinitely).
+- A **replay** reads events from an archive for a start and end time and sends them back to the same bus. You can select which rules receive the replay.
+Example: archive `detail-type = "OrderPlaced"` events for 30 days. After the invoicing bug is fixed, replay 02:00-08:00 to the `invoicing` rule only. Replayed events carry a `replay-name` field, so consumers can tell them apart. Consumers should be idempotent in case some events were already processed.
+V: Amazon EventBridge
+
+@ SAA-C03 D2 T2.1 advanced troubleshooting
+S: A Lambda function reads orders from an SQS queue and writes them to an Amazon RDS for MySQL database. During a large import, the queue backlog made Lambda scale to about 900 concurrent executions, the database ran out of connections, and unrelated functions in the account were throttled. Lambda must not throttle the SQS poller. Which TWO changes meet these requirements? (Select TWO)
+A: Set a maximum concurrency on the SQS event source mapping so that the poller never invokes more than a fixed number of function instances at once
+B: Put Amazon RDS Proxy between the function and the database so that many function instances share a small pool of database connections
+C: Set reserved concurrency on the function to a low value so that Lambda rejects invocations from the poller above that limit during an import
+D: Enable provisioned concurrency of 900 on the function so that execution environments are already initialized when the import traffic arrives
+E: Increase the queue's visibility timeout to six times the function timeout so that messages stay hidden longer while the database is busy
+K: A,B
+W: A=Event source mapping maximum concurrency: this caps how many concurrent invocations the SQS poller itself starts. Excess messages simply wait in the queue, so the account's concurrency is not exhausted and Lambda never throttles the poller.
+B=RDS Proxy: the proxy keeps a pool of database connections and multiplexes requests from many function instances onto it, so bursts of executions no longer translate into bursts of new MySQL connections.
+X: C=Low reserved concurrency: it limits the function, but the poller keeps invoking at a higher rate and receives throttling errors. Throttled messages return to the queue, their receive count grows, and they can end up in the dead-letter queue.
+D=Provisioned concurrency of 900: this pre-initializes environments to cut cold starts. It does not limit concurrency, so the database would still see 900 callers, and it adds a large ongoing cost.
+E=Longer visibility timeout: this changes how long an in-flight message stays hidden. It does not limit how many functions run at once or how many connections they open.
+T: To protect a downstream database from SQS-driven Lambda bursts, cap concurrency on the event source mapping and pool connections with RDS Proxy; reserved concurrency alone causes throttling.
+G: ## How SQS drives Lambda concurrency
+The SQS event source mapping adds pollers as the backlog grows, and each poller invokes the function. With a large backlog, concurrency can rise to hundreds of executions, consuming the account's shared concurrency pool.
+## Two ways to limit it
+- **Reserved concurrency** is a limit on the function. The poller does not know about it, so extra invocations fail with throttling errors and messages are retried.
+- **Maximum concurrency** (`ScalingConfig.MaximumConcurrency`) is a limit on the event source mapping. The poller stops invoking beyond it, and messages stay in the queue until capacity frees up.
+## Connections
+Each execution environment opens its own database connection. **RDS Proxy** holds a warm pool and shares it between callers.
+Example: max concurrency 50 plus RDS Proxy means at most 50 functions, served by a pool of connections well below the MySQL limit.
+V: AWS Lambda, Amazon SQS, Amazon RDS Proxy, Amazon RDS
+
+@ SAA-C03 D2 T2.2 advanced use-case
+S: A company runs an Aurora PostgreSQL global database with its primary cluster in us-east-1 and a secondary cluster in us-west-2. For a quarterly disaster recovery exercise, the company must move the writer role to us-west-2 with no data loss, keep the global database topology intact, and later move it back. What should a solutions architect use?
+A: A global database failover, which promotes the secondary cluster immediately without waiting for replication to catch up with the primary
+B: Detaching the us-west-2 cluster from the global database and promoting it to a standalone cluster that accepts writes in that Region
+C: A global database switchover, which synchronizes the secondary with the primary before changing roles and keeps the replication topology
+D: An Aurora Backtrack operation on the primary, followed by restoring an automated snapshot of it as a new cluster in the us-west-2 Region
+K: C
+W: Global database switchover: it is the planned operation for healthy clusters. Aurora waits until the secondary is fully synchronized, then swaps the roles, so the RPO is zero, and the old primary becomes a secondary, which makes switching back just as easy.
+X: A=Global database failover: this is meant for an unplanned Regional outage. It does not wait for replication to catch up, so any writes not yet replicated can be lost, which fails the no-data-loss requirement for a planned test.
+B=Detach and promote: the promoted cluster becomes a separate, standalone cluster. The global database topology is broken, un-replicated writes can be lost, and the setup must be rebuilt afterwards.
+D=Backtrack and snapshot restore: Backtrack rewinds a cluster in place to an earlier time and is not a cross-Region mechanism. Restoring a snapshot takes a long time and loses every write after the snapshot.
+T: Planned Region swap with RPO zero means switchover; unplanned outage means failover, which may lose the last un-replicated writes.
+G: ## How an Aurora global database replicates
+One **primary cluster** accepts writes. Up to several **secondary clusters** in other Regions receive changes through storage-level replication with typical lag under one second, and serve reads.
+## Two ways to change the writer Region
+- **Switchover** (formerly called managed planned failover): used when both Regions are healthy, for DR drills or moving the workload closer to users. Aurora stops writes, waits until the chosen secondary has every change, then promotes it and demotes the old primary to a secondary. RPO is zero and the topology stays the same.
+- **Failover**: used when the primary Region is impaired. The secondary is promoted right away, so changes still in flight are lost (RPO equals the replication lag). Aurora can later rebuild the old primary as a secondary.
+Example: a drill uses switchover to us-west-2, runs there for a day, then switches back to us-east-1.
+V: Amazon Aurora
+
+@ SAA-C03 D2 T2.2 applied troubleshooting
+S: A Network Load Balancer spans two Availability Zones with default settings. After a partial deployment, AZ-a has 2 registered targets and AZ-b has 6. Clients resolve the NLB DNS name to both zonal IP addresses evenly. The 2 targets in AZ-a run at 100% CPU while those in AZ-b are nearly idle. What should a solutions architect do?
+A: Change the target group's load balancing algorithm to least outstanding requests so that busy targets automatically receive fewer new connections
+B: Enable cross-zone load balancing for the NLB so that each load balancer node distributes traffic across the registered targets in both zones
+C: Enable sticky sessions based on source IP on the target group so that each client keeps using the same target for its later connections
+D: Increase the deregistration delay on the target group so that connections to the overloaded targets are drained more slowly and evenly
+K: B
+W: Cross-zone load balancing: it is off by default for NLBs, so each zonal node sends traffic only to targets in its own AZ. With half the traffic arriving in AZ-a, its 2 targets carry 50% of the load. Turning it on lets every node use all 8 targets, so each gets about one eighth. Note that NLB charges for inter-AZ data transfer when it is enabled.
+X: A=Least outstanding requests: this algorithm exists only for Application Load Balancer target groups. An NLB routes connections by flow hash, and the problem is the per-AZ split, not the algorithm.
+C=Source IP stickiness: stickiness keeps a client on one target, which would not move any traffic from AZ-a to AZ-b and can make imbalance worse.
+D=Longer deregistration delay: this controls how long a target being removed keeps existing connections. It has nothing to do with how new traffic is spread between zones.
+T: With cross-zone off (the NLB default), each AZ's share of traffic goes only to that AZ's targets; enable cross-zone or keep target counts equal per AZ.
+G: ## How a load balancer spreads traffic across zones
+A load balancer has one node per enabled Availability Zone, and DNS spreads clients roughly evenly across those nodes.
+- **Cross-zone off**: a node forwards only to targets in its own AZ.
+- **Cross-zone on**: a node forwards to healthy targets in all enabled AZs.
+## Defaults differ
+- Application Load Balancer: cross-zone is on by default (it can be turned off per target group) and inter-AZ traffic is not charged.
+- Network Load Balancer: cross-zone is off by default. You can enable it on the load balancer or the target group, and inter-AZ data transfer is charged.
+## Example
+2 targets in AZ-a and 6 in AZ-b, 1,000 connections per second split evenly:
+- Off: each AZ-a target gets 250, each AZ-b target about 83.
+- On: every target gets about 125.
+V: Elastic Load Balancing, Network Load Balancer
+
+@ SAA-C03 D2 T2.2 advanced troubleshooting
+S: An application runs on EC2 instances in an Auto Scaling group behind an Application Load Balancer in three Availability Zones. A networking problem in one AZ causes intermittent timeouts for requests handled there, but the target health checks keep passing. The team needs to stop sending traffic to that AZ within minutes and restore it easily afterwards. What should they do?
+A: Change the Route 53 alias record for the application to failover routing and point the secondary record at a static maintenance page in S3
+B: Update the Auto Scaling group to remove the impaired AZ's subnet so that its instances terminate and capacity is launched in the other zones
+C: Start a zonal shift in Amazon Application Recovery Controller for the ALB, moving traffic away from the impaired AZ for a set duration
+D: Tighten the target group health check to a 2-second timeout with a threshold of 2 so the impaired zone's targets are marked unhealthy
+K: C
+W: Zonal shift: it tells the load balancer to stop routing to one AZ for a duration you choose. Traffic moves to the healthy AZs within minutes, nothing is terminated or redeployed, and when the shift ends or is cancelled traffic returns automatically.
+X: A=Route 53 failover to a maintenance page: failover routing is for when the whole endpoint is unhealthy. It would take the entire application offline for everyone instead of shifting away from one bad AZ.
+B=Remove the subnet from the group: this terminates and relaunches capacity, which takes time and must be undone by hand. The ALB would still route to that AZ until the instances are gone.
+D=Aggressive health checks: gray failures are intermittent, so tighter checks would make the impaired zone's targets flap between healthy and unhealthy rather than cleanly removing the AZ, and brief slowdowns could mark healthy targets in other zones as failed too.
+T: For a gray failure in one AZ that health checks miss, shift traffic away with ARC zonal shift; DNS failover and redeployments act on the wrong scope or too slowly.
+G: ## Gray failures
+A gray failure is a partial impairment: some requests in one AZ time out or slow down, but simple health checks still pass. Load balancers keep sending traffic there because every target looks healthy.
+## Zonal shift
+**Amazon Application Recovery Controller (ARC) zonal shift** lets you move traffic for a supported resource, such as an ALB or NLB, away from one Availability Zone:
+- You pick the resource, the AZ to avoid, and an expiry time (you can extend it).
+- The load balancer stops routing to that AZ; the other AZs take the load.
+- When the shift expires or you cancel it, traffic returns. Nothing is deleted.
+**Zonal autoshift** lets AWS start a shift for you when it detects an AZ impairment.
+## Design implication
+Shifting away one AZ out of three removes a third of capacity, so size each AZ to carry the load of a lost zone (static stability).
+V: Amazon Application Recovery Controller, Elastic Load Balancing, Amazon EC2 Auto Scaling
+
+@ SAA-C03 D2 T2.2 applied use-case
+S: A company replicates new objects from an S3 bucket in eu-west-1 to a bucket in eu-central-1. A regulator requires that the company can show that 99.99% of new objects are copied to the second Region within 15 minutes, and operations must be alerted when an object misses that threshold. What should a solutions architect configure?
+A: Cross-Region Replication with S3 Replication Time Control enabled, plus replication metrics and event notifications for missed thresholds
+B: Cross-Region Replication with S3 Transfer Acceleration enabled on both buckets, plus an S3 Storage Lens dashboard for replication status
+C: A nightly S3 Batch Replication job that copies all new objects, with an Amazon EventBridge rule that reports failed tasks in each job
+D: Cross-Region Replication with delete marker replication enabled, plus an AWS Config rule that checks the replication status of each object
+K: A
+W: Replication Time Control: RTC is designed to replicate 99.99% of new objects within 15 minutes and is backed by a service level agreement. It turns on replication metrics (pending bytes, pending operations, latency) and can raise S3 event notifications when an object exceeds the threshold, which covers both the evidence and the alerting requirement.
+X: B=Transfer Acceleration and Storage Lens: Transfer Acceleration speeds up client uploads over long distances through edge locations; it does not apply to replication between buckets. Storage Lens gives aggregated usage insights, not per-object alerts.
+C=Nightly Batch Replication: Batch Replication is for existing objects or retries of failed ones. A nightly job means new objects wait up to 24 hours, which breaks the 15-minute requirement.
+D=Delete marker replication and Config: replicating delete markers changes what is copied, not how fast. AWS Config checks resource configurations and does not track the replication time of individual objects.
+T: Plain replication is asynchronous with no time guarantee; when you need a 15-minute SLA with metrics and alerts, enable S3 Replication Time Control.
+G: ## S3 replication basics
+**Cross-Region Replication (CRR)** asynchronously copies new objects from a source bucket to a destination bucket in another Region. Versioning must be on for both buckets. Most objects arrive within seconds, but plain CRR gives no time guarantee.
+## Replication Time Control
+**S3 Replication Time Control (RTC)** is an option on a replication rule:
+- It is designed to replicate 99.99% of new objects within 15 minutes, backed by a service level agreement.
+- It enables **replication metrics** in CloudWatch: bytes pending, operations pending and replication latency.
+- It can emit **S3 event notifications** such as `s3:Replication:OperationMissedThreshold` and `OperationReplicatedAfterThreshold`, which can go to SNS, SQS, Lambda or EventBridge.
+Example: an EventBridge rule on missed-threshold events pages the on-call engineer.
+## Related tools
+**Batch Replication** copies objects that existed before the rule or that failed earlier.
+V: Amazon S3, Amazon EventBridge, Amazon CloudWatch
+
+@ SAA-C03 D2 T2.2 applied troubleshooting
+S: A Java application connects to an Aurora MySQL cluster by using the instance endpoint of the current writer instance. During a test failover, a replica was promoted in about 30 seconds, but the application kept failing writes for more than 10 minutes until it was restarted. Which TWO changes reduce the outage in future failovers? (Select TWO)
+A: Change the application's connection string to the cluster endpoint, which always points to the instance that is currently the writer
+B: Configure the JVM DNS cache TTL to a few seconds, or use the AWS Advanced JDBC Wrapper, so the new writer's address is picked up quickly
+C: Change the application's connection string to the reader endpoint, which balances connections across all instances of the cluster
+D: Create a custom endpoint that contains only the current writer instance and point the application's write connections at that endpoint
+E: Add an Aurora cross-Region replica in a second Region so that the application can switch its write connections to it during a failover
+K: A,B
+W: A=Cluster endpoint: Aurora updates the cluster (writer) endpoint's DNS record to the new primary during failover. An instance endpoint keeps pointing to the old instance, which is now a read-only replica, so writes fail.
+B=Short DNS caching or a failover-aware driver: the JVM can cache DNS lookups for a long time, so even the cluster endpoint would resolve to the old address. A TTL of a few seconds, or the AWS Advanced JDBC Wrapper which tracks the cluster topology, reconnects to the new writer within seconds.
+X: C=Reader endpoint for writes: the reader endpoint routes to replicas, which are read-only. Write statements would fail even without a failover.
+D=Custom endpoint with the writer: custom endpoints have a fixed membership. After failover the listed instance becomes a replica, so the endpoint still points at a read-only instance.
+E=Cross-Region replica: it adds Regional disaster recovery, but promoting it is a manual, slower step. It does not fix the stale endpoint that caused a 10-minute outage inside one Region.
+T: Aurora failover is fast only if the app follows it: connect to the cluster endpoint and avoid long DNS caching (or use a failover-aware driver), never a fixed instance endpoint.
+G: ## Aurora endpoints
+- **Cluster endpoint**: always resolves to the current writer. Use it for writes.
+- **Reader endpoint**: spreads connections across replicas. Use it for read-only traffic.
+- **Instance endpoint**: points to one specific instance, whatever its role.
+- **Custom endpoint**: a fixed set of instances you choose, for example large replicas for reports.
+## What happens during failover
+Aurora promotes a replica, typically in about 30 seconds, and updates the cluster endpoint's DNS record, which has a short TTL. Clients must:
+1. Use the cluster endpoint, not an instance endpoint.
+2. Not cache DNS for long. In Java, set `networkaddress.cache.ttl` low.
+3. Reconnect on errors.
+The **AWS Advanced JDBC Wrapper** knows the cluster topology and switches to the new writer without waiting for DNS, which shortens the outage further.
+V: Amazon Aurora
+
+@ SAA-C03 D2 T2.2 advanced troubleshooting
+S: A company uses a Route 53 private hosted zone with failover routing for an internal API. The primary record points to the private IP address of an internal Network Load Balancer, and the record has a standard HTTPS health check on that IP. The health check always reports unhealthy, even when the API works. What should a solutions architect do?
+A: Allow inbound HTTPS in the NLB's security group from the Route 53 health checker IP address ranges published by AWS for each Region
+B: Move the NLB to a public subnet and assign it an Elastic IP address so the Route 53 health checkers can reach the health check target
+C: Enable health checks on the NLB's target group and associate the target group with the failover record instead of a Route 53 health check
+D: Create a CloudWatch alarm on the NLB's HealthyHostCount metric and associate a Route 53 health check based on that alarm with the record
+K: D
+W: CloudWatch alarm-based health check: Route 53 health checkers run on the internet and cannot reach private IP addresses in a VPC. A health check that watches a CloudWatch alarm, for example `HealthyHostCount < 1` on the internal NLB, gives Route 53 a health signal for private resources, and failover records in private hosted zones can use it.
+X: A=Allow health checker IP ranges: security group rules cannot help because the checkers have no network path to a private IP in the VPC. They are outside the VPC and can only reach public endpoints.
+B=Make the NLB public: this exposes an internal API to the internet just to satisfy a health check, which is a security regression and changes the architecture.
+C=Target group health on the record: Route 53 records can use alias target health for some AWS resources, but a record cannot be associated with a target group, and a record pointing to an IP address has no target health to evaluate. For a private IP, the health signal comes from a CloudWatch alarm-based health check.
+T: Route 53 health checkers cannot reach private IPs; for private endpoints, base the health check on a CloudWatch alarm.
+G: ## Where Route 53 health checkers run
+Standard Route 53 health checks are sent from health checkers in several AWS Regions over the internet. They can check public IP addresses and domain names only. A private IP such as `10.0.3.25` is unreachable for them, so the check fails no matter how healthy the service is.
+## Health checks for private resources
+Route 53 offers other kinds of health checks:
+- **CloudWatch alarm health check**: healthy when the alarm is in `OK` state, unhealthy when it is in `ALARM`.
+- **Calculated health check**: combines several other checks.
+Example: create an alarm on the internal NLB metric `HealthyHostCount` with the condition `< 1` for 2 periods. Attach a Route 53 health check that monitors that alarm to the primary failover record. When no targets are healthy, Route 53 answers queries in the private hosted zone with the secondary record.
+V: Amazon Route 53, Amazon CloudWatch, Network Load Balancer
+
+@ SAA-C03 D2 T2.2 advanced use-case
+S: A DynamoDB table in us-east-1 stores customer profiles. The company must be able to restore the table as it was at any second in the past two weeks after a faulty batch job overwrites data, and must keep serving reads and writes from a second Region within seconds of a Regional outage. Which TWO actions meet these requirements? (Select TWO)
+A: Enable point-in-time recovery on the table so it can be restored to any second within the configured recovery period
+B: Convert the table to a global table with a replica in a second Region so that both Regions can serve reads and writes
+C: Schedule daily on-demand backups of the table with AWS Backup and copy each backup to a vault in the second Region
+D: Add a DynamoDB Accelerator cluster in front of the table so that cached items can still be served if the table becomes unavailable
+E: Stream changes with DynamoDB Streams to a Lambda function that writes each item to a separate table in the second Region
+K: A,B
+W: A=Point-in-time recovery: PITR keeps continuous backups and restores the table to any second within the recovery period (up to 35 days) into a new table, which undoes a faulty batch job.
+B=Global table: a replica in another Region is kept in sync, typically within a second, and accepts reads and writes, so the application can switch Regions immediately during an outage.
+X: C=Daily on-demand backups: they restore only to the time of each backup, not to any second, so up to a day of good changes could be lost. Restoring a backup in another Region also takes far longer than seconds.
+D=DynamoDB Accelerator: DAX is an in-memory cache in one Region for read latency. It does not protect against data corruption and does not provide a second Region.
+E=Streams to a custom replica: this rebuilds global tables by hand, with code to maintain and no conflict handling. It also copies the faulty overwrites, so it gives no restore to an earlier point.
+T: Replication protects against losing a Region but copies bad writes too; PITR protects against bad writes. Resilience needs both.
+G: ## Two different failure modes
+- **Regional outage**: the data is fine, but the Region is unavailable. You need a live copy elsewhere.
+- **Logical corruption**: a bug or bad job writes wrong data. Every replica copies the wrong data, so you need to go back in time.
+## DynamoDB features for each
+- **Global tables** keep replica tables in several Regions synchronized with typical lag under one second. Every replica accepts reads and writes.
+- **Point-in-time recovery (PITR)** records changes continuously. You can restore to any second within the recovery period (configurable from 1 to 35 days). The restore creates a new table.
+## Example
+A job at 14:05 overwrites 200,000 profiles. The overwrite reaches the replica too. The team restores the table to 14:04:59 into `profiles-restored`, compares, and copies the correct items back.
+V: Amazon DynamoDB
+
+@ SAA-C03 D3 T3.2 applied tradeoff
+S: A Java Spring Boot API runs on AWS Lambda. Initialization takes about 8 seconds, and traffic is sporadic, so many requests hit cold starts. The company wants to cut cold start latency sharply without paying to keep execution environments running while the API is idle. What should a solutions architect recommend?
+A: Configure provisioned concurrency on a published alias so that a fixed number of environments stay initialized and ready at all times
+B: Enable Lambda SnapStart on the function and invoke a published version, so new environments resume from a cached initialized snapshot
+C: Increase the function's memory allocation to the maximum so that it receives more CPU and completes its initialization code faster
+D: Schedule an Amazon EventBridge rule that invokes the function every five minutes so that one execution environment always stays warm
+K: B
+W: Lambda SnapStart: when a version is published, Lambda runs initialization once, takes a snapshot of the memory and disk state, and caches it. New environments resume from the snapshot instead of running the 8-second startup, and there is no charge for idle environments.
+X: A=Provisioned concurrency: it removes cold starts, but you pay for the configured environments every hour whether requests arrive or not, which the company wants to avoid for sporadic traffic.
+C=Maximum memory: more memory brings more CPU and can shorten initialization somewhat, but framework startup work still runs on every cold start, and the higher memory price applies to every invocation.
+D=Scheduled warm-up pings: this keeps at most about one environment warm. Any concurrent request still triggers a cold start, and it is a fragile workaround.
+T: For heavy initialization and spiky traffic, SnapStart restores a pre-initialized snapshot at no idle cost; provisioned concurrency also works but bills for idle capacity.
+G: ## Where cold start time goes
+A cold start includes creating the environment, loading the code and running **initialization**: for Java frameworks such as Spring Boot, class loading and dependency injection can take several seconds.
+## Options to reduce it
+- **Provisioned concurrency**: keeps N environments initialized all the time. No cold starts up to N, billed per hour.
+- **SnapStart**: at publish time Lambda initializes a version, snapshots the state (Firecracker microVM snapshot), and caches it. Cold starts resume from the snapshot, often cutting startup from seconds to sub-second.
+## Using SnapStart
+- It works on published versions (and aliases pointing to them), not `$LATEST`.
+- Supported runtimes include Java 11 and later, plus newer Python and .NET runtimes.
+- Code that creates unique values at startup (random seeds, connections) should use runtime hooks to refresh them after restore.
+V: AWS Lambda
+
+@ SAA-C03 D3 T3.2 advanced use-case
+S: A research team runs a computational fluid dynamics simulation with MPI on 128 EC2 instances. Profiling shows that scaling efficiency drops sharply beyond 64 instances because the nodes spend most of their time waiting on small, frequent messages between them. Which solution will MOST improve performance?
+A: Launch the instances across a spread placement group and turn on ENA Express so that TCP traffic between nodes uses the SRD protocol
+B: Launch the instances in a partition placement group with seven partitions so that each group of nodes sits on its own hardware rack
+C: Use larger instance sizes with EBS-optimized throughput so that each node can read its input data and write checkpoints faster to disk
+D: Use EFA-enabled instance types in a cluster placement group and run the MPI library over libfabric so traffic bypasses the OS kernel
+K: D
+W: Elastic Fabric Adapter in a cluster placement group: EFA lets MPI send messages through libfabric directly to the network hardware, bypassing the operating system's network stack. That gives the low, consistent latency tightly coupled jobs need, and the cluster placement group puts the nodes close together in one AZ.
+X: A=Spread placement with ENA Express: spread groups deliberately place instances on distinct hardware and are limited to seven instances per AZ, the opposite of close placement. ENA Express improves TCP and UDP flows but still goes through the kernel network stack, so it does not give the OS-bypass that MPI benefits from.
+B=Partition placement group: partitions isolate groups of instances on separate racks for large distributed stores such as HDFS or Cassandra. It improves fault isolation, not inter-node latency.
+C=Larger instances with EBS throughput: the bottleneck is small messages between nodes, not disk I/O. Faster storage does nothing for communication latency.
+T: Tightly coupled HPC scales with EFA (OS-bypass networking) plus a cluster placement group; spread and partition groups trade proximity for fault isolation.
+G: ## Why tightly coupled jobs stop scaling
+In MPI simulations, every node exchanges boundary data with neighbours at every step. When messages are small and frequent, **latency**, not bandwidth, decides speed. As nodes are added, each does less computation but the same amount of waiting.
+## EC2 networking options
+- **ENA** (Elastic Network Adapter): standard enhanced networking through the kernel TCP/IP stack.
+- **ENA Express**: uses the AWS SRD protocol under TCP and UDP for higher single-flow bandwidth and steadier latency, still through the kernel.
+- **EFA** (Elastic Fabric Adapter): ENA plus an OS-bypass interface. MPI and NCCL use it through `libfabric`, skipping the kernel.
+## Placement groups
+- **Cluster**: packs instances close together in one AZ for low latency.
+- **Partition**: separate racks per partition for fault isolation.
+- **Spread**: each instance on distinct hardware, at most 7 per AZ.
+V: Amazon EC2, Elastic Fabric Adapter
+
+@ SAA-C03 D3 T3.2 applied troubleshooting
+S: A reporting service runs on t3.large instances launched in standard credit mode. It performs well in the morning, but every afternoon response times rise sharply. CloudWatch shows CPUCreditBalance falling to zero around noon and CPU utilization then flat at about 30%. Which TWO actions will resolve the slowdown? (Select TWO)
+A: Switch the instances to unlimited credit mode so that they can keep bursting above the baseline after the earned credits are used up
+B: Move the workload to an M-family instance type such as m7i.large, which provides its full CPU performance without a credit system
+C: Replace the gp3 root volumes with io2 volumes that have provisioned IOPS so that reports read their data from disk much more quickly
+D: Launch the instances in a cluster placement group so that network latency between the service and its database is reduced further
+E: Increase the Auto Scaling group's cooldown period so that new instances have longer to accumulate CPU credits before receiving traffic
+K: A,B
+W: A=Unlimited mode: a T instance in unlimited mode keeps bursting when its credit balance is empty and pays a per-vCPU-hour charge for the surplus. It is the smallest change if bursts are short or average usage stays near the baseline.
+B=Fixed-performance instance: M-family instances always deliver their full vCPU performance. If the service needs more than the T baseline for hours each day, this is usually cheaper and more predictable than paying for surplus credits.
+X: C=io2 volumes: the metrics show CPU throttling (credit balance at zero, CPU capped at the 30% baseline), not a disk bottleneck. Faster storage leaves the CPU cap in place.
+D=Cluster placement group: placement affects network latency between instances, not the CPU cap caused by exhausted credits.
+E=Longer cooldown: cooldown only delays further scaling actions. New T3 instances do not start with a large credit balance, and the running instances would still be throttled.
+T: A T instance flat at its baseline with zero credits is CPU-throttled: allow surplus bursting (unlimited) or move to a fixed-performance family.
+G: ## How burstable instances work
+T instances (T3, T3a, T4g) provide a **baseline** CPU level and earn **CPU credits** while running below it. One credit is one vCPU at 100% for one minute. Above baseline, credits are spent.
+Example: a `t3.large` has 2 vCPUs with a baseline of 30% each. A job that needs 80% for hours spends credits faster than it earns them.
+## What happens when credits run out
+- **Standard mode**: CPU is limited to the baseline. In CloudWatch, `CPUCreditBalance` is 0 and `CPUUtilization` is flat at the baseline, exactly the symptom here.
+- **Unlimited mode** (the launch default for T3, T3a and T4g): the instance keeps bursting and you pay for surplus credits.
+## When to leave T instances
+If average CPU stays well above baseline for long periods, an M, C or R family instance gives steady performance at a predictable price.
+V: Amazon EC2, Amazon CloudWatch
+
+@ SAA-C03 D3 T3.3 applied use-case
+S: An e-commerce application stores orders in a DynamoDB table with partition key orderId. A new support screen must find all orders for a customer email address, sorted by order date, in single-digit milliseconds. The table already exists and holds 400 million items. What should a solutions architect do?
+A: Add a local secondary index with partition key customerEmail and sort key orderDate, and query that index from the support screen
+B: Run a Scan on the table with a filter expression on customerEmail, and sort the returned items by orderDate in the application code
+C: Add a global secondary index with partition key customerEmail and sort key orderDate, and query that index from the support screen
+D: Put a DynamoDB Accelerator cluster in front of the table so that repeated lookups by customerEmail are answered from its item cache
+K: C
+W: Global secondary index: a GSI can be added to an existing table and can use a completely different partition key. Querying it with `customerEmail = :e` returns only that customer's orders, already sorted by `orderDate`, with single-digit millisecond latency.
+X: A=Local secondary index: an LSI must share the table's partition key (`orderId`) and can only be defined when the table is created. It cannot index by email, and it cannot be added to an existing table.
+B=Scan with a filter: a scan reads all 400 million items and filters afterwards, consuming huge read capacity and taking minutes, not milliseconds.
+D=DAX item cache: DAX caches results of GetItem and Query calls by their keys. It cannot answer a lookup by a non-key attribute; that still needs an index.
+T: A new access pattern on a different partition key needs a GSI; LSIs keep the table's partition key and exist only from table creation.
+G: ## DynamoDB access patterns
+DynamoDB answers fast queries only by key: `GetItem` and `Query` need the partition key. Any other lookup needs a Scan, which reads the entire table.
+## Secondary indexes
+- **Global secondary index (GSI)**: its own partition key and optional sort key, taken from any attributes. It can be created or deleted at any time, has its own throughput, and is eventually consistent.
+- **Local secondary index (LSI)**: same partition key as the table, different sort key. It must be created with the table and supports strongly consistent reads.
+## Example
+Table `Orders` keyed on `orderId`. GSI `byEmail` with partition key `customerEmail` and sort key `orderDate`:
+`Query(IndexName="byEmail", KeyConditionExpression="customerEmail = :e", ScanIndexForward=false)` returns the customer's newest orders first. Only projected attributes are returned from the index, so project what the screen needs.
+V: Amazon DynamoDB
+
+@ SAA-C03 D3 T3.3 applied use-case
+S: A social platform stores users and follow relationships in Aurora MySQL. A new feature must suggest "people followed by people you follow" and detect fraud rings by traversing 3 to 5 levels of relationships. The recursive SQL joins take tens of seconds as data grows. Which database is the BEST fit for these queries?
+A: Amazon DocumentDB, storing each user as a document that embeds an array of the user IDs that the user follows
+B: Amazon Neptune, storing users as vertices and follow relationships as edges, queried with Gremlin or openCypher
+C: Amazon Redshift, loading the relationship tables nightly and running the recursive joins on its columnar engine
+D: Aurora MySQL with more Aurora Replicas and a larger instance class for the writer to run the recursive joins
+K: B
+W: Amazon Neptune: a graph database stores relationships as edges that point directly to connected vertices, so a multi-hop traversal follows pointers instead of joining large tables at each level. Queries such as friends-of-friends or fraud-ring detection stay fast as the graph grows.
+X: A=DocumentDB with embedded arrays: finding second- and third-level connections means repeated lookups or `$graphLookup` stages over growing documents, which does not perform like a native graph engine for deep traversals.
+C=Redshift nightly: Redshift is built for analytical scans and aggregations. Recursive joins are still joins, and nightly loads make suggestions stale.
+D=Bigger Aurora cluster: replicas spread read load and a bigger instance adds CPU, but each deeper hop still multiplies join work, so query time keeps growing with depth and data size.
+T: Deep, variable-depth relationship traversals belong in a graph database like Neptune; relational, document and warehouse engines pay a join or lookup cost per hop.
+G: ## Why relationships are slow in SQL
+In a relational model, follows live in a table such as `follows(follower_id, followee_id)`. A 3-hop question joins that table with itself 3 times. Each hop can multiply the rows involved, so time grows quickly with depth.
+## How a graph database stores them
+Amazon Neptune stores **vertices** (users) and **edges** (follows). Each vertex knows its edges, so a traversal moves from one user to connected users directly.
+Example in openCypher:
+`MATCH (me:User {id:'u1'})-[:FOLLOWS]->()-[:FOLLOWS]->(s) WHERE NOT (me)-[:FOLLOWS]->(s) RETURN s LIMIT 20`
+## Query languages
+Neptune supports Gremlin and openCypher for property graphs, and SPARQL for RDF data.
+## Typical graph use cases
+Social recommendations, fraud rings, knowledge graphs, identity and access graphs, network topology.
+V: Amazon Neptune, Amazon Aurora
+
+@ SAA-C03 D3 T3.4 applied troubleshooting
+S: A news site serves articles through Amazon CloudFront. The cache hit ratio is only 15%, and the origin is overloaded. The distribution uses a legacy configuration that forwards the User-Agent header and several others, all cookies, and all query strings to the origin. Articles only vary by the query string parameter lang. What should a solutions architect do?
+A: Enable Origin Shield in the Region closest to the origin so that all edge locations fetch objects through one additional caching layer
+B: Increase the default TTL and the maximum TTL of the cache behavior to one week so that edge locations keep cached objects for longer
+C: Use a cache policy that includes only the lang query string in the cache key, and an origin request policy for values the origin needs
+D: Add a second origin with an origin group so that CloudFront fails over to the second origin when the first returns server errors
+K: C
+W: Narrow cache key: when User-Agent, all cookies and all query strings are part of the cache key, almost every request looks unique (different User-Agent, session cookies, tracking parameters), so CloudFront misses. A cache policy keyed only on `lang` makes requests for the same article share one cached copy. An origin request policy can still pass other values to the origin without adding them to the key.
+X: A=Origin Shield: it adds a central cache that can reduce origin load, but with User-Agent and all cookies in the cache key, requests are still mostly unique and miss there as well.
+B=Longer TTLs: TTL only helps objects that are requested again with the same cache key. When the key contains per-user cookies and headers, repeats are rare, so longer TTLs change little.
+D=Origin failover: an origin group adds availability for errors. It does not reduce the number of cache misses reaching the origin.
+T: A low CloudFront hit ratio is usually a cache key problem: include only what changes the response in the cache policy, and forward the rest with an origin request policy.
+G: ## What the cache key is
+CloudFront stores each response under a **cache key**. By default this is the domain and path. Anything else you add (headers, cookies, query strings) splits the cache: a different value means a different object.
+Example: forwarding `User-Agent` adds a header with thousands of values to the key, so each article is cached thousands of times and most requests miss.
+## Cache policy versus origin request policy
+- **Cache policy**: decides which values are in the cache key and sets TTLs. Keep it minimal: here only `lang`.
+- **Origin request policy**: decides which extra values CloudFront sends to the origin **without** adding them to the cache key, such as a header the origin logs.
+## Checking the result
+The CloudFront cache statistics and the `CacheHitRate` metric (with additional metrics enabled) show whether the change worked.
+V: Amazon CloudFront
+
+@ SAA-C03 D3 T3.4 applied comparison
+S: A company serves millions of requests per second through Amazon CloudFront. For every request it must rewrite legacy URLs to new paths and add security headers such as Strict-Transport-Security to responses. The logic is simple JavaScript with no network calls. Which solution provides the lowest latency and cost?
+A: Lambda@Edge functions on the origin request and origin response events that rewrite the URL and add the headers
+B: CloudFront Functions on the viewer request and viewer response events that rewrite the URL and add the headers
+C: Lambda@Edge functions on the viewer request and viewer response events that rewrite the URL and add the headers
+D: An Application Load Balancer at the origin with listener rules that rewrite the path and insert response headers
+K: B
+W: CloudFront Functions: they run lightweight JavaScript in the edge locations closest to viewers, start in under a millisecond, scale to millions of requests per second, and cost much less than Lambda@Edge. URL rewrites and header changes without network access are their main use case. Security headers can also be added with a response headers policy.
+X: A=Lambda@Edge on origin events: origin events run only on cache misses and the result is cached, so this can work, but Lambda@Edge is priced higher per request and per duration than CloudFront Functions and adds more latency to each invocation.
+C=Lambda@Edge on viewer events: it works functionally, but runs in regional edge caches with higher latency and price per request. Its extra power (network calls, longer runtime) is not needed here.
+D=ALB listener rules: the work happens at the origin, so every request that needs it must first travel from the edge to the Region, and the ALB adds its own processing charges. Code at the edge is closer to viewers and cheaper at this volume.
+T: Simple, high-volume viewer-side changes fit CloudFront Functions; use Lambda@Edge only when you need network access, larger payloads or longer run time.
+G: ## Two ways to run code in CloudFront
+- **CloudFront Functions**: JavaScript runtime in all CloudFront edge locations. Viewer request and viewer response events only. Sub-millisecond execution, no network or file system access, small size limits, very low price.
+- **Lambda@Edge**: Node.js or Python in regional edge caches. Viewer and origin events. Up to seconds of runtime, network access, access to the request body.
+## Which event
+- **Viewer request/response**: runs for every request, including cache hits.
+- **Origin request/response**: runs only when CloudFront goes to the origin (cache misses).
+## Example
+A viewer request function maps `/old/article.php?id=42` to `/articles/42`. A viewer response function adds `strict-transport-security: max-age=63072000`. For static headers alone, a **response headers policy** needs no code at all.
+V: Amazon CloudFront, AWS Lambda
+
+@ SAA-C03 D3 T3.4 applied troubleshooting
+S: An Auto Scaling group behind an Application Load Balancer runs a Java service. Each new instance needs about 3 minutes of light traffic to warm up its JIT compiler and caches. When the group scales out, new instances pass health checks, immediately receive a full share of requests, and respond slowly or time out. What should a solutions architect configure?
+A: Enable slow start mode on the target group with a duration of about 3 minutes, so new targets receive a gradually increasing share of requests
+B: Increase the deregistration delay on the target group to about 3 minutes, so existing connections are drained more slowly during scale-out
+C: Enable load balancer generated cookie stickiness on the target group, so clients keep going to the warm instances they already use
+D: Increase the health check grace period of the Auto Scaling group to 3 minutes, so new instances are not replaced while they warm up
+K: A
+W: Slow start mode: the ALB ramps up the share of requests to a newly healthy target linearly over the configured duration (30 to 900 seconds). Each new instance gets light traffic first and full traffic only after it is warm.
+X: B=Longer deregistration delay: this affects targets being removed, keeping their in-flight requests alive. It does not change what newly registered targets receive.
+C=Cookie stickiness: it keeps existing clients on existing instances, but new clients are still spread evenly, so new instances still get a full share of new sessions and can remain unbalanced afterwards.
+D=Longer health check grace period: this stops the Auto Scaling group from terminating instances that fail health checks early. The ALB still sends full traffic as soon as its own health check passes.
+T: When new targets need a warm-up, ALB slow start ramps their traffic gradually; deregistration delay and grace periods address other phases.
+G: ## What happens when a target joins
+With round robin, an ALB sends a new target its full share of requests as soon as the target passes the health check. For services with JIT compilation or empty caches, that burst arrives when they are slowest.
+## Slow start mode
+**Slow start** is a target group attribute (`slow_start.duration_seconds`, 30-900):
+- A target that becomes healthy enters slow start.
+- Its share of requests grows linearly until the duration ends.
+- Targets already in service when slow start is enabled are not affected.
+Example: with 180 seconds, a new instance gets about a third of its share after 1 minute, and a full share after 3 minutes.
+## Related settings
+- **Deregistration delay**: time to finish in-flight requests on targets being removed.
+- **ASG health check grace period**: time before the Auto Scaling group acts on failed health checks.
+V: Elastic Load Balancing, Application Load Balancer, Amazon EC2 Auto Scaling
+
+@ SAA-C03 D3 T3.1 applied troubleshooting
+S: A log ingestion service writes about 20,000 small objects per second to one S3 bucket, all under the key prefix logs/current/. Clients receive many HTTP 503 Slow Down errors, and uploads lag behind. Which TWO actions will improve the upload throughput? (Select TWO)
+A: Spread the object keys across many prefixes, for example by adding a hash-based or shard number segment near the start of each key
+B: Make sure clients retry the 503 responses with exponential backoff and jitter, as the AWS SDKs do by default for throttled requests
+C: Enable S3 Transfer Acceleration on the bucket so that every upload enters AWS through the nearest CloudFront edge location first
+D: Change the storage class of new objects to S3 Intelligent-Tiering so that frequently written objects are placed on the faster tier
+E: Enable S3 Versioning on the bucket so that concurrent writes to similar keys are stored as separate versions instead of conflicts
+K: A,B
+W: A=More prefixes: S3 supports at least 3,500 write requests per second per partitioned prefix and scales by prefix. Spreading 20,000 writes per second across many prefixes, such as `logs/07/...` with a shard number, lets S3 serve them in parallel.
+B=Retries with exponential backoff: 503 Slow Down means S3 is asking clients to slow down while it scales. Retrying with backoff and jitter lets requests succeed as capacity grows, instead of hammering the same prefix.
+X: C=Transfer Acceleration: it speeds up long-distance transfers over the network. It does not raise the request rate a single prefix can accept.
+D=Intelligent-Tiering: storage classes affect cost and retrieval behavior, not the request rate limit per prefix. Intelligent-Tiering does not have a faster write tier.
+E=Versioning: versioning keeps older copies of objects. It adds no request capacity and would increase storage for no benefit here.
+T: S3 request rates scale per prefix: spread keys across prefixes and back off on 503s; acceleration, storage classes and versioning do not raise request limits.
+G: ## S3 request rate limits
+Amazon S3 automatically scales, and each **partitioned prefix** supports at least:
+- 3,500 PUT, COPY, POST or DELETE requests per second
+- 5,500 GET or HEAD requests per second
+There is no limit on the number of prefixes, so throughput grows by using more of them.
+## What a prefix is
+Everything in the key before the object name, for example `logs/current/` in `logs/current/a1.json`. If all writes use one prefix, they share one set of limits until S3 repartitions, and meanwhile clients get `503 Slow Down`.
+## Designing keys
+Example: `logs/shard-00/...` to `logs/shard-15/...`, with the shard chosen by hash. 16 prefixes allow 56,000 writes per second at the documented baseline.
+## Retries
+The AWS SDKs retry throttling errors with exponential backoff and jitter. Custom clients should do the same.
+V: Amazon S3
+
+@ SAA-C03 D3 T3.1 applied use-case
+S: A company is migrating a shared engineering file repository. Linux build servers must access the files over NFS, while Windows workstations joined to Active Directory must access the same files over SMB at the same time. The storage must be fully managed and span two Availability Zones. Which service meets these requirements?
+A: Amazon FSx for Windows File Server in a Multi-AZ deployment, shared over SMB to both the Windows and Linux clients
+B: Amazon FSx for NetApp ONTAP in a Multi-AZ deployment, serving the same volume over both the NFS and SMB protocols
+C: Amazon EFS with Regional storage, mounted over NFS by the Linux servers and by the Windows workstations as well
+D: Amazon FSx for Lustre with a persistent deployment, mounted by the Linux servers and exported to the Windows clients
+K: B
+W: FSx for NetApp ONTAP: ONTAP volumes are multiprotocol, so Linux clients use NFS and AD-joined Windows clients use SMB on the same data at the same time. A Multi-AZ file system keeps a standby in a second AZ with automatic failover, and AWS manages the service.
+X: A=FSx for Windows File Server: it serves SMB only. The requirement is that Linux build servers use NFS, which it does not offer.
+C=Amazon EFS: EFS supports NFS for Linux clients and is not supported for Windows instances or workstations, so the Windows side cannot use it.
+D=FSx for Lustre: Lustre is a high-performance file system for Linux compute clusters. It does not provide SMB access for Windows clients.
+T: One managed dataset shared over both NFS and SMB points to FSx for NetApp ONTAP; EFS is NFS-only, FSx for Windows is SMB-only, and Lustre is for Linux HPC.
+G: ## AWS file services by protocol
+- **Amazon EFS**: NFS for Linux. Serverless and elastic.
+- **FSx for Windows File Server**: SMB with Active Directory, Windows ACLs and DFS.
+- **FSx for Lustre**: high-throughput parallel file system for Linux HPC and ML, often linked to S3.
+- **FSx for NetApp ONTAP**: NFS, SMB and iSCSI from the same file system, plus snapshots, SnapMirror replication and data tiering.
+- **FSx for OpenZFS**: NFS with ZFS features for Linux workloads.
+## Multiprotocol access
+On ONTAP, a storage virtual machine (SVM) is joined to Active Directory. A volume can be exported over NFS and shared over SMB, with a security style that maps Windows and UNIX identities to each other.
+Example: `/eng` is mounted at `/mnt/eng` on build servers and appears as `\\svm1\eng` on workstations.
+## Availability
+Multi-AZ deployments run an active and a standby file server in two AZs with automatic failover.
+V: Amazon FSx for NetApp ONTAP, Amazon FSx for Windows File Server, Amazon EFS, Amazon FSx for Lustre
+
+@ SAA-C03 D3 T3.5 applied use-case
+S: A SaaS company streams JSON usage events from all customers into Amazon Data Firehose, which writes them to one S3 prefix. Analysts query per-customer data with Amazon Athena, and every query scans all customers' files. The company wants events stored under prefixes such as customer_id=123/date=2026-09-01/ with no custom servers. What should a solutions architect do?
+A: Configure dynamic partitioning on the Firehose stream, extracting customer_id and the date from each JSON record to build the S3 prefix
+B: Add an S3 event notification that invokes a Lambda function to copy each delivered file into per-customer prefixes and delete the original
+C: Configure the Firehose stream's S3 buffer size to 128 MB and its buffer interval to 900 seconds so that each file holds fewer customers
+D: Schedule an AWS Glue crawler every hour so that it detects customer_id in the data and adds it as a partition column in the Data Catalog
+K: A
+W: Firehose dynamic partitioning: Firehose reads partition keys from each record, using inline JSON parsing (jq expressions) or a Lambda function, and writes records to S3 prefixes built from them, such as `customer_id=!{partitionKeyFromQuery:customer_id}/`. Athena can then prune partitions and read only one customer's files.
+X: B=Lambda to copy files: each delivered file mixes many customers, so the function would have to split files record by record, and copying then deleting objects doubles writes and adds code to run and maintain.
+C=Bigger buffers: buffering controls how often and how large files are written. Each file would still mix all customers under one prefix, and Athena would still scan everything.
+D=Hourly Glue crawler: a crawler records partitions that already exist as folders. It cannot move data into per-customer prefixes, so a column inside mixed files does not let Athena skip them.
+T: To lay out streaming data by key for partition pruning, use Firehose dynamic partitioning at write time; crawlers and buffering do not reorganize files.
+G: ## Why the S3 layout matters for Athena
+Athena reads the files under a table's location. With **Hive-style partitions** such as `customer_id=123/date=2026-09-01/`, a query that filters on those columns reads only the matching folders (partition pruning), which cuts both time and cost.
+## Dynamic partitioning in Firehose
+- Enable dynamic partitioning on the stream.
+- Define partition keys, either with inline JSON parsing using jq, for example `customer_id: .customer_id`, or from a Lambda transformation.
+- Build the S3 prefix from the keys: `customer_id=!{partitionKeyFromQuery:customer_id}/date=!{partitionKeyFromQuery:event_date}/`.
+Firehose buffers records per partition and writes separate objects for each one. Dynamic partitioning is set when a stream is created, so for an existing stream you create a replacement stream with it enabled and point producers at it. It can also convert the records to Parquet before writing.
+## Registering partitions
+Use partition projection in the Athena table or a Glue crawler so new partitions become queryable.
+V: Amazon Data Firehose, Amazon S3, Amazon Athena, AWS Glue
+
+@ SAA-C03 D3 T3.5 advanced troubleshooting
+S: A Kinesis data stream with 10 shards feeds five separate consumer applications that use the GetRecords API. Writers are well below the shard write limits, but consumers regularly receive ReadProvisionedThroughputExceeded errors and lag several seconds behind. Two more consumers are planned. Each consumer needs its own read throughput and low latency. What should a solutions architect do?
+A: Double the number of shards in the stream so that the shared read throughput and the GetRecords call limits of the stream are doubled
+B: Register the consumers for enhanced fan-out so that each consumer receives its own 2 MB per second per shard through SubscribeToShard
+C: Increase the stream's data retention period to 7 days so that lagging consumers can catch up later without losing any of the records
+D: Configure every consumer to call GetRecords with a larger batch limit so that each call returns more records for each of the shards
+K: B
+W: Enhanced fan-out: every registered consumer gets a dedicated 2 MB per second per shard, and records are pushed over HTTP/2 with latency around 70 ms. Adding consumers no longer divides the shared read limit, so the two planned consumers do not slow the others.
+X: A=Double the shards: it doubles the shared read capacity for now, but all consumers still split it, and the planned consumers would reduce it again. It also doubles shard cost even though writers do not need more capacity.
+C=Longer retention: keeping data longer prevents loss while consumers lag, but it does nothing to remove the throttling or the delay.
+D=Larger GetRecords batches: the limit is 2 MB per second per shard shared by all consumers, plus 5 calls per second per shard. Bigger batches do not raise the byte limit, so throttling continues.
+T: Shared-throughput consumers split 2 MB/s per shard; enhanced fan-out gives each consumer its own 2 MB/s per shard with push delivery.
+G: ## Reading from a Kinesis data stream
+Each shard supports writes of 1 MB per second and reads of 2 MB per second.
+- **Shared throughput (standard) consumers** poll with `GetRecords`. All of them share the 2 MB per second per shard and a limit of 5 read calls per second per shard. With five consumers, each gets about 400 KB per second, and polling adds delay.
+- **Enhanced fan-out consumers** register with the stream and call `SubscribeToShard`. Kinesis pushes records to each one over HTTP/2 with a dedicated 2 MB per second per shard.
+## Example
+10 shards, 7 consumers:
+- Shared: 20 MB per second in total, split seven ways.
+- Enhanced fan-out: 20 MB per second for each consumer, 140 MB per second in total.
+Enhanced fan-out is billed per consumer-shard hour and per GB retrieved, so use it when several consumers or low latency are needed.
+V: Amazon Kinesis Data Streams

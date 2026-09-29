@@ -1,0 +1,534 @@
+# MLA-C01 batch 05: Domain 1 (data preparation) and Domain 3 (deployment and orchestration), detailed explanations
+
+@ MLA-C01 D1 T1.1 advanced tradeoff
+S: A SageMaker Feature Store feature group ingests about 20,000 small records per minute. Its offline store in S3 now holds millions of tiny files, and Athena queries that build weekly training sets have become slow and expensive. The team is creating a replacement feature group. Which configuration addresses the root cause?
+A: Create the new feature group with the Apache Iceberg table format for the offline store and run periodic compaction on it
+B: Disable the offline store on the new feature group and build training sets by calling GetRecord on the online store for every customer
+C: Keep the default Glue table format and raise the Athena workgroup's per-query data scan limit so the weekly queries are not cancelled
+D: Move the offline store bucket to S3 Glacier Flexible Retrieval so the growing number of small files costs less to keep over time
+K: A
+G: ## Why many small files hurt queries
+Feature Store writes online-store records to the offline store in S3 in small batches. At high ingest rates this creates a very large number of small Parquet files. Athena and Spark pay a fixed cost per file (listing, opening, reading footers), so query time and cost grow with file count, not only with data size.
+## Offline store table formats
+When you create a feature group you choose the offline store table format:
+- `Glue` (default): plain Parquet files registered in the AWS Glue Data Catalog.
+- `Iceberg`: the same data managed as an Apache Iceberg table. Iceberg tracks files in metadata, so engines plan queries without listing every object, and you can compact small files into larger ones (for example with Athena `OPTIMIZE ... REWRITE DATA USING BIN_PACK`) and remove old snapshots.
+The format is set when the feature group is created, which is why the team builds a replacement.
+Example: `OfflineStoreConfig={"S3StorageConfig": {...}, "TableFormat": "Iceberg"}`.
+W: Iceberg offline store with compaction: Iceberg metadata avoids expensive S3 listing, and compaction merges the tiny files into larger ones, which directly fixes the slow, costly scans.
+X: B=GetRecord on the online store: the online store keeps only the latest value per record, so it cannot give historical, point-in-time training data, and millions of API calls are slower and costlier than one query.
+C=Raise the scan limit: a higher limit only stops queries from being cancelled. The same millions of files are still listed and opened, so the queries stay slow and expensive.
+D=Glacier Flexible Retrieval: archived objects cannot be read by Athena without a restore, and the storage class does nothing about the per-file overhead that causes the slowness.
+T: Small-file overhead in the offline store is fixed by the Iceberg table format plus compaction, not by bigger query limits or colder storage.
+V: Amazon SageMaker Feature Store, Amazon Athena, Apache Iceberg
+
+@ MLA-C01 D1 T1.1 advanced troubleshooting
+S: A churn model uses features from SageMaker Feature Store. Validation AUC is 0.95, but production AUC is 0.74. The training set was built by joining each labeled churn event with the most recent feature values currently in the offline store, regardless of when those values were written. What should the team change?
+A: Build the training set with a point-in-time join that uses only feature records whose event time is at or before each label's timestamp
+B: Build the training set from the online store instead, because it always returns the freshest feature values for every customer record
+C: Increase the number of validation folds so that the reported validation AUC becomes a more stable estimate of production performance
+D: Add more trees and a larger maximum depth to the model so it can learn the production patterns that the current version is missing
+K: A
+G: ## What point-in-time correctness means
+Each training example should look exactly like what the model would have seen at prediction time. If a label is dated 1 March, its features must come from records written on or before 1 March.
+Joining with the latest values leaks the future: a customer who churned in March may have `days_since_last_login = 60` written in May. The model learns from information it will never have in production, so validation scores look great and live scores drop.
+## How Feature Store supports it
+Every record in a feature group has an `EventTime`. The offline store keeps all versions, so you can join each label to the newest feature row whose event time is not later than the label's timestamp. The SageMaker Python SDK dataset builder does this with `point_in_time_accurate_join()`, or you write the equivalent Athena query.
+W: Point-in-time join: restricting each label to features that existed at the label's time removes the future information that inflated validation AUC.
+X: B=Online store: it holds only the latest value per record, which is the same leakage problem in a worse form, and it has no history to rebuild past examples.
+C=More validation folds: every fold is drawn from the same leaked dataset, so cross-validation will keep reporting the same inflated score.
+D=Bigger model: the gap comes from leaked features, not from underfitting. A larger model would exploit the leak even more and widen the gap.
+T: A validation-to-production gap after joining "latest" features points to time leakage; fix it with a point-in-time join on event time.
+V: Amazon SageMaker Feature Store, Amazon Athena
+
+@ MLA-C01 D1 T1.1 applied troubleshooting
+S: A SageMaker Processing job with 40 instances writes millions of small feature files to one S3 prefix, `s3://ml-feat/out/`. The job intermittently fails with `503 Slow Down` errors. Which change is MOST likely to fix the errors?
+A: Spread the output across many prefixes, for example with a hash component in each key, and let writers retry with backoff
+B: Turn on S3 Transfer Acceleration for the bucket so the processing instances upload their files through the nearest edge locations
+C: Enable S3 Versioning on the bucket so concurrent writes to the same prefix are stored as separate object versions without conflicts
+D: Switch the bucket's default encryption from SSE-S3 to SSE-KMS so each write is authorized by a dedicated customer managed key
+K: A
+G: ## S3 request rates are per prefix
+Amazon S3 scales automatically, but each partitioned prefix supports about 3,500 PUT/COPY/POST/DELETE and 5,500 GET/HEAD requests per second. When a burst of writers targets a single prefix faster than S3 can scale it, S3 answers with HTTP `503 Slow Down`.
+## How to spread the load
+- Use more prefixes, for example `out/part=17/...` or a short hash of the file name at the start of the key. Throughput adds up across prefixes.
+- Retry with exponential backoff; the AWS SDKs do this by default, and S3 keeps scaling while clients back off.
+- Write fewer, larger files where possible (for example 128 MB Parquet parts instead of thousands of tiny ones).
+Example: 40 instances each writing 150 small files per second is 6,000 PUTs per second, well above one prefix's baseline.
+W: Many prefixes plus retries: request limits apply per prefix, so spreading keys multiplies the available write rate and backoff absorbs short bursts.
+X: B=Transfer Acceleration: it speeds long-distance uploads over the internet. The instances are in the same Region, and the limit hit here is request rate per prefix, not network distance.
+C=Versioning: versioning keeps old copies of overwritten objects. It does not raise request limits and adds storage cost for every write.
+D=SSE-KMS: every write would also call AWS KMS, which has its own request quotas, so this adds another throttling point instead of removing one.
+T: `503 Slow Down` means too many requests on one prefix; spread keys across prefixes and retry, instead of changing encryption or transfer paths.
+V: Amazon S3, Amazon SageMaker Processing
+
+@ MLA-C01 D1 T1.1 applied use-case
+S: Order data lives in an Aurora MySQL cluster. Data scientists need it in Amazon Redshift within seconds of each commit for SQL feature engineering, and the team does not want to build or operate any ETL pipeline. Which solution fits BEST?
+A: Nightly AWS Glue ETL jobs that read the Aurora tables over JDBC and load the transformed rows into Redshift with a COPY command
+B: An Aurora zero-ETL integration with Amazon Redshift that replicates the committed changes into a Redshift database automatically
+C: Scheduled Aurora snapshot exports to S3 in Parquet, loaded into Redshift every hour by a COPY command triggered from EventBridge
+D: An AWS DMS task with change data capture that writes to Kinesis Data Streams, followed by a Lambda function that inserts rows into Redshift
+K: B
+G: ## The usual path from OLTP to analytics
+Traditionally, transactional data reaches a warehouse through an ETL pipeline: extract from the database, transform, load into Redshift. That pipeline has schedules, code, retries and monitoring that someone has to run, and the data is only as fresh as the last run.
+## What zero-ETL integration does
+An Aurora zero-ETL integration with Amazon Redshift continuously replicates data and schema changes from an Aurora cluster (MySQL- or PostgreSQL-compatible) into a Redshift database. There is no pipeline to build; data typically appears within seconds of the commit.
+- Source: the Aurora cluster. Target: a Redshift provisioned cluster or Redshift Serverless namespace.
+- Data scientists then run SQL on the replicated tables, for example `SELECT customer_id, COUNT(*) FROM orders GROUP BY 1`.
+W: Zero-ETL integration: it replicates committed changes into Redshift within seconds with no pipeline to build or operate, meeting both the freshness and the no-ETL requirements.
+X: A=Nightly Glue jobs: data would be up to a day old, and the team would own the job code, scheduling and failures.
+C=Hourly snapshot exports: freshness is at best hourly, and the export, trigger and COPY steps are still a pipeline to maintain.
+D=DMS to Kinesis to Lambda: it can be near real time, but it is several services, custom code and row-by-row inserts that Redshift handles poorly, which is exactly the ETL work the team wants to avoid.
+T: Near-real-time Aurora data in Redshift without a pipeline is the zero-ETL integration; Glue, exports and DMS chains are pipelines you operate.
+V: Amazon Aurora, Amazon Redshift
+
+@ MLA-C01 D1 T1.1 advanced troubleshooting
+S: A Kinesis data stream with 8 provisioned shards feeds a real-time feature pipeline. Producers get `ProvisionedThroughputExceededException`, yet CloudWatch shows one shard at its write limit while the other seven are nearly idle. Producers use the store ID as the partition key, and one flagship store generates most events. What is the BEST fix?
+A: Add eight more shards with UpdateShardCount so the stream's total write capacity doubles from 8 MB/s to 16 MB/s
+B: Increase the data retention period from 24 hours to 7 days so that throttled records can be accepted and written again later on
+C: Use a higher-cardinality partition key, such as store ID plus a random suffix, so records spread across all shards
+D: Switch the consumers to enhanced fan-out so each consumer gets its own 2 MB/s of read throughput for every shard
+K: C
+G: ## How Kinesis places records
+Each record's partition key is hashed with MD5, and the hash decides which shard receives it. All records with the same key go to the same shard. Each shard accepts up to 1 MB/s or 1,000 records/s of writes.
+If one key dominates the traffic, its shard hits the limit even though the stream as a whole has spare capacity. This is a **hot shard**.
+## Fixing a hot shard
+- Choose a partition key with many distinct, evenly used values, for example an event ID, or `storeId#<random 0-9>` when related records do not need strict ordering.
+- Adding shards only helps if the keys spread evenly; one key still maps to one shard.
+- On-demand capacity mode also scales total throughput, but it has the same per-shard, per-key behavior.
+W: Higher-cardinality partition key: spreading records across many hash values uses all eight shards and removes the single-shard bottleneck.
+X: A=Add eight shards: the flagship store's key still hashes to exactly one shard, so that shard stays at 1 MB/s and keeps throttling while the new shards sit idle.
+B=Longer retention: retention controls how long written records stay readable. It does nothing for writes that are rejected before they reach the stream.
+D=Enhanced fan-out: it adds dedicated read throughput for consumers. The exception here is on the write side.
+T: One busy shard among idle ones is a partition-key problem; fix the key distribution, because adding shards or read capacity does not move a hot key.
+V: Amazon Kinesis Data Streams, Amazon CloudWatch
+
+@ MLA-C01 D1 T1.2 applied use-case
+S: A neural network predicts hourly ride demand. The raw feature `hour_of_day` is an integer from 0 to 23, and the model treats 23:00 and 00:00 as far apart even though demand is similar. Which feature engineering step fits BEST?
+A: One-hot encode `hour_of_day` into 24 binary columns so each hour becomes an independent category the network can weigh separately
+B: Min-max scale `hour_of_day` to the range 0 to 1 so the feature has the same scale as the other numeric inputs of the network
+C: Bin `hour_of_day` into four six-hour buckets (night, morning, afternoon, evening) and encode each bucket as an ordinal integer
+D: Replace `hour_of_day` with two features, `sin(2*pi*hour/24)` and `cos(2*pi*hour/24)`, so the hours lie on a circle
+K: D
+G: ## Cyclical features
+Some features wrap around: hour of day, day of week, month, compass direction. As plain integers, 23 and 0 are 23 units apart, but in reality they are neighbours. Models that use distances or smooth functions (linear models, neural networks, k-NN) then learn a false jump at midnight.
+## Sine and cosine encoding
+Map the value onto a circle with two features:
+- `hour_sin = sin(2*pi*hour/24)`
+- `hour_cos = cos(2*pi*hour/24)`
+Now 23:00 and 00:00 are close in the two-dimensional space, and the distance between any two hours reflects how far apart they really are on the clock. Both features are needed: sine alone gives the same value (about 0.71) for 03:00 and 09:00, and cosine separates them.
+Tree models are less affected, but for neural networks this encoding usually helps.
+W: Sine and cosine encoding: placing hours on a circle makes 23:00 and 00:00 close neighbours, so the network sees the real cyclical similarity.
+X: A=One-hot encoding: every hour becomes an unrelated category, so the model loses the fact that neighbouring hours are similar and must learn 24 separate effects.
+B=Min-max scaling: scaling changes the range, not the order, so 23:00 maps to about 1.0 and 00:00 to 0.0, still the two furthest points.
+C=Ordinal buckets: coarse bins throw away detail, and the ordinal code still puts the last bucket and the first bucket at opposite ends.
+T: For values that wrap around, encode with sine and cosine; scaling, bins and one-hot do not make the ends of the cycle neighbours.
+V: Amazon SageMaker
+
+@ MLA-C01 D1 T1.2 applied comparison
+S: A linear regression model uses `annual_income`, which is strongly right-skewed (most values between 30,000 and 90,000, a long tail up to 20 million). The residuals are large and uneven. Which TWO transformations reduce the skew of this feature? (Select TWO)
+A: A log transform such as `log1p(annual_income)`
+B: Min-max scaling of `annual_income` to the range 0 to 1
+C: A Box-Cox or Yeo-Johnson power transform
+D: Standardization of `annual_income` to zero mean and unit variance
+E: One-hot encoding of every distinct `annual_income` value
+K: A,C
+G: ## Skewed features and linear models
+A right-skewed feature has most values bunched at the low end and a long tail of very large values. A linear model fits one slope for the whole range, so the tail dominates the fit and the residuals grow with income.
+## Shape-changing versus scale-changing transforms
+- **Log transform** (`log1p(x) = log(1 + x)`) compresses large values much more than small ones. 30,000 and 20,000,000 become about 10.3 and 16.8.
+- **Power transforms**: Box-Cox (positive values only) and Yeo-Johnson (also handles zero and negatives) search for the exponent that makes the distribution most normal-like. scikit-learn exposes both in `PowerTransformer`.
+- **Min-max scaling and standardization** are linear: they shift and stretch values but keep the shape exactly the same, so a skewed feature stays just as skewed.
+W: A=Log transform: `log1p` compresses large values far more than small ones, pulling in the long income tail so the feature becomes much more symmetric for the linear model.
+C=Box-Cox or Yeo-Johnson power transform: it is non-linear and fits the exponent that makes the distribution most normal-like, which reduces the skew instead of only rescaling it.
+X: B=Min-max scaling: it is a linear rescale, so the tail keeps the same relative shape, now squeezed between 0 and 1.
+D=Standardization: it also only shifts and rescales, so the skew value is unchanged.
+E=One-hot of each value: thousands of sparse columns remove the numeric order and make the linear model overfit, without addressing skew.
+T: To reduce skew use non-linear transforms such as log or Box-Cox/Yeo-Johnson; min-max and z-score scaling change the scale, not the shape.
+V: Amazon SageMaker
+
+@ MLA-C01 D1 T1.2 applied use-case
+S: A team has existing PySpark feature engineering scripts. They want to run them as a step in SageMaker Pipelines on a temporary multi-instance Spark cluster that is created for each run and removed afterwards, without managing clusters. Which option fits BEST?
+A: A SageMaker Processing step that runs the scripts with `SKLearnProcessor` on a single large instance with the Spark libraries pip-installed
+B: A SageMaker Processing step that runs the scripts with `PySparkProcessor` and an instance count greater than one
+C: A long-running Amazon EMR cluster that the pipeline reaches through SSH to submit the scripts with spark-submit on each run
+D: An AWS Glue DataBrew recipe job that re-creates the PySpark logic with built-in transformations and runs on a daily schedule
+K: B
+G: ## SageMaker Processing for Spark
+SageMaker Processing runs a script on managed instances that exist only for the job. For Spark, the SDK offers `PySparkProcessor` (and `SparkJarProcessor` for Scala/Java). It uses a SageMaker-provided Spark container, builds a Spark cluster across the requested instances, runs the script with `spark-submit`, and tears everything down when the job ends.
+Example:
+`PySparkProcessor(framework_version="3.3", role=role, instance_type="ml.m5.xlarge", instance_count=4)`
+Wrapped in a `ProcessingStep`, it becomes a normal step in a SageMaker Pipeline, with inputs and outputs in S3 and lineage tracked.
+## Why it fits
+Existing PySpark code runs unchanged, and there is no cluster to keep alive between runs.
+W: PySparkProcessor: it runs the existing PySpark scripts on an ephemeral, managed multi-instance Spark cluster and plugs directly into SageMaker Pipelines as a processing step.
+X: A=SKLearnProcessor on one instance: it uses a scikit-learn container and does not set up a distributed Spark cluster, so the scripts would run in local mode on one machine, if the libraries install at all.
+C=Long-running EMR over SSH: a permanent cluster is exactly the cluster management the team wants to avoid, and SSH submission is fragile inside a pipeline.
+D=DataBrew recipe: it would mean rewriting the PySpark logic into recipe steps, and a DataBrew schedule is not a SageMaker Pipelines step.
+T: Existing PySpark in a SageMaker Pipeline without managing clusters → `PySparkProcessor` in a processing step.
+V: Amazon SageMaker Processing, Amazon SageMaker Pipelines
+
+@ MLA-C01 D1 T1.2 advanced troubleshooting
+S: A gradient boosting model forecasts next-day sales per store. The engineer added a feature `rolling_mean_7d`, computed as the average of sales over a centered 7-day window (3 days before, the day itself, and 3 days after). Offline error dropped sharply, but live forecasts are poor. What is the MOST likely cause and fix?
+A: The window is too short to capture weekly seasonality; widen it to a centered 28-day window so the model sees monthly patterns
+B: Gradient boosting cannot use rolling features; replace the model with an LSTM that learns the temporal averages by itself
+C: The window uses future sales; compute the rolling mean only over days before the forecast date, for example the 7 days ending yesterday
+D: The feature is not scaled; standardize `rolling_mean_7d` with the training mean and standard deviation before training the model
+K: C
+G: ## Lag and rolling features must look backwards
+Time series features describe the past relative to the moment of prediction. A lag feature `sales_lag_1` is yesterday's sales. A rolling feature such as `rolling_mean_7d` should be the mean of the 7 days that end before the forecast date.
+A centered window includes days after the target date. When forecasting tomorrow, those days have not happened yet, so the feature cannot be computed in production. Offline, it quietly hands the model part of the answer: this is target leakage through time.
+## Safe construction
+- Sort by store and date, then `shift(1)` before `rolling(7).mean()` in pandas, so the window ends yesterday.
+- Split train and validation by time, not randomly.
+- Rebuild the feature exactly the same way in the inference pipeline.
+W: Backward-looking window: a centered window leaks future sales, which explains the great offline score and the poor live forecasts. Using only past days removes the leak.
+X: A=Wider centered window: it looks even further into the future and makes the leak larger, not smaller.
+B=Switch to LSTM: gradient boosting uses rolling features very well; the problem is what the feature contains, and an LSTM fed the same leaked input would fail the same way.
+D=Scaling: tree-based gradient boosting splits on thresholds and is insensitive to feature scale, and scaling does not remove future information.
+T: Rolling and lag features must use only data available before the prediction time; centered windows leak the future.
+V: Amazon SageMaker
+
+@ MLA-C01 D1 T1.3 advanced use-case
+S: A dataset for a claim-fraud model has 1.2 million rows from 90,000 customers; each customer appears in many rows, and only 2% of rows are fraud. The team must build train and validation sets that give a trustworthy estimate on new customers. Which TWO practices should they apply? (Select TWO)
+A: Split by customer ID so that all rows of a customer fall into either the training set or the validation set
+B: Keep the fraud rate about the same in each split by stratifying on the label while grouping by customer
+C: Oversample the fraud rows with SMOTE on the full dataset first and then split the result randomly into train and validation
+D: Shuffle all 1.2 million rows and assign 80% to training and 20% to validation at the row level for maximum randomness
+E: Compute standardization statistics on the full dataset before splitting so that both sets share identical scaling
+K: A,B
+G: ## Group leakage
+When one entity (customer, patient, device) contributes many rows, those rows share patterns. A random row-level split puts some of a customer's rows in training and others in validation, so the model partly "recognises" validation customers. Scores look better than they will be on truly new customers.
+Fix: split by the group key, for example with scikit-learn `GroupShuffleSplit` or `GroupKFold` on `customer_id`.
+## Keeping rare classes represented
+With 2% fraud, a random split can leave one fold with noticeably fewer positives. Stratification keeps the label ratio similar in every split. `StratifiedGroupKFold` does both: groups stay intact and the fraud rate stays balanced.
+## Order of operations
+Resampling (such as SMOTE) and fitting scalers must happen after the split and only on training data; otherwise validation information leaks into training.
+W: A=Split by customer ID: keeping all rows of a customer on one side of the split measures performance on truly unseen customers and prevents group leakage.
+B=Stratify while grouping: keeping the 2% fraud rate similar in every split leaves enough fraud cases in each for stable metrics, while customer groups stay intact.
+X: C=SMOTE before splitting: synthetic points are interpolated from real fraud rows, so near-copies of training examples land in validation and inflate the scores.
+D=Row-level shuffle: rows of the same customer end up on both sides of the split, which is exactly the group leakage to avoid.
+E=Statistics on full data: fitting the scaler on all rows leaks validation information into training; fit on the training split only.
+T: Many rows per entity → split by entity; rare labels → stratify; and do resampling and scaling only after the split.
+V: Amazon SageMaker
+
+@ MLA-C01 D1 T1.3 applied use-case
+S: A company has 400 S3 buckets from many teams and plans to reuse their data for ML training. Nobody knows which buckets contain personal data such as passport numbers or credit card numbers. The security team wants an automated, managed way to find and report sensitive data across the buckets. Which service fits BEST?
+A: Amazon Macie with automated sensitive data discovery across the buckets
+B: Amazon GuardDuty S3 Protection that is enabled for every bucket
+C: AWS Config managed rules that evaluate every bucket's configuration
+D: Amazon Inspector scans that are configured for every S3 bucket
+K: A
+G: ## Finding sensitive data before training
+Before data is used for ML, you need to know whether it contains personal or regulated data, so you can remove, mask or protect it. Checking hundreds of buckets by hand does not scale.
+## What Amazon Macie does
+Macie inspects the contents of S3 objects with managed data identifiers (for example credit card numbers, passport numbers, bank account numbers, names and addresses in many countries) and custom identifiers you define with regular expressions.
+- **Automated sensitive data discovery** samples objects across all buckets continuously and gives each bucket a sensitivity score.
+- **Sensitive data discovery jobs** do a targeted, deeper scan of chosen buckets.
+- Findings go to the Macie console, EventBridge and Security Hub, so they can trigger remediation.
+Macie also reports bucket-level risks such as public access or missing encryption.
+W: Amazon Macie: it scans S3 object contents for personal and financial data with managed identifiers and reports which buckets hold it, which is exactly the discovery task.
+X: B=GuardDuty S3 Protection: it detects suspicious access patterns to S3 from CloudTrail data events, such as unusual API calls. It does not read object contents to find personal data.
+C=AWS Config rules: they check resource configuration, such as whether encryption or versioning is on, not what data the objects contain.
+D=Amazon Inspector: it scans EC2 instances, container images and Lambda functions for software vulnerabilities, not S3 objects for personal data.
+T: To discover personal data inside S3 objects use Macie; GuardDuty watches access behavior, Config checks settings, Inspector finds vulnerabilities.
+V: Amazon Macie, Amazon S3
+
+@ MLA-C01 D1 T1.3 applied use-case
+S: A contact center wants to train an intent classifier on 3 million English call transcripts stored in S3. Names, phone numbers and addresses must be removed from the text before data scientists can access it, while the rest of the sentence stays intact. Which approach fits with the LEAST custom code?
+A: Run an Amazon Textract asynchronous job over the transcripts and drop every line that Textract labels as a key-value pair
+B: Run an Amazon Comprehend PII entity detection job in redaction mode over the transcripts and write the redacted text to a new bucket
+C: Apply S3 Object Lambda with a hand-written regular expression function that masks digits in the transcripts whenever they are read
+D: Label the transcripts in a SageMaker Ground Truth job where workers manually highlight and delete every piece of personal data
+K: B
+G: ## Redacting PII in free text
+Structured columns such as `email` can simply be dropped. In free text, personal data is mixed into sentences: "Hi, this is Maria Lopez, my number is 555 0100." You need entity recognition to find each piece and replace it while keeping the rest of the sentence.
+## Amazon Comprehend PII detection
+Amazon Comprehend detects PII entity types such as `NAME`, `PHONE`, `ADDRESS`, `EMAIL` and `CREDIT_DEBIT_NUMBER`.
+- Real-time APIs: `DetectPiiEntities` for single documents.
+- Batch: `StartPiiEntitiesDetectionJob` over documents in S3. With `Mode=ONLY_REDACTION` and a `RedactionConfig`, it writes copies of the documents where each entity is replaced by a mask character or the entity type, for example `Hi, this is [NAME], my number is [PHONE].`
+The redacted output bucket is what data scientists get access to; the raw bucket stays locked down.
+W: Comprehend PII redaction job: it finds names, phone numbers and addresses in the text with a managed model and writes redacted copies at scale, with no model or regex code to maintain.
+X: A=Textract: it extracts text and forms from scanned documents and images. The transcripts are already text, and dropping key-value lines would not find names inside sentences.
+C=S3 Object Lambda with regex: it is custom code, masking digits misses names and addresses, and it can also mangle non-personal numbers.
+D=Ground Truth manual redaction: human review of 3 million transcripts is slow, costly and exposes the personal data to more people.
+T: PII inside free text → Amazon Comprehend PII detection with redaction; drop structured PII columns, but do not hand-write regexes for names.
+V: Amazon Comprehend, Amazon S3
+
+@ MLA-C01 D1 T1.3 applied use-case
+S: An image classifier trained on 6,000 product photos reaches 99% training accuracy but 78% validation accuracy. Collecting more photos will take months. Which data preparation step is MOST appropriate to reduce overfitting?
+A: Apply random flips, crops, rotations and color jitter to the training images during each epoch, and keep validation images unchanged
+B: Apply the same random flips, crops, rotations and color jitter to both training and validation images before splitting the data
+C: Duplicate each training image five times on disk so the model sees more examples of every product during each training epoch
+D: Remove the validation set and train on all 6,000 images so the model learns from more examples of every product it must recognize
+K: A
+G: ## Why the model overfits
+99% on training data but 78% on validation data means the model memorises details of the specific training photos (exact position, lighting, background) instead of learning the product itself. More varied data is the usual cure.
+## Data augmentation
+Augmentation creates new, realistic variations of training images on the fly: horizontal flips, random crops, small rotations, brightness and color changes. Each epoch the model sees slightly different versions, so it must learn features that survive those changes.
+Rules that keep the evaluation honest:
+- Augment only the training data; validation and test images stay as they are, so they still reflect real inputs.
+- Split before augmenting, so variants of one photo never appear on both sides.
+- Pick transforms that keep the label valid (a vertical flip may not suit text or digits).
+W: Training-only augmentation: random transforms add realistic variety and reduce memorisation, while untouched validation images keep the measurement honest.
+X: B=Augment before splitting: variants of the same photo end up in both sets, so validation accuracy is inflated by near-duplicates of training images.
+C=Duplicate images: identical copies add no new information, so the model memorises the same pixels even harder.
+D=Drop the validation set: the model gets marginally more data, but the team loses the only way to detect overfitting.
+T: Overfitting on a small image set → augment the training images only; duplicating data or augmenting validation data gives false confidence.
+V: Amazon SageMaker
+
+@ MLA-C01 D1 T1.3 applied troubleshooting
+S: A team exports a table to CSV for the SageMaker built-in XGBoost algorithm. The file has a header row, and the label `defaulted` is the last column. Training completes, but the validation metrics are meaningless. What should the team change in the training data?
+A: Convert the CSV to JSON Lines with one object per row, because the built-in XGBoost algorithm does not read CSV input
+B: Move the label column to the first position and remove the header row, keeping the content type as `text/csv`
+C: Add a second header row that describes each column's data type so the algorithm can find the label column
+D: Compress the CSV file with gzip and set the content type to `application/x-parquet` for the training channel
+K: B
+G: ## How built-in XGBoost reads CSV
+The SageMaker built-in XGBoost algorithm accepts CSV (`text/csv`), LIBSVM, Parquet and RecordIO-protobuf. For CSV it assumes:
+- The **target is the first column**.
+- There is **no header row**.
+The algorithm does not look at column names. If the label is last, XGBoost treats the first feature as the label and the real label as a feature. A header row adds a bad first record as well. Training still "succeeds", so the mistake only shows up as nonsense metrics.
+## Preparing the file
+In pandas: `df[["defaulted"] + features].to_csv("train.csv", header=False, index=False)`. Do the same for the validation channel, and make sure the inference payload contains only the feature columns in the same order.
+W: Label first, no header: that is the CSV layout the built-in XGBoost algorithm expects, so it trains on the right target.
+X: A=JSON Lines: built-in XGBoost reads CSV natively, and JSON Lines is not one of its training input formats.
+C=Second header row: the algorithm reads no header at all; an extra header only adds another bad record.
+D=Wrong content type: declaring gzip-compressed CSV as Parquet makes the job fail to parse the input, and the label is still in the wrong column.
+T: Built-in XGBoost CSV input = label in the first column, no header; the algorithm never uses column names.
+V: Amazon SageMaker
+
+@ MLA-C01 D3 T3.1 applied use-case
+S: A model on SageMaker Serverless Inference is idle overnight. Every weekday at 09:00 traffic jumps from zero to steady use, and the first requests suffer multi-second cold starts that break the latency target. The team wants to stay serverless. Which change fits BEST?
+A: Configure provisioned concurrency on the serverless endpoint and scale it up before 09:00 on weekdays
+B: Increase the serverless endpoint's memory size to 6 GB so each container starts and loads the model faster
+C: Increase the serverless endpoint's maximum concurrency to 200 so that more containers can start up in parallel
+D: Replace the endpoint with an asynchronous inference endpoint that queues requests and processes them later
+K: A
+G: ## Why serverless endpoints cold start
+SageMaker Serverless Inference starts compute only when requests arrive and scales to zero when idle. After an idle period, the first requests wait while a container starts and the model loads: a cold start, often several seconds for larger models.
+## Provisioned concurrency
+Provisioned concurrency keeps a chosen number of serverless workers initialised and ready. Requests up to that level are served without cold starts; you pay for the provisioned capacity while it is configured.
+- You can manage it with Application Auto Scaling, including scheduled actions, so capacity is raised shortly before 09:00 and lowered in the evening.
+- `MaxConcurrency` limits how many concurrent requests the endpoint can handle; it does not pre-warm anything.
+Example: `ServerlessConfig={"MemorySizeInMB": 4096, "MaxConcurrency": 20, "ProvisionedConcurrency": 5}`.
+W: Provisioned concurrency: pre-initialised serverless workers remove cold starts for the morning surge while the endpoint stays serverless and pay-per-use for the rest.
+X: B=More memory: it gives each container more memory and proportional compute, but a new container still has to start and load the model after idle time.
+C=Higher max concurrency: it only raises the ceiling on parallel requests; every new container still cold starts.
+D=Asynchronous inference: it queues requests and returns results later, which breaks a real-time latency target instead of meeting it.
+T: Serverless cold starts at a predictable peak → provisioned concurrency; max concurrency and memory do not keep containers warm.
+V: Amazon SageMaker Serverless Inference, Application Auto Scaling
+
+@ MLA-C01 D3 T3.1 advanced troubleshooting
+S: A SageMaker batch transform job reads input files of about 2 GB each, where every line is one CSV record. The job fails with errors that the request payload is too large. Which configuration change fixes this?
+A: Increase `MaxPayloadInMB` to 2048 so each whole 2 GB file can be sent to the model container as one single request
+B: Set `SplitType` to `None` and `BatchStrategy` to `SingleRecord` so each file is processed by the container as a single record
+C: Increase the instance count of the transform job so that each instance receives a smaller share of the 2 GB files
+D: Set `SplitType` to `Line` and `BatchStrategy` to `MultiRecord` so the file is split into mini-batches under `MaxPayloadInMB`
+K: D
+G: ## How batch transform sends data to the model
+A batch transform job reads objects from S3 and sends them to the model container over HTTP, like calls to `/invocations`. Three settings control the size of each request:
+- `SplitType`: how to cut an input object into records. `None` sends the whole object; `Line` splits on newlines; `RecordIO` and `TFRecord` split binary formats.
+- `BatchStrategy`: `SingleRecord` sends one record per request; `MultiRecord` packs as many records as fit.
+- `MaxPayloadInMB`: the maximum size of one request, with an upper limit of 100 MB.
+With `SplitType=None`, a 2 GB file is one request, which exceeds any allowed payload.
+## Fix
+`SplitType="Line"`, `BatchStrategy="MultiRecord"`, `MaxPayloadInMB=6` sends many small mini-batches. `AssembleWith="Line"` stitches the outputs back into one result file per input.
+W: Line splitting with MultiRecord: the job cuts each file into line-based mini-batches that fit under the payload limit, so no single request is too large.
+X: A=MaxPayloadInMB of 2048: the parameter is capped at 100 MB, so a whole 2 GB file can never be one request.
+B=SplitType None with SingleRecord: without splitting, the whole file is still the one record, so the request is still 2 GB.
+C=More instances: files are distributed between instances, but each file is still sent unsplit, so every request stays too large.
+T: Large files in batch transform must be split (`SplitType=Line`) into mini-batches; the payload limit cannot be raised to fit a whole file.
+V: Amazon SageMaker Batch Transform
+
+@ MLA-C01 D3 T3.1 applied comparison
+S: A real-time endpoint hosts two production variants, `ModelA` with weight 90 and `ModelB` with weight 10. For an internal QA suite, testers must send specific requests to `ModelB` every time, without changing the traffic split for customers. What should the testers do?
+A: Update the endpoint's variant weights to 0 and 100 while the QA suite runs and then set them back to 90 and 10 afterwards
+B: Call InvokeEndpoint with the `TargetVariant` parameter set to `ModelB`, which overrides the weighted routing for those requests
+C: Deploy a separate endpoint with a shadow variant so the QA requests are mirrored to `ModelB` while customers see `ModelA`
+D: Attach a sticky session header to the QA requests so that the endpoint keeps sending them to the variant that served them first
+K: B
+G: ## Production variants
+One SageMaker endpoint can host several production variants, each with its own model and instances. By default, requests are distributed by variant weight: with weights 90 and 10, about 90% of calls go to `ModelA` and 10% to `ModelB`. This is how A/B tests run on one endpoint.
+## Targeting a specific variant
+`InvokeEndpoint` accepts an optional `TargetVariant` parameter. When set, that request goes to the named variant regardless of the weights. Other callers keep the weighted split.
+Example with boto3:
+`runtime.invoke_endpoint(EndpointName="churn", TargetVariant="ModelB", ContentType="text/csv", Body=payload)`
+Metrics such as `Invocations` and `ModelLatency` are published per variant, so QA traffic and customer traffic can be compared.
+W: TargetVariant: it routes individual requests to `ModelB` deterministically while the 90/10 split for customers stays exactly as configured.
+X: A=Change the weights: every customer would be sent to `ModelB` during testing, which is exactly what must not happen.
+C=Shadow variant: shadow testing copies a share of production traffic to a shadow model and does not return its responses to callers, so testers cannot choose which requests reach `ModelB` or see its answers.
+D=Sticky session header: session stickiness only keeps later requests where the first one landed, and that first request is still routed by the 90/10 weights, so most QA sessions would end up on `ModelA`.
+T: Weights split normal traffic between variants; `TargetVariant` pins a single request to one variant without touching the weights.
+V: Amazon SageMaker
+
+@ MLA-C01 D3 T3.2 applied use-case
+S: A team defines a SageMaker endpoint in AWS CloudFormation and must add target-tracking auto scaling on invocations per instance in the same template. Which TWO resources must the template include? (Select TWO)
+A: An `AWS::ApplicationAutoScaling::ScalableTarget` with the dimension `sagemaker:variant:DesiredInstanceCount`
+B: An `AWS::ApplicationAutoScaling::ScalingPolicy` of type `TargetTrackingScaling` that references the scalable target
+C: An `AWS::AutoScaling::AutoScalingGroup` that contains the endpoint's ML instances and sets their minimum and maximum
+D: An `AWS::AutoScaling::LaunchTemplate` that defines the ML instance type used when the endpoint scales out
+E: An `AWS::CloudWatch::Alarm` for each scaling direction with the endpoint's variant name as its only dimension
+K: A,B
+G: ## Who scales a SageMaker endpoint
+SageMaker endpoint instances are not EC2 Auto Scaling groups you manage. Their count is changed through **Application Auto Scaling**, the service that scales resources of other AWS services (DynamoDB, ECS, SageMaker and more).
+## The two pieces
+- **Scalable target**: which resource and which dimension may change, and the limits. For SageMaker: `ServiceNamespace: sagemaker`, `ResourceId: endpoint/<endpoint-name>/variant/<variant-name>`, `ScalableDimension: sagemaker:variant:DesiredInstanceCount`, `MinCapacity: 2`, `MaxCapacity: 10`.
+- **Scaling policy**: how to scale. A target tracking policy names a metric and a target, for example `SageMakerVariantInvocationsPerInstance` with `TargetValue: 70`.
+With target tracking, Application Auto Scaling creates and manages the CloudWatch alarms itself. Add `DependsOn` the endpoint so the target is registered after the endpoint exists.
+W: A=Scalable target: registers the endpoint variant with Application Auto Scaling, naming the resource, the DesiredInstanceCount dimension and the minimum and maximum instance limits.
+B=Target-tracking scaling policy: references the scalable target and tells Application Auto Scaling which metric, such as invocations per instance, to hold at the target value.
+X: C=EC2 Auto Scaling group: SageMaker manages the endpoint's instances itself; they cannot be placed in an Auto Scaling group.
+D=Launch template: instance types come from the endpoint configuration, and launch templates belong to EC2 Auto Scaling, not to SageMaker endpoints.
+E=Hand-made alarms: target tracking creates and manages its own alarms, so separate alarms are not required, and alarms alone never change the instance count.
+T: SageMaker endpoint scaling in templates = `ScalableTarget` + `ScalingPolicy` from Application Auto Scaling, not EC2 Auto Scaling resources.
+V: AWS CloudFormation, Application Auto Scaling, Amazon SageMaker
+
+@ MLA-C01 D3 T3.2 applied tradeoff
+S: An endpoint uses target tracking on invocations per instance with 2 to 12 instances. Every weekday at 08:00 traffic jumps fivefold within a few minutes, and for the first 10 minutes latency breaches the SLA while new instances start. Which change is MOST effective?
+A: Lower the target value of the tracking policy so scaling reacts to smaller increases in the invocations per instance
+B: Remove the maximum capacity limit from the scalable target so the endpoint can add as many instances as it needs
+C: Add an Application Auto Scaling scheduled action that raises the minimum capacity shortly before 08:00 and lowers it in the evening
+D: Replace target tracking with a step scaling policy that adds one instance whenever CPU utilization is above 90% for 5 minutes
+K: C
+G: ## Reactive scaling has a delay
+Target tracking reacts to metrics after the load has arrived: CloudWatch alarms need data points, then new ML instances must launch, pull the container and load the model. For a sudden, large jump this can take many minutes, and the first users feel it.
+## Scheduled scaling for known patterns
+When the peak is predictable, Application Auto Scaling scheduled actions change the scalable target's `MinCapacity` and `MaxCapacity` at set times, for example with `cron(45 7 ? * MON-FRI *)`.
+- 07:45: raise `MinCapacity` to 8, so capacity is ready before 08:00.
+- 19:00: lower `MinCapacity` back to 2.
+Target tracking keeps working inside those limits and still handles unexpected spikes. The combination gives both readiness for the known peak and reaction to the unknown.
+W: Scheduled action: capacity is added before the predictable 08:00 jump, so no request waits for instances to start, and target tracking still handles the rest of the day.
+X: A=Lower target value: scaling starts a little earlier and keeps more instances all day, but it is still reactive, so the first minutes of a fivefold jump still wait for instance startup.
+B=No maximum: the problem is how fast instances arrive, not the upper limit of 12, and Application Auto Scaling always requires a maximum capacity.
+D=Step scaling on CPU at 90% for 5 minutes: it reacts later than invocation tracking and adds only one instance per step, making the startup gap longer.
+T: Predictable spikes are handled by scheduled scaling ahead of time; target or step tracking only reacts after the load arrives.
+V: Application Auto Scaling, Amazon SageMaker, Amazon CloudWatch
+
+@ MLA-C01 D3 T3.2 advanced troubleshooting
+S: A model container on a SageMaker real-time endpoint must read reference data from an Amazon RDS database in a private subnet. The engineer created the endpoint from an IaC template, but connections to the database time out, and the endpoint has no network path into the VPC. Where must the subnets and security groups be specified?
+A: In the `VpcConfig` of the SageMaker model (CreateModel), which the endpoint's containers use for their network interfaces
+B: In a new field of the endpoint configuration's production variant that lists the subnets used by the variant's instances
+C: In an interface VPC endpoint for the SageMaker Runtime API created in the database's VPC for the model to use
+D: In the VPC settings of the SageMaker Studio domain that the engineer used to write and deploy the IaC template
+K: A
+G: ## Where a hosted model's network settings live
+A SageMaker real-time endpoint is built from three resources: the **model** (container image, model artifacts, execution role, and network settings), the **endpoint configuration** (variants, instance types and counts), and the **endpoint** itself.
+Network placement belongs to the model: `CreateModel` takes `VpcConfig` with `Subnets` and `SecurityGroupIds`. SageMaker then attaches elastic network interfaces in those subnets to the hosting containers, so they can reach private resources such as RDS.
+Example in CloudFormation, `AWS::SageMaker::Model`:
+`VpcConfig: {Subnets: [subnet-0a1...], SecurityGroupIds: [sg-0b2...]}`
+The database's security group must then allow inbound traffic from that security group on the database port. Setting `EnableNetworkIsolation: true` on the model would block this outbound access completely.
+W: Model VpcConfig: subnets and security groups are defined on the SageMaker model, and the endpoint's containers get network interfaces there, which gives them a route to the private database.
+X: B=Production variant field: endpoint configurations define instance types, counts and weights; they have no subnet settings for the containers.
+C=SageMaker Runtime interface endpoint: it lets clients in the VPC call InvokeEndpoint privately. It is the inbound path to the endpoint and gives the container no route to RDS.
+D=Studio domain VPC: that controls the network of the Studio notebooks and apps, not of the endpoints they deploy.
+T: A hosted model's VPC access comes from `VpcConfig` on the model; a SageMaker Runtime VPC endpoint is only for callers reaching the endpoint privately.
+V: Amazon SageMaker, Amazon VPC, Amazon RDS
+
+@ MLA-C01 D3 T3.2 advanced use-case
+S: A central tooling account (A) stores a private inference image in Amazon ECR. SageMaker endpoints in a workload account (B) must pull that image, and the image must not be made public. Which TWO configurations are required? (Select TWO)
+A: A repository policy on the ECR repository in account A that allows account B's SageMaker execution role to pull the image
+B: A VPC peering connection between the two accounts' VPCs so SageMaker in account B can reach the ECR registry in account A
+C: A resource share in AWS RAM that shares the ECR repository from account A with account B through AWS Organizations
+D: An IAM policy on the SageMaker execution role in account B that allows the ECR pull actions on the repository in account A
+E: An S3 bucket policy in account A that grants account B read access to the bucket where ECR stores the image layers
+K: A,D
+G: ## Cross-account access needs two yes answers
+For most cross-account access in AWS, both sides must agree:
+- The **resource owner** (account A) grants access with a resource-based policy.
+- The **caller's account** (account B) allows its principal to use that resource with an identity-based IAM policy.
+## Applied to ECR and SageMaker
+The ECR repository policy in account A allows the account B role to use `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` and `ecr:BatchCheckLayerAvailability`. The SageMaker execution role in account B needs those actions on the repository ARN in its own IAM policy, plus `ecr:GetAuthorizationToken`. SageMaker then pulls the image using `123456789012.dkr.ecr.us-east-1.amazonaws.com/infer:1.4`.
+If the repository uses a customer managed KMS key, account B also needs permission to use that key. An alternative design is ECR cross-account replication, which copies the image into account B.
+W: A=ECR repository policy in account A: the resource owner's resource-based policy grants account B's SageMaker execution role the pull actions on the repository.
+D=IAM policy on the execution role in account B: the caller's account must also allow its role to use the ECR pull actions on that repository, completing both halves of cross-account authorization.
+X: B=VPC peering: ECR is reached through its regional service endpoint, not through a VPC in account A, so peering adds no access; authorization is the missing piece.
+C=AWS RAM share: AWS RAM is not how ECR repositories are shared; cross-account pulls are granted with an ECR repository policy.
+E=S3 bucket policy: ECR stores image layers in storage that the ECR service manages, not in a bucket in the customer account, so there is no bucket policy to set; access is controlled through ECR permissions.
+T: Cross-account ECR pulls need a repository policy in the owner account and an IAM policy on the pulling role; networking and RAM are not the mechanism.
+V: Amazon ECR, Amazon SageMaker, AWS IAM
+
+@ MLA-C01 D3 T3.3 advanced use-case
+S: A CodePipeline in a shared DevOps account deploys a SageMaker endpoint stack with a CloudFormation action into a separate production account. The deploy action fails because the production account cannot read the pipeline's artifacts in S3. Which TWO changes are required? (Select TWO)
+A: Encrypt the artifact bucket with a customer managed KMS key whose key policy allows the production account to use it
+B: Keep the default AWS managed `aws/s3` key and add the production account to the artifact bucket's ACL as a grantee
+C: Create an IAM role in the production account that trusts the DevOps account and set it as the deploy action's role
+D: Enable S3 Cross-Region Replication from the artifact bucket to a bucket in the production account before each deploy
+E: Move the whole pipeline into the production account so the artifacts never have to cross an account boundary
+K: A,C
+G: ## How cross-account CodePipeline deploys work
+CodePipeline stores the output of each stage as artifacts in an S3 artifact bucket, encrypted with AWS KMS. A deploy action that runs in another account must be able to read those artifacts and then act inside that account.
+## What must be in place
+- **Customer managed KMS key** for the artifact store. The default AWS managed key `aws/s3` cannot be shared with other accounts, so another account can never decrypt objects encrypted with it. The customer managed key's policy grants the production account decrypt rights, and the bucket policy allows it to read the artifacts.
+- **Cross-account role** in the production account that trusts the DevOps account. The action's `RoleArn` points to it, so CodePipeline assumes it to run the action there. The CloudFormation action can also pass a deployment role that CloudFormation uses to create the stack's resources.
+W: A=Customer managed KMS key: unlike the AWS managed `aws/s3` key, its key policy can grant the production account decrypt rights, so the production account can read the artifacts.
+C=Cross-account role in production: the role trusts the DevOps account and is set as the action's role, so CodePipeline assumes it and runs the CloudFormation action inside the production account.
+X: B=AWS managed key with ACL: the `aws/s3` key policy cannot be changed to trust another account, so even with bucket access the objects cannot be decrypted.
+D=Cross-Region Replication: it adds a copy step but does not solve decryption or give the action a role in the production account, and replicated objects still need a usable key.
+E=Pipeline in production: it removes the error by giving up the separation of the shared DevOps account, and it breaks the design of deploying from one central pipeline.
+T: Cross-account CodePipeline deployments need a customer managed KMS key shared with the target account and a role in that account for the action; AWS managed keys cannot be shared.
+V: AWS CodePipeline, AWS CloudFormation, AWS KMS, Amazon S3
+
+@ MLA-C01 D3 T3.3 applied use-case
+S: The same SageMaker Pipeline definition must run in dev with `ml.m5.large` instances and 10% sample data, and in prod with `ml.p3.2xlarge` instances and full data, without maintaining two copies of the pipeline code. Which approach fits BEST?
+A: Keep two Git branches with different hard-coded instance types and data paths and deploy whichever branch matches the account
+B: Store the values in a notebook that edits the pipeline's JSON definition by hand before each run in the target account
+C: Define `ParameterString` values for the instance type and input path and override them in `pipeline.start()` for each environment
+D: Create two separate pipelines with different names and copy every step definition from the dev pipeline into the prod pipeline
+K: C
+G: ## Pipeline parameters
+SageMaker Pipelines let you declare parameters in the pipeline definition: `ParameterString`, `ParameterInteger`, `ParameterFloat` and `ParameterBoolean`. Steps reference the parameter objects instead of literal values. Each parameter has a default, and every execution can override it.
+Example:
+- `instance_type = ParameterString(name="TrainInstanceType", default_value="ml.m5.large")`
+- `input_uri = ParameterString(name="InputData", default_value="s3://dev-bucket/sample/")`
+- Production run: `pipeline.start(parameters={"TrainInstanceType": "ml.p3.2xlarge", "InputData": "s3://prod-bucket/full/"})`
+## Why it matters for CI/CD
+One reviewed definition is promoted through environments; only the parameter values differ. Every execution records the values it used, which helps with auditing and reproducing a run.
+W: Pipeline parameters: one definition with `ParameterString` values for instance type and data path runs in each environment with different overrides, so there is only one copy of the code.
+X: A=Two branches: hard-coded differences drift apart over time and every fix must be merged twice, which is the duplication to avoid.
+B=Hand-edited JSON: manual edits are error-prone, are not reviewed, and make runs hard to reproduce.
+D=Two copied pipelines: that is exactly two copies of the pipeline to keep in sync.
+T: Environment differences in SageMaker Pipelines belong in pipeline parameters overridden at start time, not in copied code or branches.
+V: Amazon SageMaker Pipelines
+
+@ MLA-C01 D3 T3.3 applied use-case
+S: Data scientists have tested Python functions for preprocessing, training and evaluation in notebooks. They want to turn them into a SageMaker Pipeline with minimal rewriting, keeping the functions as plain Python. Which approach fits BEST?
+A: Rewrite every function as a separate Docker image and reference each image from its own custom container processing step
+B: Decorate the functions with the `@step` decorator from the SageMaker Python SDK and build the pipeline from the step outputs
+C: Schedule the notebooks with cron on a SageMaker notebook instance so they run one after the other in the required order
+D: Convert the functions into AWS Lambda functions and chain them with Lambda steps, since Lambda runs plain Python code
+K: B
+G: ## From notebook functions to pipeline steps
+Classic SageMaker Pipelines steps (`ProcessingStep`, `TrainingStep`) need a processor or estimator, a script file and explicit inputs and outputs. Moving notebook code into that shape takes work.
+## The `@step` decorator
+The SageMaker Python SDK can turn a Python function into a pipeline step directly:
+`from sagemaker.workflow.function_step import step`
+`@step(instance_type="ml.m5.xlarge")`
+`def preprocess(raw_path): ...`
+Calling decorated functions builds a graph: `data = preprocess(raw)`, `model = train(data)`, `evaluate(model)`. Passing the final output to `Pipeline(steps=[...])` creates the pipeline. Each function runs as a SageMaker job on its own instance, with dependencies taken from a `requirements.txt` or a chosen image, and return values passed between steps.
+W: `@step` decorator: it wraps existing Python functions as pipeline steps, so the tested code is reused almost unchanged while each step runs as a managed SageMaker job.
+X: A=Separate Docker images: building and maintaining an image per function is the opposite of minimal rewriting.
+C=Cron on a notebook instance: there is no pipeline, lineage, retry or caching, and a single instance runs everything.
+D=Lambda steps: Lambda has a 15-minute limit and no GPU, so training would not fit, and each function must be repackaged as a Lambda deployment.
+T: To pipeline plain Python functions with little rework, use the `@step` decorator; containers or Lambda repackaging are much more work.
+V: Amazon SageMaker Pipelines
+
+@ MLA-C01 D3 T3.3 advanced tradeoff
+S: A large model runs on a real-time endpoint with 16 GPU instances. The team wants guarded updates with automatic rollback on CloudWatch alarms, but the account's GPU quota cannot fit a second full fleet during the update. Which deployment option fits BEST?
+A: A blue/green update with all-at-once traffic shifting, because it provisions the new fleet and switches traffic in a single step
+B: A blue/green update with canary traffic shifting that sends 10% of traffic to a full new fleet before the remaining 90% moves
+C: Deleting the endpoint and creating a new one with the updated model, followed by a manual check of the CloudWatch alarms
+D: A rolling deployment that replaces instances in small batches, with alarms that trigger an automatic rollback if they fire
+K: D
+G: ## Deployment guardrails for SageMaker endpoints
+When you update an endpoint, SageMaker can apply guardrails with automatic rollback on CloudWatch alarms.
+- **Blue/green** (all at once, canary, or linear shifting): SageMaker provisions a complete new (green) fleet next to the old (blue) one, shifts traffic, and then removes the old fleet. For a moment you run both fleets, so you need roughly double the capacity.
+- **Rolling deployment**: SageMaker updates the fleet in batches. You set `MaximumBatchSize` (for example 4 instances or 25%), `WaitIntervalInSeconds` to watch alarms between batches, and `RollbackMaximumBatchSize`. Only one batch of extra capacity is needed at a time.
+## When to pick rolling
+Large models on scarce or expensive GPU instances often cannot get a second full fleet. Rolling updates trade a slower rollout for a much smaller extra capacity need, and still roll back automatically.
+W: Rolling deployment: it needs only one batch of spare GPU capacity at a time and still watches alarms and rolls back automatically, which fits the quota limit.
+X: A=Blue/green all at once: it still provisions a complete new fleet before switching, which the GPU quota cannot fit.
+B=Blue/green canary: only 10% of traffic goes to the new fleet at first, but the new fleet is still provisioned at full size.
+C=Delete and recreate: it causes downtime and has no automatic rollback, so failures reach users.
+T: Blue/green needs a full second fleet; rolling deployment updates in batches with rollback when capacity is limited.
+V: Amazon SageMaker, Amazon CloudWatch

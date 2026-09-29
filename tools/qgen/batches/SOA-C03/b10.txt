@@ -1,0 +1,584 @@
+# SOA-C03 batch 10: detailed explanations (D1, D2, D5)
+
+@ SOA-C03 D1 T1.1 applied use-case
+S: A Lambda function behind API Gateway must publish per-endpoint latency and order-value metrics to CloudWatch with an Endpoint dimension. Each log line must also keep the customer ID and request ID for later investigation. The team does not want extra synchronous API calls inside the request path. Which approach fits best?
+A: Write each record in CloudWatch embedded metric format to standard output so CloudWatch extracts the metrics from the log events
+B: Call PutMetricData from the handler for every request and write the customer ID to the log as a separate plain-text log line
+C: Create one metric filter per customer ID on the function's log group so that every customer gets an individual latency metric
+D: Add the customer ID and latency as AWS X-Ray annotations and build CloudWatch alarms directly on the resulting trace segments
+K: A
+W: Embedded metric format: the function prints a structured JSON log event with an `_aws` metadata block, and CloudWatch Logs extracts the declared metrics asynchronously. There is no extra API call in the request path, and high-cardinality fields such as the customer ID stay in the same log event for Logs Insights queries.
+X: B=PutMetricData per request: it adds a synchronous network call and API cost to every invocation, can be throttled at high request rates, and splits metrics and context into separate records.
+C=Metric filter per customer: a log group supports only a limited number of metric filters (100), so one per customer does not scale, and it would create a separate high-cardinality metric for every customer.
+D=X-Ray annotations: annotations index traces for filtering in X-Ray, but CloudWatch alarms are built on metrics, not on individual trace segments, so this does not produce the required alarmable metrics.
+T: Metrics plus rich context from Lambda without extra API calls → embedded metric format in the logs, not PutMetricData or per-value metric filters.
+G: ## Two ways to publish custom metrics
+- **PutMetricData**: the code calls the CloudWatch API. Simple, but every call is a network round trip, costs money per request and can be throttled.
+- **Embedded metric format (EMF)**: the code writes a JSON log event. A special `_aws` block lists which fields are metrics (with units) and which are dimensions. CloudWatch Logs extracts those metrics in the background.
+## Why EMF suits Lambda
+Lambda already ships standard output to CloudWatch Logs, so EMF adds no network call to the handler. The same log event can carry extra fields that are *not* dimensions, such as `customerId` or `requestId`. They do not become metrics (no cardinality explosion) but remain searchable with Logs Insights.
+Example event: `{"_aws":{"CloudWatchMetrics":[{"Namespace":"Shop","Dimensions":[["Endpoint"]],"Metrics":[{"Name":"Latency","Unit":"Milliseconds"}]}]},"Endpoint":"/order","Latency":87,"customerId":"c-123"}`
+Libraries such as Powertools for AWS Lambda generate this format for you.
+V: Amazon CloudWatch, AWS Lambda
+
+@ SOA-C03 D1 T1.1 advanced tradeoff
+S: A CloudWatch alarm on an EC2 fleet's CPUUtilization uses a 1-minute period and 1 evaluation period, and it pages on single short spikes. The team wants a page only when CPU is high for most of a 5-minute window, even if one or two samples inside that window dip below the threshold. Which alarm configuration fits?
+A: Set evaluation periods to 5 and datapoints to alarm to 3, keeping the 1-minute period and the current CPU threshold
+B: Set evaluation periods to 5 and datapoints to alarm to 5, keeping the 1-minute period and the current CPU threshold
+C: Change the statistic to Maximum with a single 5-minute period and one datapoint to alarm at the current CPU threshold
+D: Keep one evaluation period and set the alarm to treat missing data as notBreaching to suppress the brief spike alerts
+K: A
+W: 3 out of 5 datapoints: the alarm looks at the last five 1-minute points and fires when any three breach. A single spike is ignored, while sustained high CPU still alarms even if one or two samples dip.
+X: B=5 out of 5 datapoints: every one of the five points must breach, so a single dip below the threshold resets the condition and a real sustained problem can go unreported.
+C=Maximum over 5 minutes: the Maximum statistic reports the highest sample in the period, so one short spike still makes the whole 5-minute datapoint breach. This makes the noise worse, not better.
+D=Treat missing data as notBreaching: this only changes how gaps in the data are evaluated. The spikes are real datapoints, not missing ones, so the alarm keeps firing on them.
+T: To tolerate spikes and dips at the same time use "M out of N" datapoints to alarm; "N out of N" is too strict and Maximum amplifies spikes.
+G: ## How an alarm evaluates
+A metric alarm has three settings that work together:
+- **Period**: the length of one datapoint, for example 60 seconds.
+- **Evaluation periods (N)**: how many of the most recent datapoints are examined.
+- **Datapoints to alarm (M)**: how many of those N must breach the threshold.
+## M out of N
+With `Period=60`, `N=5`, `M=3` the alarm checks the last five minutes and goes to ALARM when any three minutes breach. The breaching points do not have to be consecutive.
+- 1 out of 1: every spike pages.
+- 5 out of 5: a single healthy minute cancels the alarm.
+- 3 out of 5: short spikes are ignored and short dips do not hide a sustained problem.
+The statistic also matters: `Average` smooths a period, `Maximum` reports its worst sample.
+V: Amazon CloudWatch, Amazon EC2
+
+@ SOA-C03 D1 T1.1 applied use-case
+S: Application logs in a CloudWatch Logs log group sometimes contain customer email addresses and credit card numbers. Developers must keep reading these logs for troubleshooting without seeing those values, while a small security group must still be able to view the original values. What should the CloudOps engineer configure?
+A: A data protection policy on the log group with managed data identifiers, granting logs:Unmask only to the security group
+B: A customer managed KMS key on the log group, granting kms:Decrypt on that key only to the members of the security group
+C: An IAM policy that denies logs:GetLogEvents and logs:FilterLogEvents on the log group for every developer role
+D: A Logs Insights saved query that filters out lines matching card and email patterns, shared with the developer roles
+K: A
+W: Data protection policy: CloudWatch Logs scans events at ingestion with managed data identifiers such as `EmailAddress` and `CreditCardNumber` and masks matches for all readers. Only principals with the `logs:Unmask` permission can view the original values.
+X: B=KMS key on the log group: encryption protects data at rest, but it never hides parts of a log event. Anyone who can read the log group sees the full values, so developers cannot be given readable logs with the sensitive fields masked.
+C=Deny read APIs: this blocks developers from reading the logs entirely, which breaks the requirement that they keep troubleshooting with them.
+D=Saved query with filters: a saved query is only a convenience. Developers can still open the log stream or write their own query and see every sensitive value in clear text.
+T: Hide sensitive values while keeping logs readable → data protection policy with masking and `logs:Unmask`, not encryption or access denial.
+G: ## Masking sensitive data in CloudWatch Logs
+A **data protection policy** is attached to a log group (or set account-wide). It uses **managed data identifiers**, predefined patterns for things like email addresses, credit card numbers, AWS secret keys or national ID numbers.
+- Matching text in new log events is masked, for example `card=****************`.
+- The original data is kept; a principal with `logs:Unmask` can see it in the console or through `GetLogEvents` with `unmask=true`.
+- The policy can also send audit findings (which identifier matched, how often) to another log group, S3 or Firehose.
+## Why not just encrypt?
+KMS encryption answers "who can read stored data at all". Masking answers "which parts of a record can a reader see". Here both groups need access to the logs, so only masking separates them.
+V: Amazon CloudWatch, AWS IAM
+
+@ SOA-C03 D1 T1.1 applied troubleshooting
+S: An internal reverse proxy process named haproxy on several EC2 instances is occasionally killed by the OS, but the instances keep passing status checks. Traffic is sporadic, so long periods without requests are normal. The team wants an alarm within minutes when the process is not running. What should they do?
+A: Configure the CloudWatch agent procstat plugin to track haproxy and alarm when the process PID count drops below 1
+B: Enable detailed monitoring on the instances and alarm when CPUUtilization falls below 1 percent for five minutes
+C: Create alarms on StatusCheckFailed_Instance for each instance and add an EC2 reboot action when the check fails
+D: Stream the haproxy access log to CloudWatch Logs and alarm when the IncomingLogEvents metric drops to zero
+K: A
+W: procstat plugin: the CloudWatch agent looks up processes by name or pattern and publishes metrics such as `procstat_lookup_pid_count`. An alarm on that metric below 1 fires as soon as the process disappears, independent of traffic.
+X: B=Low CPU alarm: idle periods are normal here, so low CPU also occurs while haproxy runs fine, and CPU from other processes can hide a dead proxy. The metric does not represent the process.
+C=Instance status check: this check tests OS reachability and networking. A single killed process leaves the OS healthy, which is exactly why the checks keep passing.
+D=IncomingLogEvents at zero: with sporadic traffic the access log is often quiet while the proxy is healthy, so the alarm would fire constantly or have to be too slow to be useful.
+T: Watch a specific process with the CloudWatch agent's procstat plugin; hypervisor metrics and status checks cannot see individual processes.
+G: ## What EC2 metrics can and cannot see
+Default EC2 metrics come from the hypervisor: CPU, network, disk I/O and status checks. The hypervisor sees the VM, not the processes inside it.
+## The procstat plugin
+The unified CloudWatch agent runs inside the OS and can collect process-level data. In its config you name a process by `exe`, `pattern` or `pid_file`:
+`"procstat": [{"exe": "haproxy", "measurement": ["pid_count", "cpu_usage", "memory_rss"]}]`
+- `procstat_lookup_pid_count` reports how many matching processes exist.
+- When the process dies the count becomes 0, and an alarm with threshold `< 1` fires on the next evaluation.
+- With the instance ID appended as a dimension, create one alarm per instance to cover the fleet.
+Treat missing data as breaching so the alarm also fires if the agent itself stops reporting.
+V: Amazon CloudWatch, Amazon EC2
+
+@ SOA-C03 D1 T1.2 advanced troubleshooting
+S: An AWS Config rule uses automatic remediation with an AWS Systems Manager Automation runbook to fix noncompliant resources. Evaluations work, but every remediation execution fails with an authorization error on the API call the runbook makes. What should the CloudOps engineer do?
+A: Create an IAM role that trusts ssm.amazonaws.com with the needed permissions and pass its ARN as the AutomationAssumeRole parameter
+B: Attach the permissions the runbook needs to the AWS Config service-linked role that evaluates the rule and triggers remediation
+C: Add the permissions the runbook needs to the instance profile role of every EC2 instance that is managed by Systems Manager
+D: Increase the remediation retry attempts and retry interval so the runbook is re-executed until the API call eventually succeeds
+K: A
+W: AutomationAssumeRole: Automation runbooks make their AWS API calls with the role passed in `AutomationAssumeRole`. That role must trust `ssm.amazonaws.com` and hold the permissions the runbook's steps need, and the remediation configuration maps its ARN into the parameter.
+X: B=Config service-linked role: service-linked roles are managed by AWS and cannot be edited, and the runbook does not run with Config's credentials anyway, so its API calls would still be denied.
+C=Instance profile role: the instance profile is used by the SSM Agent on the instance. Automation steps such as `aws:executeAwsApi` run in the Automation service, not on the instances, so they never use that role.
+D=More retries: an authorization error is deterministic. Retrying the same call with the same missing permission fails every time and only delays the fix.
+T: Config remediation runs as the Automation assume role you supply; fix permissions there, not in Config's own role or the instance profile.
+G: ## How Config remediation runs
+An AWS Config rule only evaluates. When a resource is noncompliant, the remediation configuration starts an **SSM Automation** runbook such as `AWS-EnableS3BucketEncryption` or a custom one.
+## Whose permissions?
+Automation executes each step itself (for example `aws:executeAwsApi` calls an AWS API). It needs credentials, and remediation supplies them through the `AutomationAssumeRole` parameter:
+- The role's trust policy allows `ssm.amazonaws.com` to assume it.
+- Its permissions policy allows exactly what the runbook does, for example `s3:PutEncryptionConfiguration`.
+- The remediation's parameter mapping sets `AutomationAssumeRole` to a static value, the role's ARN.
+If the role is missing or too narrow, the rule keeps flagging the resource and the execution history shows `AccessDenied` on the step's API call.
+V: AWS Config, AWS Systems Manager, AWS IAM
+
+@ SOA-C03 D1 T1.2 advanced troubleshooting
+S: After the security team enabled server-side encryption on an SNS topic using the AWS managed key aws/sns, CloudWatch alarms that publish to the topic still enter ALARM, but no notifications arrive. The alarm history shows the action failed. Subscriptions are confirmed. What is the fix?
+A: Re-encrypt the topic with a customer managed KMS key whose key policy allows cloudwatch.amazonaws.com to use the key
+B: Add cloudwatch.amazonaws.com to the aws/sns key policy so the CloudWatch service principal can call kms:GenerateDataKey
+C: Delete and re-create the email subscriptions so each subscriber confirms the new encrypted delivery path of the topic
+D: Recreate the alarms so their actions use the SNS topic's delivery policy instead of publishing to the topic ARN directly
+K: A
+W: Customer managed key: CloudWatch must be allowed to call `kms:GenerateDataKey*` and `kms:Decrypt` to publish to an encrypted topic. The key policy of an AWS managed key cannot be changed, so the topic needs a customer managed key whose policy grants these actions to `cloudwatch.amazonaws.com`.
+X: B=Edit the aws/sns key policy: AWS managed key policies are owned by AWS and cannot be modified, so this grant cannot be made.
+C=Re-create subscriptions: the failure happens when CloudWatch publishes to the topic, before any delivery to subscribers. Confirmed subscriptions are not the problem and re-confirming changes nothing.
+D=Use the delivery policy: a delivery policy controls retries for HTTP/S endpoints. Alarms always publish to a topic ARN, and the KMS permission problem remains.
+T: Services that publish to encrypted SNS topics (such as CloudWatch alarms) need a customer managed key they are allowed to use; aws/sns cannot be shared with them.
+G: ## Encrypted SNS topics
+With server-side encryption, SNS encrypts each message with a data key from AWS KMS. The **publisher** therefore needs KMS permissions on the topic's key, not only `sns:Publish`.
+## AWS managed vs customer managed keys
+- **AWS managed key** (`alias/aws/sns`): free and automatic, but its key policy is fixed. It only allows principals in your account that use SNS on their own behalf.
+- **Customer managed key**: you write the key policy, so you can allow AWS service principals.
+Key policy statement for CloudWatch alarms:
+`{"Effect":"Allow","Principal":{"Service":"cloudwatch.amazonaws.com"},"Action":["kms:Decrypt","kms:GenerateDataKey*"],"Resource":"*"}`
+The same pattern applies to EventBridge, S3 event notifications and other services that publish to encrypted topics.
+V: Amazon SNS, AWS KMS, Amazon CloudWatch
+
+@ SOA-C03 D1 T1.2 applied troubleshooting
+S: New EC2 instances in a private subnet do not appear as managed nodes in Systems Manager, so Run Command and Session Manager cannot reach them. The AMI includes a current SSM Agent, and the account does not use Default Host Management Configuration. Which TWO causes should the engineer check? (Select TWO)
+A: The instance profile does not include the AmazonSSMManagedInstanceCore managed policy
+B: The subnet has no NAT gateway route and no interface endpoints for ssm, ssmmessages, and ec2messages
+C: The security group does not allow inbound TCP 22 from the Systems Manager service IP ranges
+D: The instances were launched without an EC2 key pair, so the agent cannot sign its registration
+E: The security group does not allow inbound TCP 443 from the Systems Manager service endpoints
+K: A,B
+W: A=Instance profile permissions: the SSM Agent registers with Systems Manager using the instance profile credentials, which need `AmazonSSMManagedInstanceCore` when Default Host Management Configuration is not used.
+B=Outbound path from the private subnet: the agent must reach the service endpoints over outbound HTTPS, through a NAT gateway or through interface VPC endpoints for `ssm`, `ssmmessages` and `ec2messages`.
+X: C=Inbound SSH rule: Systems Manager does not use SSH. The agent opens outbound connections, so no inbound port is needed at all.
+D=Missing key pair: key pairs are only for SSH or RDP logins. The agent authenticates with the instance profile's IAM credentials, not a key pair.
+E=Inbound HTTPS rule: the connection is initiated outbound by the agent; security groups are stateful, so return traffic is allowed without any inbound rule.
+T: A node becomes managed when the agent has IAM permissions and an outbound path to the SSM endpoints; inbound ports and key pairs play no role.
+G: ## How a node becomes "managed"
+The SSM Agent on the instance calls the Systems Manager service outbound over HTTPS (port 443). Three things must be true:
+- **Agent** installed and running (true here).
+- **Credentials**: normally an instance profile role with the managed policy `AmazonSSMManagedInstanceCore`. (Default Host Management Configuration can supply them instead, but it is not enabled here.)
+- **Network path** to the endpoints `ssm.<region>.amazonaws.com`, `ssmmessages...` and `ec2messages...`.
+## Private subnets
+A private subnet has no internet gateway route. The path must come from:
+- a NAT gateway route `0.0.0.0/0 → nat-...`, or
+- interface VPC endpoints for the three services, with private DNS enabled and a security group on the endpoints allowing 443 from the instances.
+Nothing needs to reach the instance inbound, which is why Session Manager works without open ports.
+V: AWS Systems Manager, Amazon VPC, AWS IAM
+
+@ SOA-C03 D1 T1.3 advanced troubleshooting
+S: During a disaster recovery drill, EBS volumes for a database are created from snapshots. For the first hour the database shows extremely high read latency, then performance becomes normal. The runbook requires full volume performance as soon as the restored instances start. What should the team do?
+A: Enable EBS fast snapshot restore on the snapshots in the Availability Zones where the recovery volumes will be created
+B: Restore the volumes as io2 with much higher provisioned IOPS than production so reads have enough headroom right away
+C: Register the snapshots as an AMI and launch the database instances from it so the volumes are created during instance launch
+D: Choose a larger instance type with more dedicated EBS bandwidth so reads from the new volumes are not limited by the instance
+K: A
+W: Fast snapshot restore: volumes created from a snapshot normally load blocks lazily from Amazon S3 on first access. With fast snapshot restore enabled for a snapshot in an AZ, volumes created there are fully initialized at creation and deliver full performance immediately.
+X: B=Higher provisioned IOPS: the delay comes from fetching each block from S3 on first read, not from the IOPS limit. Extra IOPS do not remove the first-read penalty.
+C=Launch from an AMI: an AMI is backed by the same EBS snapshots, so its volumes are also initialized lazily and show the same first-read latency.
+D=Larger instance type: the instance was not the bottleneck; performance becomes normal later on the same instance once blocks are loaded, which points to volume initialization.
+T: Slow first reads on restored volumes come from lazy loading; fast snapshot restore (or pre-reading every block) removes it, more IOPS or bigger instances do not.
+G: ## How a volume is restored from a snapshot
+Snapshots live in Amazon S3. When you create an EBS volume from one, the volume is usable at once, but its blocks are pulled from S3 **the first time they are read**. That first access can be much slower than normal, which is called volume initialization.
+## Ways to avoid the penalty
+- **Fast snapshot restore (FSR)**: enabled per snapshot and per Availability Zone. Volumes created from it in those AZs are fully initialized at creation. Billed per snapshot-AZ hour, so enable it before drills or for critical DR snapshots.
+- **Pre-warm by reading everything**: run `fio` or `dd` over the whole device after restore. It works without extra cost but takes time proportional to the volume size.
+Example: a 2 TiB database volume restored normally might take hours to warm under load; with FSR on `snap-0abc` in `us-east-1a`, the volume created in `us-east-1a` performs fully from its first read.
+V: Amazon EBS, Amazon EC2
+
+@ SOA-C03 D1 T1.3 applied tradeoff
+S: A CPU-bound image-processing Lambda function is configured with 512 MB of memory and takes about 8 seconds per invocation. CloudWatch shows it uses only 180 MB of memory, so a teammate proposes reducing memory to save cost. What should the CloudOps engineer recommend?
+A: Test higher memory settings, because Lambda assigns CPU in proportion to memory and shorter runs can cost less
+B: Reduce the memory to 256 MB, because billed cost scales with configured memory and the extra memory is unused
+C: Configure provisioned concurrency for the function, because it gives each execution environment dedicated CPU
+D: Increase the function timeout, because the 8-second duration shows the function is close to hitting its limit
+K: A
+W: Raise memory to get CPU: Lambda allocates CPU power proportionally to the memory setting (about one full vCPU at 1,769 MB, up to 6 vCPUs at 10,240 MB). A CPU-bound function often finishes several times faster with more memory, and because cost is memory x duration, the total can stay the same or drop.
+X: B=Reduce to 256 MB: it halves the CPU share too, so a CPU-bound function runs roughly twice as long. Cost per invocation barely changes while latency gets worse.
+C=Provisioned concurrency: it keeps environments initialized to avoid cold starts. It does not give an invocation more CPU than its memory setting allows.
+D=Longer timeout: nothing indicates timeouts are occurring, and a longer limit does not make the code run faster.
+T: For CPU-bound Lambda functions memory is the CPU dial; tune it by measuring duration and cost, not by memory used.
+G: ## Memory is the only compute knob in Lambda
+You set memory from 128 MB to 10,240 MB. CPU and network bandwidth are assigned in proportion:
+- About 1,769 MB equals one vCPU.
+- 10,240 MB gives up to 6 vCPUs (useful only if the code is multithreaded).
+## Cost is memory x time
+Lambda bills GB-seconds. Example for this function:
+- 512 MB x 8 s = 4 GB-s
+- 1,536 MB x 2.5 s = 3.75 GB-s: faster **and** slightly cheaper.
+- 256 MB x 16 s = 4 GB-s: same cost, twice as slow.
+## How to choose
+Run the function at several memory sizes and compare duration and cost. AWS Lambda Power Tuning automates this, and AWS Compute Optimizer gives memory recommendations from real invocations. The "Max Memory Used" value in the logs only tells you the floor, not the best setting.
+V: AWS Lambda, Amazon CloudWatch
+
+@ SOA-C03 D1 T1.3 advanced troubleshooting
+S: A database on an m5.large instance uses an io2 volume provisioned for 40,000 IOPS, but under load it never gets close. CloudWatch shows the instance's EBSIOBalance% draining to zero and volume IOPS then settling far below the provisioned value. What should the CloudOps engineer do?
+A: Move to an instance type whose EBS-optimized IOPS and bandwidth limits meet or exceed the volume's provisioned performance
+B: Modify the io2 volume to raise its provisioned IOPS further so that it can push more operations through the same instance
+C: Stripe two io2 volumes in RAID 0 on the same instance so that the operating system can spread its I/O across both volumes
+D: Turn on the EBS-optimized attribute for the instance so that storage traffic gets its own dedicated network bandwidth
+K: A
+W: Bigger EBS limit on the instance: every instance type has its own maximum EBS IOPS and throughput. Smaller sizes can burst above a low baseline only while their EBS I/O credits (`EBSIOBalance%`) last. Once the balance is empty the instance, not the volume, caps performance, so the fix is an instance type with higher sustained EBS limits.
+X: B=Raise volume IOPS: the volume is already provisioned above what the instance can deliver. More volume IOPS cannot pass through an instance-level cap.
+C=RAID 0 across two volumes: striping helps when a single volume is the limit. Both volumes share the same instance EBS limit, so the total stays capped.
+D=Enable EBS-optimized: current-generation types like m5 are EBS-optimized by default. The attribute is already in effect, and the limit being hit is the size of that dedicated bandwidth.
+T: EBS performance is the lower of the volume's and the instance's limits; a draining EBSIOBalance% means resize the instance, not the volume.
+G: ## Two limits on every EBS I/O
+Each I/O must fit within both:
+- the **volume** limit (for example provisioned io2 IOPS), and
+- the **instance** EBS limit, which depends on instance type and size.
+## Burst EBS performance on smaller instances
+Many smaller sizes list EBS performance as "up to" a value. They have a lower **baseline** and can burst above it for a limited time (around 30 minutes per day) using credits. CloudWatch exposes the credits as `EBSIOBalance%` (IOPS) and `EBSByteBalance%` (throughput).
+Example: the volume allows 40,000 IOPS, but a small instance's baseline is a few thousand IOPS. When `EBSIOBalance%` reaches 0 the volume metrics flatten at the instance baseline.
+## What to do
+Compare the instance type's documented EBS baseline IOPS and throughput with the volume's needs and pick a size or family that meets them in sustained operation.
+V: Amazon EBS, Amazon EC2, Amazon CloudWatch
+
+@ SOA-C03 D1 T1.3 advanced troubleshooting
+S: A provisioned-capacity DynamoDB table uses event_date as its partition key. Writes for the current day are throttled even though the table's consumed WCU is far below provisioned WCU. The team wants to confirm the cause and fix it for the long term. Which TWO actions should they take? (Select TWO)
+A: Enable CloudWatch Contributor Insights for DynamoDB on the table to identify the most throttled partition keys
+B: Redesign the key with a higher-cardinality partition key or add a calculated suffix to spread writes across partitions
+C: Double the table's provisioned WCU so that each partition receives a larger share of the total write capacity
+D: Put DynamoDB Accelerator (DAX) in front of the table so that the write traffic for the current day is absorbed
+E: Add a global secondary index keyed on event_date so the writes for the current day are divided between table and index
+K: A,B
+W: A=Contributor Insights for DynamoDB: it ranks the most accessed and most throttled partition keys, confirming that one date value receives nearly all of the day's writes.
+B=Higher-cardinality key or write sharding: a key with more distinct values, or a suffix such as `2026-09-29#7`, spreads the writes across many partitions and removes the hot key.
+X: C=Double provisioned WCU: a single partition still cannot exceed about 1,000 WCU. When all writes target one key, raising the table total leaves that partition's limit unchanged.
+D=Add DAX: DAX caches reads. Writes go through DAX to the table (write-through), so the hot-partition writes still hit the same partition.
+E=GSI on event_date: the index has the same hot key, and writes to the table must also be written to the index. A throttled GSI adds back-pressure instead of relieving it.
+T: Throttling with spare table capacity means a hot partition key; find it with Contributor Insights and fix the key design, not the capacity.
+G: ## Partitions and their limits
+DynamoDB stores items in partitions chosen by hashing the partition key. Each partition supports up to **3,000 RCU and 1,000 WCU**. Adaptive capacity shifts unused capacity toward busy partitions, but it cannot fully absorb traffic that is concentrated on one partition key value.
+## The hot-key pattern
+With `event_date` as the key, every write of the day has the same key, so all writes land on one partition. The table total looks fine, yet requests are throttled.
+## Diagnose and fix
+- **Contributor Insights for DynamoDB**: ranks keys by traffic and by throttled requests.
+- **Write sharding**: append a random or calculated suffix, `event_date#0` ... `event_date#9`, and query all suffixes when reading a day.
+- **Better key**: use a high-cardinality attribute such as `device_id` and keep the date as the sort key.
+V: Amazon DynamoDB, Amazon CloudWatch
+
+@ SOA-C03 D2 T2.1 applied tradeoff
+S: Instances in an Auto Scaling group need about 12 minutes after launch to load application data before they can serve traffic. Traffic spikes are unpredictable. The team wants new capacity in service within about a minute of a scale-out, while paying as little as possible for pre-initialized capacity that is waiting. Which solution fits best?
+A: Add a warm pool to the Auto Scaling group with the pool state set to Stopped and use a lifecycle hook to initialize instances
+B: Add a warm pool to the Auto Scaling group with the pool state set to Running so initialized instances can join immediately
+C: Raise the group's minimum capacity to cover the largest expected spike so that initialized instances are always in service
+D: Enable predictive scaling on the group in forecast-and-scale mode so that instances are launched ahead of each spike
+K: A
+W: Warm pool in Stopped state: instances are launched, fully initialized once by a lifecycle hook, then stopped. While stopped you pay only for EBS volumes and attached Elastic IPs; on scale-out they start in seconds with the application data already loaded.
+X: B=Warm pool in Running state: it gives the fastest join, but you pay full instance-hours for every waiting instance, which is not the lowest cost for idle capacity.
+C=Higher minimum capacity: the extra instances run and serve traffic all the time, costing full price around the clock just to cover rare spikes.
+D=Predictive scaling: it forecasts from recurring daily or weekly patterns. Unpredictable spikes have no pattern to learn, so instances would still launch late.
+T: Long boot plus unpredictable spikes → warm pool; Stopped state keeps pre-initialized capacity cheap, Running state is faster but pays for compute.
+G: ## What a warm pool is
+A **warm pool** is a set of pre-initialized EC2 instances kept next to an Auto Scaling group. On scale-out, the group takes instances from the warm pool instead of launching fresh ones, skipping the slow boot and application setup.
+## Pool states and cost
+- **Running**: instances run but receive no traffic. Fastest, full compute cost.
+- **Stopped**: instances are stopped after initialization. You pay only for storage (EBS) and Elastic IPs. Starting takes seconds to a minute.
+- **Hibernated**: memory is saved to EBS, useful when in-memory state is expensive to rebuild.
+## How initialization works
+A lifecycle hook on the warm pool launch runs your setup (download data, warm caches), then completes the hook and the instance moves to its pool state. Example: `MinSize=4`, warm pool `MinSize=6`, state `Stopped`; a spike moves up to six ready instances into service within about a minute.
+V: Amazon EC2 Auto Scaling, Amazon EC2
+
+@ SOA-C03 D2 T2.1 applied comparison
+S: An API fleet behind an ALB is limited by calls to a downstream service, not by CPU. Load tests show each instance handles about 500 requests per minute before latency rises, while CPU stays under 30%. A CPU-based target tracking policy therefore never scales out. Which policy fits best?
+A: Target tracking on ALBRequestCountPerTarget with a target value somewhat below 500 requests per target
+B: Target tracking on average CPUUtilization with the target value lowered from 50 percent to 20 percent
+C: Step scaling on the NetworkIn metric of the group, adding instances as inbound bytes cross set thresholds
+D: Scheduled scaling that adds instances during business hours and removes them in the evening each weekday
+K: A
+W: ALBRequestCountPerTarget: this predefined metric divides the target group's request count by the number of healthy targets, which is exactly the per-instance limit found in testing. Target tracking adds instances when the per-target count rises toward the target and removes them when it falls.
+X: B=Lower CPU target: CPU is only loosely related to this workload's real bottleneck, so a 20% target scales at the wrong times, too early at some loads and too late at others.
+C=Step scaling on NetworkIn: inbound bytes depend on request size, not on request count, and step thresholds must be tuned by hand. It tracks the real limit poorly.
+D=Scheduled scaling: it follows the clock, not demand, so load outside the expected pattern still overloads the fleet.
+T: Scale on the metric that represents the bottleneck; for request-bound web fleets that is requests per target, not CPU.
+G: ## Choosing a scaling metric
+Target tracking keeps one metric near a target value. It only works well when the metric grows in proportion to load **and** reflects what actually saturates the instance.
+## Request-bound workloads
+Some services spend their time waiting on a database or downstream API. Their CPU stays low while latency climbs, so CPU never tells Auto Scaling that more capacity is needed.
+## ALBRequestCountPerTarget
+- Predefined metric for EC2 Auto Scaling target tracking, tied to one ALB target group.
+- Value = requests to the target group per minute divided by healthy targets.
+- Example: capacity found in testing is 500 per instance; set the target to about 400 to keep headroom. At 4,000 requests per minute the group aims for 10 instances.
+Other load-proportional choices are SQS backlog per instance for queue workers or a custom metric such as active connections.
+V: Amazon EC2 Auto Scaling, Elastic Load Balancing
+
+@ SOA-C03 D2 T2.1 advanced troubleshooting
+S: An ECS service on EC2 container instances uses service auto scaling. During peaks the desired task count rises, but new tasks stay unplaced with events reporting insufficient memory. The cluster's Auto Scaling group scales only on average instance CPU, which stays low. What should the CloudOps engineer do?
+A: Create an Auto Scaling group capacity provider with managed scaling and use it in the service's capacity provider strategy
+B: Add a target tracking policy on the cluster's CPUReservation metric so the Auto Scaling group grows as CPU is reserved
+C: Change the service's task placement strategy to binpack on memory so that tasks fill the existing instances more tightly
+D: Raise the maximum task count in the service auto scaling policy so the service can request more tasks during the peaks
+K: A
+W: Capacity provider with managed scaling: ECS computes the `CapacityProviderReservation` metric from the CPU and memory that tasks need, including tasks waiting for placement, and scales the Auto Scaling group to fit them. Unplaced tasks then trigger new instances automatically.
+X: B=Scale on CPUReservation: the tasks are blocked by memory, not CPU. Reserved CPU can stay low while memory is exhausted, so the group still does not grow.
+C=Binpack on memory: binpacking only changes where tasks go on existing instances. When memory across the cluster is already insufficient, no placement strategy can create room.
+D=Raise maximum task count: the service already asks for more tasks; the problem is where to run them. A higher ceiling just adds more unplaced tasks.
+T: For ECS on EC2, let a capacity provider with managed scaling grow the instances from task needs; instance CPU or a single reservation metric misses memory-bound shortfalls.
+G: ## Two layers of scaling in ECS on EC2
+- **Service auto scaling** changes how many **tasks** a service wants (Application Auto Scaling).
+- **Cluster capacity** is the EC2 instances in an Auto Scaling group. If tasks need more CPU or memory than free capacity, they cannot be placed.
+Scaling the group on instance CPU utilization ignores memory and ignores tasks that are still waiting.
+## Capacity providers with managed scaling
+An **Auto Scaling group capacity provider** links the group to the cluster. With managed scaling on, ECS publishes `CapacityProviderReservation` (capacity needed / capacity available x 100) and creates a target tracking policy on it.
+- Target 100 means "no spare instances"; a lower target such as 90 keeps headroom.
+- Waiting tasks raise the metric above target, so instances launch until the tasks fit.
+The service uses it through `capacityProviderStrategy: [{"capacityProvider": "cp-web", "weight": 1}]`.
+V: Amazon ECS, Amazon EC2 Auto Scaling
+
+@ SOA-C03 D2 T2.1 applied use-case
+S: A latency-sensitive Lambda function behind API Gateway has multi-second cold starts because of heavy initialization. Every weekday traffic jumps sharply at 08:00 and stays high until 18:00, and is low at night. The team wants requests during business hours to avoid initialization delays without paying for idle warm capacity at night. What should they configure?
+A: Provisioned concurrency on a function alias, adjusted by Application Auto Scaling scheduled actions before 08:00 and after 18:00
+B: Reserved concurrency on the function, adjusted by an EventBridge Scheduler job before 08:00 and after 18:00 every weekday
+C: An EventBridge rule that invokes the function every five minutes during business hours to keep its execution environments warm
+D: A larger memory setting and a longer timeout during business hours, applied and reverted by an EventBridge Scheduler job
+K: A
+W: Scheduled provisioned concurrency: provisioned concurrency keeps a set number of execution environments initialized before requests arrive. Application Auto Scaling scheduled actions on the alias raise it just before 08:00 and lower it after 18:00, so you pay for warm environments only during business hours.
+X: B=Reserved concurrency: it reserves and caps how many concurrent executions the function may use, but it does not pre-initialize any environment, so cold starts remain.
+C=Ping every five minutes: a ping keeps roughly one environment warm. A sharp surge needs many concurrent environments, and each new one still pays the initialization cost.
+D=Bigger memory and timeout: more memory can shorten initialization somewhat, but new environments still initialize on first request, and a timeout change has no effect on startup.
+T: Pre-initialized capacity on a schedule → provisioned concurrency with scheduled scaling; reserved concurrency only caps, and pings only keep one environment warm.
+G: ## Cold starts
+When Lambda needs a new execution environment it downloads the code and runs the initialization code (imports, SDK clients, model loading) before the handler. That delay is the cold start.
+## Reserved vs provisioned concurrency
+- **Reserved concurrency**: guarantees and limits the number of concurrent executions a function can use. No environment is created in advance.
+- **Provisioned concurrency**: Lambda creates and initializes N environments ahead of time on a published version or alias. Requests up to N run without init delay. You pay per hour while it is configured.
+## Scheduling it
+Provisioned concurrency is a scalable target in Application Auto Scaling (`lambda:function:ProvisionedConcurrency`). Example:
+- `cron(45 7 ? * MON-FRI *)`: set min capacity to 200.
+- `cron(0 18 ? * MON-FRI *)`: set it back to a small night-time value.
+A target tracking policy on utilization can be added for traffic above the scheduled level.
+V: AWS Lambda, AWS Application Auto Scaling
+
+@ SOA-C03 D2 T2.1 advanced use-case
+S: A fault-tolerant batch fleet runs on Spot Instances in an Auto Scaling group. It currently uses one instance type with the lowest-price allocation strategy and loses many instances at once during interruptions. Which TWO changes improve availability of Spot capacity? (Select TWO)
+A: Allow many suitable instance types and use the price-capacity-optimized allocation strategy
+B: Enable Capacity Rebalancing so replacements launch when instances receive a rebalance recommendation
+C: Keep the single instance type but set a low maximum Spot price to avoid the most contested capacity
+D: Restrict the group to one Availability Zone so that all Spot requests draw from the same capacity pool
+E: Switch the allocation strategy to lowest-price and set the number of pools to use for Spot to only one
+K: A,B
+W: A=Diversify with price-capacity-optimized: many instance types across several AZs give many Spot capacity pools, and this strategy picks pools with deep capacity at a low price.
+B=Capacity Rebalancing: when an instance receives a rebalance recommendation, the group launches a replacement first, often before the two-minute interruption notice arrives.
+X: C=Low maximum price: Spot prices move gradually with long-term supply and demand, and interruptions are mainly driven by capacity. A low max price can also make requests fail or be interrupted more, while one type still means one pool.
+D=Single Availability Zone: fewer AZs means fewer capacity pools. When that one pool is reclaimed the whole fleet is hit at once, the opposite of the goal.
+E=Lowest-price from one pool: this concentrates the whole fleet in the cheapest pool, which is often the most contested, so one reclaim event interrupts most instances.
+T: Spot availability comes from many capacity pools plus proactive replacement; price-capacity-optimized with instance diversity and Capacity Rebalancing beats cheapest-single-pool.
+G: ## Spot capacity pools
+A **Spot capacity pool** is one instance type in one Availability Zone. AWS reclaims Spot capacity pool by pool. A fleet in a single pool is interrupted all at once; a fleet spread over many pools loses only a slice.
+## Allocation strategies in a mixed instances policy
+- `lowest-price`: fills the cheapest pools; highest interruption risk.
+- `capacity-optimized`: pools with the most available capacity.
+- `price-capacity-optimized` (recommended): deep pools that are also low priced.
+Diversify with a list of types or with attribute-based selection, for example "4-8 vCPU, 16-32 GiB, current generation".
+## Capacity Rebalancing
+EC2 sends a **rebalance recommendation** when an instance is at elevated risk, often before the two-minute interruption notice. With Capacity Rebalancing on, the group launches a replacement first, then terminates the at-risk instance after the new one is running.
+V: Amazon EC2 Auto Scaling, Amazon EC2
+
+@ SOA-C03 D2 T2.2 advanced troubleshooting
+S: An application behind an ALB runs in three Availability Zones. Instances in one AZ start returning slow, partial responses while still passing health checks, a gray failure. The team wants to move traffic away from that AZ for the load balancer within minutes, without changing infrastructure, and move it back easily later. What should they do?
+A: Start a zonal shift in Amazon Application Recovery Controller for the load balancer away from the impaired AZ
+B: Turn off cross-zone load balancing on the target group so that the other zones no longer send traffic to that zone
+C: Change the Route 53 record to a failover policy that points to a standby stack running in another AWS Region
+D: Tighten the target group health check thresholds so the ALB marks the slow instances in that zone as unhealthy
+K: A
+W: Zonal shift: Application Recovery Controller temporarily moves traffic for a supported resource such as an ALB away from one Availability Zone. It needs no infrastructure change, takes effect within minutes, expires after the duration you set, and can be cancelled to bring the AZ back.
+X: B=Disable cross-zone load balancing: without cross-zone, each load balancer node sends only to targets in its own zone, so the impaired zone's node would send all its share to the slow instances. It does not remove the zone from service.
+C=Cross-Region DNS failover: moving the whole application to another Region is far bigger than needed for one bad AZ, depends on a standby stack, and the two healthy AZs would be abandoned.
+D=Stricter health checks: in a gray failure the health check path keeps passing. Guessing thresholds during an incident is slow, can mark healthy targets unhealthy, and is not quickly reversible.
+T: One impaired AZ behind a load balancer → zonal shift; it is fast, temporary and reversible, unlike health check tuning or Regional failover.
+G: ## Gray failures
+A **gray failure** is partial: instances are up and health checks pass, yet real requests are slow or fail. Automatic health checks often cannot detect it, so operators need a quick manual lever.
+## Zonal shift
+Amazon Application Recovery Controller (ARC) offers **zonal shift** for supported resources, including Application Load Balancers and Network Load Balancers.
+- You pick the resource, the AZ to move away from, and an expiry (up to several days, extendable).
+- The load balancer stops routing traffic to that AZ; the remaining AZs take the load, so plan capacity for losing one AZ.
+- Cancelling or letting the shift expire returns traffic to the AZ.
+**Zonal autoshift** lets AWS start such a shift automatically when it detects an AZ impairment, with regular practice runs to prove that the application can handle it.
+V: Amazon Application Recovery Controller, Elastic Load Balancing
+
+@ SOA-C03 D2 T2.2 advanced comparison
+S: A company uses an Aurora global database with its primary cluster in us-east-1 and a secondary cluster in eu-west-1. For a planned quarterly exercise, the team must make eu-west-1 the primary with no data loss and keep the global database replication topology intact. Which action fits?
+A: Run a global database switchover to promote the eu-west-1 cluster to primary
+B: Run a global database failover with the allow data loss option selected for it
+C: Detach the eu-west-1 cluster from the global database and then promote it alone
+D: Restore a cross-Region snapshot copy in eu-west-1 and point applications to it
+K: A
+W: Switchover: designed for planned operations on a healthy global database. Aurora waits until the chosen secondary is fully synchronized before changing roles, so no committed data is lost (RPO 0), and the old primary becomes a secondary in the same global topology.
+X: B=Failover with data loss allowed: it is meant for an unplanned Regional outage. It promotes the secondary without waiting for synchronization, so recent transactions can be lost, which the planned exercise must avoid.
+C=Detach and promote: removing the secondary from the global database breaks replication. The promoted cluster stands alone and the global topology must be rebuilt afterward.
+D=Restore a snapshot copy: a snapshot is a point-in-time copy, so every change after it is lost, and restoring a new cluster takes much longer than a role change.
+T: Planned Region rotation with RPO 0 → switchover; failover is for outages and may lose data, detaching breaks the topology.
+G: ## Aurora global database
+One **primary** cluster in a Region accepts writes; up to several **secondary** clusters in other Regions receive storage-level replication, typically with under one second of lag.
+## Two ways to change the primary
+- **Switchover** (formerly "managed planned failover"): for healthy clusters and planned events such as Region rotation or DR drills. Aurora stops writes, waits until the secondary has caught up, then swaps roles. RPO is 0 and the replication topology is preserved.
+- **Failover**: for when the primary Region is impaired. The chosen secondary is promoted without waiting, so a small amount of recent data may be lost (RPO is the replication lag), in exchange for the fastest recovery.
+- **Detach and promote**: turns a secondary into an independent cluster; replication stops for it.
+After either role change, applications must use the new writer endpoint, or a global writer endpoint that follows the primary.
+V: Amazon Aurora
+
+@ SOA-C03 D2 T2.2 advanced use-case
+S: A primary site depends on three independently monitored endpoints: web, API, and payments. Route 53 failover should send users to a secondary site only when at least two of the three endpoints are unhealthy, not when a single one fails. How should the health check for the primary failover record be built?
+A: Create a calculated health check with the three endpoint checks as children that is healthy when at least two are healthy
+B: Associate all three endpoint health checks directly with the primary failover record so Route 53 counts the failures
+C: Replace the failover records with multivalue answer records that list each of the three endpoints with its own check
+D: Enable Evaluate Target Health on the primary record so Route 53 averages the health of the three endpoints behind it
+K: A
+W: Calculated health check: it combines the status of child health checks with a rule such as "healthy if at least 2 of 3 children are healthy". Associating it with the primary record makes failover happen only when two or more endpoints are down.
+X: B=Three checks on one record: a Route 53 record accepts only one health check ID, so there is no built-in counting across several checks attached to one record.
+C=Multivalue answer records: they return several healthy IP addresses for load spreading. They do not model primary/secondary sites or a two-of-three failure rule.
+D=Evaluate Target Health: it applies to alias records and inherits the health of the alias target, such as a load balancer. It cannot combine three separate endpoints with a threshold.
+T: To fail over on a combination of conditions use a calculated health check with a child threshold; a record can carry only one health check.
+G: ## Route 53 health check types
+- **Endpoint** checks call an IP or domain name over HTTP, HTTPS or TCP.
+- **CloudWatch alarm** checks follow the state of an alarm.
+- **Calculated** checks monitor other health checks (children).
+## Calculated health checks
+You choose up to 256 child checks and a rule:
+- healthy if **all** children are healthy,
+- healthy if **at least one** is healthy, or
+- healthy if **at least N** are healthy.
+Example: children `hc-web`, `hc-api`, `hc-pay`, rule "at least 2 healthy". One failure leaves the parent healthy; a second failure makes it unhealthy.
+## Using it with failover routing
+Each record can reference one health check. Attach the calculated check to the `PRIMARY` failover record. When the parent is unhealthy, Route 53 answers with the `SECONDARY` record. The children do not need to be associated with any record.
+V: Amazon Route 53
+
+@ SOA-C03 D2 T2.3 applied tradeoff
+S: A company keeps month-end EBS snapshots for seven years for compliance. They are almost never restored, and a restore that takes up to three days is acceptable. Daily snapshots are kept for only 14 days. How can the company reduce storage cost for the month-end snapshots the most?
+A: Move the month-end snapshots to the EBS Snapshots Archive tier with a Data Lifecycle Manager archiving rule
+B: Export the month-end snapshots to an S3 bucket and add a lifecycle rule that moves them to Glacier Deep Archive
+C: Keep the month-end snapshots in the standard tier and delete all earlier snapshots so that only changes are stored
+D: Create an AMI from each month-end snapshot and deregister it so that only the underlying snapshot storage remains
+K: A
+W: EBS Snapshots Archive: an archived snapshot is stored as a full copy in a low-cost tier (up to about 75% cheaper than standard). It suits snapshots kept 90 days or longer and rarely restored; restoring takes up to 72 hours, which fits the three-day allowance. Data Lifecycle Manager can archive snapshots automatically.
+X: B=Export to S3 Glacier: EBS snapshots are stored by AWS in a service-managed location. There is no feature to export a snapshot as objects into your own bucket for S3 lifecycle rules.
+C=Standard tier only: standard snapshots are incremental, but each one still references the blocks it needs, so deleting older ones saves little. The seven-year data stays at the standard storage price.
+D=AMI then deregister: an AMI adds no storage of its own; deregistering it leaves the same snapshots in the standard tier at the same price.
+T: Long-term, rarely restored EBS snapshots → Snapshots Archive tier; it is full-copy, cheaper, 90-day minimum, restore up to 72 hours.
+G: ## Snapshot tiers
+- **Standard**: incremental snapshots, instant restore, higher price per GB-month.
+- **Archive**: a full snapshot copy in a cheaper tier. Minimum retention 90 days (deleting earlier is charged for 90 days), restore to standard takes up to 72 hours before a volume can be created.
+## When archive pays off
+Incremental standard snapshots are cheap when there are many close copies. For one snapshot per month kept for years, each archived copy is full but billed at a much lower rate, which usually wins.
+Example: a 500 GiB month-end snapshot kept for 84 months, restored perhaps once for an audit with a few days' notice.
+## Automating it
+Amazon Data Lifecycle Manager policies can create snapshots on a schedule and include an **archiving rule** for a monthly schedule, so snapshots that leave the standard tier move to the archive tier and are kept there for 7 years. Restores use `RestoreSnapshotTier`.
+V: Amazon EBS, Amazon Data Lifecycle Manager
+
+@ SOA-C03 D2 T2.3 applied troubleshooting
+S: A team adds a Cross-Region Replication rule to an existing versioned S3 bucket holding 40 million objects. New uploads replicate, but the objects that existed before the rule do not. The copies must keep their version IDs and metadata, and the team needs a completion report. What should the engineer do?
+A: Run an S3 Batch Replication job for the existing objects using the replication configuration and enable its completion report
+B: Enable S3 Replication Time Control on the replication rule so that all objects are copied within its 15-minute window
+C: Run aws s3 sync from the source bucket to the destination bucket on a large EC2 instance until the copy has finished
+D: Enable delete marker replication and replica modification sync on the rule so earlier objects are included in the scope
+K: A
+W: S3 Batch Replication: it replicates objects that existed before the rule was added, objects that previously failed, or objects that were already replicated to another destination. It uses the replication configuration, keeps version IDs and metadata like live replication, and writes a completion report.
+X: B=Replication Time Control: it adds a 15-minute SLA and metrics for newly written objects only. It does not reach back to objects uploaded before the rule existed.
+C=aws s3 sync: sync uploads copies as new objects, so the destination gets new version IDs and new timestamps, and there is no replication status or completion report.
+D=Delete marker and replica modification sync: these control which kinds of changes replicate going forward. Neither adds existing objects to replication.
+T: Live replication covers only new writes; existing objects need S3 Batch Replication, not RTC or manual copying.
+G: ## What live replication covers
+Same-Region and Cross-Region Replication copy objects written **after** the replication rule is in place. Objects already in the bucket keep the replication status they had (usually none) and are not copied.
+## S3 Batch Replication
+Batch Replication is an S3 Batch Operations job type that replicates:
+- existing objects added before the rule,
+- objects with status `FAILED`,
+- objects already replicated, to a new destination.
+It uses the bucket's replication configuration and IAM role, so replicas keep the **same version IDs**, metadata and object lock settings as with live replication. S3 can generate the manifest for you, and the job writes a completion report to a bucket you choose.
+Example: create the job in the console right after saving the new rule ("replicate existing objects: yes"), with the report sent to `s3://ops-reports/replication/`.
+V: Amazon S3
+
+@ SOA-C03 D2 T2.3 advanced use-case
+S: A team restores a DynamoDB table with point-in-time recovery to a new table after a bad deployment, then points the application at it. Some settings of the source table do not carry over to the restored table automatically. Which TWO settings must the team configure again on the restored table? (Select TWO)
+A: The auto scaling policies for read and write capacity
+B: The time to live (TTL) setting for automatic item expiry
+C: The global secondary indexes defined on the source table
+D: The items as they existed at the chosen restore time
+E: The billing mode and provisioned capacity of the source
+K: A,B
+W: A=Auto scaling policies: a restored table is a new table, and its Application Auto Scaling policies for read and write capacity are not copied, so they must be set up again.
+B=Time to live: the TTL setting is not carried over to the restored table, so automatic item expiry must be enabled again, like streams, alarms, tags and IAM policies.
+X: C=Global secondary indexes: GSIs and LSIs are restored with the table by default (you may choose to exclude GSIs), so they do not have to be recreated by hand.
+D=Item data: restoring the items as of the chosen point in time is exactly what point-in-time recovery does. The data is already in the restored table.
+E=Billing mode and capacity: the restored table takes the source's billing mode and provisioned capacity values (they can be overridden at restore), so nothing needs to be reapplied.
+T: A PITR restore brings back data, indexes and capacity; operational settings like auto scaling, TTL, streams, alarms, tags and PITR itself must be reconfigured.
+G: ## Restores always create a new table
+DynamoDB point-in-time recovery (PITR) and on-demand backups restore to a **new table name**. The application or an alias in configuration must be switched to it.
+## What comes across
+- All items as of the restore time.
+- Local and global secondary indexes (GSIs can be excluded).
+- Billing mode and provisioned read/write capacity.
+- Encryption, with an option to pick a different key.
+## What you must set again
+- Auto scaling policies (Application Auto Scaling)
+- Time to live (TTL)
+- DynamoDB Streams
+- IAM policies that reference the table ARN
+- CloudWatch alarms and tags
+- PITR itself
+Runbook tip: keep these in infrastructure as code so a restored table gets them in one deploy.
+V: Amazon DynamoDB
+
+@ SOA-C03 D5 T5.1 advanced troubleshooting
+S: Spoke VPCs route through a transit gateway to an inspection VPC that runs stateful firewall appliances in two Availability Zones. Traffic between spokes in different AZs intermittently fails, and firewall logs show replies arriving at a different appliance than the one that saw the request. What should the network engineer change?
+A: Enable appliance mode on the transit gateway attachment for the inspection VPC so both directions use the same AZ
+B: Enable equal-cost multipath routing on the transit gateway so traffic is spread evenly over the firewall appliances
+C: Enable security group referencing on the transit gateway so the firewalls can match flows by the spoke security groups
+D: Add static routes in each spoke VPC route table that point directly to the firewall network interface in one Availability Zone
+K: A
+W: Appliance mode: by default a transit gateway keeps traffic in the AZ where it entered, so a request and its reply can enter the inspection VPC in different AZs and hit different appliances. With appliance mode on the inspection VPC attachment, the transit gateway picks one AZ per flow (by flow hash) for both directions, so the same stateful appliance sees the whole flow.
+X: B=ECMP routing: ECMP spreads traffic over multiple VPN or Connect paths. It does not keep both directions of a flow on the same inspection appliance, and more spreading makes asymmetry more likely.
+C=Security group referencing: this lets security groups in attached VPCs reference each other across the transit gateway. It does not affect which AZ or appliance carries the return traffic.
+D=Spoke routes to a firewall ENI: a VPC route table can only target resources in its own VPC or attachments, not an ENI in another VPC, and forcing one AZ would remove its high availability anyway.
+T: Stateful appliances behind a transit gateway need symmetric paths; appliance mode on the inspection attachment keeps each flow in one AZ.
+G: ## Why the path becomes asymmetric
+A transit gateway tries to keep traffic in the Availability Zone where it originated. Picture a flow from spoke A (AZ 1) to spoke B (AZ 2):
+- The request enters the inspection VPC in AZ 1 and passes firewall 1.
+- The reply starts in AZ 2 and enters the inspection VPC in AZ 2, passing firewall 2.
+Firewall 2 never saw the start of the session, so a stateful firewall drops it.
+## Appliance mode
+Set `ApplianceModeSupport=enable` on the **inspection VPC's** transit gateway attachment. The transit gateway then uses a flow hash (source and destination IP and port, protocol) to choose one AZ for the whole flow, in both directions, for its lifetime.
+Gateway Load Balancer with GWLB endpoints is a common way to scale the appliances; appliance mode is still needed on the inspection attachment when traffic crosses a transit gateway.
+V: AWS Transit Gateway, Amazon VPC
+
+@ SOA-C03 D5 T5.1 applied use-case
+S: A central network team must own and manage all VPCs, subnets, route tables, and NAT gateways. Application teams in separate accounts of the same AWS Organization must launch EC2 instances and RDS databases into those subnets without any peering or transit gateway attachments. Which approach fits?
+A: Share the subnets from the network account with the application accounts using AWS Resource Access Manager
+B: Create a VPC peering connection from each application account's VPC to the central network team's VPC
+C: Publish the central VPC as a PrivateLink endpoint service and create interface endpoints in each account
+D: Give the application teams cross-account IAM roles to launch their resources inside the network account
+K: A
+W: VPC sharing with AWS RAM: the VPC owner shares subnets with other accounts in the organization. Participant accounts launch and manage their own instances and databases in those subnets, while the owner alone controls the VPC, subnets, route tables and gateways, and no peering or attachments are needed.
+X: B=VPC peering: each application team would still own a separate VPC with its own subnets and routes, and the requirement explicitly excludes peering.
+C=PrivateLink endpoint service: PrivateLink exposes one service behind a Network Load Balancer. It does not let other accounts place their instances and databases into the central subnets.
+D=Cross-account roles into the network account: the resources would be created and billed in the network account, not in the application accounts, mixing ownership and blast radius.
+T: Central team owns the network, app accounts own their resources in it → share subnets with RAM (VPC sharing), not peering or PrivateLink.
+G: ## VPC sharing
+With **AWS Resource Access Manager (RAM)** a VPC owner account can share one or more subnets with other accounts, or with OUs, in the same AWS Organization.
+## Who controls what
+- **Owner** (network account): VPC, subnets, route tables, network ACLs, internet and NAT gateways, transit gateway attachments.
+- **Participants** (application accounts): their own EC2 instances, RDS databases, Lambda ENIs, load balancers and security groups inside the shared subnets. They cannot modify or delete resources they do not own.
+- Each account pays for its own resources.
+## Why teams use it
+Fewer VPCs means fewer CIDR ranges to plan, one set of NAT gateways and endpoints, and no peering mesh. Example: `subnet-app-a` and `subnet-app-b` in `vpc-shared-prod` are shared with the payments and orders accounts, which launch their workloads directly into them.
+V: AWS Resource Access Manager, Amazon VPC
+
+@ SOA-C03 D5 T5.1 applied use-case
+S: A dual-stack VPC has private subnets whose instances reach the IPv4 internet through a NAT gateway. The instances now need outbound access to IPv6 internet destinations, but nothing on the internet may initiate IPv6 connections to them. What should the engineer configure?
+A: An egress-only internet gateway, with a ::/0 route in the private route tables pointing to that egress-only gateway
+B: A ::/0 route in the private route tables pointing to the existing NAT gateway so it also handles IPv6 traffic
+C: A ::/0 route to the internet gateway plus a network ACL rule that denies all inbound IPv6 traffic to the subnets
+D: DNS64 on the private subnets so that their IPv6 traffic is translated by the NAT gateway before reaching the internet
+K: A
+W: Egress-only internet gateway: it is the IPv6 counterpart of NAT for outbound-only access. It allows connections that the instances start and their replies, and blocks connections initiated from the internet. A `::/0` route to it in the private route tables completes the setup.
+X: B=Route IPv6 to the NAT gateway: a NAT gateway does not provide general IPv6-to-IPv6 internet access. It only supports NAT64 toward IPv4 destinations, so IPv6 internet destinations stay unreachable.
+C=Internet gateway plus deny NACL: network ACLs are stateless, so denying all inbound IPv6 also drops the replies to outbound connections, which breaks the access the instances need.
+D=DNS64: DNS64 synthesizes IPv6 addresses for IPv4-only names so NAT64 can reach IPv4 hosts. It does not provide a path to destinations that already have IPv6 addresses.
+T: Outbound-only IPv6 → egress-only internet gateway; NAT gateway and DNS64 serve IPv4 destinations, and a stateless NACL would block replies.
+G: ## Why IPv6 needs a different gateway
+IPv6 addresses in a VPC are globally unique and publicly routable, so there is no address translation. A NAT gateway's job for IPv4 (hiding private addresses and blocking inbound connections) has to be done another way.
+## Egress-only internet gateway
+- Horizontally scaled and highly available, like an internet gateway.
+- **Stateful**: allows outbound connections and their return traffic, and drops connections initiated from the internet.
+- Works only for IPv6.
+Route table for the private subnets:
+- `0.0.0.0/0 → nat-0abc` (IPv4 outbound)
+- `::/0 → eigw-0def` (IPv6 outbound only)
+## Related features
+NAT64 with DNS64 lets IPv6-only instances reach IPv4-only services through a NAT gateway (`64:ff9b::/96`). That solves a different problem than reaching IPv6 destinations.
+V: Amazon VPC

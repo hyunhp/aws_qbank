@@ -1,0 +1,620 @@
+# DVA-C02 batch 09: D2 (13) + D3 (12), detailed explanations
+
+@ DVA-C02 D2 T2.1 applied troubleshooting
+S: A REST API in API Gateway uses a Cognito user pool authorizer. The developer adds the OAuth scope orders/read to the GET /orders method. Afterwards the SPA, which sends the user's ID token in the Authorization header, receives 401 Unauthorized on every call. What should the developer change?
+A: Send the access token instead of the ID token, because methods with authorization scopes validate the scopes claim in the access token
+B: Add a custom:scope attribute to the user pool and map it into the ID token so the authorizer can find the orders/read scope value
+C: Switch the method to IAM authorization and sign each request from the browser with SigV4 using the user's Cognito ID token directly
+D: Increase the authorizer's result TTL so that the previously cached allow decision is reused for requests made with the same ID token
+K: A
+G: ## ID tokens and access tokens
+A Cognito user pool issues two JWTs after sign-in:
+- The **ID token** describes who the user is (`sub`, `email`, `cognito:groups`, custom attributes). It has no `scope` claim.
+- The **access token** describes what the client may do. It carries a `scope` claim, for example `openid orders/read`, filled from the scopes the app client requested.
+## How the REST API Cognito authorizer checks them
+- With **no** OAuth scopes on the method, the authorizer validates the ID token sent in the header.
+- With **OAuth scopes** set on the method, the authorizer requires an access token and checks that its `scope` claim contains at least one listed scope.
+Example: the app client is allowed `orders/read` from a resource server named `orders`; the SPA requests that scope at sign-in and sends `Authorization: <access token>`.
+W: Send the access token: once a method lists authorization scopes, only an access token whose scope claim includes one of them is accepted, and the ID token has no scope claim.
+X: B=Custom attribute in the ID token: the authorizer never reads scopes from ID token attributes; scope checks work only on the access token's scope claim issued by the resource server.
+C=IAM authorization with SigV4: SigV4 needs AWS credentials, not a JWT. The browser would first have to exchange tokens through an identity pool, which is a redesign, not the fix for the scope check.
+D=Longer authorizer TTL: caching can only reuse an earlier decision for a token. The ID token never passed the scope check, so there is no allow decision to reuse.
+T: Method-level OAuth scopes require the access token; the ID token only works for Cognito authorizers without scopes.
+V: Amazon Cognito, Amazon API Gateway
+
+@ DVA-C02 D2 T2.1 applied use-case
+S: A document-sharing SaaS app must enforce rules such as "owners can edit their documents, and members of a project can view documents in that project". Product managers change these rules often, and the team wants them outside the application code, centrally evaluated and auditable. Which service fits?
+A: Amazon Verified Permissions with Cedar policies, calling IsAuthorized from the application with the principal, action and document
+B: IAM identity-based policies attached to one IAM role per end user, with resource ARNs listing the documents each user may access
+C: A Cognito user pool with one group per document, checking the cognito:groups claim in the ID token for the document identifier
+D: AWS Resource Access Manager shares that grant each project's members access to the documents stored for that same project
+K: A
+G: ## Two layers of authorization
+- **AWS access**: IAM decides which AWS API calls a principal can make, such as `s3:GetObject` on a bucket.
+- **Application access**: the app decides whether user `alice` may `edit` document `doc-17`. These rules are about your own domain objects and change with the product.
+## Amazon Verified Permissions
+Verified Permissions is a managed authorization service for application permissions. Rules are written in the **Cedar** policy language and stored in a policy store, separate from code.
+```
+permit (principal, action == Action::"edit", resource)
+when { resource.owner == principal };
+```
+The application calls `IsAuthorized` (or `IsAuthorizedWithToken` with a Cognito or OIDC token) passing principal, action, resource and entity data, and gets Allow or Deny. Decisions can be logged for audit, and policies can be changed without redeploying the app.
+W: Verified Permissions with Cedar: it centralizes fine-grained application authorization in a policy store, supports owner and relationship rules, and changes take effect without code changes.
+X: B=IAM role per end user: IAM limits roles per account, cannot express ownership of application objects that are not AWS resources, and would need policy edits for every document.
+C=One Cognito group per document: user pools cap the number of groups, tokens would grow with every document, and "owner can edit" logic would still sit in the application code.
+D=Resource Access Manager: RAM shares AWS resources such as subnets or Transit Gateways between AWS accounts. It knows nothing about application users or documents.
+T: Use IAM for AWS API permissions and Verified Permissions (Cedar) for fine-grained, externally managed application permissions.
+V: Amazon Verified Permissions, Amazon Cognito
+
+@ DVA-C02 D2 T2.1 applied use-case
+S: A monitoring vendor asks customers to create an IAM role in their accounts that the vendor's AWS account can assume. The customer's security team worries that another vendor customer could trick the vendor into assuming this customer's role by supplying its ARN. What should the role's trust policy include?
+A: A condition on sts:ExternalId that requires the unique value the vendor assigned to this customer when it calls AssumeRole
+B: A condition on aws:SourceIp that allows AssumeRole only from the vendor's published NAT gateway addresses in every Region
+C: A condition on aws:MultiFactorAuthPresent that requires the vendor's automation to sign in with MFA before assuming the role
+D: A permissions boundary on the role that restricts it to read-only actions so that another customer cannot change resources
+K: A
+G: ## The confused deputy problem
+A vendor's service (the deputy) assumes roles in many customer accounts. If customer X can register customer Y's role ARN in the vendor console, the vendor might assume Y's role on X's behalf. The vendor has the permission; it is simply being confused about whom it is acting for.
+## External ID
+The vendor generates a unique, unguessable ID for each customer and always passes it in `AssumeRole`. The customer's trust policy only allows the call when the value matches:
+```
+"Condition": {"StringEquals": {"sts:ExternalId": "vendor-cust-8842"}}
+```
+Customer X never sees Y's external ID, so even if X enters Y's role ARN, the vendor would call AssumeRole with X's ID and the trust policy rejects it.
+- The external ID is not a secret password; it is a binding between the vendor's tenant and the role.
+W: sts:ExternalId condition: requiring the per-customer value assigned by the vendor ensures the vendor can assume the role only when acting for this customer, which blocks the confused deputy.
+X: B=Source IP condition: every request from the vendor, including one made on behalf of another customer, comes from the same vendor addresses, so an IP check cannot tell the customers apart.
+C=MFA condition: automated cross-account calls cannot provide MFA, and MFA proves who signed in, not which customer the vendor is acting for.
+D=Permissions boundary: limiting the role to read-only still lets the wrong party read this customer's data; it reduces impact but does not stop the confused deputy.
+T: Third-party cross-account roles need an sts:ExternalId condition; IP, MFA and boundaries do not identify which customer the vendor acts for.
+V: AWS STS, AWS IAM
+
+@ DVA-C02 D2 T2.1 advanced use-case
+S: A Lambda function named pricing runs in Account A. An ECS service in Account B must invoke it directly with the SDK using its task role. Which TWO configurations are required? (Select TWO)
+A: A resource-based policy statement on the pricing function in Account A that allows lambda:InvokeFunction for the ECS task role in Account B
+B: An identity-based policy on the ECS task role in Account B that allows lambda:InvokeFunction on the ARN of the pricing function in Account A
+C: A trust policy on the pricing function's execution role in Account A that lists the ECS task role from Account B as a trusted principal
+D: A function URL on the pricing function with AuthType NONE so that the ECS task in Account B can call it without signing requests
+E: A VPC peering connection between the two accounts' VPCs so that the Lambda Invoke API call can reach the function in Account A
+K: A,B
+G: ## Cross-account access needs both sides
+For a principal in one account to use a resource in another account, two policies must allow the call:
+- The **caller's identity policy** in its own account must allow the action on the remote resource ARN.
+- The **resource's resource-based policy** must allow the caller's account or role.
+## Lambda resource-based policies
+A Lambda function has a resource-based policy that controls who may invoke it. You add statements with `aws lambda add-permission`:
+```
+aws lambda add-permission --function-name pricing \
+  --statement-id acctB --action lambda:InvokeFunction \
+  --principal arn:aws:iam::222222222222:role/ecs-task
+```
+The **execution role** is something different: it is the role the function itself assumes to call other services, and its trust policy trusts `lambda.amazonaws.com`.
+W: A=Function resource-based policy: the pricing function's policy must allow Account B's task role to call lambda:InvokeFunction, otherwise Account A never trusts the caller.
+B=Caller identity policy: in a cross-account call both sides are evaluated, so the task role in Account B must also allow lambda:InvokeFunction on the function ARN.
+X: C=Execution role trust policy: the execution role is assumed by Lambda to run the code. Trusting the ECS role there would let that role assume the function's permissions, not invoke the function.
+D=Function URL with AuthType NONE: this makes the function publicly callable over HTTPS by anyone, which is not required for an SDK Invoke call and violates least privilege.
+E=VPC peering: Invoke is a regional AWS API endpoint call authenticated with IAM; it does not travel between the two VPCs, so peering is irrelevant.
+T: Cross-account Lambda invoke = function resource policy allowing the caller + caller identity policy allowing the function ARN; the execution role is not involved.
+V: AWS Lambda, AWS IAM, Amazon ECS
+
+@ DVA-C02 D2 T2.1 applied use-case
+S: An internal REST API must be reachable only from applications in one VPC through its execute-api interface endpoint, and calls from any other network, including other VPC endpoints, must be denied. The API is already set to the PRIVATE endpoint type. What should the developer configure?
+A: An API resource policy that allows execute-api:Invoke only when aws:SourceVpce equals the ID of that VPC's interface endpoint
+B: A security group on the API itself that allows inbound HTTPS only from the CIDR range of that VPC and denies all other sources
+C: A usage plan and API key distributed to that VPC's applications, with the key required on every method of the private API
+D: A network ACL on the endpoint's subnets that blocks all traffic except requests arriving from the API's regional endpoint
+K: A
+G: ## Private APIs in API Gateway
+A REST API with the **PRIVATE** endpoint type is reachable only through interface VPC endpoints for `execute-api`. Traffic stays on the AWS network.
+- A private API **must** have a resource policy; without one, every call is denied.
+- Any VPC endpoint for execute-api, in any account, could reach the API if the resource policy allows it, so the policy is where you narrow access.
+## Resource policy conditions
+```
+"Effect": "Deny", "Action": "execute-api:Invoke",
+"Resource": "execute-api:/*",
+"Condition": {"StringNotEquals": {"aws:SourceVpce": "vpce-0abc123"}}
+```
+combined with an Allow for `execute-api:/*`. You can also use `aws:SourceVpc` to allow any endpoint in one VPC. After changing the policy, redeploy the API for it to take effect.
+W: Resource policy on aws:SourceVpce: private APIs are authorized through their resource policy, and matching the specific endpoint ID denies every other endpoint and network.
+X: B=Security group on the API: API Gateway APIs have no security groups. Security groups attach to the interface endpoint's network interfaces and cannot tell apart other VPC endpoints calling the API.
+C=API keys and usage plans: API keys are for throttling and quotas, not authorization, and anyone holding the key from another endpoint could still call the API.
+D=Network ACL on subnets: NACLs filter traffic in the caller's subnets only; they cannot stop other VPCs' endpoints from reaching the API.
+T: Restrict a private API with its resource policy (aws:SourceVpce or aws:SourceVpc); keys and network filters are not API authorization.
+V: Amazon API Gateway, Amazon VPC
+
+@ DVA-C02 D2 T2.1 applied comparison
+S: A nightly batch job running on a server outside AWS must call an API Gateway API that is protected by a Cognito user pool authorizer with the scope reports/write. No human user is involved. How should the job obtain a token?
+A: Use an app client with a client secret and the OAuth client credentials grant against the user pool token endpoint, requesting reports/write
+B: Create a user named batch-job in the user pool and store its password in the script so it can sign in with the USER_PASSWORD_AUTH flow
+C: Use the authorization code grant with PKCE from the job, opening the hosted UI so that the batch job can complete the sign-in step
+D: Use a Cognito identity pool with unauthenticated access so that the job receives temporary AWS credentials instead of a user token
+K: A
+G: ## OAuth grant types in Cognito user pools
+- **Authorization code (with PKCE)**: for apps with a human user who signs in through the browser.
+- **Client credentials**: for machine-to-machine calls. The app authenticates as itself with its client ID and client secret; no user exists.
+## Setting up client credentials
+1. Create a **resource server** (for example identifier `reports`) with custom scopes such as `write`, which become `reports/write`.
+2. Create an app client **with a client secret** and allow the client credentials flow and that scope.
+3. The job posts to the user pool domain's `/oauth2/token` endpoint with `grant_type=client_credentials&scope=reports/write` and Basic authentication.
+It receives an **access token** only (no ID or refresh token) and sends it to the API, whose authorizer checks the scope.
+W: Client credentials grant: it is the OAuth flow for services without users, returning an access token with the requested custom scope that the authorizer accepts.
+X: B=Fake user with stored password: it creates a long-lived password in a script, depends on user sign-in flows meant for people, and the user's password is harder to rotate than a client secret.
+C=Authorization code with PKCE: this flow needs an interactive browser sign-in by a person, which a nightly unattended job cannot do.
+D=Unauthenticated identity pool: it returns AWS credentials, not a user pool access token, so a Cognito authorizer expecting reports/write would reject the request.
+T: Machine-to-machine access to a Cognito-protected API uses the client credentials grant with a resource server scope, not a fake user or an identity pool.
+V: Amazon Cognito, Amazon API Gateway
+
+@ DVA-C02 D2 T2.2 applied troubleshooting
+S: An ingestion service writes about 4,000 small objects per second to an S3 bucket that uses SSE-KMS with a customer managed key. Uploads intermittently fail and the logs show KMS ThrottlingException errors. The key must stay the same. Which change resolves this with the least effort?
+A: Enable S3 Bucket Keys for SSE-KMS on the bucket so S3 uses a bucket-level key and makes far fewer requests to AWS KMS
+B: Switch the bucket default encryption to the AWS managed key aws/s3, which is exempt from the KMS request rate quotas
+C: Add a second customer managed key and alternate between the two keys in the application to double the KMS request rate
+D: Enable automatic annual rotation on the customer managed key so that each new backing key gets a separate request quota
+K: A
+G: ## Why SSE-KMS can throttle
+With SSE-KMS, S3 asks KMS for a new data key (`GenerateDataKey`) on every PUT and calls `Decrypt` on every GET. KMS has a per-account, per-Region request quota for cryptographic operations (thousands to tens of thousands per second depending on Region). A busy bucket can exceed it and get `ThrottlingException`.
+## S3 Bucket Keys
+With a Bucket Key, S3 asks KMS for a short-lived **bucket-level key** and uses it to create data keys for many objects locally.
+- KMS request traffic can drop by up to 99%, which also cuts KMS request cost.
+- Objects are still protected by the same customer managed key.
+- CloudTrail shows the bucket ARN as the encryption context instead of each object ARN.
+Enable it in the bucket's default encryption (`BucketKeyEnabled: true`); it applies to new objects.
+W: Enable Bucket Keys: S3 then requests keys from KMS once per bucket-level key period instead of per object, removing the throttling while keeping the same customer managed key.
+X: B=AWS managed key: requests using aws/s3 still count against the KMS request quota, and switching keys breaks the requirement to keep the current key.
+C=Alternate two keys: the KMS request quota is shared across all keys in the account and Region, so splitting traffic across keys does not raise the limit.
+D=Automatic rotation: rotation changes the backing key material yearly; the key ID and the request quota stay the same, so throttling continues.
+T: High-volume SSE-KMS throttling is fixed with S3 Bucket Keys (fewer KMS calls), not by more keys, rotation or the AWS managed key.
+V: Amazon S3, AWS KMS
+
+@ DVA-C02 D2 T2.2 advanced troubleshooting
+S: A developer's IAM role has an identity policy that allows kms:Decrypt on a customer managed key's ARN in the same account, yet Decrypt calls fail with AccessDeniedException. The key was created from a template whose key policy lists only a security administrator role as principal. What is the cause?
+A: The key policy has no statement that allows the account root principal, so IAM policies in the account cannot grant use of the key at all
+B: The identity policy must use the key alias ARN instead of the key ARN, because KMS evaluates Decrypt permissions against the alias
+C: Decrypt also requires kms:GenerateDataKey in the identity policy, because KMS checks both actions whenever ciphertext is decrypted
+D: The developer's role needs a KMS grant created by the administrator because identity policies cannot be used for any KMS key action
+K: A
+G: ## Key policies are the starting point
+Every KMS key has exactly one **key policy**, and no principal, not even the account root, can use the key unless the key policy allows it, directly or indirectly.
+The default key policy contains this statement:
+```
+"Principal": {"AWS": "arn:aws:iam::111122223333:root"},
+"Action": "kms:*", "Resource": "*"
+```
+It does not give everyone access. It **delegates** to IAM: identity policies in account 111122223333 can now grant KMS permissions on this key.
+## What happens without it
+If the key policy names only specific roles, those roles are the only principals that can use the key. An IAM policy that allows `kms:Decrypt` in the same account is ignored, because the key never enabled IAM policies.
+Fix: add the root account statement (then control access with IAM), or add the developer's role to the key policy directly.
+W: Missing root account statement: without the key policy statement that allows the account principal, identity policies cannot grant access to this key, so the developer's Allow has no effect.
+X: B=Use the alias ARN: aliases can be used in some conditions, but permissions are evaluated on the key itself; the key ARN in the identity policy is the correct resource.
+C=Also require GenerateDataKey: Decrypt is authorized on its own. GenerateDataKey is needed only to create new data keys, not to decrypt existing ciphertext.
+D=Grants only: grants are one option, but identity policies do work for KMS keys whenever the key policy enables them, which is the normal setup.
+T: A KMS key policy must allow a principal directly or enable IAM policies through the account root statement; otherwise IAM Allows are ignored.
+V: AWS KMS, AWS IAM
+
+@ DVA-C02 D2 T2.2 advanced use-case
+S: A customer managed KMS key encrypts objects in one S3 bucket. Security requires that the application role can use the key only when requests come through Amazon S3, so the role can never call KMS Decrypt directly on data it has copied elsewhere. Which key policy condition meets this?
+A: kms:ViaService with the value s3.us-east-1.amazonaws.com on the statement that allows the application role to use the key
+B: aws:SourceVpce with the ID of the S3 gateway endpoint on the statement that allows the application role to use the key
+C: kms:EncryptionContextKeys with the value aws:s3:arn on the statement that allows the application role to create grants
+D: aws:PrincipalServiceName with the value s3.amazonaws.com on the statement that allows the application role to use the key
+K: A
+G: ## Direct KMS calls versus calls made for you
+A role can use a KMS key in two ways:
+- **Directly**: the code calls `kms:Decrypt` with a ciphertext it holds.
+- **Through an integrated service**: the role calls `s3:GetObject`, and S3 calls KMS on the role's behalf with the role's permissions.
+## kms:ViaService
+The `kms:ViaService` condition key limits use of the key to requests that an AWS service makes for the principal, in a given Region:
+```
+"Condition": {"StringEquals": {
+  "kms:ViaService": "s3.us-east-1.amazonaws.com"}}
+```
+With this condition, `s3:GetObject` on an SSE-KMS object still works, but a direct `kms:Decrypt` call from the same role is denied because it does not come through S3.
+It combines well with `kms:EncryptionContext:aws:s3:arn` to limit the key to one bucket.
+W: kms:ViaService for S3: the key can then be used by the role only for requests that S3 makes on its behalf in that Region, so direct KMS API calls fail.
+X: B=aws:SourceVpce: S3 calls KMS from its own service side, not through the caller's gateway endpoint, and the condition says nothing about whether the call was direct or through S3.
+C=Encryption context keys on grants: this controls which context keys a grant must use, and applies to CreateGrant, not to whether the role calls KMS directly.
+D=aws:PrincipalServiceName: this key is present only when an AWS service principal makes the call with its own service identity, not when S3 acts with the role's permissions, so it would not match the role's S3 requests.
+T: To allow a key only through a specific AWS service, use kms:ViaService; network and grant conditions do not distinguish direct KMS calls.
+V: AWS KMS, Amazon S3
+
+@ DVA-C02 D2 T2.2 applied tradeoff
+S: An application encrypts records client-side with the AWS Encryption SDK and replicates them to a second Region for disaster recovery. In a Regional outage, the DR copy must be decryptable in the second Region without any call to the first Region. Which key setup fits BEST?
+A: A KMS multi-Region primary key with a replica key in the DR Region, so ciphertext from either Region can be decrypted locally
+B: Two independent single-Region KMS keys, one per Region, with the DR Region's key used to decrypt the replicated ciphertext
+C: A single-Region KMS key in the primary Region with a cross-Region grant that allows the DR application role to decrypt
+D: An AWS managed key in each Region, since AWS managed keys automatically share key material with other Regions of the account
+K: A
+G: ## Keys are Regional by default
+A normal KMS key exists in one Region. Ciphertext produced with it can only be decrypted by calling KMS in that Region. If that Region is down, the data cannot be decrypted.
+## Multi-Region keys
+A **multi-Region key** is a set of related keys in different Regions that share the **same key material and the same key ID** (IDs start with `mrk-`).
+- You create a primary key and replicate it to other Regions.
+- Data encrypted with the primary in us-east-1 can be decrypted with the replica in eu-west-1 by calling KMS in eu-west-1 only.
+- Each replica has its own key policy, aliases and grants.
+The AWS Encryption SDK can use multi-Region aware keyrings to decrypt with the local replica. Multi-Region keys are meant for exactly this: client-side encrypted data that moves between Regions.
+W: Multi-Region key with a replica: the replica has the same key material, so the DR Region can decrypt the replicated ciphertext by calling its own KMS endpoint during an outage.
+X: B=Two independent keys: different keys have different key material, so ciphertext from the primary key cannot be decrypted with the DR key unless data was also encrypted under both.
+C=Cross-Region grant: grants do not move a key between Regions; decrypting still requires calling KMS in the primary Region, which is unavailable.
+D=AWS managed keys: AWS managed keys are single-Region, cannot be used directly by the Encryption SDK, and do not share material across Regions.
+T: Decrypting client-side ciphertext in another Region without the source Region needs a multi-Region key replica, not separate keys or grants.
+V: AWS KMS, AWS Encryption SDK
+
+@ DVA-C02 D2 T2.3 advanced tradeoff
+S: A high-traffic service reads its database credentials from Secrets Manager and caches them. With single-user rotation, some requests fail for a short time after each rotation because cached passwords no longer work. Which rotation approach avoids this window?
+A: Alternating users rotation, which uses a separate admin secret to switch between two database users so the previous password keeps working
+B: Single-user rotation with a longer rotation schedule, so the password changes less often and the failing window happens only rarely
+C: Single-user rotation with the Lambda rotation function's timeout raised so the database password change completes more quickly
+D: Parameter Store SecureString with a custom rotation Lambda, since Parameter Store updates cached copies in clients automatically
+K: A
+G: ## How single-user rotation works
+The rotation function creates a new password (`AWSPENDING`), sets it on the database user, tests it, and then moves the `AWSCURRENT` label to the new version. From the moment the database password changes, clients that still hold the old password in memory fail until they refresh the secret. For busy services with caches, that is a short but real outage window.
+## Alternating users rotation
+The **alternating users** strategy uses two database users, for example `app_user` and `app_user_clone`.
+- A separate **superuser secret** lets the rotation function create and update the clone user.
+- Each rotation updates the password of the user that is *not* current, then points `AWSCURRENT` to it.
+- The previous user and password still work until the next rotation, so cached credentials stay valid while clients refresh.
+Combine it with a cache TTL shorter than the rotation interval.
+W: Alternating users: each rotation switches to the other database user, leaving the old credentials valid until the next cycle, so cached passwords never break mid-flight.
+X: B=Rotate less often: the failing window still happens at every rotation; it is just rarer, and longer rotation periods weaken security.
+C=Longer rotation timeout: the timeout does not change the fact that the old password stops working as soon as the database is updated.
+D=Parameter Store rotation: Parameter Store has no built-in rotation or client push; a custom rotator would face the same stale-cache problem.
+T: When clients cache credentials, use alternating users rotation so the previous credential remains valid; single-user rotation always has a cutover window.
+V: AWS Secrets Manager, AWS Lambda
+
+@ DVA-C02 D2 T2.3 applied troubleshooting
+S: An ECS Fargate task definition injects a database password with the secrets section, using valueFrom set to a Secrets Manager secret ARN. The secret is encrypted with a customer managed KMS key. Tasks fail to start with ResourceInitializationError: unable to pull secrets. Which TWO permissions must be added? (Select TWO)
+A: secretsmanager:GetSecretValue on the secret ARN in the policy of the task execution role that is set in the task definition
+B: kms:Decrypt on the customer managed key for the task execution role, allowed by both its identity policy and the key policy
+C: secretsmanager:GetSecretValue on the secret ARN in the policy of the task role that the application code assumes at runtime
+D: secretsmanager:DescribeSecret on the secret ARN in a resource-based policy attached to the ECS cluster that runs the service
+E: kms:Encrypt on the customer managed key for the ECS service-linked role, so that the agent can re-encrypt the injected value
+K: A,B
+G: ## Two roles in an ECS task definition
+- **Task execution role** (`executionRoleArn`): used by the ECS agent and Fargate *before* your container starts: pulling images from ECR, sending logs to CloudWatch, and fetching values listed in the `secrets` section.
+- **Task role** (`taskRoleArn`): used by your application code *inside* the container when it calls AWS APIs.
+## Injecting secrets
+```
+"secrets": [{"name": "DB_PASSWORD",
+  "valueFrom": "arn:aws:secretsmanager:...:secret:prod/db-AbCd"}]
+```
+At task start, Fargate retrieves the value with the execution role and exposes it as an environment variable. If the execution role cannot read the secret, the task never starts and shows `ResourceInitializationError`.
+When the secret uses a customer managed key, reading it also needs `kms:Decrypt` on that key, allowed by the key policy and the role's policy.
+W: A=GetSecretValue for the execution role: values in the task definition secrets section are fetched by the task execution role before the container starts.
+B=kms:Decrypt for the execution role: the secret is encrypted with a customer managed key, so reading it also needs decrypt permission allowed by the role policy and the key policy.
+X: C=Task role permission: the task role is used by the application after start; it is not used to inject secrets, so this error remains.
+D=Cluster resource policy: ECS clusters have no resource-based policies for secret access, and DescribeSecret does not return the secret value.
+E=kms:Encrypt for the service-linked role: injection only needs to decrypt the secret, and it is done with the execution role, not the service-linked role.
+T: Task definition secrets are fetched by the task execution role (GetSecretValue plus kms:Decrypt for a customer managed key), not by the task role.
+V: Amazon ECS, AWS Fargate, AWS Secrets Manager, AWS KMS
+
+@ DVA-C02 D2 T2.3 applied use-case
+S: A CloudFormation template creates an RDS instance. The master password already exists in a Secrets Manager secret owned by the security team. The password must not appear in the template, in parameter values, or in stack outputs and events. What should the developer put in the MasterUserPassword property?
+A: A dynamic reference such as {{resolve:secretsmanager:prod/db:SecretString:password}} that CloudFormation resolves at deploy time
+B: A template parameter with NoEcho set to true and a Default value holding the password, referenced with Ref in the property
+C: A dynamic reference such as {{resolve:ssm:/prod/db/password}} that points to a Parameter Store String parameter with the password
+D: An Fn::ImportValue that reads the password from an output exported by a separate stack that the security team deploys and owns
+K: A
+G: ## Keeping secrets out of templates
+Anything written into a template, a parameter default, or an output can be read by people with access to the stack or the template file. CloudFormation offers **dynamic references** to pull values at deploy time instead:
+- `{{resolve:secretsmanager:secret-id:SecretString:json-key}}` reads a Secrets Manager secret (optionally a version stage or ID).
+- `{{resolve:ssm-secure:name}}` reads a Parameter Store SecureString, for supported properties only.
+- `{{resolve:ssm:name}}` reads plain String parameters and is not meant for secrets.
+CloudFormation does not show resolved secret values in the console, events or outputs.
+## Example
+```
+MasterUserPassword: '{{resolve:secretsmanager:prod/db:SecretString:password}}'
+```
+Pin a version with `SecretString:password::<version-id>` if the stack must not pick up a newer value on its next update.
+W: Secrets Manager dynamic reference: the template stores only a pointer, CloudFormation fetches the value at deploy time, and the value is not exposed in the template, parameters or events.
+X: B=NoEcho parameter with Default: NoEcho masks the value in displays, but a Default value is stored in the template in plaintext, so the password is in the file.
+C=ssm plain String reference: a String parameter stores the password unencrypted, and the plain ssm reference is not intended for secrets.
+D=Fn::ImportValue: exported outputs are visible in plaintext to anyone who can list exports, which exposes the password.
+T: Use {{resolve:secretsmanager:...}} dynamic references for passwords in templates; NoEcho defaults, plain ssm values and exports leak them.
+V: AWS CloudFormation, AWS Secrets Manager, Amazon RDS
+
+@ DVA-C02 D3 T3.1 applied use-case
+S: Twelve Python Lambda functions in different SAM stacks copy the same internal validation library into each zip. Updating the library means rebuilding every package, and zips keep growing. The team wants to publish the library once, version it, and choose per function when to adopt a new version. What should they use?
+A: A Lambda layer containing the library, with each function referencing a specific layer version ARN that is updated when ready
+B: A Lambda extension that downloads the newest library from S3 during each init phase and adds it to the Python import path
+C: An EFS file system mounted into each function, with the library copied to a shared folder that functions import from at startup
+D: An S3 object holding the library zip, with each function setting the object URL as a second handler in its runtime settings
+K: A
+G: ## Lambda layers
+A **layer** is a zip archive of libraries, a custom runtime or other files that Lambda extracts into `/opt` in the execution environment. For Python, files under `python/` in the layer land on the import path.
+- Each publish creates an **immutable, numbered version**, for example `arn:aws:lambda:...:layer:validation:7`.
+- A function can use up to 5 layers, and the total unzipped size of function plus layers must stay within 250 MB.
+- Functions keep using the version they reference until you change it, so each team can move from `:7` to `:8` on its own schedule.
+## In SAM
+```
+ValidationLayer:
+  Type: AWS::Serverless::LayerVersion
+  Properties: {ContentUri: layer/, CompatibleRuntimes: [python3.12]}
+```
+Functions add `Layers: [!Ref ValidationLayer]`, or the published version ARN when the layer lives in another stack.
+W: Lambda layer with versioned ARNs: the library is packaged once, each function pins an immutable version, and teams upgrade by changing the ARN.
+X: B=Extension that downloads at init: extensions are for tooling such as monitoring agents; downloading code at every cold start adds latency and removes version pinning.
+C=Shared EFS folder: it works for very large files but needs VPC configuration, and every function would see changes immediately with no per-function versioning.
+D=S3 object as second handler: Lambda has no setting for a second handler or code URL; a function's code comes from its package, image and layers.
+T: Share code across functions with versioned Lambda layers; each function pins a layer version and upgrades independently.
+V: AWS Lambda, AWS SAM
+
+@ DVA-C02 D3 T3.1 applied troubleshooting
+S: A team moves a Python Lambda function to the arm64 architecture. The zip is built on an x86_64 CI runner with pip install -r requirements.txt -t ., and now fails at import with errors about an invalid ELF header in a compiled cryptography module. What should the developer change in the build?
+A: Install arm64 wheels, for example with sam build --use-container for arm64 or pip --platform manylinux2014_aarch64
+B: Add the environment variable AWS_LAMBDA_ARCH=x86_64 to the function so that the arm64 runtime emulates the x86 binary code
+C: Move the dependencies into a Lambda layer, because layers are compiled again by Lambda for the target architecture on publish
+D: Increase the function's memory to 3,008 MB, since compiled modules need more memory to load when running on Graviton hardware
+K: A
+G: ## Native code is architecture specific
+Pure Python packages run anywhere, but many popular libraries (`cryptography`, `numpy`, `pydantic-core`) ship **compiled binaries**. `pip install` on an x86_64 machine downloads x86_64 wheels. On an arm64 (Graviton) Lambda function those binaries cannot load, which shows up as an `invalid ELF header` or similar import error.
+## Building for arm64
+- **SAM**: set `Architectures: [arm64]` on the function and run `sam build --use-container`, which builds inside an arm64 Lambda build image.
+- **pip**: download matching wheels explicitly:
+```
+pip install -r requirements.txt -t package/ \
+  --platform manylinux2014_aarch64 --only-binary=:all: --python-version 3.12
+```
+- Or build on an arm64 CI runner.
+Layers follow the same rule: each layer version must contain binaries for the architectures it declares.
+W: Build dependencies for arm64: the compiled wheels must match the function's architecture, which a container build for arm64 or pip platform flags provide.
+X: B=AWS_LAMBDA_ARCH variable: Lambda has no such variable and does not emulate x86 code on arm64 functions.
+C=Move into a layer: Lambda never recompiles layer contents; an x86_64 binary in a layer fails on arm64 in the same way.
+D=More memory: memory does not change the instruction set; a wrong-architecture binary cannot load at any memory size.
+T: Switching Lambda to arm64 requires building native dependencies for arm64; runtime settings, layers and memory do not translate binaries.
+V: AWS Lambda, AWS SAM
+
+@ DVA-C02 D3 T3.1 applied troubleshooting
+S: A developer runs cdk deploy for the first time in a new account and Region. The stack includes a Lambda function whose code is a local folder. The deployment fails with an error that the SSM parameter /cdk-bootstrap/hnb659fds/version was not found. What should the developer do?
+A: Run cdk bootstrap for that account and Region to create the staging bucket, ECR repository and deployment roles that CDK assets use
+B: Run cdk synth and upload the generated template manually in the console, since cdk deploy cannot deploy stacks that contain assets
+C: Create the SSM parameter by hand with the value 1 so that the CDK CLI skips its version check and uploads the assets itself
+D: Convert the function code to an inline string in the stack, because CDK supports only inline code for Lambda functions by default
+K: A
+G: ## CDK assets need a landing place
+When a CDK app contains **assets**, such as a local folder for Lambda code or a Dockerfile, `cdk deploy` must upload them before CloudFormation can reference them. It uploads to resources created by **bootstrapping**:
+- an S3 staging bucket for file assets,
+- an ECR repository for image assets,
+- IAM roles for publishing assets, deploying and looking up context,
+- an SSM parameter `/cdk-bootstrap/<qualifier>/version` that the CLI reads to confirm the bootstrap stack version.
+These live in the `CDKToolkit` stack, one per account and Region.
+## Example
+```
+cdk bootstrap aws://111122223333/eu-west-1
+```
+Run it once per environment (again when a newer bootstrap version is required). Cross-account pipelines use `--trust` so a tools account can deploy.
+W: Run cdk bootstrap: the error means the environment was never bootstrapped, so the asset bucket, repository and roles that deployments rely on do not exist yet.
+X: B=Manual template upload: the template would reference asset locations that do not exist; CDK apps with assets deploy normally once the environment is bootstrapped.
+C=Create the parameter by hand: this only hides the check; the bucket, repository and roles still do not exist, so asset publishing fails next.
+D=Inline code only: CDK fully supports asset-based Lambda code; inline code is limited in size and is not required.
+T: A missing /cdk-bootstrap version parameter means run cdk bootstrap for that account and Region; assets need the bootstrap resources.
+V: AWS CDK, AWS CloudFormation, AWS Lambda
+
+@ DVA-C02 D3 T3.2 applied use-case
+S: A developer has deployed a SAM application to a dev account and wants to invoke the deployed OrderFunction from the terminal with a saved JSON event, referring to it by its logical ID in the stack, and see the response and logs without opening the console. Which command fits?
+A: sam remote invoke OrderFunction --stack-name orders-dev --event-file events/order.json
+B: sam local invoke OrderFunction --event events/order.json --profile dev --region us-east-1
+C: sam logs --stack-name orders-dev --name OrderFunction --tail combined with the saved order event
+D: sam sync --stack-name orders-dev --watch --code with the saved order event passed as a parameter
+K: A
+G: ## Local versus remote testing in SAM
+- `sam local invoke` runs the function code **on your machine** in a Docker container that mimics Lambda. It does not call the deployed function.
+- `sam remote invoke` calls the **deployed** resource in AWS. You can name it by logical ID plus `--stack-name`, and pass an event with `--event` or `--event-file`. It prints the response and, for Lambda, the log output.
+- `sam remote test-event` stores and fetches **shareable test events** (the same ones the Lambda console uses, kept in the EventBridge schema registry).
+## Related commands
+- `sam sync --watch` pushes code changes to the deployed stack quickly.
+- `sam logs --tail` streams CloudWatch Logs from deployed functions.
+## Example
+```
+sam remote invoke OrderFunction --stack-name orders-dev \
+  --event-file events/order.json
+```
+W: sam remote invoke: it invokes the deployed function in the cloud by logical ID and stack name with the saved event and shows its response and logs.
+X: B=sam local invoke: it runs the code locally in Docker; even with a profile, it does not test the function deployed in the dev account.
+C=sam logs --tail: it only streams logs from the deployed function; it cannot send an event or invoke anything.
+D=sam sync --watch: it deploys code changes to the stack as files change; it has no option to invoke the function with an event.
+T: sam local invoke tests code on your machine; sam remote invoke tests the deployed function in AWS.
+V: AWS SAM, AWS Lambda
+
+@ DVA-C02 D3 T3.2 advanced use-case
+S: A Step Functions workflow has a Task state that calls DynamoDB UpdateItem with a complex ResultSelector and ResultPath. Each test currently requires running the whole state machine from the start. The developer wants to test only that state with a chosen input and see the processed output, without deploying a new version of the state machine. What should be used?
+A: The Step Functions TestState API, which runs a single state definition with a given input and role and returns its output
+B: Step Functions Local in a Docker container, running the full state machine definition on the developer's laptop
+C: A Pass state inserted before the Task state that injects the test input into every production execution of the workflow
+D: CloudWatch Logs for the state machine with log level ALL, replaying a previous failed execution from the chosen state
+K: A
+G: ## Testing one state at a time
+Step Functions state machines can be long, and debugging the input and output processing of one step (`InputPath`, `Parameters`, `ResultSelector`, `ResultPath`, `OutputPath`) by running the whole workflow is slow.
+## The TestState API
+`TestState` takes a **single state definition**, an **input**, and, for states that call services, an IAM **role ARN**. It runs that state once and returns the output, the next state, and any error. You do not have to create or update a state machine.
+- With `inspectionLevel` set to `DEBUG`, it also shows intermediate data after each processing step, such as the result after `ResultSelector` and after `ResultPath`.
+- It is available from the console's "Test state" button, the CLI and SDKs.
+```
+aws stepfunctions test-state --definition file://update.json \
+  --role-arn arn:aws:iam::...:role/sfn-test --input '{"id":"o-1"}' \
+  --inspection-level DEBUG
+```
+W: TestState API: it executes just one state with a chosen input and returns the processed output, with no deployment of the workflow.
+X: B=Step Functions Local: it emulates whole executions on a laptop, lacks feature parity with the service, and still runs the workflow from the start instead of testing one state.
+C=Injected Pass state: this changes the production workflow and still runs the whole state machine for every test.
+D=Logs with level ALL: logs only record past executions. Redrive can restart a failed Standard execution from the failed step, but with its original input, not a chosen test input.
+T: To test one state's service call and data processing in isolation, use TestState; logs and full executions are slower and indirect.
+V: AWS Step Functions, Amazon DynamoDB
+
+@ DVA-C02 D3 T3.3 applied use-case
+S: A CodeBuild project runs pytest for a service. Test failures are visible only in the raw build log, and the team wants a history of pass rates and failing test cases across builds, viewable in the CodeBuild console. What should the developer add?
+A: A reports section in buildspec.yml that points to the JUnit XML file pytest writes, with file-format set to JUNITXML
+B: An artifacts section in buildspec.yml that uploads the pytest output folder to S3 so the console can chart the results
+C: A CloudWatch Logs metric filter on the build log group that counts the lines containing FAILED for each build run
+D: A post_build command that runs aws codebuild batch-get-builds and prints the test summary at the end of the log
+K: A
+G: ## CodeBuild test reports
+CodeBuild can collect test results into **report groups**. Each build adds a report with the total, passed and failed test cases, durations and failure messages, and the console shows trends across builds.
+Supported formats include JUnit XML, Cucumber JSON, NUnit, TestNG and Visual Studio TRX; code coverage reports are also supported (for example JaCoCo, Clover, Cobertura).
+## buildspec example
+```
+phases:
+  build:
+    commands:
+      - pytest --junitxml=reports/results.xml
+reports:
+  unit-tests:
+    files: ['results.xml']
+    base-directory: reports
+    file-format: JUNITXML
+```
+The build role needs permission to create report groups and add reports (`codebuild:CreateReportGroup`, `CreateReport`, `UpdateReport`, `BatchPutTestCases`).
+W: reports section with JUNITXML: CodeBuild parses the results into a report group, giving per-test details and pass-rate history in the console.
+X: B=Artifacts upload: artifacts store files in S3; CodeBuild does not parse or chart them as test results.
+C=Metric filter on logs: it counts log lines, not test cases, and gives no per-test details or report history in the CodeBuild console.
+D=batch-get-builds in post_build: it describes build status, not test cases, and printing to the log is the problem the team wants to avoid.
+T: Structured test results in CodeBuild come from the buildspec reports section (JUnit XML and similar), not from artifacts or log parsing.
+V: AWS CodeBuild
+
+@ DVA-C02 D3 T3.3 advanced use-case
+S: An ECS service uses CodeDeploy blue/green deployments behind an Application Load Balancer that has a production listener on port 443 and a test listener on port 8443. The team wants an automated test to run against the new task set through the test listener and to stop the deployment before any production traffic reaches it if the test fails. Where should the test run?
+A: In a Lambda function referenced by the AfterAllowTestTraffic hook in the AppSpec file, reporting Failed to CodeDeploy on errors
+B: In a Lambda function referenced by the AfterAllowTraffic hook in the AppSpec file, reporting Failed to CodeDeploy on errors
+C: In a ValidateService script in the AppSpec file that runs on each container instance after the new tasks have started
+D: In the container image's HEALTHCHECK command, which marks the replacement task set unhealthy when any tests fail
+K: A
+G: ## Blue/green for ECS with CodeDeploy
+CodeDeploy starts a **replacement (green) task set**, attaches it to the **test listener**, then moves the **production listener** from blue to green. Lifecycle hooks for ECS run Lambda functions at fixed points:
+- `BeforeInstall`, `AfterInstall`: around creating the green task set.
+- `AfterAllowTestTraffic`: after the test listener routes to green, before any production traffic.
+- `BeforeAllowTraffic`: just before production traffic shifts.
+- `AfterAllowTraffic`: after production traffic has moved.
+Each hook function reports back with `PutLifecycleEventHookExecutionStatus` as `Succeeded` or `Failed`; a failure fails the deployment, and with automatic rollback enabled traffic stays on or returns to the original task set.
+## Example
+The hook function calls `https://alb.example.com:8443/health/deep`, runs a few API checks, and reports `Failed` if any fail, so users never see the green version.
+W: AfterAllowTestTraffic hook: it runs once the test listener points to the new task set and before production traffic moves, so a failed test stops the deployment before production traffic shifts.
+X: B=AfterAllowTraffic hook: this runs after production traffic has already shifted, so users would reach the failing version before the test runs.
+C=ValidateService script: ValidateService is an EC2/on-premises hook that runs scripts on instances; ECS deployments use Lambda hooks only.
+D=Container HEALTHCHECK: health checks confirm the container is running; they are not an integration test through the test listener and do not gate the traffic shift on test results.
+T: For ECS blue/green, run pre-production tests in the AfterAllowTestTraffic hook against the test listener; AfterAllowTraffic is too late.
+V: AWS CodeDeploy, Amazon ECS, Elastic Load Balancing, AWS Lambda
+
+@ DVA-C02 D3 T3.3 applied comparison
+S: A team deploys a REST API in API Gateway and wants to send 5% of prod stage traffic to a new deployment, compare its errors with the current version, and then promote it or remove it, while keeping a single prod stage URL. Which feature fits?
+A: A canary release on the prod stage with canarySettings percentTraffic set to 5, then promoting or deleting the canary
+B: A second stage named prod-v2 with its own invoke URL, with 5% of clients reconfigured to call the new stage directly
+C: Stage variables on the prod stage that point to the new deployment ID for 5% of requests chosen at random per client
+D: A usage plan that assigns 5% of API keys to the new deployment and the remaining API keys to the current deployment
+K: A
+G: ## Canary releases in API Gateway REST APIs
+A REST API **stage** points to one deployment. A **canary** on the stage adds a second deployment and a percentage of traffic for it:
+- `canarySettings.percentTraffic`, for example `5.0`, sends that share of requests to the canary deployment.
+- The canary can override **stage variables**, for example pointing `lambdaAlias` to `v2`.
+- Canary requests are written to a separate CloudWatch execution log group (suffix `/Canary`), so you can compare them with the base version.
+## Finishing the release
+- **Promote**: the canary deployment becomes the stage's deployment and the canary is removed.
+- **Delete** the canary: all traffic goes back to the base deployment.
+Clients keep calling the same `https://.../prod` URL throughout.
+W: Stage canary release: it splits a percentage of prod stage traffic to a new deployment on the same URL, with separate canary logs, and can be promoted or deleted.
+X: B=Separate prod-v2 stage: it needs a different URL and client changes, and traffic is split by which clients were changed, not by percentage.
+C=Stage variables per request: stage variables have one value per stage (and per canary); they cannot randomly select a deployment for a share of requests.
+D=Usage plan by API key: usage plans set throttling and quotas for keys; they cannot route requests to different deployments.
+T: Gradual rollout on one REST API stage URL = stage canary settings; extra stages, stage variables and usage plans do not split traffic.
+V: Amazon API Gateway, Amazon CloudWatch
+
+@ DVA-C02 D3 T3.4 applied use-case
+S: A monorepo on GitHub contains services/billing and services/catalog, each with its own CodePipeline V2 pipeline using a CodeConnections source. Today every push to main starts both pipelines. Each pipeline should start only when files under its own service folder change on main. What should the developer configure?
+A: Pipeline triggers on each pipeline with a push filter on branch main and a file path include filter for its own service folder
+B: A buildspec condition in each first CodeBuild stage that exits early when git diff shows no changes in the service folder
+C: A separate GitHub repository per service, since CodePipeline cannot tell which files changed in a push to a monorepo
+D: An S3 source action per service that polls a zip of the service folder uploaded by a GitHub Action on every push event
+K: A
+G: ## Triggers in CodePipeline V2
+V2 pipelines can define **triggers** on a connection-based source action (GitHub, GitLab, Bitbucket through CodeConnections, formerly CodeStar Connections). Triggers filter which Git events start the pipeline:
+- **Push** filters on branches, tags and **file paths** (includes and excludes, with glob patterns).
+- **Pull request** filters on events (opened, updated, closed), branches and file paths.
+## Example
+```
+triggers:
+- providerType: CodeStarSourceConnection
+  gitConfiguration:
+    sourceActionName: Source
+    push:
+    - branches: {includes: [main]}
+      filePaths: {includes: ['services/billing/**']}
+```
+With this filter, a commit that changes only `services/catalog/` does not start the billing pipeline at all, so no build minutes are spent and no empty release appears.
+W: Pipeline triggers with file path filters: V2 triggers can start a pipeline only for pushes to main that change files matching the service folder.
+X: B=Exit early in CodeBuild: the pipeline still starts and runs a stage for every push, wasting time and cluttering history; it only masks the problem.
+C=Split the repository: CodePipeline V2 supports file path filters, so restructuring the repository is unnecessary.
+D=S3 polling source: this adds a custom GitHub Action and a zip upload for what triggers already do, and S3 sources do not see Git file changes.
+T: In a monorepo, use CodePipeline V2 trigger filters on branch and file paths so each pipeline starts only for its own folder.
+V: AWS CodePipeline, AWS CodeConnections, GitHub
+
+@ DVA-C02 D3 T3.4 advanced troubleshooting
+S: A developer changes the TableName property of a DynamoDB table in a CloudFormation template. The change set shows Replacement: True. The rename must go ahead, but the old table and its data must not be deleted when CloudFormation replaces the resource. What should the developer add to the table resource before updating?
+A: UpdateReplacePolicy: Retain, so CloudFormation keeps the old physical table instead of deleting it after creating the new one
+B: DeletionPolicy: Retain alone, since it controls what happens to the old physical resource whenever it is replaced in an update
+C: A stack policy that denies Update:Replace on the table, so CloudFormation keeps the old table while creating the new one
+D: Stack termination protection, so that no physical resources in the stack can be deleted during any update to the stack
+K: A
+G: ## What replacement means
+Some property changes cannot be made in place. For `AWS::DynamoDB::Table`, changing `TableName` requires **replacement**: CloudFormation creates a new table and, during cleanup, deletes the old physical table, along with its data.
+## Two separate policies
+- `DeletionPolicy` applies when the resource is **removed from the template** or the **stack is deleted**.
+- `UpdateReplacePolicy` applies when the resource is **replaced during an update**; the old physical resource is what gets deleted.
+```
+OrdersTable:
+  Type: AWS::DynamoDB::Table
+  DeletionPolicy: Retain
+  UpdateReplacePolicy: Retain
+```
+With `UpdateReplacePolicy: Retain`, the old table stays in the account (no longer managed by the stack) and you can copy data into the new table. Always read change sets for `Replacement: True` before updating stateful resources.
+W: UpdateReplacePolicy: Retain: it governs what happens to the old resource when an update replaces it, so the new table is created and the old one is kept.
+X: B=DeletionPolicy alone: DeletionPolicy covers stack deletion and removal from the template; replacement during an update is controlled by UpdateReplacePolicy.
+C=Stack policy denying replace: a stack policy would block the update entirely, so the rename could not happen, which contradicts the requirement.
+D=Termination protection: it only prevents deleting the whole stack; it does not stop CloudFormation from deleting a replaced resource during an update.
+T: Replacement deletes the old physical resource unless UpdateReplacePolicy is Retain; DeletionPolicy and termination protection cover other cases.
+V: AWS CloudFormation, Amazon DynamoDB
+
+@ DVA-C02 D3 T3.4 advanced use-case
+S: An ECS service on Fargate uses the rolling update deployment type. The team wants automatic rollback to the last completed deployment when new tasks keep failing to start or fail health checks, and also when a CloudWatch alarm on the 5xx error rate fires even though tasks are healthy. Which TWO settings meet this? (Select TWO)
+A: The deployment circuit breaker in the service's deployment configuration, with enable and rollback both set to true
+B: CloudWatch alarms in the service's deployment configuration, naming the 5xx alarm with enable and rollback set to true
+C: A minimumHealthyPercent of 100 and maximumPercent of 200, which make ECS roll back when the new tasks are unhealthy
+D: A task definition HEALTHCHECK with retries set to 10, which makes ECS roll back when the container is repeatedly unhealthy
+E: An EventBridge rule on ECS task state changes that calls UpdateService with the previous task definition on each STOPPED task
+K: A,B
+G: ## Rolling updates in ECS
+With the rolling update (`ECS`) deployment controller, ECS replaces tasks gradually within `minimumHealthyPercent` and `maximumPercent`. By default, a broken new version can leave the deployment retrying for a long time.
+## Two built-in rollback triggers
+- **Deployment circuit breaker**: detects that new tasks fail to reach a running, healthy state (launch failures, failed container or load balancer health checks) and, with `rollback: true`, returns the service to the last completed deployment.
+- **Deployment alarms**: you list CloudWatch alarms; if one enters ALARM during the deployment, ECS marks it failed and, with `rollback: true`, rolls back. This catches bad versions whose tasks are healthy but return errors.
+```
+"deploymentConfiguration": {
+  "deploymentCircuitBreaker": {"enable": true, "rollback": true},
+  "alarms": {"alarmNames": ["api-5xx"], "enable": true, "rollback": true}}
+```
+W: A=Deployment circuit breaker with rollback: it detects new tasks that fail to start or fail health checks and returns the service to the last completed deployment.
+B=Deployment alarms with rollback: it rolls back when the named 5xx alarm enters ALARM during the deployment, which catches versions whose tasks are healthy but return errors.
+X: C=Healthy percent settings: they control how many tasks run during the update, not whether ECS rolls back.
+D=More health check retries: this only changes how quickly a container is marked unhealthy; without the circuit breaker, ECS keeps replacing tasks instead of rolling back, and it never sees the 5xx alarm.
+E=Custom EventBridge rollback: tasks stop for many normal reasons, so rolling back on every STOPPED task is fragile, and it does not react to the error-rate alarm.
+T: ECS rolling updates roll back automatically with the deployment circuit breaker (unhealthy tasks) and deployment alarms (bad metrics).
+V: Amazon ECS, AWS Fargate, Amazon CloudWatch
+
+@ DVA-C02 D3 T3.4 advanced use-case
+S: A CodePipeline in a tools account builds a CloudFormation template and must deploy it to a separate production account. The artifact bucket currently uses default encryption with the AWS managed key aws/s3. Which TWO changes are required for the cross-account deploy action? (Select TWO)
+A: Encrypt the artifact bucket with a customer managed KMS key whose key policy lets the production account's roles decrypt it
+B: Create a role in the production account that the pipeline can assume, and set it as the deploy action's roleArn in the pipeline
+C: Enable S3 Cross-Region Replication from the artifact bucket to a bucket in the production account for every new artifact
+D: Replace the CloudFormation deploy action with a CodeBuild action that runs with the pipeline's service role in the tools account
+E: Share the pipeline with the production account through AWS Resource Access Manager so it can start the deploy stage itself
+K: A,B
+G: ## Cross-account CodePipeline
+A pipeline in account A (tools) can run actions in account B (prod). Two things must work across the boundary:
+- **Assuming a role in B**: the action's `roleArn` points to a role in B whose trust policy allows account A. CloudFormation then runs in B, usually with a separate deployment role passed to the stack.
+- **Reading artifacts**: the action in B reads input artifacts from A's artifact bucket. That needs a bucket policy allowing B's role and a KMS key that B can use.
+## Why aws/s3 does not work
+An AWS managed key's policy cannot be edited, so it can never grant another account access. Artifacts must be encrypted with a **customer managed key** whose key policy allows the prod roles `kms:Decrypt` (and `kms:DescribeKey`), and the pipeline's `encryptionKey` must point to it.
+W: A=Customer managed artifact key: its key policy can grant the production account's roles kms:Decrypt, so the deploy action can read artifacts from the tools account bucket.
+B=Cross-account action role: the pipeline assumes this role in the production account through the action's roleArn, so CloudFormation runs there with production permissions.
+X: C=Replicate artifacts: replicated objects still use keys B cannot use unless changed, and the pipeline would not know to read from the copy; it does not replace the role.
+D=CodeBuild with the tools role: the tools account's service role has no permissions in the production account, so the deployment still needs a role there.
+E=Share through RAM: CodePipeline pipelines are not shared with RAM; cross-account actions work through roles and the artifact key.
+T: Cross-account CodePipeline needs a role in the target account plus a customer managed KMS key for artifacts; the AWS managed aws/s3 key cannot be shared.
+V: AWS CodePipeline, AWS KMS, AWS CloudFormation, Amazon S3

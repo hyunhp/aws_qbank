@@ -1,0 +1,537 @@
+# SCS-C03 batch 04: detailed questions for D1 (detection), D3 (infrastructure), D5 (data protection)
+
+@ SCS-C03 D1 T1.3 applied troubleshooting
+S: An EventBridge rule matches GuardDuty findings with severity 7 or higher and targets an SNS topic that emails the SOC. The topic was recently encrypted with the AWS managed key alias/aws/sns. Since then, the rule's metrics show matched events and failed invocations, and no emails arrive. What should the security engineer do?
+A: Re-encrypt the topic with a customer managed KMS key whose key policy lets events.amazonaws.com call kms:GenerateDataKey and kms:Decrypt
+B: Add a statement to the alias/aws/sns key policy that allows events.amazonaws.com to call kms:GenerateDataKey and kms:Decrypt on the key
+C: Attach an IAM role to the EventBridge rule with sns:Publish permission, because encrypted topics ignore the topic's resource-based access policy
+D: Recreate the EventBridge rule in the SNS topic's owner account, because encrypted topics reject events published by rules in any other account
+K: A
+G: ## How SNS server-side encryption works
+When an SNS topic uses server-side encryption, every publisher must be able to use the topic's KMS key: SNS asks KMS for a data key (`kms:GenerateDataKey`) to encrypt each message, and `kms:Decrypt` is needed as well. For an AWS service such as EventBridge, that permission comes from the **key policy**.
+## AWS managed keys versus customer managed keys
+- An AWS managed key such as `alias/aws/sns` has a key policy that AWS owns. You can view it but never edit it, and it only allows use by principals in your account through SNS.
+- A customer managed key has a key policy you write, so you can add a statement for a service principal:
+`"Principal": {"Service": "events.amazonaws.com"}, "Action": ["kms:GenerateDataKey*", "kms:Decrypt"]`
+## Typical symptom
+The rule matches (MatchedEvents rises) but delivery fails (FailedInvocations rises). The event pattern is fine; the target cannot accept the message.
+W: Customer managed key with a service statement: EventBridge publishing to an encrypted topic needs KMS permissions in the key policy, and only a customer managed key lets you grant them to `events.amazonaws.com`.
+X: B=Edit the AWS managed key policy: AWS managed key policies are read-only, so this statement can never be added. That is exactly why the AWS managed SNS key cannot be used with EventBridge.
+C=IAM role for the SNS target: EventBridge uses the topic's resource-based policy for SNS targets, and a role would still not grant use of the KMS key. The failure is at the encryption step, not at sns:Publish.
+D=Move the rule to another account: nothing in the scenario involves an account boundary, and the failures began when the key changed. Encryption does not block cross-account publishing either; missing key permissions do.
+T: Encrypted SNS topics used by EventBridge need a customer managed key that grants events.amazonaws.com; the AWS managed aws/sns key cannot be edited to allow it.
+V: Amazon EventBridge, Amazon SNS, AWS KMS, Amazon GuardDuty
+
+@ SCS-C03 D1 T1.3 advanced troubleshooting
+S: A team runs its whole workload in eu-west-1 and has an organization trail logging management events. It creates an EventBridge rule in eu-west-1 for "AWS API Call via CloudTrail" events with source aws.iam and eventName CreateAccessKey. Access keys are created, but the rule never matches. What is the cause?
+A: IAM is a global service, so its CloudTrail events are delivered to EventBridge in us-east-1, where the rule must be created
+B: CreateAccessKey is a read-only management event, and EventBridge never receives read-only CloudTrail events from any service at all
+C: The organization trail only logs data events for IAM, so the management event CreateAccessKey is never sent to EventBridge at all
+D: EventBridge only receives IAM events after IAM Access Analyzer is enabled in the Region where the matching rule was created
+K: A
+G: ## How CloudTrail events reach EventBridge
+EventBridge receives API calls recorded by CloudTrail as events with `detail-type` "AWS API Call via CloudTrail". Each event is delivered to the default event bus in the Region where the API call was processed.
+## Global services
+Some services are global: IAM, AWS STS global endpoint calls, and CloudFront, for example. Their API calls are processed in, and recorded as coming from, **us-east-1**. So a rule that watches `aws.iam` events must live in us-east-1, even if every workload runs elsewhere.
+- Rule in us-east-1: `{"source": ["aws.iam"], "detail": {"eventName": ["CreateAccessKey"]}}`
+- If the alert must go to a team in eu-west-1, the us-east-1 rule can forward to a bus or SNS topic in eu-west-1.
+## Read-only calls
+Read-only calls (Get, List, Describe) reach a rule only if it opts in with the state `ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS`, but CreateAccessKey is a write call, so that setting is irrelevant here.
+W: Global service events land in us-east-1: IAM API calls are delivered to EventBridge in us-east-1, so a rule in eu-west-1 never sees them. Creating the rule in us-east-1 fixes it.
+X: B=Read-only event: CreateAccessKey changes state and is a write management event. Read-only events also can reach EventBridge when a rule opts in, so the premise is wrong twice.
+C=Data events only: the trail logs management events, and IAM API calls such as CreateAccessKey are management events, so they are captured. The problem is the Region of the rule, not the trail.
+D=Access Analyzer required: Access Analyzer analyzes policies and access; it is not a prerequisite for EventBridge to receive CloudTrail events.
+T: Rules for global-service API calls such as IAM belong in us-east-1; a rule in the workload Region never matches them.
+V: Amazon EventBridge, AWS CloudTrail, AWS IAM
+
+@ SCS-C03 D1 T1.3 applied troubleshooting
+S: A security engineer runs aws logs associate-kms-key to encrypt an existing CloudWatch Logs log group with a new customer managed KMS key in us-east-1. The command fails with an access denied error for the key, although the engineer has full KMS and CloudWatch Logs permissions. What fixes this?
+A: Add a key policy statement allowing the logs.us-east-1.amazonaws.com service principal to use the key for encrypt, decrypt, and data key operations
+B: Add an IAM policy to the engineer's role that grants kms:CreateGrant, because CloudWatch Logs only accepts keys shared through a KMS grant
+C: Replace the key with the AWS managed key alias/aws/logs, because CloudWatch Logs log groups cannot use customer managed keys at all
+D: Disable automatic key rotation on the key, because CloudWatch Logs rejects keys whose backing material may change over time
+K: A
+G: ## Who actually uses the key
+When a log group is encrypted, the **CloudWatch Logs service** encrypts and decrypts log data, not the engineer. So the key policy must allow the Regional service principal, for example `logs.us-east-1.amazonaws.com`, to call:
+- `kms:Encrypt*`, `kms:Decrypt*`, `kms:ReEncrypt*`, `kms:GenerateDataKey*`, `kms:Describe*`
+## Scoping the statement
+A condition such as `kms:EncryptionContext:aws:logs:arn` set to the log group ARN limits the key to specific log groups, so the key cannot be used to decrypt any other log data.
+## Why the engineer's permissions are not enough
+IAM permissions let the engineer call the API. CloudWatch Logs checks that it can use the key before it associates it; if the key policy does not name the service, the association fails with access denied.
+W: Key policy for the Logs service principal: CloudWatch Logs itself performs the cryptographic calls, so the key policy must allow `logs.<region>.amazonaws.com`, ideally scoped with the log group ARN encryption context.
+X: B=Grant-only key sharing: CloudWatch Logs uses the key policy, not grants the caller creates. Giving the engineer kms:CreateGrant does not let the service use the key.
+C=Switch to aws/logs: there is no AWS managed key for CloudWatch Logs; log groups are encrypted by default with service-owned keys, and customer managed keys are exactly how you take control.
+D=Disable rotation: automatic rotation keeps old key material for decryption and is fully supported. Rotation has nothing to do with the access denied error.
+T: For log group encryption, grant the Regional CloudWatch Logs service principal in the key policy; the caller's own KMS permissions do not cover the service.
+V: Amazon CloudWatch Logs, AWS KMS
+
+@ SCS-C03 D1 T1.2 advanced use-case
+S: A company uses VPC endpoints with endpoint policies that restrict S3 and KMS access to the company's own organization. The security team wants to see API calls through those endpoints, including calls denied by the endpoint policy and calls by principals from other accounts. Which approach fits?
+A: Enable CloudTrail network activity events for the S3 and KMS event sources and filter on errorCode VpceAccessDenied for denied calls
+B: Enable VPC Flow Logs on the endpoint network interfaces and filter records on action REJECT to find denied calls and their principals
+C: Enable S3 server access logs on every bucket and KMS key usage logs, then join them in Athena by source VPC endpoint identifier
+D: Enable Route 53 Resolver query logging for the VPC and alert on DNS lookups of S3 and KMS names that come from other accounts
+K: A
+G: ## Network activity events
+CloudTrail logs three kinds of events: management events, data events, and **network activity events**. Network activity events record AWS API calls that pass through a VPC endpoint, from the point of view of the VPC endpoint owner.
+- They include calls made by principals from other accounts using your endpoint.
+- They include calls the VPC endpoint policy denied, with `errorCode` `VpceAccessDenied`.
+- You choose event sources such as `s3.amazonaws.com` or `kms.amazonaws.com` using advanced event selectors on a trail or CloudTrail Lake event data store.
+## Why this matters
+An endpoint policy is a perimeter control. Without logging, you cannot tell whether someone is trying to use your endpoint to reach buckets outside your organization, which is a common data exfiltration pattern.
+W: Network activity events: they are designed exactly for VPC endpoint visibility, recording allowed and denied API calls with the caller identity, including denials by the endpoint policy.
+X: B=Flow Logs with REJECT: flow logs record IP packets, not API calls or IAM principals. An endpoint policy denial happens at the API layer over an accepted TLS connection, so no REJECT record appears.
+C=Server access and key usage logs: S3 server access logs cover only requests that reach buckets, and there is no separate KMS key usage log. Neither shows requests the endpoint policy blocked before they reached the service.
+D=Resolver query logging: DNS logs show that a name was resolved, not who called which API or whether the endpoint policy denied it.
+T: For API calls through VPC endpoints, including endpoint-policy denials, enable CloudTrail network activity events; flow logs only see packets.
+V: AWS CloudTrail, Amazon VPC, Amazon S3, AWS KMS
+
+@ SCS-C03 D1 T1.2 applied use-case
+S: A company needs full AWS WAF request logs for a web ACL stored in Amazon S3 for threat hunting. The logs must never contain the Authorization header value sent by clients. Which TWO steps are required? (Select TWO)
+A: Create the destination S3 bucket with a name that starts with aws-waf-logs-
+B: Add the Authorization header to the redacted fields of the logging configuration
+C: Enable CloudFront standard logging and add the Authorization header to its field list
+D: Create an S3 Lifecycle rule that deletes objects containing the Authorization header
+E: Turn on CloudTrail data events for the web ACL so each request is logged with headers
+K: A,B
+G: ## AWS WAF logging destinations
+AWS WAF can send full request logs (headers, rule matches, action taken) to three destinations: a CloudWatch Logs log group, an S3 bucket, or an Amazon Data Firehose stream. For all three, the destination name must begin with `aws-waf-logs-`, for example `aws-waf-logs-prod-web`.
+## Keeping secrets out of logs
+Headers such as `Authorization` or `Cookie` can hold credentials. The logging configuration has **redacted fields**: you choose single headers, the query string, the URI path or the HTTP method, and WAF replaces their values with `REDACTED` before writing the log.
+## Filtering
+Logging filters can also keep only requests with certain actions (for example only BLOCK), which reduces volume but does not remove sensitive values.
+W: A=Bucket name prefix: AWS WAF delivers logs only to destinations whose name starts with `aws-waf-logs-`, so the S3 bucket must be named that way before logging can be enabled.
+B=Redacted Authorization header: WAF replaces the header value with REDACTED before writing, so the secret never appears in any log record from the start.
+X: C=CloudFront standard logging: CloudFront access logs are a different log with fixed fields; they do not contain WAF rule details and do not control what the WAF log contains.
+D=Lifecycle deletion: Lifecycle rules act on whole objects by age or prefix, not on content. Every log object would contain the header, so the secret would be stored first and exposed until deleted.
+E=CloudTrail data events: CloudTrail does not log each web request through a web ACL. It logs WAF API calls such as UpdateWebACL, not HTTP requests.
+T: WAF logs need an aws-waf-logs- destination, and secrets are removed with redacted fields in the logging configuration, not by cleaning up afterward.
+V: AWS WAF, Amazon S3
+
+@ SCS-C03 D1 T1.2 advanced tradeoff
+S: A security team queries VPC Flow Logs in Amazon S3 with Athena. Queries over a day of data scan terabytes of plain text and are slow and costly. The team wants cheaper queries without losing any record fields. Which change to the flow log configuration helps most?
+A: Deliver flow logs to S3 in Apache Parquet format with Hive-compatible prefixes and hourly partitions
+B: Change the flow log traffic type from ALL to REJECT so that only denied connections are written to S3
+C: Increase the maximum aggregation interval from 1 minute to 10 minutes to reduce the number of records
+D: Send flow logs to CloudWatch Logs instead and query them there with Logs Insights instead of using Athena
+K: A
+G: ## Flow log delivery options for S3
+When VPC Flow Logs publish to S3, you can choose:
+- **File format**: plain text (default, gzip) or **Apache Parquet**. Parquet is columnar and compressed, so Athena reads only the columns a query uses and scans far less data.
+- **Hive-compatible S3 prefixes**, such as `.../year=2026/month=09/day=29/`, which Athena can use as partitions.
+- **Hourly partitions** instead of daily, so a query for one hour reads one hour of files.
+## Why it matters for cost
+Athena charges per byte scanned. A query like `SELECT srcaddr, dstport FROM flow_logs WHERE day='29' AND action='REJECT'` against Parquet with partitions scans a small fraction of the plain-text data, while every field remains in the log.
+W: Parquet with Hive prefixes and hourly partitions: columnar compressed files plus partition pruning cut the bytes Athena scans, and every record and field is still kept.
+X: B=REJECT only: this drops all accepted traffic, which is essential for investigations such as data exfiltration. It violates the requirement to keep all records.
+C=10-minute aggregation: longer intervals merge records and lose timing precision, and the remaining text files are still scanned in full. It changes the data, not the query efficiency.
+D=CloudWatch Logs Insights: this moves the cost to log ingestion and query charges without columnar storage, and it does not make large historical queries cheaper than partitioned Parquet in S3.
+T: For cheap Athena queries on flow logs, store them as Parquet with Hive-style hourly partitions; filtering or aggregating the logs loses evidence.
+V: Amazon VPC, Amazon S3, Amazon Athena
+
+@ SCS-C03 D1 T1.1 applied use-case
+S: A SOC receives many separate GuardDuty findings, such as unusual API calls, a policy change, and S3 data access, that analysts only later realize were steps of one intrusion. The team wants GuardDuty to correlate such signals into one finding with the full timeline. What should it use?
+A: GuardDuty Extended Threat Detection, which produces attack sequence findings that link related signals across a timeline
+B: GuardDuty suppression rules that merge all findings for the same account into one archived finding each day for review
+C: GuardDuty trusted IP lists that group all findings from one source IP address into a single correlated finding per day
+D: GuardDuty Malware Protection for EC2, which scans every resource mentioned in related findings and merges them together
+K: A
+G: ## Single findings versus attack sequences
+Classic GuardDuty findings each describe one suspicious behavior, for example an API call from an unusual location. Real attacks are multi-stage: credential misuse, then privilege escalation, then data access. Analysts had to correlate these manually.
+## Extended Threat Detection
+GuardDuty **Extended Threat Detection** correlates events and signals across data sources and over time within an account. When they form a known attack pattern it creates one **attack sequence** finding, for example `AttackSequence:IAM/CompromisedCredentials`, usually with Critical severity.
+- The finding lists the signals, affected resources, and a timeline mapped to MITRE ATT&CK tactics.
+- It is enabled automatically in every account that has GuardDuty turned on, at no additional cost; protection plans such as S3 Protection or EKS Protection widen the signals it can use.
+W: Extended Threat Detection: it is the GuardDuty feature built to link related signals into one attack sequence finding with a timeline, which is exactly the correlation the SOC is doing by hand.
+X: B=Suppression rules: they archive findings that match criteria so analysts do not see them. They never merge findings or build a timeline, and hiding real signals is the opposite of the goal.
+C=Trusted IP lists: they stop GuardDuty from generating findings for listed addresses. They do not group or correlate findings.
+D=Malware Protection: it scans EBS volumes for malware when triggered. It adds findings but does not correlate multi-stage activity into one finding.
+T: To see a multi-step attack as one finding, use GuardDuty Extended Threat Detection attack sequences; suppression and trusted IP lists only hide findings.
+V: Amazon GuardDuty
+
+@ SCS-C03 D1 T1.1 applied use-case
+S: A developer accidentally pushed an IAM user's access key to a public code repository. AWS detected it, and the security team wants such detections in any account to automatically open a ticket and page on-call within minutes. Which approach fits?
+A: An EventBridge rule on AWS Health events with event type AWS_RISK_CREDENTIALS_EXPOSED that invokes the ticketing and paging workflow
+B: A CloudWatch metric filter on CloudTrail logs that matches the text of the access key ID and triggers an alarm on every new appearance
+C: An AWS Config managed rule that checks IAM access key age and invokes the ticketing workflow when a key is older than 90 days
+D: An Amazon Inspector scan of the public repository that raises a finding whenever it detects an AWS access key inside source code
+K: A
+G: ## How AWS tells you about exposed keys
+AWS monitors popular public code repositories for AWS access keys. When it finds a valid key for your account, it notifies you, and it creates an **AWS Health** event of type `AWS_RISK_CREDENTIALS_EXPOSED` in the affected account.
+## Automating the response
+AWS Health events are sent to EventBridge with `source` `aws.health`. A rule such as:
+`{"source": ["aws.health"], "detail": {"eventTypeCode": ["AWS_RISK_CREDENTIALS_EXPOSED"]}}`
+can target a Lambda function, SNS topic, or incident tool to open a ticket, page on-call, and even deactivate the key. With AWS Organizations, organizational view in AWS Health can surface these events from all accounts centrally.
+W: Health event rule: the exposure is reported as an AWS Health event, and EventBridge delivers it within minutes to any automated target, so the response starts without waiting for a human to read email.
+X: B=Metric filter on key ID: CloudTrail records API calls made with a key, not the fact that the key was posted publicly. The alert would only fire after an attacker used the key.
+C=Config key age rule: it checks rotation age, so a key leaked one day after creation stays compliant. It does not know about exposure.
+D=Inspector repository scan: Amazon Inspector scans workloads and only code repositories you connect to it; it does not watch every public repository, and AWS already reports the exposure as a Health event that can be routed automatically.
+T: Leaked access keys detected by AWS surface as AWS_RISK_CREDENTIALS_EXPOSED Health events; route them through EventBridge instead of waiting for API misuse.
+V: AWS Health, Amazon EventBridge, AWS IAM
+
+@ SCS-C03 D3 T3.3 applied use-case
+S: Security groups in 30 accounts must allow SSH only from 40 corporate CIDR ranges, which change several times a year. Today each change means editing hundreds of rules. Which approach reduces effort while keeping the rules precise?
+A: A customer managed prefix list with the corporate CIDRs, shared through AWS RAM and referenced as the source in the security group rules
+B: A network ACL in every subnet that allows port 22 from the corporate CIDRs, while security groups allow port 22 from 0.0.0.0/0
+C: A single security group in a central account that holds the corporate CIDRs and is referenced by the member accounts' groups
+D: An AWS Config rule that detects security groups without the new CIDRs and a runbook that adds them to each rule by hand
+K: A
+G: ## Managed prefix lists
+A **customer managed prefix list** is a named set of CIDR blocks, for example `pl-0abc...` containing `198.51.100.0/24`, `203.0.113.0/25` and so on. Security group rules and route tables can reference the list instead of individual CIDRs.
+- Update the list once, and every rule that references it uses the new entries.
+- Share it with other accounts or the whole organization through **AWS RAM**.
+- Each rule that references a list counts toward the security group's rule quota by the list's **maximum entries**, so size the list realistically.
+## Example rule
+Inbound: TCP 22, source `pl-0abc1234`. When a new office range is added to the list, no security group has to change.
+W: Shared prefix list: one central list, shared with RAM and referenced in the rules, turns hundreds of edits into one update while keeping the source restricted to exact corporate ranges.
+X: B=NACL plus open security groups: this weakens the stateful layer to 0.0.0.0/0 and still requires editing a NACL in every subnet, which is no less work.
+C=Central security group reference: a referenced group matches traffic from resources that are members of that group, and only across connected VPCs. Corporate office addresses outside AWS are never members of a security group.
+D=Config detection with manual fixes: it finds drift but still leaves hundreds of manual edits for every change.
+T: Reuse the same CIDR set in many rules and accounts with a RAM-shared managed prefix list, not copies of CIDRs or wider rules.
+V: Amazon VPC, AWS RAM
+
+@ SCS-C03 D3 T3.3 advanced use-case
+S: A company must ensure that no VPC in its production accounts can send or receive traffic through an internet gateway, except for one central egress VPC whose NAT subnets must reach the internet. Teams keep attaching internet gateways anyway. Which control enforces this directly?
+A: VPC Block Public Access in bidirectional mode, with an exclusion that allows egress for the central egress VPC's NAT subnets
+B: An SCP that denies ec2:CreateInternetGateway in every production account, including the account that owns the central egress VPC
+C: Network ACLs in each subnet that deny 0.0.0.0/0 in both directions, applied by a CloudFormation StackSet across all accounts
+D: A security group in each VPC that denies inbound 0.0.0.0/0, attached automatically to every new instance by an EventBridge rule
+K: A
+G: ## VPC Block Public Access (BPA)
+VPC BPA is a Regional account setting that blocks traffic through internet gateways and egress-only internet gateways for all VPCs, regardless of routes, security groups, or NACLs.
+- **Bidirectional** mode blocks both inbound and outbound internet gateway traffic.
+- **Ingress-only** mode blocks only inbound traffic, so NAT and egress-only gateways still work.
+- **Exclusions** let specific VPCs or subnets opt out, either allowing bidirectional traffic or egress only.
+It does not affect traffic over VPN, Direct Connect, transit gateways, or peering. Across an organization, it can be enforced with EC2 declarative policies so account admins cannot turn it off.
+## Example
+Account setting: bidirectional. Exclusion: the NAT gateway subnets in the egress VPC with egress-only access. Spoke VPCs reach the internet only through the transit gateway and that egress VPC.
+W: VPC BPA with an exclusion: it blocks internet gateway traffic account-wide no matter how routes are set, and a targeted exclusion lets only the central egress path work.
+X: B=Deny CreateInternetGateway: this also blocks the egress VPC's owner account and does nothing about internet gateways that already exist and are attached.
+C=Deny-all NACLs: a deny for 0.0.0.0/0 matches every address, so it also blocks internal and hybrid traffic, and any account admin can edit the NACLs later.
+D=Security group deny rule: security groups have no deny rules at all; they only allow traffic.
+T: To block internet gateway traffic regardless of how VPCs are configured, use VPC Block Public Access with exclusions, not per-VPC ACLs or broad SCPs.
+V: Amazon VPC, AWS Organizations
+
+@ SCS-C03 D3 T3.3 advanced troubleshooting
+S: A team inserted AWS Network Firewall endpoints in front of a public ALB. The ALB subnet route table sends 0.0.0.0/0 to the firewall endpoint, and the firewall subnet routes 0.0.0.0/0 to the internet gateway. Clients now time out, and the firewall shows only one direction of each flow. What is missing?
+A: An internet gateway edge-associated route table that routes the ALB subnet CIDRs to the firewall endpoint
+B: A stateless rule that forwards all return traffic to the stateful engine instead of passing it to the ALB directly
+C: A route in the ALB subnet route table that sends the VPC CIDR to the firewall endpoint as well as 0.0.0.0/0
+D: A security group on the firewall endpoint that allows inbound HTTPS from 0.0.0.0/0 to reach the ALB subnets
+K: A
+G: ## Stateful inspection needs symmetric routing
+Network Firewall's stateful engine must see both directions of a connection. If only responses pass through it, it sees packets for flows it never saw start and drops them.
+## The inbound path
+Without special routing, the internet gateway delivers inbound packets straight to the ALB, because the VPC's local route wins. Responses then go ALB subnet, firewall endpoint, internet gateway. The firewall sees half the flow.
+## Ingress routing
+An **edge-associated route table** is attached to the internet gateway itself. It can hold a route like:
+`10.0.1.0/24 (ALB subnet) -> vpce-firewall-endpoint`
+Now inbound packets go internet gateway, firewall, ALB, and responses go ALB, firewall, internet gateway: symmetric and fully inspected.
+W: Internet gateway ingress route table: it sends inbound traffic for the ALB subnets through the firewall endpoint, so both directions of each connection pass through the firewall.
+X: B=Stateless forward rule: stateless rules act on packets the firewall already receives. The inbound packets never reach the firewall, so no rule can fix the asymmetry.
+C=VPC CIDR route in the ALB subnet: a subnet route table only steers traffic leaving that subnet. Inbound internet traffic is steered by the route table associated with the internet gateway, so this route cannot pull it through the firewall.
+D=Firewall endpoint security group: Network Firewall endpoints are Gateway Load Balancer-type endpoints without security groups; the problem is routing, not filtering.
+T: Inspecting inbound traffic with Network Firewall needs an internet gateway ingress route table; otherwise routing is asymmetric and stateful rules drop flows.
+V: AWS Network Firewall, Amazon VPC
+
+@ SCS-C03 D3 T3.3 advanced comparison
+S: A company deploys third-party next-generation firewall appliances behind a Gateway Load Balancer in a security VPC and routes spoke VPC traffic through Gateway Load Balancer endpoints. Which TWO statements about this design are correct? (Select TWO)
+A: The appliances must support GENEVE encapsulation, which GWLB uses on UDP port 6081 to exchange traffic with them
+B: GWLB endpoints are used as next-hop targets in route tables, and they can be in other accounts than the GWLB itself
+C: GWLB terminates TLS from clients and passes decrypted traffic to the appliances, so they can inspect payload content
+D: GWLB replaces the client source IP with its own address, so appliances only see the load balancer as the traffic source
+E: GWLB requires each appliance to have a public IP address so it can return inspected packets directly to the internet
+K: A,B
+G: ## What Gateway Load Balancer does
+Gateway Load Balancer (GWLB) lets you insert a fleet of virtual appliances, such as firewalls or IDS/IPS, transparently into network traffic.
+- It works at layer 3 and forwards whole IP packets to healthy appliances, keeping flows sticky to one appliance.
+- It wraps each packet in **GENEVE** (UDP port 6081), so the appliance sees the original packet with source and destination IPs unchanged, plus metadata.
+## GWLB endpoints
+A **GWLB endpoint** is a VPC endpoint (built on PrivateLink) that you use as a route target, for example `0.0.0.0/0 -> vpce-gwlb`. Because it is PrivateLink, the security VPC with the GWLB can be in a central account while endpoints live in many spoke accounts.
+## What it does not do
+GWLB does not terminate TLS or change IP addresses. Decryption, if any, is a feature of the appliance itself.
+W: A=GENEVE support: GWLB exchanges traffic with the appliances wrapped in GENEVE on UDP port 6081, so each appliance must speak GENEVE to receive and return packets.
+B=GWLB endpoints as route targets: the endpoints are PrivateLink-based next hops in route tables, so they can live in spoke accounts while the GWLB sits in a central security account.
+X: C=TLS termination: GWLB is a transparent layer 3 load balancer and never terminates TLS. Only the appliance could decrypt traffic, using its own features.
+D=Source NAT: GWLB preserves the original packet, including the client source IP, inside GENEVE. That transparency is the reason it exists.
+E=Public IPs on appliances: appliances receive and return traffic to GWLB inside the security VPC; the packets continue on their original path, so no public IP is needed.
+T: Gateway Load Balancer is transparent: GENEVE on 6081 to appliances and PrivateLink endpoints as route targets, with no TLS termination or NAT.
+V: Elastic Load Balancing, Amazon VPC, AWS PrivateLink
+
+@ SCS-C03 D3 T3.1 applied comparison
+S: An online store behind CloudFront must block requests from two countries only for paths under /checkout/, for sanctions compliance. Visitors from those countries must still be able to browse product pages. Which approach fits?
+A: An AWS WAF rule that blocks when a geo match for the two countries and a URI path that starts with /checkout/ are both true
+B: CloudFront geographic restrictions with a deny list of the two countries, configured on the cache behavior for /checkout/*
+C: A CloudFront Function on viewer request that reads the client IP and compares it with a list of country IP ranges kept in code
+D: An S3 bucket policy on the origin that denies requests whose aws:SourceIp belongs to the two countries for /checkout/ keys
+K: A
+G: ## Two ways to block by country
+- **CloudFront geographic restrictions** apply to the whole distribution. Every request from a listed country gets a 403, regardless of path or cache behavior.
+- **AWS WAF geo match statements** are rule conditions. You can combine them with other statements using `AND`, `OR`, `NOT`.
+## Combining conditions in WAF
+A rule for this scenario:
+`AND( GeoMatch countryCodes [XX, YY], ByteMatch UriPath STARTS_WITH "/checkout/" ) -> Block`
+Requests from those countries to product pages match only the first half and are allowed; checkout requests match both and are blocked. WAF can also add labels or a custom response body explaining the restriction.
+W: WAF geo match combined with a path match: only WAF can apply a country condition to part of the site, which is exactly what a path-limited sanctions rule needs.
+X: B=Geo restriction on a cache behavior: CloudFront geo restriction is a distribution-level setting and cannot be set per cache behavior, so it would block the whole store.
+C=IP list in a CloudFront Function: maintaining country IP ranges in code is error-prone and quickly stale, and function code size limits make a full list impractical. WAF already has a maintained geo database.
+D=S3 bucket policy by source IP: CloudFront calls the origin, so the bucket sees CloudFront, not client IPs; checkout is also usually dynamic, not served from S3.
+T: Country blocking for only some paths needs WAF geo match combined with other conditions; CloudFront geo restriction is all-or-nothing for the distribution.
+V: AWS WAF, Amazon CloudFront
+
+@ SCS-C03 D3 T3.1 advanced troubleshooting
+S: An ALB is protected by an AWS WAF web ACL with a rate-based rule of 500 requests per 5 minutes per IP. A partner's third-party CDN now fronts the site, and the rule blocks all traffic from a few CDN edge addresses at peak times. The CDN adds X-Forwarded-For. What should be changed?
+A: Set the rate-based rule to aggregate on the forwarded IP address from the X-Forwarded-For header, with a fallback behavior
+B: Raise the rate-based rule limit to 50,000 requests so CDN edge addresses no longer exceed it during peak traffic hours
+C: Add the CDN edge address ranges to an IP set allow rule evaluated before the rate-based rule in the same web ACL
+D: Replace the rate-based rule with an AWS Shield Advanced subscription for the ALB, which rate limits by client address
+K: A
+G: ## What a rate-based rule counts
+A rate-based rule counts requests per **aggregation key** over a time window and blocks keys that exceed the limit. By default, the key is the **source IP** of the connection to AWS WAF.
+## The proxy problem
+When a CDN or proxy sits in front, thousands of real users share a handful of CDN egress addresses. Counting by source IP punishes the CDN, not the abusive client.
+## Forwarded IP
+Rate-based rules can instead aggregate on the **forwarded IP**: WAF reads the first address in a header such as `X-Forwarded-For`. You also choose a **fallback behavior** (MATCH or NO_MATCH) for requests where the header is missing or invalid. Custom keys can combine other values too, such as a header or query argument.
+W: Forwarded IP aggregation: counting by the client address in X-Forwarded-For restores per-client limits, so a single abusive client is blocked without blocking the whole CDN.
+X: B=Raise the limit: a limit high enough for all CDN traffic is useless for stopping any single abusive client, who can now send 50,000 requests per window.
+C=Allow the CDN ranges: an allow rule before the rate rule exempts all traffic through the CDN, which removes rate limiting entirely for most users.
+D=Shield Advanced: Shield Advanced adds DDoS response and application layer mitigation, but it does not replace a per-client rate rule and still sees the same CDN addresses.
+T: Behind a proxy or CDN, make rate-based rules count the forwarded client IP; raising limits or allowlisting the proxy removes protection.
+V: AWS WAF, Elastic Load Balancing
+
+@ SCS-C03 D3 T3.1 advanced tradeoff
+S: A company's ALB is internet-facing only so that CloudFront can reach it, protected by a CloudFront prefix list and a secret custom header. The security team wants the ALB to have no public exposure at all while still serving users through CloudFront. Which approach fits?
+A: Move the ALB to private subnets as an internal load balancer and configure it as a CloudFront VPC origin
+B: Keep the ALB internet-facing and rotate the secret custom header every day with a Lambda function on a schedule
+C: Put the ALB behind an interface VPC endpoint for CloudFront so that CloudFront can reach it over AWS PrivateLink
+D: Replace the ALB with an API Gateway private API and point CloudFront to its execute-api endpoint for the Region
+K: A
+G: ## The classic pattern and its weakness
+To stop users bypassing CloudFront, teams restrict an internet-facing ALB with the `com.amazonaws.global.cloudfront.origin-facing` managed prefix list and a secret header checked by the ALB or WAF. The ALB still has public IP addresses and DNS, so misconfigured rules could expose it.
+## CloudFront VPC origins
+With **VPC origins**, CloudFront can deliver to an ALB, NLB, or EC2 instance in a **private subnet**. CloudFront creates a service-managed network interface in your VPC and reaches the origin privately.
+- The origin needs no public IP and no internet-facing listener.
+- CloudFront becomes the only path in from the internet, and the origin's security group can be limited to traffic from CloudFront's VPC origin network interfaces.
+W: CloudFront VPC origin: the internal ALB has no public endpoint at all, and CloudFront remains the single public entry point, which removes the bypass risk instead of guarding against it.
+X: B=Rotate the custom header: rotating secrets strengthens the existing control but the ALB stays internet-facing, which is what the team wants to eliminate.
+C=Interface endpoint for CloudFront: CloudFront does not reach origins through an interface endpoint you create; PrivateLink interface endpoints are for your VPC calling AWS services.
+D=Private API Gateway: private APIs are reachable only through interface endpoints from inside a VPC, so CloudFront, which is outside your VPC, cannot use them as an origin this way.
+T: To give a CloudFront origin zero public exposure, use a VPC origin in private subnets rather than hardening an internet-facing ALB.
+V: Amazon CloudFront, Elastic Load Balancing, Amazon VPC
+
+@ SCS-C03 D3 T3.2 applied tradeoff
+S: Administrators need native SSH and RDP client access to EC2 instances in private subnets with no public IPs. Some instances run appliances where the SSM Agent cannot be installed. Access must be controlled with IAM and logged in CloudTrail, without a bastion host. Which option fits?
+A: An EC2 Instance Connect Endpoint in the VPC, with IAM policies that allow ec2-instance-connect:OpenTunnel to that endpoint
+B: AWS Systems Manager Session Manager port forwarding, with IAM policies that allow ssm:StartSession to those instances
+C: An AWS Client VPN endpoint with certificate authentication, so administrators can reach the private addresses over TLS
+D: A Network Load Balancer in a public subnet that forwards ports 22 and 3389 to the instances, restricted by security group
+K: A
+G: ## Private access options
+- **Session Manager** gives shell or port forwarding without open inbound ports, but it needs the **SSM Agent** running on the instance and a path to Systems Manager.
+- **EC2 Instance Connect Endpoint (EIC Endpoint)** is a managed endpoint in a subnet that opens a TCP tunnel to a private IP, so you can use native SSH (22) or RDP (3389) clients. No agent is required on the target; the instance's security group just allows the EIC Endpoint.
+## Control and logging
+Access is granted with IAM action `ec2-instance-connect:OpenTunnel`, and conditions can limit ports and target IPs. Each tunnel opening is recorded in CloudTrail.
+Example: `aws ec2-instance-connect open-tunnel --instance-id i-0abc --remote-port 3389 --local-port 3389`
+W: EC2 Instance Connect Endpoint: it gives agentless, IAM-authorized, CloudTrail-logged SSH and RDP tunnels to private instances without a bastion or public IP, which fits the appliances that cannot run the SSM Agent.
+X: B=Session Manager port forwarding: it fits most instances, but it requires the SSM Agent on the target, which the appliances cannot run.
+C=Client VPN: it gives network access with certificates, not per-instance IAM authorization, and CloudTrail does not record which instance each administrator connects to.
+D=Public NLB for 22 and 3389: this publishes management ports to the internet, which is exactly the exposure the private design is meant to avoid.
+T: Agentless native SSH/RDP to private instances with IAM and CloudTrail points to EC2 Instance Connect Endpoint; Session Manager needs the SSM Agent.
+V: Amazon EC2, AWS IAM, AWS CloudTrail
+
+@ SCS-C03 D3 T3.2 applied troubleshooting
+S: An Amazon ECS task definition injects a database password from AWS Secrets Manager through the secrets field. The secret is encrypted with a customer managed KMS key. Tasks fail to start with an error that the secret cannot be retrieved. The task role has full Secrets Manager access. Which TWO changes fix this? (Select TWO)
+A: Allow secretsmanager:GetSecretValue on the secret for the task execution role
+B: Allow kms:Decrypt on the customer managed key for the task execution role
+C: Allow secretsmanager:RotateSecret on the secret for the ECS task role as well
+D: Add the ECS service-linked role as a principal in the secret's rotation schedule
+E: Grant the container instance profile kms:Encrypt on the customer managed key
+K: A,B
+G: ## Two roles in an ECS task
+- The **task execution role** is used by the ECS agent (or Fargate) to prepare the task: pull images from ECR, send logs, and fetch values from Secrets Manager or Parameter Store for the `secrets` field.
+- The **task role** is used by the application code after it starts, for example to call S3.
+## Injected secrets
+When a task definition contains:
+`"secrets": [{"name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:...:secret:prod/db"}]`
+the execution role needs `secretsmanager:GetSecretValue` on that secret. If the secret uses a customer managed KMS key, it also needs `kms:Decrypt` on the key (and the key policy must allow it).
+## Symptom
+Permissions on the task role do not help, because the value is fetched before the container runs.
+W: A=GetSecretValue for the execution role: the execution role, not the task role, fetches values for the secrets field before the container starts, so it needs this permission on the secret.
+B=Decrypt for the execution role: because the secret is encrypted with a customer managed key, the execution role also needs kms:Decrypt on that key to read the secret value.
+X: C=RotateSecret for the task role: rotation is unrelated to reading the value at startup, and the task role is not used for injection.
+D=Service-linked role in rotation: rotation schedules do not take principals, and the service-linked role is not what fetches task secrets.
+E=Encrypt on the instance profile: fetching a secret needs Decrypt, not Encrypt, and the ECS agent uses the task execution role for this, not the instance profile.
+T: Secrets injected into ECS tasks are fetched with the task execution role, which needs GetSecretValue and kms:Decrypt; the task role only serves the running app.
+V: Amazon ECS, AWS Secrets Manager, AWS KMS, AWS IAM
+
+@ SCS-C03 D5 T5.1 applied use-case
+S: A media site uses CloudFront with a custom origin on EC2 behind an ALB. Auditors require that traffic be encrypted between viewers and CloudFront and between CloudFront and the origin, while users who type http:// still reach the site. Which TWO settings are required? (Select TWO)
+A: Set the viewer protocol policy to Redirect HTTP to HTTPS
+B: Set the origin protocol policy to HTTPS only for the ALB
+C: Set the viewer protocol policy to HTTP and HTTPS for all
+D: Enable field-level encryption for the entire request body
+E: Enable Origin Shield in the Region closest to the origin
+K: A,B
+G: ## Two legs of every CloudFront request
+- **Viewer to CloudFront**: controlled by the cache behavior's **viewer protocol policy**: `HTTP and HTTPS`, `Redirect HTTP to HTTPS`, or `HTTPS only`.
+- **CloudFront to origin**: for custom origins such as an ALB, controlled by the **origin protocol policy**: `HTTP only`, `HTTPS only`, or `Match viewer`.
+## Choosing values
+- `Redirect HTTP to HTTPS` returns a 301 for http:// requests, so users still arrive, and the actual content is served only over TLS. `HTTPS only` would return 403 instead.
+- `HTTPS only` for the origin makes CloudFront always use TLS to the ALB. The ALB needs a certificate that matches the origin domain name CloudFront uses.
+W: A=Redirect HTTP to HTTPS for viewers: http:// requests get a redirect, so users still reach the site, while content on the viewer leg is served only over TLS.
+B=HTTPS only origin protocol policy: CloudFront always uses TLS when connecting to the ALB, which encrypts the second leg between CloudFront and the origin.
+X: C=HTTP and HTTPS for viewers: this serves content over plain HTTP to anyone who asks for it, which fails the auditors' requirement.
+D=Field-level encryption: it encrypts selected POST form fields for specific back-end apps, but it does not require TLS on either leg of the connection.
+E=Origin Shield: it adds a caching layer to reduce origin load and does not change the protocol used to the origin.
+T: End-to-end TLS through CloudFront means a viewer protocol policy that forces HTTPS (redirect keeps http users working) plus an HTTPS-only origin protocol policy.
+V: Amazon CloudFront, Elastic Load Balancing
+
+@ SCS-C03 D5 T5.1 applied use-case
+S: An Amazon RDS for PostgreSQL 14 instance must reject any client connection that does not use TLS, for every database user. Some application users authenticate with passwords, and some use IAM database authentication. Which change enforces this?
+A: Set the rds.force_ssl parameter to 1 in a custom DB parameter group attached to the instance, and apply the change
+B: Set the require_secure_transport parameter to ON in a custom DB parameter group attached to the PostgreSQL instance
+C: Enable IAM database authentication on the instance, because it forces TLS for every user once it is switched on
+D: Enable storage encryption with a KMS key, because encrypted instances automatically reject unencrypted connections
+K: A
+G: ## TLS enforcement is engine-specific
+RDS supports TLS for every engine, but whether clients **must** use it is set by an engine parameter:
+- RDS for PostgreSQL: `rds.force_ssl = 1`. It is the default for PostgreSQL 15 and later, but older versions such as 14 default to `0`.
+- RDS for MySQL and MariaDB: `require_secure_transport = ON`.
+You change these in a custom DB parameter group attached to the instance.
+## What other features do
+- IAM database authentication requires TLS for the IAM users that use tokens, but password users can still connect in plain text.
+- Storage encryption protects data at rest on disk and snapshots, not the network connection.
+W: rds.force_ssl: this PostgreSQL parameter makes the server reject non-TLS connections for all users, regardless of how they authenticate.
+X: B=require_secure_transport: this is the MySQL and MariaDB parameter; it does not exist for RDS for PostgreSQL.
+C=IAM database authentication: TLS is required only for connections that use IAM tokens, so the password-based users are not covered.
+D=Storage encryption: encryption at rest does not affect the network connection and cannot be enabled on an existing unencrypted instance anyway.
+T: Enforce TLS on RDS with the engine parameter (rds.force_ssl for PostgreSQL, require_secure_transport for MySQL); IAM auth or at-rest encryption does not cover all clients.
+V: Amazon RDS
+
+@ SCS-C03 D5 T5.1 advanced use-case
+S: A bucket policy already denies requests when aws:SecureTransport is false. A new standard requires that S3 requests use TLS 1.2 or later, and clients that negotiate TLS 1.0 or 1.1 must be refused. Which bucket policy statement enforces this?
+A: Deny s3:* when the s3:TlsVersion condition key is NumericLessThan 1.2
+B: Deny s3:* when the aws:SecureTransport condition key is Bool false
+C: Deny s3:* when the aws:SourceVpce condition key is not the VPC endpoint
+D: Allow s3:* only when the s3:signatureversion key equals AWS4-HMAC-SHA256
+K: A
+G: ## Two different TLS questions
+- `aws:SecureTransport` answers "was TLS used at all?". A request over TLS 1.0 is still `true`, so a SecureTransport deny cannot block old versions.
+- `s3:TlsVersion` is an S3 condition key holding the negotiated TLS version as a number, such as `1.2`.
+## Example statement
+`"Effect": "Deny", "Principal": "*", "Action": "s3:*", "Resource": ["arn:aws:s3:::bucket", "arn:aws:s3:::bucket/*"], "Condition": {"NumericLessThan": {"s3:TlsVersion": "1.2"}}`
+Keep the SecureTransport deny as well, so plain HTTP is still refused. Because it is a deny with `Principal "*"`, it applies to every caller, including administrators.
+W: s3:TlsVersion with NumericLessThan: this key carries the negotiated version, so a deny below 1.2 refuses TLS 1.0 and 1.1 while TLS 1.2 and 1.3 continue to work.
+X: B=SecureTransport false: this statement already exists and only blocks plain HTTP. Any TLS version, including 1.0, satisfies it.
+C=SourceVpce restriction: this limits the network path, not the TLS version, and would block legitimate callers outside that endpoint.
+D=Signature version condition: SigV4 is about how requests are signed, not how they are transported, so TLS 1.0 requests signed with SigV4 would still pass.
+T: aws:SecureTransport only checks that TLS is used; to require a minimum version on S3, deny with s3:TlsVersion NumericLessThan 1.2.
+V: Amazon S3, AWS IAM
+
+@ SCS-C03 D5 T5.2 applied use-case
+S: A defense agency workload stores files in Amazon S3. Its compliance framework requires two independent layers of encryption at rest applied by the storage service, with keys that the agency controls and whose use is logged. Which configuration fits?
+A: Set the bucket default encryption to DSSE-KMS using a customer managed KMS key for all new objects
+B: Set the bucket default encryption to SSE-KMS and enable S3 Bucket Keys to add a second layer of keys
+C: Set the bucket default encryption to SSE-S3 and also enable S3 Object Lock in compliance mode for files
+D: Set the bucket default encryption to SSE-KMS and require clients to also send SSE-C headers on uploads
+K: A
+G: ## S3 server-side encryption options
+- **SSE-S3**: one layer, keys managed by S3.
+- **SSE-KMS**: one layer, data keys protected by a KMS key you can control and audit in CloudTrail.
+- **DSSE-KMS** (dual-layer server-side encryption with KMS keys): S3 applies **two layers of AES-256 encryption** to each object, using keys protected by a KMS key. It is designed for requirements that call for multilayer encryption, such as some US government standards.
+- **SSE-C**: you provide the key with each request; only one method can be used per object.
+## Example
+Default encryption rule: `"SSEAlgorithm": "aws:kms:dsse", "KMSMasterKeyID": "arn:aws:kms:...:key/..."`
+Every use of the KMS key is logged in CloudTrail, and the key policy stays under the agency's control.
+W: DSSE-KMS with a customer managed key: S3 applies two separate encryption layers itself, and the KMS key gives the agency control and CloudTrail auditing.
+X: B=SSE-KMS with Bucket Keys: a Bucket Key reduces KMS calls by caching a bucket-level key; it is not a second encryption layer on the object data.
+C=SSE-S3 with Object Lock: Object Lock prevents deletion but does not encrypt anything, and SSE-S3 keys are not customer controlled.
+D=SSE-KMS plus SSE-C: an object can use only one server-side encryption method per request; S3 rejects combining them.
+T: Two layers of encryption applied by S3 itself means DSSE-KMS; Bucket Keys and Object Lock do not add encryption layers.
+V: Amazon S3, AWS KMS
+
+@ SCS-C03 D5 T5.2 applied troubleshooting
+S: An engineer tries to share an encrypted EBS snapshot with a disaster recovery account. The console does not allow the share, and the snapshot is encrypted with the default aws/ebs key. What should the engineer do?
+A: Copy the snapshot while re-encrypting it with a customer managed key, allow the DR account in that key policy, and share the copy
+B: Add the DR account to the key policy of the aws/ebs AWS managed key, then share the original snapshot directly with the DR account
+C: Make the snapshot public for a short time so the DR account can copy it, then remove public access once the copy has completed
+D: Disable EBS encryption by default in the Region, create an unencrypted copy of the snapshot, and share that copy with the account
+K: A
+G: ## Why the default key blocks sharing
+To use a shared encrypted snapshot, the other account must be able to use the KMS key that encrypts it. The AWS managed key `aws/ebs` has a key policy AWS controls, and it only allows use within your own account. So snapshots encrypted with it cannot be shared.
+## Working pattern
+- Copy the snapshot and choose a **customer managed key** during the copy (copying is when you can re-encrypt).
+- Add the DR account to that key's policy with `kms:Decrypt`, `kms:DescribeKey`, `kms:CreateGrant` and data key permissions.
+- Share the copied snapshot with the DR account ID.
+- In the DR account, copy the snapshot again under its own key, so it no longer depends on the source account's key.
+W: Re-encrypt the copy with a customer managed key: only a key you control can be granted to another account, and a snapshot copy is the step where you change the key.
+X: B=Edit the aws/ebs key policy: AWS managed key policies cannot be changed, which is exactly why this snapshot cannot be shared.
+C=Make it public: encrypted snapshots cannot be made public, and public exposure of backup data would be a serious risk anyway.
+D=Unencrypted copy: you cannot create an unencrypted copy of an encrypted snapshot, and removing encryption would break the protection requirement.
+T: Share encrypted EBS snapshots only after re-encrypting them with a customer managed key granted to the target account; aws/ebs cannot be shared.
+V: Amazon EBS, AWS KMS
+
+@ SCS-C03 D5 T5.3 advanced use-case
+S: A customer managed KMS key is used for SSE-KMS on a bucket in us-east-1. Roles that can decrypt with the key must only be able to use it through Amazon S3 in that Region, never by calling kms:Decrypt directly from scripts. Which key policy condition enforces this?
+A: kms:ViaService with the value s3.us-east-1.amazonaws.com on the statement that allows the roles to use the key
+B: kms:CallerAccount with the account ID of the roles on the statement that allows the roles to use the key
+C: aws:SourceVpce with the S3 gateway endpoint ID on the statement that allows the roles to use the key
+D: kms:GrantIsForAWSResource set to true on the statement that allows the roles to use the key for decryption
+K: A
+G: ## Limiting how a key is used
+When an AWS service such as S3 uses a KMS key for a caller, KMS knows which service made the request on their behalf. The condition key `kms:ViaService` holds that service's endpoint name, for example `s3.us-east-1.amazonaws.com`.
+## Example statement
+`"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::111122223333:role/Analytics"}, "Action": ["kms:Decrypt", "kms:GenerateDataKey"], "Resource": "*", "Condition": {"StringEquals": {"kms:ViaService": "s3.us-east-1.amazonaws.com"}}`
+- A GetObject on an SSE-KMS object works, because S3 calls KMS for the role.
+- `aws kms decrypt` run by the same role directly fails, because no service is in between.
+W: kms:ViaService: it allows key use only when the request comes through the named service and Region, which blocks direct KMS API calls by the same roles.
+X: B=kms:CallerAccount: it limits which account the caller belongs to, but the roles are already in that account and could still call KMS directly.
+C=aws:SourceVpce: requests from S3 to KMS are made by the S3 service, not through the customer's gateway endpoint, so this would break S3 use instead of restricting direct calls.
+D=kms:GrantIsForAWSResource: it applies to grant operations such as CreateGrant for integrated services, not to direct Decrypt calls.
+T: To make a key usable only through a specific AWS service, add kms:ViaService; account and network conditions do not stop direct KMS calls.
+V: AWS KMS, Amazon S3
+
+@ SCS-C03 D5 T5.3 advanced use-case
+S: A secret in Account A must be read by a Lambda role in Account B. The role already has an IAM policy allowing secretsmanager:GetSecretValue on the secret and kms:Decrypt on its key. The secret is encrypted with the AWS managed key aws/secretsmanager. Which TWO changes in Account A are required? (Select TWO)
+A: Add a resource-based policy to the secret that allows the Account B role to call GetSecretValue
+B: Re-encrypt the secret with a customer managed key whose policy allows the role to use kms:Decrypt
+C: Share the secret with Account B through AWS RAM so that the Lambda role can see the secret's ARN
+D: Add the Account B role to the aws/secretsmanager key policy with kms:Decrypt permission for the key
+E: Replicate the secret into Account B with Secrets Manager replication so the role can read it locally
+K: A,B
+G: ## Cross-account secret access needs three permissions
+1. An IAM policy in the consumer account (already done here).
+2. A **resource-based policy on the secret** that allows the consumer principal, for example `"Principal": {"AWS": "arn:aws:iam::222233334444:role/app"}` with `secretsmanager:GetSecretValue`.
+3. Permission to use the **KMS key** that encrypts the secret.
+## The KMS key detail
+The AWS managed key `aws/secretsmanager` can only be used within its own account, and its key policy cannot be edited. For cross-account access, the secret must use a **customer managed key** whose key policy allows the other account's role `kms:Decrypt` (often with `kms:ViaService` for Secrets Manager).
+W: A=Resource-based policy on the secret: cross-account access requires the secret's own policy in Account A to allow the Account B role to call GetSecretValue, in addition to the role's IAM policy.
+B=Customer managed key: the aws/secretsmanager key cannot be used across accounts, so the secret must be re-encrypted with a customer managed key whose policy allows the role kms:Decrypt.
+X: C=Share through RAM: Secrets Manager cross-account access is granted with the secret's resource policy, not with RAM shares.
+D=Edit the aws/secretsmanager key policy: AWS managed key policies cannot be modified, so this grant is impossible.
+E=Replicate into Account B: Secrets Manager replication copies secrets to other Regions in the same account, not to another account.
+T: Cross-account secrets need a secret resource policy plus a customer managed KMS key; the aws/secretsmanager key never works across accounts.
+V: AWS Secrets Manager, AWS KMS, AWS IAM
+
+@ SCS-C03 D5 T5.3 applied use-case
+S: A company must find S3 objects that contain its internal employee IDs, formatted as EMP- followed by six digits, usually near the words employee or staff. Macie's managed data identifiers do not detect this format. Which Macie feature fits?
+A: A custom data identifier with a regular expression for the ID format, keywords for employee and staff, and a maximum match distance
+B: An allow list with a regular expression for the ID format, so Macie reports every object that matches the pattern as sensitive data
+C: A suppression rule with the ID format as the criteria, so Macie groups all matching objects into one sensitive data finding
+D: A managed data identifier for national identification numbers configured with the EMP- prefix as its country code setting
+K: A
+G: ## Managed versus custom detection in Macie
+Amazon Macie comes with **managed data identifiers** for common types such as credit card numbers, AWS secret keys, and national IDs. For organization-specific formats, you create a **custom data identifier** with:
+- A **regular expression**, for example `EMP-\d{6}`.
+- Optional **keywords** such as `employee` or `staff` that must appear near the match, and a **maximum match distance** in characters.
+- Optional **ignore words** to skip known false positives.
+## Using it
+Add the custom identifier to a sensitive data discovery job or to automated sensitive data discovery. Findings then show the custom identifier as the detected type, and they can flow to Security Hub and EventBridge like other Macie findings.
+## Allow lists are the opposite
+An **allow list** tells Macie which text or patterns to **ignore**, such as a public sample value.
+W: Custom data identifier: a regex plus nearby keywords and a match distance is exactly how Macie detects organization-specific identifiers with few false positives.
+X: B=Allow list: allow lists exclude matches from findings; using the ID pattern there would hide the very data the company needs to find.
+C=Suppression rule: suppression rules archive findings that match criteria, so they reduce visibility instead of adding detection for a new format.
+D=Reconfigured managed identifier: managed identifiers cannot be edited with custom prefixes or patterns; that is what custom data identifiers are for.
+T: Detect organization-specific formats in Macie with a custom data identifier; allow lists and suppression rules only reduce what is reported.
+V: Amazon Macie, Amazon S3

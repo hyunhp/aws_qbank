@@ -159,6 +159,17 @@ def rich_checks(f, entries, where, errors):
             errors.append(f"{where}: {k}: refers to an option by letter ({m.group(0)!r}); name the option instead")
 
 
+def why_by_key(f, keys, where, errors):
+    """Multi-answer detailed explanations give one W: entry per correct option ("A=Name: why")."""
+    if len(keys) < 2:
+        return {}
+    by = split_x(f["W"])
+    if sorted(by) != sorted(keys):
+        errors.append(f"{where}: multi-answer W: needs one entry per correct option, one per line: "
+                      + " / ".join(f"{k}=Name: why" for k in keys))
+    return by
+
+
 def build_explain(block, errors):
     """@ Q001592 explain: replace the explanation of a published question."""
     qid = EXPL_HEAD.match(block["_head"]).group(1)
@@ -181,7 +192,8 @@ def build_explain(block, errors):
     if extra:
         errors.append(f"{where}: X: covers {extra}, which are not wrong choices of {qid}")
     rich_checks(f, wrong, where, errors)
-    return {"explain_only": True, "id": qid, "where": where, "bg": f["G"], "why": f["W"], "wrong": wrong,
+    why_by = why_by_key(f, q["correctKeys"], where, errors)
+    return {"explain_only": True, "id": qid, "where": where, "bg": f["G"], "why": f["W"], "why_by": why_by, "wrong": wrong,
             "take": f["T"], "keys": q["correctKeys"], "choices": {c["key"]: c["text"] for c in q["choices"]}}
 
 
@@ -251,12 +263,13 @@ def build(block, errors):
         errors.append(f"{where}: X: has no reason for wrong choice(s) {missing}")
     if f.get("G"):
         rich_checks(f, {k: v for k, v in wrong.items() if k not in keys}, where, errors)
+    why_by = why_by_key(f, keys, where, errors) if f.get("G") else {}
     if len(f["S"]) < 60:
         errors.append(f"{where}: stem too short to be a scenario")
     return {
         "exam": exam, "dom": dom, "task": task, "diff": diff, "scen": scen, "shared": shared,
         "stem": f["S"], "choices": {k: f[k] for k in letters}, "keys": keys, "why": f["W"],
-        "wrong": wrong, "take": f["T"], "bg": f.get("G") or None, "services": [s.strip() for s in f.get("V", "").split(",") if s.strip()],
+        "wrong": wrong, "why_by": why_by, "take": f["T"], "bg": f.get("G") or None, "services": [s.strip() for s in f.get("V", "").split(",") if s.strip()],
         "pin": f.get("I") or None,
         "hash": hashlib.sha1(re.sub(r"\s+", " ", f["S"].lower()).encode()).hexdigest()[:12], "where": where,
     }
@@ -276,7 +289,7 @@ def rich_explanation(item, order):
     lines = [bg, "", RICH + "Why each option works or fails"]
     for pos, k in enumerate(order):
         ok = k in item["keys"]
-        text = re.sub(r"\s*\n\s*", " ", item["why"] if ok else item["wrong"][k]).strip()
+        text = re.sub(r"\s*\n\s*", " ", (item.get("why_by") or {}).get(k, item["why"]) if ok else item["wrong"][k]).strip()
         m = re.match(r"^([^:]{2,60}):\s+(.*)$", text)          # "Short name: reason"
         label = f"{'ABCDE'[pos]}. {m.group(1)}" if m else f"{'ABCDE'[pos]}."
         body = m.group(2) if m else text
@@ -451,7 +464,7 @@ def ingest_explanations(explains):
     for x in explains:
         letters = list(x["choices"])
         text = rich_explanation({"bg": x["bg"], "why": x["why"], "wrong": x["wrong"], "take": x["take"],
-                                 "keys": x["keys"]}, letters)
+                                 "why_by": x["why_by"], "keys": x["keys"]}, letters)
         for e in EXAMS:
             for q in files[e]:
                 if q["id"] == x["id"]:

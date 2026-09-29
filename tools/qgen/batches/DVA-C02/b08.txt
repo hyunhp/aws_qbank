@@ -1,0 +1,563 @@
+# DVA-C02 batch 08: D1 (16) + D4 (9), detailed explanations
+
+@ DVA-C02 D1 T1.1 applied tradeoff
+S: An SQS FIFO queue feeds a Lambda function that updates customer account ledgers. Every producer sends messages with the same MessageGroupId, "ledger". Events for one customer must stay in order, but the backlog keeps growing even though the function has plenty of unreserved concurrency. What should the developer change?
+A: Set MessageGroupId to the customer ID so each customer's events form their own ordered group that can be processed in parallel
+B: Keep the single message group and raise the function's reserved concurrency so more Lambda pollers can drain it in parallel
+C: Enable content-based deduplication on the queue so repeated ledger events are dropped before they ever reach the function
+D: Move to an SQS standard queue and add a 5-second delivery delay so that events usually arrive at the function in order
+K: A
+G: ## Ordering in SQS FIFO is per message group
+A FIFO queue guarantees order only inside a message group, identified by `MessageGroupId`. While one batch from a group is in flight, SQS will not hand out the next messages of that same group, so a group is always processed one batch at a time.
+- One group for the whole queue = strictly serial processing, no matter how many consumers exist.
+- Many groups = many independent ordered streams that different consumers can work on at the same time.
+## How Lambda scales on FIFO
+The Lambda event source mapping for a FIFO queue scales with the number of active message groups. Example: with `MessageGroupId = customerId`, events for customer `c-42` still arrive in order, while `c-43` and `c-44` are processed by other concurrent invocations.
+Choose the group key as the smallest unit that truly needs ordering.
+W: Customer ID as the group key: ordering is only needed per customer, and giving each customer its own group lets Lambda process many groups concurrently while keeping each customer's events in sequence.
+X: B=More concurrency, one group: SQS never releases the next batch of a group while one is in flight, so extra pollers or concurrency sit idle; a single group stays serial.
+C=Content-based deduplication: it only removes duplicate sends within the 5-minute deduplication window. It has no effect on how many messages can be processed in parallel.
+D=Standard queue with delay: standard queues give best-effort ordering only, and a delivery delay does not restore order, so ledger events could be applied out of sequence.
+T: FIFO parallelism comes from the number of message groups; pick the narrowest key that needs ordering instead of adding consumers to one group.
+V: Amazon SQS, AWS Lambda
+
+@ DVA-C02 D1 T1.1 applied use-case
+S: A developer must run a validation step on each of 3 million JSON files stored under one S3 prefix. The team wants a managed workflow with high parallelism, per-item retries, and a report of failed items, without writing its own fan-out code. Which approach fits?
+A: A Step Functions Distributed Map state that reads the S3 prefix and runs a child workflow per batch of objects with high concurrency
+B: A Step Functions Inline Map state that receives the full list of 3 million object keys in its state input and iterates over them
+C: A single Lambda function that lists the prefix and loops through every object sequentially with an increased 15-minute timeout
+D: An S3 event notification on the prefix that re-invokes the validation function once for every object that is already stored there
+K: A
+G: ## Two ways to iterate in Step Functions
+The `Map` state runs the same steps for every item in a collection. It has two modes:
+- **Inline** mode runs iterations inside the parent execution. Concurrency is limited (up to 40 parallel iterations), the item array must fit within the state payload size limit, and every iteration adds events to one execution history (limit 25,000 events).
+- **Distributed** mode starts child workflow executions. It can read items directly from S3 (all objects under a prefix, a CSV or JSON file, or an S3 inventory manifest), batch them, run up to 10,000 child executions in parallel, apply a tolerated failure threshold, and write results to S3 with `ResultWriter`.
+## Example
+An `ItemReader` that points at `s3://bucket/incoming/` plus `MaxConcurrency: 1000` validates millions of files, retries failed batches, and writes succeeded and failed items to an output prefix.
+W: Distributed Map: it is built for large-scale parallel processing of S3 datasets, reading the object list itself and running child workflows with retries and an S3 results report.
+X: B=Inline Map with key list: a 3 million key array is far larger than the Step Functions state payload size limit, and inline iterations are limited to 40 in parallel within one execution history.
+C=One long Lambda loop: a single invocation is capped at 15 minutes and processes items one at a time, so it cannot finish 3 million files and has no per-item retry report.
+D=S3 event notifications: notifications fire only for new events such as object creation. Objects that already exist do not generate events, so nothing would process the backlog.
+T: For millions of S3 objects use Distributed Map (child workflows, S3 item reader, high concurrency); Inline Map is for small collections in the state input.
+V: AWS Step Functions, Amazon S3, AWS Lambda
+
+@ DVA-C02 D1 T1.1 applied troubleshooting
+S: A reporting script calls the S3 ListObjectsV2 API once and counts the keys it gets back. The bucket prefix holds about 12,000 objects, but the script always reports exactly 1,000. What should the developer change in the code?
+A: Use the SDK paginator, or loop while IsTruncated is true and pass NextContinuationToken, until all pages have been read
+B: Set the MaxKeys parameter to 20000 in the single ListObjectsV2 request so all the objects are returned in one response
+C: Switch the call to the older ListObjects API version, which returns every key under the prefix in a single response
+D: Add a Delimiter of "/" to the request so S3 groups keys by folder and returns the complete key list in the response
+K: A
+G: ## S3 list operations return pages
+`ListObjectsV2` returns at most 1,000 keys per call, no matter how many objects match. When more exist, the response includes `IsTruncated: true` and a `NextContinuationToken`. The caller sends that token as `ContinuationToken` in the next request to get the next page.
+- `MaxKeys` can only lower the page size; values above 1,000 are still capped at 1,000.
+- AWS SDKs provide paginators that hide this loop, for example `s3.get_paginator("list_objects_v2")` in boto3 or `paginateListObjectsV2` in the JavaScript SDK v3.
+## Pattern
+```
+for page in paginator.paginate(Bucket=b, Prefix=p): count += page.get("KeyCount", 0)
+```
+The same paging idea applies to many AWS list and query APIs (DynamoDB `LastEvaluatedKey`, `NextToken` in many services).
+W: Paginate the results: ListObjectsV2 returns 1,000 keys per page, so the script must follow the continuation token (or use the SDK paginator) until IsTruncated is false.
+X: B=MaxKeys of 20000: MaxKeys can reduce the page size but never raises it above 1,000, so the response would still stop at 1,000 keys.
+C=Older ListObjects API: version 1 is also paged at 1,000 keys and uses a Marker instead of a token, so it has the same limit and is not recommended for new code.
+D=Delimiter "/": a delimiter rolls keys up into CommonPrefixes, which returns fewer entries, not more; the 1,000 entry page limit still applies.
+T: AWS list APIs page their results; follow the continuation token or use an SDK paginator instead of trying to raise the page size.
+V: Amazon S3, AWS SDK
+
+@ DVA-C02 D1 T1.1 applied comparison
+S: A company is launching a partner API backed by Lambda. Each partner must receive its own API key with a monthly request quota and a per-partner throttling rate. Which API Gateway option supports this natively?
+A: A REST API with API keys attached to usage plans that define the throttling rate and quota for each partner
+B: An HTTP API with a JWT authorizer that reads a partner claim and applies route-level throttling to each partner
+C: An HTTP API with a Lambda authorizer that returns the partner identity and stage-level default throttling limits
+D: A WebSocket API with a $connect route authorizer that tracks each partner's message count in a DynamoDB table
+K: A
+G: ## REST APIs versus HTTP APIs in API Gateway
+API Gateway offers two flavours for request/response APIs:
+- **HTTP APIs** are cheaper and lower latency, with JWT and Lambda authorizers, CORS and route or stage throttling. They do not support API keys or usage plans.
+- **REST APIs** add features such as API keys, usage plans, request validation, response caching, and AWS WAF integration.
+## Usage plans
+A usage plan links API keys to API stages and sets a steady-state rate, a burst and an optional quota per day, week or month. Clients send the key in the `x-api-key` header; API Gateway returns `429 Too Many Requests` when a key exceeds its limits.
+Example: plan `gold` with 100 requests per second and 1,000,000 requests per month, attached to partner A's key.
+Note that API keys identify and meter clients; they are not a strong authentication mechanism, so pair them with an authorizer or IAM.
+W: REST API with usage plans: only REST APIs support API keys and usage plans, which give each partner its own throttling rate and monthly quota enforced by API Gateway.
+X: B=HTTP API with JWT authorizer: HTTP API throttling is set per route or stage for all callers combined; it cannot apply a separate quota to each partner.
+C=HTTP API with Lambda authorizer: the authorizer can identify the partner, but HTTP APIs have no usage plans, so per-partner quotas would have to be built by hand.
+D=WebSocket API counting messages: WebSocket APIs are for two-way persistent connections, and a hand-built DynamoDB counter is custom metering, not a native per-key quota.
+T: Per-client API keys, quotas and throttling are REST API usage plans; HTTP APIs trade those features for lower cost and latency.
+V: Amazon API Gateway, AWS Lambda
+
+@ DVA-C02 D1 T1.1 advanced use-case
+S: A trading dashboard must push price alerts from a backend Lambda function to thousands of connected browsers within a second, without clients polling. The team wants a fully managed API Gateway solution. How should the backend send each alert?
+A: Use a WebSocket API, store connection IDs from the $connect route in DynamoDB, and call PostToConnection for each target connection
+B: Use a REST API with a 1-second response cache so that clients receive new alerts quickly while polling the same endpoint
+C: Use an HTTP API route that keeps each client request open until the next alert arrives, then returns the alert as the response
+D: Use a REST API with a Lambda proxy integration that writes each alert to the stage's CloudWatch Logs for clients to read
+K: A
+G: ## Server push with API Gateway WebSocket APIs
+A WebSocket API keeps a persistent two-way connection between each client and API Gateway. Special routes handle the lifecycle:
+- `$connect` runs when a client connects; a Lambda function typically saves the `connectionId` (for example in DynamoDB).
+- `$disconnect` runs when the client leaves, so the ID can be removed.
+- `$default` or custom routes handle messages the client sends.
+## Sending to a client
+The backend pushes data by calling the `@connections` management API: `PostToConnection` with the connection ID, using the endpoint `https://{api-id}.execute-api.{region}.amazonaws.com/{stage}`. A `410 Gone` response means the client disconnected and its ID should be deleted.
+Example: an alert function queries the connection table for subscribers of `AAPL` and posts the alert to each ID.
+W: WebSocket API with @connections: clients hold open connections, and the backend pushes each alert immediately through PostToConnection using the stored connection IDs.
+X: B=REST API with 1-second cache: caching still depends on clients polling, and thousands of clients polling every second is exactly the load and delay the team wants to avoid.
+C=Long-held HTTP API request: HTTP API integrations time out after at most 30 seconds, and a request/response API cannot push several alerts over one connection.
+D=Alerts in CloudWatch Logs: execution logs are an operational tool, not a delivery channel; browsers cannot subscribe to them and would need AWS credentials to read them.
+T: For server-to-client push, use a WebSocket API and PostToConnection; REST and HTTP APIs only answer requests.
+V: Amazon API Gateway, AWS Lambda, Amazon DynamoDB
+
+@ DVA-C02 D1 T1.1 applied use-case
+S: A SaaS app lets each user schedule a reminder for an exact future time, from minutes to months ahead. Millions of reminders may be pending, and each must invoke a Lambda function once at its time. Which approach fits with the least custom code?
+A: Create an EventBridge Scheduler one-time schedule per reminder with an at() expression and delete it after it completes
+B: Create an EventBridge rule on the default event bus for each reminder, with a cron expression for the reminder time
+C: Send each reminder to an SQS queue with DelaySeconds set to the time remaining until the reminder should fire
+D: Start a Step Functions Express workflow per reminder with a Wait state that pauses until the reminder timestamp
+K: A
+G: ## EventBridge Scheduler
+EventBridge Scheduler is a managed scheduler that creates, runs and tracks very large numbers of schedules (the default quota is 1,000,000 schedules per Region and can be raised). Each schedule has:
+- An expression: `at(2026-12-24T09:00:00)` for one-time, or `rate()`/`cron()` for recurring, with a time zone.
+- A target, such as a Lambda function, SQS queue or any of hundreds of AWS API actions, plus a retry policy and an optional dead-letter queue.
+- `ActionAfterCompletion: DELETE` to remove a one-time schedule automatically after it runs.
+## Why not rules
+EventBridge rules match events on a bus; scheduled rules exist, but each bus has a limited number of rules (hundreds by default), so one rule per user does not scale.
+Example: when a user saves a reminder, the app calls `CreateSchedule` with the reminder ID in the target input.
+W: EventBridge Scheduler one-time schedules: it is designed for millions of individual schedules, fires each once at the exact time, and can delete itself after completion without extra code.
+X: B=One rule per reminder: event bus rules have a low per-bus quota and are meant for event matching, so millions of cron rules would hit limits and require cleanup code.
+C=SQS DelaySeconds: the maximum delivery delay is 15 minutes, so reminders set for hours or months ahead cannot be delayed this way.
+D=Express workflow Wait state: Express workflows run for at most 5 minutes, so a Wait state cannot pause for days or months.
+T: For many exact-time one-off jobs, use EventBridge Scheduler at() schedules; SQS delays stop at 15 minutes and bus rules do not scale per user.
+V: Amazon EventBridge, AWS Lambda
+
+@ DVA-C02 D1 T1.2 advanced use-case
+S: A Node.js Lambda function generates a large HTML report, sometimes over 6 MB, for browser users. Users wait for the whole report before seeing anything. The team wants the first bytes delivered as soon as they are produced. Which change fits?
+A: Expose the function through a function URL with invoke mode RESPONSE_STREAM and write the report with a streaming handler
+B: Increase the function memory to 10,240 MB and the timeout to 15 minutes so that the buffered response completes sooner
+C: Invoke the function asynchronously with the Event invocation type and return HTTP 202 so the browser does not wait
+D: Configure provisioned concurrency on an alias so that every request starts in an initialized execution environment
+K: A
+G: ## Buffered versus streamed responses
+By default Lambda buffers the whole response and returns it when the handler finishes. Synchronous responses are limited to 6 MB, and the client sees nothing until the end (high time to first byte).
+With **response streaming**, the function writes chunks to a stream while it runs, and the client receives them immediately.
+- Configure a function URL with `InvokeMode: RESPONSE_STREAM` (or call `InvokeWithResponseStream`).
+- In Node.js, wrap the handler with `awslambda.streamifyResponse(async (event, responseStream) => { ... })` and call `responseStream.write()` as each section is ready.
+- Streamed responses can exceed the 6 MB buffered limit (a separate, larger limit applies); bytes streamed beyond the first 6 MB carry an extra charge.
+Example: the header and summary table render in the browser within a few hundred milliseconds while the detail rows keep arriving.
+W: Response streaming via a function URL: the handler sends each chunk as it is produced, lowering time to first byte and lifting the 6 MB buffered response limit.
+X: B=More memory and timeout: faster CPU may shorten generation, but the response is still buffered until the end and still capped at 6 MB.
+C=Asynchronous Event invocation: the caller receives only a 202 acknowledgement; the report is never returned to the browser.
+D=Provisioned concurrency: it removes cold-start initialization, but the report is still generated and delivered in one buffered response.
+T: Lower time to first byte and larger payloads come from response streaming; memory and provisioned concurrency only change how fast the buffered response is built.
+V: AWS Lambda
+
+@ DVA-C02 D1 T1.2 advanced troubleshooting
+S: Order and refund messages share one SQS queue. A developer added filter criteria to the Lambda event source mapping so the function receives only messages with type ORDER. A refund service polls the same queue later, but refund messages now disappear. What is happening, and what fixes it?
+A: Lambda deletes SQS messages that do not match the filter; publish to an SNS topic with filter policies that feed separate queues
+B: Lambda hides non-matching messages until the retention period ends; lower the queue's visibility timeout to release them sooner
+C: Lambda moves non-matching messages to the queue's dead-letter queue; point the refund service at that DLQ to read refunds
+D: Lambda returns non-matching messages to the queue with a delay; shorten the delay by setting ReceiveMessageWaitTimeSeconds to 0
+K: A
+G: ## Event filtering on event source mappings
+An event source mapping can have up to 5 filter patterns (more with a quota increase), written in EventBridge pattern syntax, for example `{"body": {"type": ["ORDER"]}}`. Lambda evaluates each message before invoking the function.
+- For **SQS**, a message that does not match is **deleted** from the queue: Lambda treats it as consumed.
+- For Kinesis and DynamoDB streams, non-matching records are skipped as the iterator moves past them.
+Filtering is therefore meant for dropping messages this consumer never wants, not for sharing one queue between consumers.
+## Sharing messages by type
+To route by type, fan out before the queue: an SNS topic with subscription filter policies (`type = ORDER` to one queue, `type = REFUND` to another), or an EventBridge rule per type. Each consumer then owns its queue.
+W: Filtering deletes non-matching SQS messages: the refund messages are removed by Lambda, so the fix is one queue per consumer fed by SNS filter policies or EventBridge rules.
+X: B=Hidden until retention: filtered messages are not kept invisible; they are deleted, so changing the visibility timeout recovers nothing.
+C=Moved to the DLQ: a dead-letter queue receives messages that exceed maxReceiveCount after failed processing, not messages dropped by a filter.
+D=Returned with a delay: filtering does not re-queue messages, and ReceiveMessageWaitTimeSeconds controls long polling, not message delay.
+T: On SQS, event source mapping filters delete what they do not match; give each consumer its own queue when several consumers need different message types.
+V: AWS Lambda, Amazon SQS, Amazon SNS
+
+@ DVA-C02 D1 T1.2 applied use-case
+S: A high-traffic Lambda function reads a database password from Secrets Manager on every invocation, driving up API costs and latency. The secret is rotated monthly, and functions must pick up a new value within 5 minutes. The team wants caching without writing cache logic. Which approach fits?
+A: Add the AWS Parameters and Secrets Lambda Extension layer and read the secret from its local HTTP endpoint with a 300-second TTL
+B: Copy the secret value into an encrypted Lambda environment variable and redeploy the function each time the secret is rotated
+C: Fetch the secret once during initialization outside the handler and keep it in a global variable for the environment's lifetime
+D: Store the secret in an ElastiCache cluster that the function queries on every invocation before falling back to Secrets Manager
+K: A
+G: ## Caching secrets inside Lambda
+Calling `GetSecretValue` on every invocation adds a network round trip and a per-call charge. The **AWS Parameters and Secrets Lambda Extension** is an AWS-provided layer that runs a local cache next to the function.
+- The function calls `http://localhost:2773/secretsmanager/get?secretId=db-pass` with the header `X-Aws-Parameters-Secrets-Token` set to the `AWS_SESSION_TOKEN` value.
+- The extension caches values in memory; `SECRETS_MANAGER_TTL` (default 300 seconds) controls how long before it fetches again, so rotated values appear within the TTL.
+- It works for any runtime because it is just HTTP, and it also serves Parameter Store values.
+## Why the TTL matters
+A global variable set at init time lives as long as the execution environment, which can be hours, so it may keep serving an old password after rotation.
+W: Parameters and Secrets Lambda Extension: it caches the secret locally with a configurable TTL, cutting calls and latency while refreshing within 5 minutes, and requires no custom cache code.
+X: B=Environment variable plus redeploy: every rotation needs a manual or scripted redeploy, and the secret is copied out of Secrets Manager into the function configuration, where rotation no longer updates it.
+C=Global variable at init: execution environments can live for hours, so the cached value never refreshes and may be stale long after the 5-minute requirement.
+D=ElastiCache in front: it adds a cluster, VPC networking and custom cache code, and it places the plaintext secret in another data store.
+T: Cache secrets in Lambda with the Parameters and Secrets extension and a TTL; init-time globals never refresh and environment variables need redeploys.
+V: AWS Lambda, AWS Secrets Manager, AWS Systems Manager
+
+@ DVA-C02 D1 T1.2 advanced tradeoff
+S: A Lambda function consumes a Kinesis data stream with 4 shards. Each record needs about 200 ms of processing, and IteratorAge keeps growing at peak. Order matters only per partition key. The team does not want to add shards. Which change increases throughput?
+A: Raise the event source mapping's ParallelizationFactor so several batches from each shard are processed concurrently
+B: Register an enhanced fan-out consumer for the function so it gets its own dedicated 2 MB/s of read throughput per shard
+C: Turn on BisectBatchOnFunctionError so that any slow batches are split in half and retried as two smaller batches
+D: Lower the event source mapping batch size to 1 so each invocation finishes faster and the shard pointer moves sooner
+K: A
+G: ## How Lambda reads a Kinesis shard
+By default an event source mapping runs one invocation per shard at a time, so a 4-shard stream is processed by at most 4 concurrent invocations. If each record takes 200 ms, per-shard throughput is roughly 5 records per second, whatever the batch size.
+## ParallelizationFactor
+`ParallelizationFactor` (1 to 10) lets Lambda process up to that many batches from the same shard at once. Records are grouped by partition key, so order is still kept for each key.
+- Factor 10 on 4 shards allows up to 40 concurrent invocations.
+- No resharding or producer changes are needed.
+## Other knobs
+- Enhanced fan-out gives a consumer dedicated read throughput and lower delivery latency, useful when many consumers share a stream.
+- Bisect on error helps isolate bad records, not slow ones.
+W: ParallelizationFactor: it multiplies concurrency per shard while keeping order per partition key, directly addressing processing time as the bottleneck without adding shards.
+X: B=Enhanced fan-out: it speeds up reading records from the stream, but the bottleneck here is processing time in one invocation per shard, which fan-out does not change.
+C=BisectBatchOnFunctionError: it only applies when a batch returns an error, splitting it to find a poison record; slow but successful batches are unaffected.
+D=Batch size of 1: processing is still sequential per shard, and more invocations add overhead, so throughput stays the same or drops.
+T: When Kinesis processing (not reading) is the bottleneck, raise ParallelizationFactor; enhanced fan-out helps read throughput, not handler time.
+V: AWS Lambda, Amazon Kinesis Data Streams
+
+@ DVA-C02 D1 T1.2 applied troubleshooting
+S: A Lambda function is triggered by s3:ObjectCreated events on a bucket. It resizes each image and writes the result back into the same bucket. Invocations and costs are rising without limit. Which TWO changes stop this? (Select TWO)
+A: Write the resized images to a separate output bucket that has no event notification configured for the function
+B: Limit the notification to an uploads/ prefix and write the resized images under a different processed/ prefix
+C: Enable S3 Versioning so that writing a new version of an existing object no longer emits an ObjectCreated event
+D: Configure a dead-letter queue on the function so that repeated invocations are captured instead of being retried
+E: Set the function's maximum retry attempts for asynchronous invocations to 0 so each event is processed only once
+K: A,B
+G: ## The S3 recursive trigger
+When a function writes to the same bucket (and path) that triggers it, every output object emits a new `ObjectCreated` event, which invokes the function again. The loop continues until something stops it, multiplying invocations and cost.
+## Breaking the loop
+The trigger and the output must never match:
+- Write output to a **different bucket** that does not notify this function.
+- Or scope the notification with a **prefix/suffix filter**, for example prefix `uploads/`, and write output under `processed/`, which the filter excludes.
+Also check that the output key cannot match the filter by accident (a suffix filter of `.jpg` with output also ending in `.jpg` in the same prefix still loops).
+Lambda's recursive loop detection can stop some loops automatically, but the design itself should never create one.
+W: A=Separate output bucket: writing results to a bucket that has no notification for this function means its own output never triggers it, so each upload causes one invocation.
+B=Prefix filter with a different output prefix: the notification fires only for uploads/, and results written under processed/ fall outside the filter, which breaks the loop.
+X: C=Enable versioning: every PUT, including a new version of the same key, still emits an ObjectCreated event, so the loop continues.
+D=Dead-letter queue: a DLQ captures failed asynchronous events; these invocations succeed, and each one creates a new event, so the loop keeps running.
+E=Zero retries: retries only apply to failed invocations. The loop comes from new events generated by successful writes, not from retries.
+T: Break S3 trigger loops by separating input and output locations (another bucket or a filtered prefix); retries, DLQs and versioning do not affect new events.
+V: AWS Lambda, Amazon S3
+
+@ DVA-C02 D1 T1.2 applied use-case
+S: A Python inference function depends on ML libraries totalling about 1.8 GB. The team's CI already builds Docker images, and they want the function and its dependencies deployed as one immutable, versioned artifact. Which packaging option works?
+A: Package the function as a container image in Amazon ECR, which Lambda supports up to 10 GB uncompressed
+B: Split the libraries across five Lambda layers so that each layer stays below the per-layer size limit
+C: Upload the .zip deployment package to S3 first, which raises the unzipped package limit to 10 GB
+D: Compress the libraries more aggressively so the .zip file is under 50 MB and upload it directly
+K: A
+G: ## Lambda deployment package limits
+Lambda supports two package types:
+- **.zip archive**: 50 MB zipped for direct upload, and 250 MB **unzipped**, including all layers. Uploading through S3 lets you send a bigger zip file, but the 250 MB unzipped limit still applies.
+- **Container image**: up to 10 GB uncompressed, stored in Amazon ECR and built from an AWS base image or any image that includes the Lambda runtime interface client.
+Layers are only a way to share code among .zip functions; a function can use up to 5 layers, and they count toward the same 250 MB.
+## Example
+```
+FROM public.ecr.aws/lambda/python:3.12
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY app.py .
+CMD ["app.handler"]
+```
+The image tag or digest becomes the versioned artifact the pipeline deploys.
+W: Container image: Lambda runs images up to 10 GB, so the 1.8 GB of libraries fits, and the existing Docker CI can produce the single versioned artifact.
+X: B=Five layers: layers and the function code together are limited to 250 MB unzipped, so splitting 1.8 GB across layers still exceeds the limit.
+C=Zip through S3: uploading via S3 only lifts the direct-upload size; the 250 MB unzipped limit is unchanged, far below 1.8 GB.
+D=Better compression: the 250 MB limit applies to the unzipped content, so a smaller zip file does not help once the libraries are extracted.
+T: Dependencies beyond 250 MB unzipped need a container image (up to 10 GB); layers and S3 uploads share the .zip limits.
+V: AWS Lambda, Amazon ECR
+
+@ DVA-C02 D1 T1.2 applied tradeoff
+S: A Lambda function reads an SQS standard queue and loads messages into a warehouse API that is billed per call and prefers large bulk inserts. At off-peak times most invocations receive only 1 or 2 messages. A few minutes of latency is acceptable. Which TWO settings reduce the number of invocations? (Select TWO)
+A: Increase the event source mapping BatchSize, for example to 500 messages
+B: Set MaximumBatchingWindowInSeconds so Lambda gathers records for up to 60 seconds
+C: Raise the queue's visibility timeout to six times the function's configured timeout
+D: Enable long polling on the queue by setting ReceiveMessageWaitTimeSeconds to 20
+E: Lower the function's reserved concurrency to 1 so that only one poller runs at a time
+K: A,B
+G: ## How Lambda builds SQS batches
+The SQS event source mapping polls the queue and invokes the function when one of these happens first:
+- The batch reaches `BatchSize` (default 10; up to 10,000 for standard queues).
+- The batch payload reaches 6 MB.
+- The `MaximumBatchingWindowInSeconds` expires (0 to 300 seconds).
+With a window of 0 and low traffic, Lambda invokes as soon as it has any messages, so batches are tiny. A larger `BatchSize` with a batching window lets messages accumulate. A `BatchSize` above 10 requires a batching window of at least 1 second.
+## Example
+`BatchSize: 500`, `MaximumBatchingWindowInSeconds: 60` means at most one invocation per minute per poller at off-peak, each carrying everything that arrived, and a full 500-message batch is sent immediately at peak.
+W: A=Larger BatchSize: raising the limit to 500 lets a single invocation carry many messages instead of stopping at the default of 10, so fewer, larger bulk inserts are made.
+B=Batching window: MaximumBatchingWindowInSeconds lets Lambda wait up to 60 seconds to accumulate messages at off-peak, instead of invoking as soon as one or two arrive.
+X: C=Longer visibility timeout: it only prevents a message being redelivered while it is being processed; it has no influence on how many messages go into each batch.
+D=Queue long polling: the Lambda pollers already use long polling, and it reduces empty receives, not the number of invocations per message.
+E=Reserved concurrency of 1: it limits parallel invocations and can cause throttling, but each poll still delivers whatever small batch is available.
+T: To get bigger, fewer Lambda batches from SQS, combine a higher BatchSize with MaximumBatchingWindowInSeconds; timeouts and polling settings do not change batch size.
+V: AWS Lambda, Amazon SQS
+
+@ DVA-C02 D1 T1.3 applied troubleshooting
+S: An API returns all events for a device by running a DynamoDB Query on partition key deviceId. For busy devices the API returns only part of the history, and the response has a LastEvaluatedKey. There are no errors. What should the developer do?
+A: Repeat the Query with ExclusiveStartKey set to the returned LastEvaluatedKey until no LastEvaluatedKey is returned
+B: Increase the table's read capacity so that one Query can return every matching item in a single response
+C: Switch the call to a Scan with a FilterExpression on deviceId so all the device's items are read in one call
+D: Set ConsistentRead to true on the Query so the response includes the items that were not yet replicated
+K: A
+G: ## DynamoDB reads are paged by size
+A single `Query` or `Scan` response returns at most **1 MB** of data (read before any filter is applied), or fewer items if you set `Limit`. When more data matches, the response contains `LastEvaluatedKey`, the primary key of the last item read.
+To continue, send the same request again with `ExclusiveStartKey` set to that value. Stop when the response has no `LastEvaluatedKey`.
+- Page size is about data volume, not capacity: more RCUs raise the allowed read throughput, not the size of each page.
+- SDK paginators (for example boto3 `get_paginator("query")`) loop for you.
+## API design tip
+For an HTTP API, return the `LastEvaluatedKey` to the client as an opaque page token instead of reading all pages in one request.
+W: Follow LastEvaluatedKey: the Query stopped at the 1 MB page limit, and passing the key as ExclusiveStartKey retrieves the next page until the history is complete.
+X: B=More read capacity: capacity controls throughput and throttling, not response size; each page is still capped at 1 MB.
+C=Scan with filter: Scan reads the whole table, costs far more capacity, and is paged at 1 MB too, so it is slower and still returns partial results.
+D=ConsistentRead: strong consistency returns the latest version of items, but it does not change the 1 MB page size or return more items.
+T: A LastEvaluatedKey means more pages; loop with ExclusiveStartKey instead of adding capacity or switching to Scan.
+V: Amazon DynamoDB
+
+@ DVA-C02 D1 T1.3 advanced use-case
+S: Several workers may race to write the same daily summary object to an S3 key. The first completed write must win, and later writers must get an error instead of overwriting it. The team wants no separate locking table. Which approach fits?
+A: Send PutObject with the If-None-Match: * header so S3 rejects the write with 412 if the key already exists
+B: Call HeadObject first and send PutObject only when HeadObject reports that the key does not exist yet
+C: Enable S3 Versioning so that every writer's object is stored as a separate version of the same key
+D: Enable S3 Object Lock in governance mode so that the first object version can no longer be overwritten
+K: A
+G: ## S3 conditional writes
+S3 supports conditional requests on writes, evaluated atomically by S3 itself:
+- `If-None-Match: *` on `PutObject` (or `CompleteMultipartUpload`) succeeds only if no object exists at that key. Otherwise S3 returns `412 Precondition Failed`.
+- `If-Match: <ETag>` succeeds only if the current object still has that ETag, which enables optimistic concurrency for updates.
+If two conditional writes race, one succeeds and the other gets 412 (or 409 for a concurrent conflict), so the caller can retry or give up.
+## Why check-then-write fails
+`HeadObject` followed by `PutObject` is two separate requests. Two workers can both see "not found" and both write, and the last one wins silently.
+Example: `aws s3api put-object --bucket reports --key 2026-09-29.json --body s.json --if-none-match "*"`
+W: If-None-Match conditional write: S3 checks for an existing key and writes in one atomic operation, so only the first writer succeeds and others receive 412 without any lock table.
+X: B=HeadObject then PutObject: the check and the write are separate calls, so two workers can both pass the check and the later write overwrites the first.
+C=Versioning: it keeps every write as a version, but the latest write still becomes the current object, so the first writer does not win.
+D=Object Lock: it prevents a specific version from being deleted or overwritten, but a new PUT simply adds a newer version that becomes current.
+T: Use S3 conditional writes (If-None-Match for create-only, If-Match with an ETag for updates); check-then-write races and versioning keeps the last write.
+V: Amazon S3
+
+@ DVA-C02 D1 T1.3 applied comparison
+S: A news site keeps a view count per article in DynamoDB. The code does GetItem, adds 1 in the application, and calls PutItem. Under heavy traffic, counts are consistently lower than the real number of views. Which change fixes this with the fewest round trips?
+A: Use UpdateItem with an UpdateExpression such as ADD viewCount :one to increment the attribute in place
+B: Wrap the GetItem and PutItem calls in a TransactWriteItems request so that both run inside one transaction
+C: Use GetItem with ConsistentRead set to true so each writer always sees the latest counter before it writes
+D: Enable DynamoDB Streams and let a Lambda function recompute the article's counter from each change record
+K: A
+G: ## Read-modify-write loses updates
+When two requests both read `viewCount = 100`, both write `101`, and one view is lost. This happens because the read and the write are separate operations.
+## Atomic counters
+`UpdateItem` can change an attribute on the server in one operation:
+```
+UpdateExpression: "ADD viewCount :one"   (or "SET viewCount = viewCount + :one")
+ExpressionAttributeValues: {":one": 1}
+```
+DynamoDB applies each update in turn, so concurrent increments are all counted, and only one request is needed. `ReturnValues: UPDATED_NEW` returns the new value if the page needs it.
+## When to use something else
+- Optimistic locking with a `version` attribute and a condition expression suits edits to whole items, where a conflicting change must be rejected.
+- Atomic counters are not idempotent: a retried request increments twice, which is fine for view counts but not for money.
+W: Atomic counter with UpdateItem: the increment happens on the server in a single request, so concurrent views are never overwritten and no read is needed.
+X: B=TransactWriteItems: transactions group write actions only; a GetItem cannot be part of it, and the value added in the application would still be based on a stale read.
+C=Strongly consistent GetItem: it returns the latest committed value, but another writer can still update between the read and the PutItem, so increments are still lost.
+D=Stream-based recompute: it adds a pipeline and delay and still needs a race-free way to update the counter, which is the atomic update itself.
+T: For concurrent counters, increment on the server with UpdateItem ADD or SET x = x + :n; read-modify-write loses updates even with strong reads.
+V: Amazon DynamoDB
+
+@ DVA-C02 D4 T4.1 applied troubleshooting
+S: A Lambda function that parses large CSV files fails for some inputs with "Runtime exited with error: signal: killed". The REPORT log line shows "Memory Size: 512 MB Max Memory Used: 512 MB", and Duration is well below the timeout. What is the most likely cause and fix?
+A: The function ran out of memory; increase its memory setting or stream the file instead of loading all of it at once
+B: The function hit its timeout; increase the timeout to 15 minutes so that large CSV files have time to be parsed
+C: The /tmp directory filled up; increase the ephemeral storage setting from 512 MB to 10,240 MB for the function
+D: The function was throttled by the account limit; request a higher concurrency quota and add reserved concurrency
+K: A
+G: ## Reading the Lambda REPORT line
+Every invocation ends with a `REPORT` line in CloudWatch Logs, for example:
+`REPORT RequestId: 7f... Duration: 2140 ms Billed Duration: 2141 ms Memory Size: 512 MB Max Memory Used: 512 MB`
+- **Max Memory Used equal to Memory Size** means the process reached the configured limit. The runtime is then killed by the operating system, which appears as `Runtime exited with error: signal: killed` (or an out-of-memory error in the runtime).
+- A timeout instead logs `Task timed out after N seconds` and Duration close to the timeout.
+- Throttling never starts the function, so there is no REPORT line; the caller gets a `429`/`TooManyRequestsException`.
+## Fixes
+Raise the memory setting (which also adds CPU) or reduce peak memory, for example by streaming the file line by line instead of reading it into one buffer. CloudWatch Lambda Insights can chart memory use over time.
+W: Out of memory: the REPORT line shows memory fully used and the process was killed well before the timeout, so more memory or a streaming parser fixes it.
+X: B=Timeout: a timeout produces a "Task timed out" message and a duration near the configured limit, while here duration is well below it.
+C=/tmp full: running out of ephemeral storage raises a "No space left on device" error when writing files, not a killed runtime with maxed memory.
+D=Throttling: throttled requests are rejected before the function runs, so there would be no REPORT line or runtime error at all.
+T: Max Memory Used equal to Memory Size plus "signal: killed" means out of memory; timeouts and throttles leave different signatures.
+V: AWS Lambda, Amazon CloudWatch
+
+@ DVA-C02 D4 T4.1 applied troubleshooting
+S: During traffic spikes, a Lambda function that queries an Amazon RDS for MySQL instance starts failing with "Too many connections". The function opens its connection during initialization. The team cannot resize the database. Which change addresses the root cause?
+A: Place Amazon RDS Proxy between the function and the database so connections are pooled and shared across invocations
+B: Move the connection code into the handler so each invocation opens and closes its own connection to the database
+C: Enable provisioned concurrency on the function so that initialized execution environments already hold connections
+D: Increase the function's memory so that each execution environment can complete its queries faster and release sooner
+K: A
+G: ## Why Lambda exhausts database connections
+Each Lambda execution environment keeps its own connection when it is created at init time. During a spike Lambda may run hundreds of environments at once, so the database sees hundreds of connections, each mostly idle, until it reaches `max_connections`.
+## RDS Proxy
+Amazon RDS Proxy sits between applications and the database and keeps a pool of database connections.
+- Many client connections are multiplexed onto a smaller number of database connections.
+- It queues or rejects excess requests gracefully instead of the database refusing connections.
+- It can use IAM authentication and Secrets Manager credentials, and improves failover time.
+Example: 400 concurrent functions connect to the proxy endpoint, while the proxy uses at most a configured percentage (such as `MaxConnectionsPercent: 80`) of the database's connection limit.
+W: RDS Proxy: it pools and reuses a bounded set of database connections for all Lambda environments, so spikes no longer exceed the database's connection limit.
+X: B=Connect in the handler: opening a connection per invocation keeps the same number of concurrent connections and adds connection setup time to every request.
+C=Provisioned concurrency: it creates more initialized environments that each hold a connection, which raises the connection count instead of lowering it.
+D=More memory: faster queries do not shrink the pool of open connections, because each environment keeps its connection open between invocations.
+T: Lambda at scale needs connection pooling in front of relational databases: use RDS Proxy rather than adding environments or reconnecting per call.
+V: AWS Lambda, Amazon RDS, Amazon RDS Proxy
+
+@ DVA-C02 D4 T4.2 applied use-case
+S: A payment service writes plain-text logs to CloudWatch Logs. The team wants an alarm when the log line "PaymentDeclined" appears more than 50 times in 5 minutes, using only native CloudWatch features. Which TWO steps are required? (Select TWO)
+A: Create a metric filter on the log group that matches "PaymentDeclined" and publishes a count to a custom metric
+B: Create a CloudWatch alarm on that custom metric with a Sum statistic over 5 minutes and a threshold of 50
+C: Create a subscription filter on the log group that sends each matching event directly to an SNS topic
+D: Enable X-Ray active tracing so declined payments are recorded as faults and trigger the alarm on their own
+E: Export the log group to S3 every 5 minutes and query the exported files with Athena to count the matches
+K: A,B
+G: ## From log lines to alarms
+CloudWatch alarms watch **metrics**, not log text. A **metric filter** bridges the two: it scans new events in a log group and publishes a metric value whenever the filter pattern matches.
+- Filter pattern: `"PaymentDeclined"` (or a JSON pattern such as `{ $.event = "PaymentDeclined" }` for structured logs).
+- Metric value: `1` per match, published as a custom metric, for example `DeclinedCount` in the namespace `Payments`.
+Filters apply only to events ingested after they are created.
+## The alarm
+An alarm on that metric with statistic `Sum`, period 300 seconds and threshold `> 50` goes to ALARM when more than 50 matches occur in 5 minutes, and can notify an SNS topic.
+## Subscription filters are different
+A subscription filter streams matching events to Kinesis Data Streams, Amazon Data Firehose or Lambda for processing; it does not count or alarm.
+W: A=Metric filter: it scans new events in the log group and publishes a count to a custom metric each time "PaymentDeclined" matches, turning log text into something an alarm can watch.
+B=Alarm on the custom metric: a Sum statistic over a 5-minute period with a threshold of 50 goes to ALARM when more than 50 declines are logged in that window.
+X: C=Subscription filter to SNS: SNS is not a supported subscription filter destination, and forwarding each event does not count occurrences over a period.
+D=X-Ray tracing: X-Ray records request traces and faults; it does not read log text and cannot count a specific log message.
+E=Export to S3 and Athena: exports are batch tasks that can take hours, need custom scheduling and counting, and are not native alarming.
+T: To alarm on log content, create a metric filter and alarm on the resulting metric; subscription filters stream logs, they do not alarm.
+V: Amazon CloudWatch, Amazon CloudWatch Logs
+
+@ DVA-C02 D4 T4.2 advanced tradeoff
+S: An API traced with X-Ray receives 90% of its requests on /health from load balancer checks, which fills trace storage. Rare /checkout failures are often missing because of the default sampling. How should the developer adjust tracing?
+A: Add custom sampling rules: a high-priority, high-rate rule for /checkout and a near-zero-rate rule for /health
+B: Add an annotation named route to every segment so the X-Ray console can filter out /health traces when engineers search
+C: Increase the X-Ray trace retention period so that the /checkout traces are kept long enough to be found by engineers
+D: Record the full request body as metadata on each segment so that /checkout failures can be rebuilt from the saved data
+K: A
+G: ## How X-Ray sampling works
+X-Ray does not record every request. The **default rule** traces the first request each second (reservoir 1) plus 5% of additional requests, for every path alike. High-volume, uninteresting traffic therefore takes most of the samples.
+## Custom sampling rules
+Rules are defined centrally in X-Ray and pulled by the SDK or the ADOT collector. Each rule matches on service name, HTTP method, URL path, host and more, and has:
+- `Priority` (lower number is evaluated first)
+- `ReservoirSize` (fixed traces per second) and `FixedRate` (percentage after the reservoir)
+Example:
+- `checkout`: priority 10, URL path `/checkout*`, reservoir 5, rate 0.5
+- `health`: priority 20, URL path `/health`, reservoir 0, rate 0.001
+Changes take effect without redeploying code. Annotations and metadata only add data to traces that were already sampled.
+W: Custom sampling rules: they control which requests get traced by path, so /checkout is sampled heavily while /health is almost never recorded, cutting cost and keeping failures visible.
+X: B=Route annotation: annotations help search traces that were already recorded; they do not stop /health from being sampled or make /checkout more likely to be traced.
+C=Longer retention: X-Ray keeps traces for a fixed 30 days; retention is not the problem, because the /checkout requests were never sampled.
+D=Request body as metadata: metadata is stored only for sampled traces, adds size and cost, and may capture sensitive payment data.
+T: Sampling rules decide which requests are traced; annotations and metadata only enrich traces that were already sampled.
+V: AWS X-Ray
+
+@ DVA-C02 D4 T4.2 applied use-case
+S: An X-Ray trace of a Lambda function shows 3.2 seconds of total duration, but the DynamoDB and HTTP subsegments add up to only 0.4 seconds. The handler runs three internal steps: parse, enrich and render. How can the developer see which step uses the remaining time?
+A: Wrap each internal step in its own custom subsegment so X-Ray records the start and end time of every step
+B: Add an annotation with the name of each step so the X-Ray console can index and filter traces by step name
+C: Enable CloudWatch Lambda Insights so that per-invocation CPU and memory metrics show which step is slowest
+D: Raise the sampling rate for the function to 100% so X-Ray records every step in each of the invocations
+K: A
+G: ## Segments and subsegments
+In X-Ray, the function's work is a **segment**. Instrumented SDK clients automatically add **subsegments** for calls to AWS services and HTTP endpoints. Time spent in your own code has no subsegment unless you create one, so it shows as a gap.
+## Custom subsegments
+- Python: `with xray_recorder.in_subsegment("enrich"): enrich(order)` or the `@xray_recorder.capture("enrich")` decorator.
+- Node.js: `AWSXRay.captureAsyncFunc("enrich", async (sub) => { ...; sub.close(); })`.
+- With OpenTelemetry (ADOT), create a child span with `tracer.start_as_current_span("enrich")`.
+Each custom subsegment appears in the timeline with its duration, so a slow `render` step stands out immediately.
+## Annotations versus subsegments
+Annotations are indexed key-value pairs for filtering traces; they carry no timing. Metadata is unindexed extra data.
+W: Custom subsegments: they add timed entries for parse, enrich and render to the trace timeline, revealing exactly where the missing 2.8 seconds go.
+X: B=Step annotations: annotations are indexed labels for searching traces, and they record no start or end time, so they cannot show how long each step takes.
+C=Lambda Insights: it reports function-level CPU, memory and duration metrics per invocation, but not how time is split between steps in the code.
+D=100% sampling: more traces of the same shape would still show the same unexplained gap, because the steps are not instrumented.
+T: To time your own code in a trace, add custom subsegments (or spans); annotations filter traces and sampling only changes how many are recorded.
+V: AWS X-Ray, AWS Lambda
+
+@ DVA-C02 D4 T4.2 applied use-case
+S: A web app's multi-step login flow sometimes breaks overnight when almost no users are active, and the team only finds out from morning complaints. They want to detect such failures within minutes, around the clock. Which solution fits?
+A: A CloudWatch Synthetics canary that scripts the login steps every 5 minutes and triggers an alarm when the canary fails
+B: CloudWatch RUM to collect page load and error data from users' browsers and alarm when the JavaScript error rate rises
+C: An Application Load Balancer health check against the login page that marks targets unhealthy when it returns errors
+D: A CloudWatch Logs metric filter on application error logs, with an alarm that fires when login errors are recorded
+K: A
+G: ## Synthetic versus real-user monitoring
+- **Real-user monitoring** (CloudWatch RUM) collects data from actual visitors' browsers. It is accurate for what users experience, but when nobody is using the app there is no data.
+- **Synthetic monitoring** (CloudWatch Synthetics) runs **canaries**: scripts in Node.js or Python (Puppeteer, Playwright or Selenium) that run on a schedule, act like a user, and record success, timings, screenshots and HAR files.
+## Example canary
+Every 5 minutes: open `/login`, type a test user's credentials from Secrets Manager, submit, and assert that the dashboard heading appears. The canary publishes `SuccessPercent` to CloudWatch; an alarm on `SuccessPercent < 100` for two periods pages the on-call engineer.
+Canaries test full user journeys and API sequences, and they keep working at 3 a.m. with zero traffic.
+W: Synthetics canary: it exercises the full login flow on a schedule regardless of traffic, so a break is detected and alarmed within minutes even overnight.
+X: B=CloudWatch RUM: it only reports data from real visitors, so with almost no overnight users there is nothing to alarm on until the morning.
+C=ALB health check: it checks that each target returns a healthy response on one path; it cannot run a multi-step login flow with credentials.
+D=Log metric filter: it only fires when real requests produce error logs, so with no users overnight the broken flow still goes unnoticed.
+T: To catch failures with no traffic, use Synthetics canaries that simulate the user journey; RUM and log alarms depend on real requests.
+V: Amazon CloudWatch, Amazon CloudWatch Synthetics
+
+@ DVA-C02 D4 T4.3 applied tradeoff
+S: A team runs a pure Python Lambda function with no native compiled dependencies on the x86_64 architecture. Duration is dominated by CPU-bound JSON transformation. They want lower cost per invocation with minimal code changes. Which change fits?
+A: Switch the function's architecture to arm64 so it runs on AWS Graviton processors at a lower price per GB-second
+B: Enable provisioned concurrency on the function so that each request runs in an already initialized execution environment
+C: Reduce the function's memory to the 128 MB minimum so that every millisecond of execution time is billed at the lowest rate
+D: Enable Lambda SnapStart on the function so that the initialization phase is restored from a cached snapshot on each invoke
+K: A
+G: ## Lambda pricing drivers
+Lambda compute cost is duration multiplied by memory (GB-seconds), with a lower price per GB-second for the **arm64** architecture (AWS Graviton) than for x86_64. AWS reports up to 34% better price-performance for many workloads.
+- Pure Python, Node.js or Java code usually runs on arm64 unchanged.
+- Native binaries (for example compiled wheels or `.so` files) must be built for arm64, so check dependencies first.
+## Memory is also CPU
+Lambda allocates CPU in proportion to memory. Cutting memory for CPU-bound code makes it run longer, and total cost can rise. Tools such as AWS Lambda Power Tuning measure the best setting.
+## Cold-start features
+Provisioned concurrency and SnapStart reduce initialization latency; they do not reduce the per-millisecond price of handler execution, and provisioned concurrency adds an hourly charge.
+W: arm64 architecture: the code has no x86-specific binaries, so switching is a configuration change, and Graviton's lower GB-second price and good CPU performance cut cost.
+X: B=Provisioned concurrency: it keeps environments initialized and adds a charge for the configured concurrency, raising cost rather than lowering it for this CPU-bound work.
+C=128 MB minimum: less memory also means less CPU, so the CPU-bound transformation runs much longer and total GB-seconds may increase.
+D=SnapStart: it shortens cold-start initialization, but the cost here comes from handler CPU time, which SnapStart does not change.
+T: For cheaper CPU-bound Lambda code with portable dependencies, move to arm64 (Graviton); cold-start features and minimum memory do not cut handler cost.
+V: AWS Lambda
+
+@ DVA-C02 D4 T4.3 applied use-case
+S: Users in Asia and Europe upload 2 GB videos to an S3 bucket in us-east-1. Uploads are slow and sometimes fail near the end, forcing a full restart. Which TWO changes improve upload speed and reliability? (Select TWO)
+A: Enable S3 Transfer Acceleration on the bucket and upload through the accelerate endpoint
+B: Use multipart upload with parts sent in parallel and retry only the parts that fail
+C: Use byte-range GET requests so that each video is split into ranges during the upload
+D: Spread the uploaded objects across many key prefixes to raise the bucket's request rate
+E: Enable S3 Intelligent-Tiering on the bucket so new objects land in the fastest access tier
+K: A,B
+G: ## Speeding up long-distance uploads
+- **S3 Transfer Acceleration** sends data to the nearest CloudFront edge location, then over the AWS backbone to the bucket's Region. It helps most when clients are far from the Region and objects are large. Clients use the endpoint `bucket.s3-accelerate.amazonaws.com`.
+- **Multipart upload** splits an object into parts (5 MB to 5 GB each, up to 10,000 parts). Parts upload in parallel, and a failed part is retried on its own, so a network error at 95% does not restart the whole file. AWS recommends it for objects over 100 MB.
+Example: a 2 GB file in 100 MB parts, 8 parts at a time, through the accelerate endpoint; the SDK transfer manager does this automatically.
+## What does not help uploads
+- Byte-range fetches parallelize **downloads**.
+- Prefix spreading raises request-rate limits (3,500 writes per second per prefix), which a few large uploads never reach.
+W: A=Transfer Acceleration: uploads enter AWS at a nearby edge location and cross the AWS backbone to us-east-1, shortening the slow long-distance internet path from Asia and Europe.
+B=Multipart upload: parts upload in parallel for higher throughput, and a failed part is retried on its own, so a network error near the end no longer restarts the whole 2 GB upload.
+X: C=Byte-range GETs: range requests read parts of an existing object; they apply to downloads and cannot split an upload.
+D=More key prefixes: prefix spreading helps workloads that exceed thousands of requests per second, not a small number of slow large uploads.
+E=Intelligent-Tiering: it is a storage class that moves objects between access tiers for cost; it has no effect on upload speed.
+T: For large uploads from far away, combine Transfer Acceleration (shorter network path) with multipart upload (parallel, retryable parts).
+V: Amazon S3
+
+@ DVA-C02 D4 T4.3 applied tradeoff
+S: A new DynamoDB table uses provisioned capacity with auto scaling. Traffic is idle most of the day but jumps from near zero to thousands of writes per second within seconds when campaigns start, causing throttling. The team wants to avoid throttling while paying mainly for actual usage. Which change fits?
+A: Switch the table to on-demand capacity mode so it serves requests immediately and bills per request
+B: Place DynamoDB Accelerator (DAX) in front of the table so that the campaign spikes are absorbed by it
+C: Set the provisioned write capacity permanently to the campaign peak so that throttling cannot happen
+D: Lower the auto scaling target utilization to 20% so that scaling reacts faster to each campaign spike
+K: A
+G: ## Provisioned versus on-demand capacity
+- **Provisioned** mode: you set RCUs and WCUs. Auto scaling adjusts them based on CloudWatch metrics, which takes minutes, so sudden spikes from near zero can be throttled before capacity catches up. You pay for provisioned capacity whether used or not.
+- **On-demand** mode: no capacity planning. DynamoDB serves traffic up to (and quickly adapts beyond) the previous peak and bills per read and write request. It suits unpredictable or spiky workloads and tables that are idle much of the time.
+## Rough comparison
+Idle 20 hours a day with short, sharp campaigns: provisioning for the peak wastes most of the capacity, and auto scaling reacts too slowly. On-demand charges only for requests made.
+Notes: on-demand instantly handles up to double the table's previous peak, warm throughput can pre-warm a table before a known launch, and a maximum throughput setting can cap cost.
+W: On-demand capacity: it absorbs sudden spikes without waiting for scaling actions and charges per request, matching idle periods and short campaigns.
+X: B=DAX: it caches reads; writes pass through to the table, so write throttling during campaigns is not solved.
+C=Permanent peak capacity: it prevents throttling but charges for peak capacity all day while the table is mostly idle.
+D=Lower target utilization: scaling still reacts after CloudWatch alarms fire, which takes minutes, so jumps from near zero within seconds are still throttled.
+T: Spiky, mostly idle DynamoDB workloads fit on-demand mode; auto scaling reacts in minutes and DAX only helps reads.
+V: Amazon DynamoDB

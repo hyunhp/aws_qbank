@@ -1,0 +1,587 @@
+# DEA-C01 batch 05: Domain 1 (ingestion, transformation, orchestration, programming) and Domain 4 (security and governance)
+
+@ DEA-C01 D1 T1.1 applied use-case
+S: A team runs a self-managed Kafka Connect cluster on EC2 that uses an open-source S3 sink connector with custom single message transforms (SMTs) to move Amazon MSK topics into S3. They want to stop patching and scaling the Connect workers while keeping the same connector plugin and configuration. Which solution fits BEST?
+A: Upload the connector plugin to S3 as a custom plugin and run it on Amazon MSK Connect with autoscaling workers
+B: Create an Amazon Data Firehose stream with the MSK cluster as its source and deliver the records to the S3 bucket
+C: Rewrite the pipeline as an AWS Glue streaming ETL job that reads the Kafka topics and writes the files to S3
+D: Migrate the MSK cluster to MSK Serverless so that the Kafka Connect workers are managed along with the brokers
+K: A
+G: ## What Kafka Connect does
+Kafka Connect is the Kafka framework for moving data in and out of topics with reusable **connectors** (for example an S3 sink) instead of custom consumer code. Connectors run on **worker** processes; single message transforms (SMTs) are small plugins that rewrite each record on the way through.
+## Managed options on AWS
+- **Amazon MSK Connect** runs Kafka Connect workers for you. You upload the connector JAR or ZIP to S3 as a **custom plugin**, create a connector with the same properties you used before, and choose provisioned or autoscaling capacity measured in MCUs (MSK Connect units).
+- **MSK Serverless** manages brokers and partitions, not Connect workers.
+- **Amazon Data Firehose** can read from an MSK topic, but it uses its own delivery settings, not Kafka Connect connectors or SMTs.
+Example: the existing `connector.class`, `topics` and `transforms.*` properties are pasted into the MSK Connect connector configuration unchanged.
+W: MSK Connect custom plugin: it runs the exact same Kafka Connect connector and SMTs on managed, autoscaling workers, so the configuration is reused and the EC2 fleet disappears.
+X: B=Firehose with MSK source: a valid way to land topics in S3, but Firehose does not run Kafka Connect plugins, so the custom SMTs and connector settings would have to be rebuilt another way.
+C=Glue streaming job: removes the servers but throws away the connector, forcing a rewrite of the transform logic in Spark code that the team would then maintain.
+D=MSK Serverless: manages broker capacity only; Kafka Connect workers are a separate component, so the EC2 Connect cluster would still need patching.
+T: To keep existing Kafka Connect connectors but drop the worker servers, use MSK Connect; Firehose or Glue replace the connector rather than host it.
+V: Amazon MSK Connect, Amazon MSK, Amazon S3
+
+@ DEA-C01 D1 T1.1 advanced troubleshooting
+S: A Lambda function consumes an Amazon Kinesis data stream through an event source mapping with default settings. One malformed record makes the function throw a parsing exception, and since then the same batch is retried again and again while IteratorAge on that shard keeps growing. Which TWO changes stop one bad record from blocking the shard? (Select TWO)
+A: Enable BisectBatchOnFunctionError so failing batches are split to isolate the bad record from good records
+B: Set MaximumRetryAttempts or MaximumRecordAgeInSeconds and add an on-failure destination such as an SQS queue
+C: Increase the ParallelizationFactor to 10 so more concurrent invocations can process records from the same shard
+D: Split the shard into two shards so that the malformed record is moved to a new child shard with fresh capacity
+E: Raise the function timeout and memory so the parsing step has enough time to complete for the large record
+K: A,B
+G: ## How Lambda reads a Kinesis shard
+For stream sources, Lambda reads each shard **in order** and invokes the function with a batch. If the function throws, the whole batch is retried. With default settings (`MaximumRetryAttempts = -1`, no record age limit) Lambda keeps retrying until the record expires from the stream, which can be days. Nothing behind that batch in the shard is processed, so `IteratorAge` climbs.
+## The error-handling knobs
+- `BisectBatchOnFunctionError`: split a failing batch in half and retry each half, narrowing down to the bad record so good records get through.
+- `MaximumRetryAttempts` / `MaximumRecordAgeInSeconds`: give up after a limit.
+- **On-failure destination** (SQS queue, SNS topic or S3 bucket): receives details of the discarded batch so it can be inspected and replayed.
+- `FunctionResponseTypes: ReportBatchItemFailures` lets code return only the failed sequence numbers.
+Example: retries 3, bisect on, destination `arn:aws:sqs:...:kinesis-dlq`.
+W: A=Bisect on error: splitting the batch isolates the malformed record so the valid records around it are processed instead of being retried with it forever.
+B=Retry limit plus on-failure destination: once the retry or age limit is reached, Lambda records the batch in the destination and moves on, so the shard stops being blocked and nothing is silently lost.
+X: C=ParallelizationFactor: records with the same partition key still go to the same in-order batcher, so the failing batch keeps retrying; it only adds concurrency for other keys.
+D=Shard split: resharding creates child shards for new data, but the bad record stays in the parent shard, which must be fully read before children, so the block remains.
+E=More timeout and memory: the failure is a parsing exception, not a timeout or out-of-memory error, so extra resources change nothing.
+T: A poison record blocks a stream shard until you bound retries (with a destination) and bisect batches; more concurrency or shards do not skip it.
+V: AWS Lambda, Amazon Kinesis Data Streams, Amazon SQS
+
+@ DEA-C01 D1 T1.1 applied use-case
+S: A SaaS company sends JSON events from hundreds of tenants into one Amazon Data Firehose stream. Each event has a tenant_id field. Data must land in S3 under prefixes such as tenant_id=acme/dt=2026-09-29/ so Athena can prune by tenant and date, without running extra infrastructure. Which approach fits?
+A: Enable Firehose dynamic partitioning with inline JQ parsing of tenant_id and use it with a timestamp in the S3 prefix
+B: Set a custom S3 prefix that uses only the !{timestamp:yyyy-MM-dd} expression and have Athena filter by tenant_id
+C: Create one separate Firehose stream for each tenant and have producers look up the correct stream name per event
+D: Land everything under a date prefix, then run a nightly S3 Batch Operations job that copies objects per tenant prefix
+K: A
+G: ## Firehose S3 prefixes
+By default Firehose writes objects under a time-based prefix such as `2026/09/29/13/`. A custom prefix can use `!{timestamp:...}` expressions, but those only know the arrival time, not what is inside the records.
+## Dynamic partitioning
+Dynamic partitioning lets Firehose read keys **from each record** and group records into separate S3 prefixes:
+- **Inline parsing** uses a JQ expression such as `.tenant_id` for JSON records, with no code.
+- A Lambda transform can return partition keys for non-JSON formats.
+- The prefix then references the keys: `tenant_id=!{partitionKeyFromQuery:tenant_id}/dt=!{timestamp:yyyy-MM-dd}/`.
+Dynamic partitioning must be turned on when the stream is created, and each active partition has its own buffer, so many tiny partitions produce many small files.
+Example: an `acme` event arriving on 29 September lands in `s3://lake/events/tenant_id=acme/dt=2026-09-29/`.
+W: Dynamic partitioning: Firehose extracts tenant_id from each JSON record with JQ and writes it into the S3 prefix alongside the date, producing Hive-style partitions Athena can prune, fully managed.
+X: B=Timestamp-only prefix: the prefix would contain only dates, so every query for one tenant still scans all tenants' files for that day, with no pruning by tenant.
+C=Stream per tenant: works but means hundreds of streams to create, monitor and keep under quotas, plus routing logic in every producer, which is the extra operations the company wants to avoid.
+D=Nightly copy job: data is only correctly partitioned a day late, and it stores and pays for every object twice while adding a batch job to maintain.
+T: To partition Firehose output by a field inside the record, use dynamic partitioning; timestamp prefixes only know arrival time.
+V: Amazon Data Firehose, Amazon S3, Amazon Athena
+
+@ DEA-C01 D1 T1.1 applied tradeoff
+S: An Aurora MySQL database runs an order application. Analysts want the order data in Amazon Redshift within seconds to minutes to join with other warehouse data. The team does not want to build or operate a replication pipeline and must not run heavy analytical queries against the Aurora cluster. Which option fits BEST?
+A: Use Redshift federated queries to read the Aurora MySQL tables live whenever analysts run their reports
+B: Create an Aurora zero-ETL integration with Amazon Redshift so changes replicate into Redshift automatically
+C: Run an AWS DMS full-load and CDC task on a replication instance that writes the changes into Redshift tables
+D: Export Aurora snapshots to S3 every hour and load the resulting Parquet files into Redshift with a COPY job
+K: B
+G: ## Moving operational data into a warehouse
+The classic approach is a pipeline: extract changes, stage them, load and merge. Each piece (replication instances, jobs, schedules) must be sized, monitored and fixed when it breaks.
+## Zero-ETL integrations
+An **Aurora zero-ETL integration with Amazon Redshift** is a managed, near real-time replication from Aurora (MySQL or PostgreSQL) into a Redshift database:
+- You create the integration from the Aurora cluster to a Redshift provisioned cluster or Serverless workgroup, then create a database from it in Redshift.
+- Initial data is seeded, then ongoing changes are replicated within seconds with minimal performance impact on the Aurora cluster, and analytic queries run on Redshift instead of Aurora.
+- There is no replication instance, job or schedule to operate.
+## Related options
+- **Federated query** reads live source tables, but every analytic query then runs against Aurora.
+- **DMS CDC** works but is a pipeline you run.
+Example: a new row in `orders` is queryable in Redshift a few seconds later.
+W: Zero-ETL integration: it replicates Aurora changes into Redshift in near real time with no pipeline to build or operate, and analytics run on Redshift rather than on the Aurora cluster.
+X: A=Federated queries: data is fresh, but each report pushes query work down to Aurora, which is exactly the analytical load the order database must avoid.
+C=DMS full load and CDC: delivers changes but is the replication pipeline the team does not want to operate, with an instance to size, patch and monitor.
+D=Hourly snapshot export: data is up to an hour old plus load time, missing the seconds-to-minutes target, and adds an export and COPY job to schedule.
+T: For Aurora-to-Redshift analytics without a pipeline or load on the source, use a zero-ETL integration; federated query and DMS each fail one of those needs.
+V: Amazon Aurora, Amazon Redshift
+
+@ DEA-C01 D1 T1.2 applied use-case
+S: An AWS Glue job reads order documents from S3 where each order is nested JSON with a customer struct and a line_items array of variable length. The target is a set of flat relational tables in Amazon Redshift: orders, and order line items linked by a key. Which Glue transform does this with the least custom code?
+A: ResolveChoice with the make_struct action, so that each column that has ambiguous types is kept as a struct field
+B: ApplyMapping with dotted source paths, so that every nested field is renamed and cast to a top-level column
+C: Relationalize, which flattens nested structs and pivots arrays into separate tables joined by generated keys
+D: Unbox on the line_items column, so that the embedded JSON string is parsed into a struct for the target table
+K: C
+G: ## Nested data vs relational tables
+JSON documents often contain **structs** (objects inside objects) and **arrays** (lists of objects). A relational warehouse wants flat rows: a struct becomes extra columns, and an array of line items becomes a **child table** with one row per element and a key back to the parent.
+## Glue DynamicFrame transforms
+- `Relationalize`: flattens structs into columns such as `customer.id`, and pivots each array into its own table with a join key and an index. It returns a `DynamicFrameCollection` with the root table plus one table per array.
+- `ApplyMapping`: renames and casts fields; it can pull a struct field up, but cannot turn an array into child rows.
+- `ResolveChoice`: settles fields whose type varies between records.
+- `Unbox`: parses a string column that contains JSON into a struct.
+Example: `Relationalize.apply(frame=orders, staging_path="s3://tmp/", name="orders")` yields `orders` and `orders_line_items`, ready to write to Redshift.
+W: Relationalize: it is designed for this case, flattening the customer struct and turning the variable-length line_items array into a separate table linked by a generated key, with one transform call.
+X: A=ResolveChoice make_struct: handles fields whose data type is inconsistent across records; it keeps nesting rather than removing it and does nothing to arrays.
+B=ApplyMapping with dotted paths: can lift individual struct fields to columns, but cannot explode a variable-length array into one row per line item.
+D=Unbox: parses JSON that is stored as a string; here line_items is already a real array, and parsing it still leaves it nested.
+T: Nested JSON with arrays into relational tables means Relationalize; ApplyMapping and ResolveChoice fix names and types, not array structure.
+V: AWS Glue, Amazon Redshift, Amazon S3
+
+@ DEA-C01 D1 T1.2 applied troubleshooting
+S: A nightly job loads a single 80 GB gzip-compressed CSV file from S3 into a table on a 4-node Amazon Redshift RA3 cluster with a COPY command. The load takes hours while CloudWatch shows most compute slices idle during the COPY. What should the data engineer change FIRST?
+A: Load the data with batched multi-row INSERT statements from a Glue job, so that many Redshift connections write in parallel
+B: Increase the WLM concurrency for the load queue, so that more queries can run at the same time while the COPY command executes
+C: Split the input into many similar-sized compressed files, a multiple of the slice count, and COPY them from one prefix
+D: Resize the cluster to eight RA3 nodes, so that the COPY command has twice as many compute slices available for the load
+K: C
+G: ## How COPY parallelizes
+A Redshift cluster is divided into **slices**; each node has several. COPY assigns input **files** to slices, and each slice loads its files in parallel. A single gzip file cannot be split, so one slice reads all 80 GB while the rest wait.
+## Best practices for load files
+- Split data into multiple files, ideally a **multiple of the number of slices**, so every slice gets equal work.
+- Keep files roughly equal in size, about 1 MB to 1 GB after compression.
+- Point COPY at a common key prefix or a manifest file that lists the files.
+- Adding nodes adds slices, but only helps when there are enough input files to keep them busy.
+Example: with 4 nodes of 4 slices each (16 slices), writing 160 gzip parts under `s3://stage/orders/part_` lets every slice load about 10 files.
+W: Split into similar-sized files: COPY loads one file per slice at a time, so many equal parts spread the work across all slices, turning a single-slice load into a fully parallel one.
+X: A=Batched INSERT statements: row inserts through the leader node are far slower than COPY for bulk data, no matter how many connections are used.
+B=Higher WLM concurrency: lets more queries run at once, but this one COPY is still limited by a single file feeding a single slice.
+D=Resize to eight nodes: doubles the slices and the cost, but the single gzip file still feeds only one slice, so the new slices sit idle as well.
+T: COPY parallelism comes from multiple input files matched to slices; one big compressed file keeps the cluster idle.
+V: Amazon Redshift, Amazon S3
+
+@ DEA-C01 D1 T1.2 advanced tradeoff
+S: A nightly Amazon EMR on EC2 Spark job must cut compute cost. Running a bit longer is acceptable, but losing the cluster or intermediate HDFS data mid-run is not. The cluster uses a primary node, core nodes that hold HDFS, and task nodes that only compute. Which purchasing layout fits BEST?
+A: Run all nodes, including the primary node, on Spot Instances using instance fleets with several instance types
+B: Run the primary and task nodes on On-Demand, and run the core nodes on Spot Instances to cut the largest cost
+C: Buy three-year Reserved Instances for every node type and keep the cluster running around the clock to use them
+D: Keep the primary and core nodes On-Demand and run the task nodes on Spot using instance fleets with mixed types
+K: D
+G: ## EMR node roles
+- **Primary node**: runs the cluster managers (YARN ResourceManager, HDFS NameNode). If it is lost, the cluster ends.
+- **Core nodes**: run tasks **and** store HDFS blocks. Losing them can lose HDFS data and fail the job.
+- **Task nodes**: run tasks only, no HDFS. Losing one just means its tasks are retried elsewhere.
+## Spot Instances
+Spot capacity is much cheaper but can be reclaimed with a two-minute warning. It fits work that can be retried.
+- **Instance fleets** let you list several instance types and allocation strategies, so EMR can find Spot capacity in more pools and is interrupted less.
+- A common pattern: primary and core On-Demand for stability, task nodes on Spot for cheap extra compute.
+Example: 1 primary and 4 core On-Demand, plus a task fleet of 20 Spot units across `m5.2xlarge`, `m6i.2xlarge` and `r5.2xlarge`.
+W: On-Demand primary and core, Spot task nodes: the parts whose loss would end the cluster or lose HDFS data stay stable, while the bulk of compute runs on cheap Spot where an interruption only causes task retries.
+X: A=All Spot including primary: cheapest, but a reclaimed primary node terminates the cluster and a reclaimed core node can lose HDFS data, which the job cannot tolerate.
+B=Spot core nodes: core nodes hold HDFS blocks, so interruptions risk intermediate data loss and job failure, while the task nodes that could safely use Spot stay expensive.
+C=Reserved Instances around the clock: pays for a 24/7 cluster to serve a job that runs a few hours a night, which raises cost instead of cutting it.
+T: On EMR, put Spot on task nodes (compute only) and keep primary and core (cluster control and HDFS) On-Demand.
+V: Amazon EMR, Amazon EC2
+
+@ DEA-C01 D1 T1.2 advanced troubleshooting
+S: An Athena table over S3 logs is partitioned by dt and hour and now has several years of hourly partitions. New partitions appear every hour, MSCK REPAIR TABLE takes a long time to run, and queries spend noticeable time in planning before scanning. Which change fixes both problems?
+A: Schedule an AWS Glue crawler every hour so that it adds the newest dt and hour partitions to the Data Catalog table
+B: Configure partition projection on the table with ranges for dt and hour and a storage.location.template property
+C: Run MSCK REPAIR TABLE every 15 minutes instead of hourly so that each repair has fewer new partitions to discover
+D: Add a Lambda function that runs ALTER TABLE ADD PARTITION for each new hour as soon as the first object arrives
+K: B
+G: ## Partitions in the Data Catalog
+For a Hive-style partitioned table, Athena normally looks up partitions in the **AWS Glue Data Catalog**. Each new hour must be registered (crawler, `MSCK REPAIR TABLE`, or `ALTER TABLE ADD PARTITION`), and at query time Athena must fetch matching partition metadata. With tens of thousands of partitions both steps get slow.
+## Partition projection
+With **partition projection**, Athena computes partition values and locations from table properties instead of reading them from the catalog:
+- `projection.enabled = true`
+- `projection.dt.type = date`, `projection.dt.range = 2022-01-01,NOW`, `projection.dt.format = yyyy-MM-dd`
+- `projection.hour.type = integer`, `projection.hour.range = 0,23`
+- `storage.location.template = s3://logs/dt=${dt}/hour=${hour}/`
+New hours are queryable as soon as data lands, with no registration step, and planning uses the query's filters directly.
+Example: `WHERE dt = '2026-09-29' AND hour = 13` resolves to one S3 prefix with no catalog lookup.
+W: Partition projection: Athena derives partitions from the configured ranges and location template, so there is nothing to repair when new hours arrive and no large partition lookups during planning.
+X: A=Hourly crawler: keeps the catalog current, but the table still holds tens of thousands of partitions to fetch at planning time, and crawlers add their own run time and cost.
+C=More frequent MSCK REPAIR: each run still lists the whole table location, and planning still reads a growing number of catalog partitions, so neither problem goes away.
+D=Lambda ALTER TABLE ADD PARTITION: fixes freshness cheaply, but the catalog keeps growing, so query planning remains slow.
+T: For many predictable partitions, partition projection removes both partition maintenance and catalog lookup overhead; crawlers and repairs only address freshness.
+V: Amazon Athena, AWS Glue Data Catalog, Amazon S3
+
+@ DEA-C01 D1 T1.3 applied use-case
+S: A Step Functions Standard workflow starts an AWS Glue job that runs about three hours, then loops through a Wait state and a Lambda function that calls GetJobRun every minute until the job finishes. The team wants to remove the polling logic and the extra state transitions. What should they do?
+A: Call the Glue StartJobRun API with the .waitForTaskToken suffix and have the Glue job script return the token on completion
+B: Use the Glue StartJobRun service integration with the .sync suffix so the state waits for the job run to finish
+C: Replace the loop with one Lambda function that starts the job and polls GetJobRun in a loop until the job completes
+D: Convert the workflow to an Express workflow so that state transitions are no longer charged individually per step
+K: B
+G: ## Service integration patterns in Step Functions
+A Task state can call another AWS service in three ways:
+- **Request Response** (`arn:aws:states:::glue:startJobRun`): starts the job and moves on immediately.
+- **Run a Job** (`.sync`, for example `arn:aws:states:::glue:startJobRun.sync`): starts the job and **waits until it finishes**, then passes on success or raises an error on failure. Step Functions does the status tracking for you.
+- **Wait for Callback** (`.waitForTaskToken`): pauses until some external code calls `SendTaskSuccess` or `SendTaskFailure` with the token.
+## Why .sync fits long jobs
+Standard workflows can run up to one year, so a three-hour Glue job is fine. With `.sync` the Task state stays open until the run ends: no Wait state, no polling Lambda, no loop of transitions.
+Example: `"Resource": "arn:aws:states:::glue:startJobRun.sync", "Parameters": {"JobName": "nightly-etl"}`, with Retry and Catch on the same state.
+W: .sync Run a Job integration: Step Functions starts the Glue run and tracks it to completion itself, so the Wait state, the polling Lambda and their transitions disappear.
+X: A=waitForTaskToken: requires the Glue script to receive the token and call SendTaskSuccess itself, adding custom code to every job; .sync already handles Glue natively.
+C=Single polling Lambda: Lambda stops after 15 minutes, so it cannot wait for a three-hour job, and polling code would still exist.
+D=Express workflow: runs for at most five minutes and does not support the .sync or callback patterns, so it cannot wait on a three-hour job.
+T: To wait for a Glue job in Step Functions, use the .sync integration; callbacks need custom code and Express cannot wait for long jobs.
+V: AWS Step Functions, AWS Glue, AWS Lambda
+
+@ DEA-C01 D1 T1.3 applied troubleshooting
+S: A data engineer added a new Python library to requirements.txt and uploaded the file to the Amazon MWAA environment's versioned S3 bucket. An hour later, tasks that import the library still fail with ModuleNotFoundError. What is the MOST likely fix?
+A: Update the MWAA environment to reference the new S3 object version of requirements.txt so the environment reinstalls packages
+B: Pause and unpause the affected DAGs in the Airflow UI so that the scheduler reloads the Python modules that the tasks import
+C: Add a PythonOperator task at the start of each DAG that runs pip install for the library on whichever worker executes it
+D: Increase the maximum number of workers so that new workers start up and read the latest requirements.txt file from S3
+K: A
+G: ## How MWAA installs Python dependencies
+Amazon MWAA reads three things from its S3 bucket: the `dags/` folder, an optional `plugins.zip`, and an optional `requirements.txt`. DAG files are synced continuously, but **plugins and requirements are pinned to a specific S3 object version** in the environment configuration. The bucket must have versioning enabled for this reason.
+## What happens when you change requirements
+- Uploading a new `requirements.txt` creates a new object version, but the environment keeps using the version it was configured with.
+- You must **update the environment** (console, `aws mwaa update-environment --requirements-s3-object-version ...`, or IaC) to point at the new version. MWAA then updates the scheduler, workers and web server with the new packages.
+- Install errors appear in the environment's CloudWatch requirements log.
+Example: version `3sL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY` becomes the configured requirements version, and after the update finishes tasks can import the library.
+W: Point the environment at the new version: MWAA installs requirements only from the object version set in its configuration, so updating that setting is what makes the new library available on all components.
+X: B=Pause and unpause DAGs: only changes scheduling state; packages are installed at environment level, so the import still fails.
+C=pip install inside a task: installs on one worker for one run at best, is lost when workers are replaced, and can break with private networking; it is not a supported way to manage dependencies.
+D=More workers: new workers are built from the same configured requirements version, so they lack the library just like the existing ones.
+T: In MWAA, requirements.txt and plugins.zip take effect only after the environment is updated to the new S3 object version; uploading alone does nothing.
+V: Amazon MWAA, Amazon S3
+
+@ DEA-C01 D1 T1.3 applied use-case
+S: A finance pipeline must start at 06:00 New York local time every business day all year, including after daylight saving time changes, without anyone editing schedules twice a year. Which scheduling option meets this requirement with the least effort?
+A: An EventBridge rule with the cron expression cron(0 11 ? * MON-FRI *) that targets the Step Functions state machine
+B: An AWS Glue scheduled trigger with a cron expression for 11:00 on weekdays that starts the first job of the pipeline
+C: Two EventBridge rules, one for standard time and one for daylight time, with a Lambda function enabling the right one
+D: An EventBridge Scheduler schedule with a cron expression and the America/New_York time zone targeting the pipeline
+K: D
+G: ## Where cron schedules run on AWS
+- **EventBridge rules** with `cron(...)` or `rate(...)` expressions are evaluated in **UTC** only.
+- **AWS Glue triggers** with schedules also use UTC.
+- **Amazon EventBridge Scheduler** is a separate scheduling service. Each schedule can set a **time zone** (IANA name such as `America/New_York`), supports one-time and recurring schedules, and invokes thousands of targets directly (Step Functions, Lambda, Glue via universal targets, and more), with retries and a dead-letter queue.
+## Why the time zone matters
+New York is UTC-5 in winter and UTC-4 in summer. A UTC schedule fixed at 11:00 fires at 06:00 in winter but 07:00 in summer. With a time-zone-aware schedule, the service adjusts for daylight saving time automatically.
+Example: `cron(0 6 ? * MON-FRI *)` with `ScheduleExpressionTimezone = America/New_York` always runs at 06:00 local time.
+W: EventBridge Scheduler with a time zone: the schedule is evaluated in America/New_York, so the pipeline starts at 06:00 local time before and after each daylight saving change with no edits.
+X: A=EventBridge rule at 11:00 UTC: rules are UTC-only, so this fires at 06:00 in winter but 07:00 during daylight time.
+B=Glue scheduled trigger: Glue cron schedules are also in UTC, so it drifts by an hour for half of the year in the same way.
+C=Two rules toggled by Lambda: can be made to work, but it is custom code and extra rules to maintain for a problem Scheduler solves with one setting.
+T: For local-time schedules that follow daylight saving, use EventBridge Scheduler with a time zone; EventBridge rules and Glue triggers use UTC.
+V: Amazon EventBridge Scheduler, Amazon EventBridge, AWS Step Functions
+
+@ DEA-C01 D1 T1.3 advanced troubleshooting
+S: An engineer created an EventBridge rule so that an S3 object upload to the raw-landing bucket starts a Step Functions workflow, but the rule never matches, even though objects are uploaded successfully and the target role is correct. Which TWO conditions must be met for this design to work? (Select TWO)
+A: The raw-landing bucket has its Amazon EventBridge notification setting turned on in its event notification properties
+B: The rule is on the default event bus with a pattern for source aws.s3, detail-type Object Created and the bucket name
+C: A CloudTrail trail records S3 data events for the raw-landing bucket so that the PutObject calls reach EventBridge
+D: The raw-landing bucket has an SQS queue configured as an event notification destination that EventBridge polls
+E: The rule is created on a custom event bus named after the raw-landing bucket so that S3 can find the matching bus
+K: A,B
+G: ## Two ways S3 can emit events
+- **S3 event notifications** send selected events straight to SNS, SQS or Lambda, configured per bucket.
+- **S3 to EventBridge**: turn on the bucket setting **Send notifications to Amazon EventBridge**. S3 then sends all its events for that bucket to the **default event bus** in the same account and Region, where rules can filter and route them to many targets, including Step Functions.
+## The event pattern
+S3 events on EventBridge look like this:
+- `"source": ["aws.s3"]`
+- `"detail-type": ["Object Created"]`
+- `"detail": {"bucket": {"name": ["raw-landing"]}, "object": {"key": [{"prefix": "orders/"}]}}`
+An older approach matched `AWS API Call via CloudTrail` events, which required CloudTrail data events. The native integration does not need CloudTrail.
+Example: after enabling the bucket setting, a rule on `default` with the pattern above starts the state machine for each upload.
+W: A=Bucket EventBridge setting: without it, S3 sends no events to EventBridge at all, which explains why the rule never matches.
+B=Default bus with the Object Created pattern: S3 delivers only to the default event bus, and the rule must match the aws.s3 source, the Object Created detail type and the bucket name.
+X: C=CloudTrail data events: only needed for the legacy CloudTrail-based pattern; the native S3 integration sends Object Created events without any trail.
+D=SQS notification destination: S3-to-SQS is a separate notification path; EventBridge does not poll queues, so adding one does not make the rule fire.
+E=Custom bus named after the bucket: S3 always delivers to the default event bus; a rule on a custom bus never sees those events unless they are forwarded.
+T: S3 events reach EventBridge only when the bucket setting is on, and only on the default bus with the Object Created pattern; CloudTrail is not required.
+V: Amazon EventBridge, Amazon S3, AWS Step Functions
+
+@ DEA-C01 D1 T1.4 applied troubleshooting
+S: A Python Lambda function processes SQS messages and writes each item to DynamoDB. The handler creates a new boto3 session and DynamoDB client on every invocation, and latency per invocation is high even when the function is warm. Which code change reduces this overhead MOST directly?
+A: Enable provisioned concurrency so a pool of pre-initialized execution environments is always ready to serve the messages
+B: Create the boto3 client once in the initialization code outside the handler and reuse it across warm invocations
+C: Move the boto3 library into a Lambda layer so the function package is smaller and loads faster on each invocation
+D: Raise the function timeout to 15 minutes and the memory to 10 GB so the client creation step always has time to finish
+K: B
+G: ## The Lambda execution environment lifecycle
+Lambda runs a function in an **execution environment** that is reused for many invocations:
+- **Init phase**: runs once per environment. Code at module level (outside the handler) runs here: imports, SDK clients, database connections, config loading.
+- **Invoke phase**: runs the handler for each event.
+Objects created in the init phase survive between invocations while the environment stays warm.
+## Why client placement matters
+Creating a boto3 session and client is expensive: it loads service models, resolves credentials and opens new TLS connections. Doing this inside the handler repeats the cost for every event. Creating the client once at module level lets every warm invocation reuse it and its HTTP keep-alive connections.
+Example:
+- `table = boto3.resource("dynamodb").Table("orders")` at module level
+- `def handler(event, context): table.put_item(Item=...)` reuses it
+W: Initialize the client outside the handler: the expensive session setup and connection handshakes happen once per environment, and every warm invocation reuses them.
+X: A=Provisioned concurrency: removes cold starts, but the handler still builds a new session and client on every warm invocation, which is where the latency comes from.
+C=boto3 in a layer: layers affect packaging, not what the handler does at run time; the per-invocation client creation is unchanged.
+D=Longer timeout and more memory: gives slow code more room instead of removing repeated work, and pays for idle headroom.
+T: Put SDK clients and connections in Lambda init code so warm invocations reuse them; provisioned concurrency only addresses cold starts.
+V: AWS Lambda, Amazon DynamoDB, Amazon SQS
+
+@ DEA-C01 D1 T1.4 advanced use-case
+S: A Redshift table of 2 billion customer rows receives about 1 million new and changed rows each hour in a staging table. Changed rows must replace existing rows by customer_id and new rows must be added, without duplicates and without reloading the whole table. Which SQL approach fits?
+A: Declare customer_id as the PRIMARY KEY of the target table and INSERT all staged rows so that Redshift rejects duplicates
+B: TRUNCATE the target table every hour and reload the full customer dataset from S3 using a COPY command with a manifest
+C: INSERT all staged rows into the target table and run VACUUM afterward so that the duplicate customer_id rows are removed
+D: Run MERGE INTO the target USING the staging table ON customer_id, updating matched rows and inserting unmatched rows
+K: D
+G: ## Upserts in a columnar warehouse
+An **upsert** updates rows that already exist and inserts rows that do not. Redshift supports the SQL `MERGE` statement for this:
+- `MERGE INTO customers USING customers_stage s ON customers.customer_id = s.customer_id`
+- `WHEN MATCHED THEN UPDATE SET name = s.name, tier = s.tier, updated_at = s.updated_at`
+- `WHEN NOT MATCHED THEN INSERT VALUES (s.customer_id, s.name, s.tier, s.updated_at)`
+Before MERGE existed, the pattern was delete-then-insert inside one transaction; MERGE does both in one statement.
+## Constraints in Redshift
+Redshift accepts `PRIMARY KEY` and `UNIQUE` definitions but does **not enforce** them. The optimizer uses them as hints, so inserting duplicate keys succeeds and gives wrong results later.
+## Other notes
+`VACUUM` reclaims space and re-sorts rows; it never removes logical duplicates. The staging table itself should have one row per key, for example deduplicated with `ROW_NUMBER()`.
+W: MERGE with staging: it updates rows whose customer_id already exists and inserts the rest in one statement, touching only the hourly changes instead of the full 2 billion rows.
+X: A=Primary key plus INSERT: Redshift does not enforce primary keys, so every changed row becomes a duplicate instead of being rejected.
+B=Hourly truncate and full reload: gives correct data but rewrites 2 billion rows each hour to apply 1 million changes, and leaves the table empty during the reload.
+C=INSERT then VACUUM: VACUUM re-sorts and reclaims deleted space; it has no notion of duplicate keys, so the old and new versions both remain.
+T: Upsert into Redshift with MERGE from a staging table; primary keys are not enforced and VACUUM does not deduplicate.
+V: Amazon Redshift
+
+@ DEA-C01 D1 T1.4 applied troubleshooting
+S: A Python Lambda function with 3 GB of memory transforms newline-delimited JSON files from S3. It calls get_object and then Body.read() to load the file before parsing. Files are growing and some now exceed 12 GB, and the function fails with out-of-memory errors. Which change fixes this while staying on Lambda?
+A: Raise the function memory to the 10,240 MB maximum and keep calling Body.read() so the whole file fits in memory
+B: Download each object to /tmp with download_file and parse the local copy line by line after the download completes
+C: Stream the object with Body.iter_lines(), transform each record, and write output in small batches as it goes
+D: Increase the function timeout to 15 minutes so that the read call has enough time to finish loading the large file
+K: C
+G: ## Loading vs streaming
+`get_object` returns a `StreamingBody`. Calling `.read()` pulls the **entire object into memory** at once, and parsing it into Python objects needs even more. Memory use grows with file size, so larger files eventually fail.
+Streaming processes data in pieces:
+- `for line in obj["Body"].iter_lines(): record = json.loads(line)` handles one record at a time.
+- `iter_chunks()` gives fixed-size byte chunks for other formats.
+- Results are buffered and flushed in batches (for example every 10,000 records via a multipart upload or Firehose).
+Memory then stays roughly constant regardless of file size.
+## Lambda limits that matter
+- Memory: up to 10,240 MB.
+- `/tmp` ephemeral storage: up to 10,240 MB.
+- Timeout: up to 15 minutes, so throughput also matters; if files grow beyond what one invocation can process in time, split the work or move to Glue.
+Example: a 12 GB file read line by line uses a few hundred MB of memory.
+W: Stream with iter_lines: each record is read, transformed and written without holding the file in memory, so memory no longer grows with file size.
+X: A=Maximum memory with read(): 10,240 MB is still smaller than a 12 GB file plus its parsed objects, and files keep growing, so the failure only moves.
+B=Download to /tmp: ephemeral storage tops out at 10,240 MB, so a 12 GB object does not fit on disk either.
+D=Longer timeout: the failure is memory exhaustion, not running out of time; more time does not make the file fit.
+T: For large S3 objects in Lambda, stream records instead of reading the whole body; more memory or /tmp is capped at about 10 GB.
+V: AWS Lambda, Amazon S3
+
+@ DEA-C01 D1 T1.4 advanced use-case
+S: A Glue Spark job joins a 3 TB fact table with a 50 MB product dimension table on product_id. The Spark UI shows a large shuffle of the fact table in the join stage, which dominates run time. The data is not skewed. Which change reduces the shuffle MOST?
+A: Repartition both DataFrames on product_id before the join so rows with the same key are colocated on the same executors
+B: Add a random salt column to product_id on both sides so the join work is spread across more partitions and executors
+C: Apply a broadcast hint to the dimension DataFrame so each executor gets a full copy and the fact table is not shuffled
+D: Double the number of Glue workers so the shuffle of the 3 TB fact table is spread across more executors in parallel
+K: C
+G: ## How Spark joins two tables
+- **Sort-merge join** (default for large tables): both sides are shuffled by the join key so matching keys meet on the same executor. Shuffling 3 TB means heavy network and disk I/O.
+- **Broadcast hash join**: the small table is sent in full to every executor, and each executor joins its local slice of the big table without moving it. No shuffle of the large side.
+Spark broadcasts automatically only when a table is below `spark.sql.autoBroadcastJoinThreshold` (10 MB by default), so a 50 MB table is not broadcast unless you ask.
+## How to request it
+- PySpark: `fact.join(F.broadcast(dim), "product_id")`
+- SQL: `SELECT /*+ BROADCAST(dim) */ ...`
+- Or raise `spark.sql.autoBroadcastJoinThreshold`.
+Broadcasting fits tables that comfortably fit in executor memory; tens or hundreds of MB is typical.
+Example: after the hint, the Spark UI shows `BroadcastHashJoin` and the fact table is read once without an exchange.
+W: Broadcast the dimension: a 50 MB table fits easily in every executor, so Spark joins locally and never shuffles the 3 TB fact table.
+X: A=Repartition both sides: repartitioning is itself a full shuffle of the 3 TB table, so it moves the cost rather than removing it.
+B=Salting keys: fixes skew where one key overloads a task; the data is not skewed, and salting adds work and a larger join.
+D=More workers: spreads the same shuffle over more machines at higher cost; the 3 TB still moves across the network.
+T: Joining a big table to a small one, broadcast the small side to avoid shuffling the big side; repartitioning and salting still shuffle.
+V: AWS Glue, Apache Spark
+
+@ DEA-C01 D1 T1.4 applied use-case
+S: Analysts query an Athena table of Parquet event data partitioned by dt. A typical query is SELECT * FROM events WHERE date(event_time) = DATE '2026-09-01' and reads 3 of the 60 columns downstream. Which TWO SQL changes reduce data scanned per query? (Select TWO)
+A: List only the three needed columns in the SELECT clause instead of selecting every column with SELECT *
+B: Filter on the dt partition column directly, for example WHERE dt = '2026-09-01', so that Athena prunes partitions
+C: Wrap the query in a CTAS statement that copies the entire table to a new location before running the aggregation
+D: Add an ORDER BY event_time clause to the query so that Athena can skip row groups that fall outside the sort range
+E: Replace the date filter with a filter on a string-formatted copy of event_time so the comparison is done as text
+K: A,B
+G: ## What Athena charges for
+Athena bills by **bytes scanned** from S3. Two features of the data layout decide how much is scanned:
+- **Columnar formats** (Parquet, ORC) store each column separately. Athena reads only the columns referenced by the query, so `SELECT *` on a 60-column table reads all 60.
+- **Partitions** split data into S3 prefixes such as `dt=2026-09-01/`. Athena skips whole prefixes only when the `WHERE` clause filters on the **partition column** itself.
+## Why the filter matters
+`date(event_time) = DATE '2026-09-01'` is a filter on a regular column. Athena cannot know which dt folders hold those rows, so it scans every partition and filters afterward. Parquet min/max statistics may skip some row groups, but partition pruning is far larger.
+Example:
+- Before: `SELECT * ... WHERE date(event_time) = ...` scans all partitions and columns.
+- After: `SELECT user_id, action, event_time ... WHERE dt = '2026-09-01'` scans one day and three columns.
+W: A=Select only needed columns: with Parquet, Athena reads just the three referenced columns instead of all 60.
+B=Filter on the partition column: a predicate on dt lets Athena read only the matching prefix instead of every day in the table.
+X: C=CTAS copy first: reads the whole table to write a copy, so it scans more data and adds storage; the later query benefits nothing unless the layout changes.
+D=ORDER BY event_time: sorting happens after rows are read, so it adds compute without reducing bytes scanned.
+E=String-formatted filter: still a filter on a regular column, and a text conversion also defeats Parquet statistics, so every partition is scanned.
+T: Cut Athena scans with column projection and partition-column filters; sorts, copies and computed filters on other columns do not prune.
+V: Amazon Athena, Amazon S3
+
+@ DEA-C01 D4 T4.1 applied use-case
+S: A Lambda function in a VPC loads records into Amazon RDS for PostgreSQL. Security policy now forbids long-lived database passwords anywhere, including in secret stores, and requires that database access be granted through IAM policies. Which approach fits?
+A: Store the password in AWS Secrets Manager with automatic rotation every 30 days and let the function fetch it at start
+B: Enable IAM database authentication, grant the rds_iam role to the DB user, and have the function use short-lived tokens
+C: Restrict the database security group to the function's security group and use a database user that has no password
+D: Join the DB instance to AWS Directory Service and have the function authenticate to PostgreSQL with Kerberos tickets
+K: B
+G: ## Ways to authenticate to RDS
+- **Password authentication**: a database user with a password, often stored in Secrets Manager and rotated.
+- **IAM database authentication** (MySQL, MariaDB, PostgreSQL): the client presents a short-lived **authentication token** instead of a password.
+- **Kerberos**: via AWS Managed Microsoft AD, for directory-based environments.
+## How IAM database authentication works
+- Enable IAM authentication on the DB instance.
+- In PostgreSQL, create the user and `GRANT rds_iam TO etl_user;`
+- Give the Lambda execution role `rds-db:connect` on `arn:aws:rds-db:region:account:dbuser:db-ABCDEFG/etl_user`.
+- In code, call `generate_db_auth_token(...)` and use the token as the password over SSL/TLS. Tokens are valid for 15 minutes.
+No password is stored anywhere, and access is granted or revoked by editing the IAM policy.
+Example: removing `rds-db:connect` from the role stops it from opening new connections.
+W: IAM database authentication: the function signs a 15-minute token with its role credentials, so there is no stored password and access is controlled through IAM policy.
+X: A=Secrets Manager rotation: rotation shortens password lifetime but a password still exists in a secret store, which the policy forbids, and access is not granted by an IAM policy on the database user.
+C=Security group and no password: network rules limit who can reach the port but authenticate no one; a passwordless user is weaker, not stronger.
+D=Kerberos with Directory Service: avoids passwords in code but needs a managed directory, keytabs and Kerberos setup, and it authorizes through the directory rather than IAM policies.
+T: For password-free, IAM-controlled database access from AWS compute, use RDS IAM database authentication tokens; rotation still keeps a password.
+V: Amazon RDS, AWS Lambda, AWS IAM
+
+@ DEA-C01 D4 T4.1 applied use-case
+S: Producer Lambda functions and consumer ECS tasks use an Amazon MSK cluster. The team wants clients to authenticate with their existing IAM roles and to control which roles can write or read each topic in IAM policies, without managing usernames, passwords, certificates or Kafka ACLs. Which configuration fits?
+A: Enable SASL/SCRAM authentication with credentials stored in Secrets Manager and set Kafka ACLs for each topic
+B: Enable mutual TLS with AWS Private CA certificates for each client and authorize topic access with Kafka ACLs
+C: Leave the cluster unauthenticated inside the VPC and restrict access to the brokers using security group rules
+D: Enable IAM access control on the cluster and grant kafka-cluster actions on topic ARNs in each role's policy
+K: D
+G: ## Client authentication options for MSK
+- **IAM access control**: clients sign requests with IAM credentials (via the `aws-msk-iam-auth` library or built-in support in newer clients) on a dedicated port. **Authorization is also in IAM**, using actions such as `kafka-cluster:Connect`, `kafka-cluster:WriteData`, `kafka-cluster:ReadData` and `kafka-cluster:DescribeTopic` on cluster, topic and group ARNs.
+- **SASL/SCRAM**: username and password stored in Secrets Manager; authorization uses Kafka ACLs.
+- **Mutual TLS**: client certificates from AWS Private CA; authorization uses Kafka ACLs.
+- **Unauthenticated**: no client identity at all.
+## Why IAM fits roles
+Lambda and ECS tasks already have execution or task roles. With IAM access control, those roles are the Kafka identities, and a policy like `kafka-cluster:WriteData` on `arn:aws:kafka:...:topic/prod-cluster/*/orders` lets only producers write to `orders`.
+W: IAM access control: clients authenticate with their existing roles and topic-level permissions live in IAM policies, so there are no passwords, certificates or Kafka ACLs to manage.
+X: A=SASL/SCRAM: introduces usernames and passwords to store and rotate, and authorization moves into Kafka ACLs, both of which the team wants to avoid.
+B=Mutual TLS: requires issuing, distributing and renewing client certificates, and topic permissions are still Kafka ACLs rather than IAM.
+C=Unauthenticated with security groups: security groups filter network traffic but give no client identity, so no per-topic write or read control is possible.
+T: To use IAM roles and IAM policies for Kafka authn and authz, enable MSK IAM access control; SCRAM and mTLS rely on Kafka ACLs.
+V: Amazon MSK, AWS IAM, AWS Lambda, Amazon ECS
+
+@ DEA-C01 D4 T4.2 advanced troubleshooting
+S: A team registered its S3 data lake location with AWS Lake Formation and granted SELECT on one table only to the analyst role. However, a data science role whose IAM policy allows glue:Get* and s3:GetObject can still query every table in the database through Athena. The tables were created before any Lake Formation settings were changed. What is the MOST likely cause and fix?
+A: The IAMAllowedPrincipals group still has Super permission on the tables; revoke it and change the default settings for new tables
+B: The analyst role's grant was not made with the grant option; re-grant SELECT with grant option to enforce the intended access
+C: The Glue crawler has not run since the location was registered; re-run it so Lake Formation can apply permissions to the tables
+D: The tables have no LF-Tags assigned yet; attach LF-Tags to every table so Lake Formation starts enforcing the tag-based access
+K: A
+G: ## Lake Formation and the IAM compatibility mode
+When Lake Formation was introduced, existing Glue Data Catalog users relied on IAM policies alone. To avoid breaking them, the default Data Catalog settings give a special group, **`IAMAllowedPrincipals`**, the `Super` permission on new databases and tables ("Use only IAM access control for new databases/tables").
+- While `IAMAllowedPrincipals` has `Super` on a table, **any principal whose IAM policy allows it** can use the table, and Lake Formation grants are effectively not enforced.
+- Lake Formation grants take full effect only after that permission is **revoked** from the table (and database) and the defaults are turned off for new objects.
+## Steps to switch
+- Grant Lake Formation permissions to every role that should keep access.
+- Revoke `IAMAllowedPrincipals` from the existing databases and tables.
+- Clear the two "Use only IAM access control" default settings.
+Example: after revoking, the data science role gets an access error on tables it has no Lake Formation grant for.
+W: IAMAllowedPrincipals still has Super: tables created under the default settings stay in IAM-only mode, so any role with broad IAM permissions can query them; revoking it lets Lake Formation grants control access.
+X: B=Grant option: controls whether the analyst can pass the permission on to others; it has nothing to do with blocking a different role that bypasses Lake Formation.
+C=Re-run the crawler: crawlers update schemas and partitions; they do not change permission modes, and the IAMAllowedPrincipals grant would remain.
+D=Attach LF-Tags: tag-based grants are another way to grant access, but while IAMAllowedPrincipals holds Super, IAM-only access still applies regardless of tags.
+T: Lake Formation grants are bypassed while IAMAllowedPrincipals has Super on a table; revoke it before relying on Lake Formation permissions.
+V: AWS Lake Formation, AWS Glue Data Catalog, Amazon Athena
+
+@ DEA-C01 D4 T4.3 applied troubleshooting
+S: A team enabled server-side encryption on an Amazon Kinesis data stream using a customer managed KMS key. Immediately afterward, producers fail with KMS access denied errors on PutRecords, and consumers can no longer read records. Which TWO permissions must be added to fix this? (Select TWO)
+A: kms:GenerateDataKey on the customer managed key for the IAM roles used by the producer applications
+B: kms:Decrypt on the customer managed key for the IAM roles used by the consumer applications and Lambda
+C: kms:Encrypt on the customer managed key for the consumer roles so they can re-encrypt records they read
+D: kms:CreateGrant on the key for the Kinesis service principal so that the stream itself can reach the key
+E: kms:ScheduleKeyDeletion on the key for the stream owner so that old data keys can be retired periodically
+K: A,B
+G: ## How Kinesis server-side encryption works
+With SSE enabled, Kinesis encrypts each record before storing it and decrypts it on read, using a KMS key you choose. It does this **on behalf of the calling principal**, so the caller's IAM permissions (and the key policy) must allow the KMS operations:
+- **Producers** (`PutRecord`, `PutRecords`): need `kms:GenerateDataKey` on the key, so Kinesis can create the data key used to encrypt the records.
+- **Consumers** (`GetRecords`, Lambda event source mappings, Firehose, Flink apps): need `kms:Decrypt` on the key.
+With the AWS managed key `aws/kinesis` these permissions are implicit; with a **customer managed key** they must be granted explicitly, either in IAM policies (when the key policy delegates to IAM) or in the key policy itself.
+## Example policy
+`{"Effect":"Allow","Action":"kms:GenerateDataKey","Resource":"arn:aws:kms:us-east-1:111122223333:key/1234..."}` on the producer role, and the same with `kms:Decrypt` on the consumer role.
+W: A=GenerateDataKey for producers: writing to an encrypted stream requires a data key from the customer managed key, so producers fail without it.
+B=Decrypt for consumers: reading records requires decrypting them with the same key, so every consumer role, including Lambda execution roles, needs kms:Decrypt.
+X: C=kms:Encrypt for consumers: consumers only read and decrypt; Kinesis does not re-encrypt on read, and Encrypt does not grant the ability to decrypt.
+D=CreateGrant for the service principal: Kinesis uses the caller's permissions for record encryption, so a grant to the service does not fix producer and consumer denials.
+E=ScheduleKeyDeletion: a destructive administrative action that would eventually make all encrypted records unreadable; it is unrelated to reading or writing.
+T: On an SSE-KMS Kinesis stream, producers need kms:GenerateDataKey and consumers need kms:Decrypt on the customer managed key.
+V: Amazon Kinesis Data Streams, AWS KMS, AWS IAM
+
+@ DEA-C01 D4 T4.4 applied use-case
+S: Auditors ask a data platform team to prove that the CloudTrail log files stored in S3 for the past year were not modified or deleted after CloudTrail delivered them. Which capability provides this proof MOST directly?
+A: Enable S3 Versioning on the log bucket so every earlier version of each log file remains available to compare with
+B: Enable CloudTrail log file integrity validation and verify the digest files with the aws cloudtrail validate-logs command
+C: Encrypt the log files with SSE-KMS using a customer managed key so only authorized principals can decrypt the logs
+D: Also send the trail to CloudWatch Logs so a second copy of every event is retained in a separate logging service
+K: B
+G: ## Proving logs are unchanged
+Storing logs safely (encryption, restricted access) is different from **proving** that they have not been altered. For proof you need a cryptographic record created at delivery time.
+## CloudTrail log file integrity validation
+When integrity validation is enabled on a trail:
+- CloudTrail delivers a **digest file** every hour alongside the logs.
+- Each digest holds the **SHA-256 hash** of every log file delivered in that hour and is **signed** with a private key held by CloudTrail (RSA with SHA-256).
+- Each digest also references the previous digest, forming a chain, so deleting a digest is detectable too.
+- `aws cloudtrail validate-logs --trail-arn ... --start-time ...` checks every file against the digests and reports files that were modified, deleted or are missing.
+Example: an attacker edits one log file to remove an event; validation reports that file as invalid because its hash no longer matches the signed digest.
+Integrity validation is often combined with S3 Object Lock and a separate log archive account to also **prevent** tampering.
+W: Integrity validation: signed, chained digest files record the hash of every delivered log, and validate-logs proves whether each file is unchanged or missing.
+X: A=S3 Versioning: keeps older versions, but anyone with sufficient permissions can delete versions, and versions alone cannot show that the original was what CloudTrail delivered.
+C=SSE-KMS encryption: protects confidentiality and controls who can read, but an authorized principal could still modify files, and encryption provides no proof of integrity.
+D=CloudWatch Logs copy: a second copy helps availability, but comparing copies is manual and neither copy is cryptographically signed by CloudTrail.
+T: To prove CloudTrail logs were not altered, use log file integrity validation; versioning and encryption store logs but prove nothing.
+V: AWS CloudTrail, Amazon S3
+
+@ DEA-C01 D4 T4.4 advanced use-case
+S: A company with 60 AWS accounts in AWS Organizations must capture API activity for all current and future accounts in one place. Administrators in member accounts must not be able to stop the logging or alter the delivered log files. Which TWO actions meet these requirements? (Select TWO)
+A: Create an organization trail from the management account so that it applies to all current and future member accounts
+B: Deliver the trail to an S3 bucket in a dedicated log archive account with S3 Object Lock in compliance mode enabled
+C: Deploy a separate CloudTrail trail in each member account with CloudFormation StackSets managed by account admins
+D: Set up an AWS Config aggregator in the management account that collects configuration records from all the accounts
+E: Send each account's trail to CloudWatch Logs in that same account and keep the log group retention set to ten years
+K: A,B
+G: ## Organization trails
+An **organization trail** is created in the management account (or a delegated administrator account) with organization-wide scope:
+- It automatically logs every member account, including accounts added later.
+- Member accounts can **see** the trail but **cannot modify or delete it**, and cannot stop its logging.
+## Protecting delivered logs
+Where logs land matters as much as how they are collected:
+- A dedicated **log archive account** keeps logs out of reach of workload account administrators.
+- **S3 Object Lock in compliance mode** makes each object immutable for its retention period; no user, including the root user, can delete or overwrite it until retention ends.
+- Adding CloudTrail log file integrity validation lets you also prove files are unchanged.
+Example: `org-trail` delivers to `s3://org-cloudtrail-archive` in the log archive account, with Object Lock compliance retention of 400 days.
+## Not the same thing
+AWS Config records **resource configurations**, not the stream of API calls.
+W: A=Organization trail: one trail covers every current and future account, and member administrators cannot stop or edit it.
+B=Log archive bucket with Object Lock: logs sit outside the member accounts and compliance-mode retention prevents anyone from deleting or overwriting them.
+X: C=Per-account trails via StackSets: trails owned by each member account can be stopped or deleted by that account's administrators, and new accounts need extra setup.
+D=Config aggregator: collects resource configuration history and compliance, not API activity, so it does not replace CloudTrail.
+E=Per-account CloudWatch Logs: logs stay in each member account, where the same administrators can change retention or delete the log group.
+T: Central, tamper-resistant API logging means an organization trail delivering to an Object Lock bucket in a log archive account.
+V: AWS CloudTrail, AWS Organizations, Amazon S3
+
+@ DEA-C01 D4 T4.5 applied use-case
+S: A retailer and a media company want to measure how many of their customers overlap and compare campaign reach. Neither company may see the other's row-level customer records, results must only be aggregates above a minimum group size, and each company's data should stay in its own AWS account. Which service fits?
+A: AWS Lake Formation cross-account table sharing with column-level grants that exclude direct identifier columns
+B: Amazon Redshift data sharing from the retailer to the media company with a view limited to the joinable columns
+C: AWS Clean Rooms with an aggregation analysis rule that sets minimum aggregation thresholds on the join columns
+D: An S3 bucket policy granting the media company read access to a daily hashed export of the retailer's customers
+K: C
+G: ## Collaborating on data without sharing it
+Many analytics partnerships need **joint results** (overlap, reach, attribution) but must not expose each party's raw records. Sharing a table, even with some columns hidden, still gives the other party row-level access.
+## AWS Clean Rooms
+AWS Clean Rooms creates a **collaboration** between AWS accounts:
+- Each member keeps its data in its own account (tables in the Glue Data Catalog over S3, or other supported sources) and associates it with the collaboration.
+- **Analysis rules** on each configured table control what queries are allowed. An **aggregation** rule allows only aggregate functions such as `COUNT(DISTINCT ...)`, sets which columns can be joined on, and enforces **minimum aggregation thresholds**, so groups smaller than the threshold are not returned.
+- Other rule types include list and custom analysis; cryptographic computing and differential privacy add further protection.
+Example: `SELECT COUNT(DISTINCT r.hashed_email) FROM retailer r JOIN media m ON r.hashed_email = m.hashed_email` returns only a count, never matching rows.
+W: Clean Rooms with aggregation rules: both parties join their data in place, only aggregates above the minimum threshold come back, and neither sees the other's rows.
+X: A=Lake Formation sharing: the media company would query the retailer's rows directly; hiding identifier columns still exposes row-level records.
+B=Redshift data sharing: gives live read access to the shared objects, so the consumer can select individual rows through the view.
+D=Hashed export with bucket policy: copies the retailer's row-level customer list into the partner's hands, and unsalted hashes of emails can be matched against the partner's own hashed emails, so individual customers are identifiable.
+T: For joint analysis where partners must not see each other's rows, use AWS Clean Rooms analysis rules; data sharing services expose rows.
+V: AWS Clean Rooms, AWS Lake Formation, Amazon Redshift
+
+@ DEA-C01 D4 T4.5 advanced use-case
+S: A data lake stores customer events in S3 as Apache Iceberg tables queried with Athena. Under GDPR, a customer's erasure request requires that their rows are physically removed from storage within 30 days, not just hidden from queries. Which process meets this requirement?
+A: Run an Athena DELETE for the customer's rows, then OPTIMIZE to rewrite data files and VACUUM to expire old snapshots
+B: Create a Lake Formation row filter that excludes the customer's ID so that no analyst query ever returns their rows
+C: Enable S3 Versioning on the bucket and delete the Parquet objects that contain the customer's rows along with others
+D: Add an S3 Lifecycle rule that expires every object older than 30 days so that the customer's data ages out naturally
+K: A
+G: ## Why row deletes are hard in data lakes
+Plain Parquet files in S3 are immutable: to remove one customer you must rewrite every file that contains their rows. Open table formats such as **Apache Iceberg** add row-level `DELETE`, `UPDATE` and `MERGE` on top of S3.
+## How Iceberg deletes work
+- An Athena `DELETE FROM events WHERE customer_id = 'c-123'` creates a new **snapshot**. Athena writes **delete files** that mark the rows as removed (merge-on-read), so the original data files still contain the bytes.
+- Older **snapshots** also keep referencing the old files for time travel.
+To physically remove the data:
+- `OPTIMIZE events REWRITE DATA USING BIN_PACK` rewrites data files with the deletes applied (files are chosen by the table's rewrite thresholds, so confirm the affected files were rewritten).
+- `VACUUM events` expires snapshots older than the table's retention (`vacuum_max_snapshot_age_seconds`) and removes files no longer referenced.
+Example: with snapshot retention set to 7 days, DELETE, OPTIMIZE and VACUUM run within the week leave no copy of `c-123` in S3.
+W: DELETE, OPTIMIZE, VACUUM: the delete marks the rows, the rewrite produces data files without them, and snapshot expiry removes the old files, so the bytes are gone from S3 within the deadline.
+X: B=Lake Formation row filter: hides the rows from queries, but the data remains in S3, which fails the physical-erasure requirement.
+C=Versioning and object delete: a delete on a versioned bucket only adds a delete marker, old versions keep the data, and deleting whole files also removes other customers' rows.
+D=Lifecycle expiry after 30 days: deletes all customers' data older than 30 days, destroying the lake's history rather than erasing one person.
+T: Erasure in an Iceberg lake needs DELETE plus rewrite and snapshot expiry; row filters only hide data and versioned deletes keep it.
+V: Amazon Athena, Apache Iceberg, Amazon S3, AWS Lake Formation

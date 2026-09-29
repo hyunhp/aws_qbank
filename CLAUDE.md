@@ -26,6 +26,8 @@ Detailed explanations (see `tools/qgen/batches/ANS-C01/e01.txt` for the referenc
   `code` for CIDRs/ARNs/commands, a concrete example. `G:`, `W:`, `X:` may span lines.
 - `W:` and each `X:` entry start with a short option name then a colon (`B=VPC peering: ...`) and give
   the real reason it works or fails; one `X:` entry per line. `T:` is the one-sentence key idea.
+- Multi-answer questions: `W:` has one entry per correct option, one per line, like `X:`
+  (`W: A=Name: why` / `D=Name: why`).
 - Never refer to options by letter in the text ("option B"): ingest reorders choices.
 - Rewrite an existing question's explanation with an explain-only batch
   `tools/qgen/batches/<EXAM>/eNN.txt` using `@ Q001592 explain` blocks (G/W/X/T; X letters are the

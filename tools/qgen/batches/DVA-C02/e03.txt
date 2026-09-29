@@ -9,8 +9,8 @@ An API Gateway Lambda authorizer runs before your integration and decides whethe
 ## Example
 A client sends `Authorization: eyJhbGci...` without `Bearer `, or puts the token in `X-Auth-Token`. The token is valid and unexpired, but the authorizer never sees it in the expected shape, so every call gets 401.
 W: Wrong token format or header: a 401 with a still-valid token points to the token not reaching the authorizer as configured, either a missing `Bearer ` prefix (failing the regex or the function's parsing) or a header other than the identity source.
-X: A=No custom domain: a stage works on its default `execute-api` URL without a custom domain. A missing custom domain would cause DNS or 403/404-type errors for that host name, not token rejection.
-B=Reserved concurrency set too high: more reserved concurrency only guarantees more capacity. Concurrency problems show up as throttling (429) or authorizer errors (500), never as a 401 for a valid token.
+X: A=No custom domain: a stage works on its default `execute-api` URL without a custom domain. A missing custom domain would only make that host name fail to resolve or route; it would not cause token rejection.
+B=Reserved concurrency set too high: more reserved concurrency only guarantees more capacity. Concurrency limits show up as throttling or authorizer errors (5xx responses), not as a 401 for a valid token.
 D=Versioned deployment bucket: S3 versioning of the code bucket only keeps old copies of the package. It has no effect on how a running authorizer parses headers.
 T: A 401 for an unexpired token usually means the token arrived in the wrong header or format; check the identity source and the `Bearer ` prefix before suspecting infrastructure.
 
@@ -35,7 +35,7 @@ Assuming a role across accounts is a two-way handshake:
 - **Target side**: the target role's **trust policy** (a resource-based policy on the role) must name the caller as a principal, for example `"Principal": {"AWS": "arn:aws:iam::111122223333:role/order-fn-role"}` with `"Action": "sts:AssumeRole"`. It may also require conditions such as an `sts:ExternalId`.
 If either side is missing, STS returns `AccessDenied`. Cross-account access always needs both accounts to agree.
 ## Example
-Account A's function is allowed to call AssumeRole on `arn:aws:iam::222233334444:role/reporting`, but that role trusts only `lambda.amazonaws.com` in account B. The call fails until the trust policy adds account A's execution role (or account A as a whole).
+Account A's function is allowed to call AssumeRole on `arn:aws:iam::222233334444:role/reporting`, but that role's trust policy names only the `lambda.amazonaws.com` service principal. The call fails until the trust policy adds account A's execution role (or account A as a whole).
 W: Trust policy must trust the caller: the caller already has its half of the permission, so the missing half is the target role's trust policy allowing the execution role's ARN (or its account) to call `sts:AssumeRole`.
 X: A=Reserved concurrency: concurrency controls how many copies of the function can run at once. It plays no part in STS authorization decisions.
 C=AWSLambdaBasicExecutionRole on the target: that managed policy only lets a function write CloudWatch Logs. Adding it to the target role changes what the role can do after assumption, not who may assume it.
@@ -190,7 +190,7 @@ Mutual TLS needs a certificate on every service, issued by a CA that the other s
 **AWS Private CA** runs a private certificate hierarchy for you. You can issue certificates for internal names such as `orders.svc.internal` with the `IssueCertificate` API or through ACM, and it has a **short-lived certificate** CA mode (validity up to 7 days) at a lower price for frequently rotated workload certificates. Tools such as cert-manager and service meshes can request certificates from it automatically.
 W: AWS Private CA with short-lived certificates: it issues privately trusted certificates for internal services through APIs, supports short-lived certificates for frequent rotation, and keeps the CA key protected by AWS.
 X: A=KMS asymmetric keys as certificates: KMS stores key pairs, but a key is not an X.509 certificate. Nothing signs a certificate chain for mTLS peers to validate.
-C=ACM public certificates: public certificates are for publicly resolvable domains validated by DNS or email, and ACM public certificates cannot be exported for use inside your own containers.
+C=ACM public certificates: they are issued by a public CA only for publicly resolvable domain names you validate, so they are trusted by everyone rather than only inside the company, and they cannot be issued for internal-only names such as `orders.svc.internal`.
 D=Self-signed certificates in S3: each service would have its own untrusted root, so peers must trust every certificate individually, with no central revocation or automated rotation, and storing private keys in S3 adds risk.
 T: Internal-only mTLS with automated, frequently rotated certificates calls for a private CA (AWS Private CA), not public ACM certificates or KMS keys.
 
@@ -199,7 +199,7 @@ G: ## Public vs private certificates
 - **Public ACM certificates** are issued by Amazon's public CA for domain names you prove you own. Browsers trust them, and they are deployed on integrated services such as ALB, CloudFront and API Gateway.
 - **AWS Private CA** (formerly ACM Private Certificate Authority) lets you run your own root and subordinate CAs. You decide the hierarchy, naming, validity and extensions, and certificates can be issued for any internal name, including client certificates for mTLS.
 ## When to choose private
-Hundreds of internal endpoints that never face the internet, talking over mTLS, need certificates that only your organization trusts and a hierarchy you control, for example a root CA kept offline in use, with a subordinate CA per environment issuing workload certificates.
+Hundreds of internal endpoints that never face the internet, talking over mTLS, need certificates that only your organization trusts and a hierarchy you control, for example a root CA used only to sign subordinate CAs, with a subordinate CA per environment issuing workload certificates.
 W: ACM Private CA: it creates and manages a private CA hierarchy under your control and issues certificates for internal endpoints and mTLS clients, at the scale of hundreds of services.
 X: A=Amazon Cognito: Cognito authenticates application users and issues JWTs. It does not issue X.509 certificates for services.
 B=Public ACM certificates: public issuance requires publicly validated domain names and gives no control over the CA hierarchy, which does not fit internal-only endpoints and mTLS.
@@ -257,7 +257,7 @@ The KMS `Encrypt` API accepts at most **4 KB** of plaintext, and every call goes
 - Store the encrypted data key next to the ciphertext, for example as object metadata.
 - To read: call `Decrypt` on the small encrypted data key, then decrypt the file locally.
 ## Example
-A 2 GB video is encrypted on the client with a fresh data key; only the 256-bit key goes to KMS for decryption later. The AWS Encryption SDK and the S3 Encryption Client implement this pattern for you.
+A 2 GB video is encrypted on the client with a fresh 256-bit data key; later only the small encrypted data key is sent to KMS for decryption. The AWS Encryption SDK and the S3 Encryption Client implement this pattern for you.
 W: Envelope encryption with GenerateDataKey: the file is encrypted locally with a data key, and KMS only protects that small key, so the 4 KB limit never applies to the file.
 X: A=Encrypt the whole file with KMS: calls with plaintext over 4 KB fail, and sending large files to KMS would be slow and costly even if it were possible.
 B=Disable key rotation: rotation only controls whether new key material is created each period. It has no effect on the maximum request size.
@@ -269,7 +269,7 @@ G: ## Kinds of KMS keys
 - **AWS managed keys** (aliases like `aws/s3`, `aws/ebs`) are created by AWS services in your account. You can view them and audit their use, but you cannot change their policy or rotation. AWS rotates their key material automatically every year.
 - **Customer managed keys** are created and fully controlled by you. Automatic rotation is **off by default**; when you enable it, you can choose a period between 90 and 2560 days (365 by default), and you can also trigger on-demand rotation.
 ## What rotation does
-Rotation creates new key material for new encryptions and keeps old material so existing ciphertext still decrypts. The key ID, ARN and aliases stay the same, so applications need no changes. Keys with imported material or in custom key stores cannot use automatic rotation; for those you rotate manually by switching an alias to a new key.
+Rotation creates new key material for new encryptions and keeps old material so existing ciphertext still decrypts. The key ID, ARN and aliases stay the same, so applications need no changes. Automatic rotation applies only to symmetric encryption keys whose material KMS generated; keys such as asymmetric, HMAC or custom key store keys are rotated manually by pointing an alias to a new key.
 W: AWS managed rotate automatically, customer managed optional: AWS rotates its managed keys yearly without your involvement, while rotation of customer managed keys is your choice to enable and configure.
 X: A=Identical schedules set by the customer: customers cannot configure rotation for AWS managed keys at all, and the two key types behave differently.
 C=AWS managed keys never rotate: they are rotated automatically every year.
@@ -292,14 +292,14 @@ T: SSH to EC2: attach a key pair at launch and keep the private key only on your
 
 @ Q000658 explain
 G: ## Encryption in transit to DynamoDB
-DynamoDB is reached only through its HTTPS API. The AWS SDK a Lambda function uses sends every request over TLS and signs it with SigV4, so data between Lambda and DynamoDB is encrypted in transit by default. Table encryption at rest (AWS owned, AWS managed or customer managed key) is a separate topic.
+DynamoDB is accessed through its API, and the AWS SDK a Lambda function uses connects to the HTTPS endpoint and signs each request with SigV4, so data between Lambda and DynamoDB is encrypted in transit by default. Table encryption at rest (AWS owned, AWS managed or customer managed key) is a separate topic.
 ## Keeping traffic off the internet
-- A Lambda function **not** attached to a VPC reaches the public DynamoDB endpoint from AWS-managed networking; traffic stays on the AWS network and is TLS-encrypted.
+- A Lambda function **not** attached to a VPC reaches the public DynamoDB endpoint from AWS-managed networking, over TLS; you cannot add VPC endpoints to that path.
 - A function **attached** to a VPC needs a route to DynamoDB. Without an endpoint, that means a NAT gateway and the public endpoint. A **gateway VPC endpoint** for DynamoDB adds a route in the subnet route tables (prefix list) so traffic goes privately to DynamoDB with no NAT and no internet gateway. Interface endpoints (PrivateLink) for DynamoDB are also available.
 W: TLS by default, gateway endpoint for a private path: all DynamoDB API calls use TLS, and a DynamoDB gateway endpoint lets a VPC-attached function reach the table without an internet or NAT path.
 X: A=Protected only outside a VPC: TLS applies wherever the function runs. Attaching the function to a VPC changes the network path, not the encryption.
 C=Only with a customer managed key: the key choice affects encryption at rest in the table, not the TLS protection of API calls.
-D=Plaintext unless the client enables TLS: DynamoDB endpoints use HTTPS, and the SDK uses TLS by default, so there is no plaintext mode to opt out of.
+D=Plaintext unless the client enables TLS: the AWS SDKs use the HTTPS endpoint by default, so TLS does not need to be switched on; plaintext would require deliberately overriding the endpoint.
 T: Lambda-to-DynamoDB traffic is always TLS-encrypted; to keep a VPC function's traffic private, add a DynamoDB VPC endpoint (usually the gateway type).
 
 @ Q000659 explain
@@ -320,7 +320,7 @@ G: ## EBS encryption and key choice
 EBS encryption uses KMS: volumes and every snapshot taken from them are encrypted with the chosen key, transparently to the instance. You can enable **encryption by default** per Region and set a default customer managed key.
 ## Sharing encrypted snapshots
 - A snapshot encrypted with the AWS managed key `aws/ebs` **cannot be shared** with another account, because you cannot change that key's policy.
-- A snapshot encrypted with a **customer managed key** can be shared: modify the snapshot's permissions to add the DR account, and allow that account in the key policy (for example `kms:Decrypt`, `kms:DescribeKey`, `kms:CreateGrant`, `kms:ReEncrypt*`).
+- A snapshot encrypted with a **customer managed key** can be shared: modify the snapshot's permissions to add the DR account, and allow that account in the key policy (for example `kms:Decrypt`, `kms:DescribeKey`, `kms:CreateGrant`, `kms:ReEncrypt*` and `kms:GenerateDataKey*`).
 - In the DR account you usually copy the snapshot and re-encrypt it with a DR-owned key, so restores do not depend on the source account's key.
 W: Customer managed key, share snapshot and key: CMK encryption covers the volumes and snapshots, and granting the DR account both snapshot access and key use lets it restore.
 X: A=S3 default encryption on a snapshot bucket: EBS snapshots are stored by AWS in S3-backed storage you cannot access as a bucket, so bucket settings do not apply and cannot encrypt them.

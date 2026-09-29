@@ -1,0 +1,347 @@
+# DVA-C02 detailed explanations, e07 (explanation-only rewrites; letters are the published ones)
+
+@ Q000737 explain
+G: ## Two different Lambda concurrency controls
+Every Region gives an account a shared pool of concurrent executions (1,000 by default, raisable). Two settings change how one function uses that pool.
+- **Reserved concurrency** carves a fixed slice out of the pool for one function. No other function can use it, and the function can never scale beyond it, so it is both a guarantee and a cap. It does not start any environments.
+- **Provisioned concurrency** keeps a number of execution environments initialized ahead of time on a published version or alias, so requests served by them have no cold start. It does not cap the function and does not by itself stop other functions from draining the rest of the pool.
+## Scheduling warm capacity
+Provisioned concurrency is billed while it is configured, so teams scale it with **Application Auto Scaling** scheduled actions, for example 50 environments on the `live` alias from 08:00 to 18:00 on weekdays and 0 at night.
+W: Reserved plus scheduled provisioned concurrency: reserved concurrency guarantees the payment function its share of the account pool so other functions cannot starve it, and scheduled provisioned concurrency keeps environments warm only during business hours, removing cold starts when they matter while limiting cost.
+X: A=More memory: memory size sets the RAM and proportional CPU for each environment. It neither sets aside account concurrency nor keeps environments initialized, so both starvation and cold starts remain possible.
+B=Provisioned concurrency only: it removes cold starts for the configured number of environments, but it is not a cap on other functions. Traffic above that level competes in the shared pool, so a noisy neighbor can still cause throttling.
+D=Reserved concurrency only: it guarantees capacity but creates environments only on demand, so the first requests after idle periods still pay the initialization cost. Reserving concurrency does not pre-warm anything.
+T: Reserved concurrency guarantees and caps capacity, provisioned concurrency keeps it warm; a function that must be both protected and cold-start free needs both.
+
+@ Q000738 explain
+G: ## Where Lambda throttling comes from
+Lambda throttles an invocation when there is no concurrency available for it. That can happen at two levels:
+- **Account level**: all functions in the Region together exceed the account concurrency quota.
+- **Function level**: the function has **reserved concurrency** configured, and that value is a hard ceiling. With reserved concurrency of 20, the 21st simultaneous request is throttled even if the account has hundreds of unused executions.
+## Reading the metrics
+The function's `Throttles` metric counts rejected invocations. Comparing `ConcurrentExecutions` for the function with its reserved concurrency value shows whether it is hitting its own cap. Synchronous callers receive a `TooManyRequestsException` (HTTP 429); for asynchronous invocations and event source mappings, Lambda retries.
+Example: an order function reserved at 20 handles normal load, but a sale pushes demand to 60 concurrent requests, so two thirds of the spike is throttled while the account total is far below its limit.
+W: Reserved concurrency below demand: reserved concurrency is also the maximum the function can scale to. When the spike needs more concurrent executions than that setting, Lambda throttles the extra requests, which matches a rising `Throttles` metric while the account limit is not reached. Raise or remove the setting.
+X: B=Memory set too high: memory affects cost per millisecond and CPU share, not how many concurrent executions are allowed. A large memory size does not cause throttling errors.
+C=Unsupported runtime: runtime deprecation affects whether the function can be created or updated, and a broken runtime shows up as invocation errors. It does not produce a gradually rising throttle count during a traffic spike.
+D=Missing execution role permission: a missing permission makes the function's own AWS SDK calls fail with an access denied error inside the code. Lambda still starts the invocation, so the `Throttles` metric would not rise.
+T: Throttling while the account limit is unused points to the function's own reserved concurrency cap, not to memory, runtime or IAM.
+
+@ Q000739 explain
+G: ## Memory, CPU and cost in Lambda
+Lambda allocates CPU in proportion to the memory setting (128 MB to 10,240 MB). You pay for memory multiplied by duration, so the cheapest setting is not obvious:
+- For CPU-bound code, doubling memory can roughly halve duration, leaving cost about the same while making it faster.
+- Past the point where the code cannot use more CPU, extra memory only adds cost.
+## AWS Lambda Power Tuning
+Lambda Power Tuning is an open-source tool (deployed from the AWS Serverless Application Repository or with SAM) built on a Step Functions state machine. You give it a function ARN, a payload, a list of memory values such as `128, 512, 1024, 2048, 3008` and a strategy (`cost`, `speed` or `balanced`). It invokes the function many times at each setting, measures duration and cost, and returns the best setting plus a chart of the trade-off.
+W: Lambda Power Tuning: it automates exactly this experiment, running the real function at many memory sizes and comparing measured cost and duration, so the developer can pick the setting with the lowest cost that still meets the duration target.
+X: A=Provisioned concurrency: it keeps environments initialized to avoid cold starts. It does not test memory sizes and it adds cost, so it does not answer which memory size is cheapest.
+B=Maximum memory always cheapest: cost is memory times duration. Once more CPU stops shortening the run, extra memory just raises the price per millisecond, so the maximum is often the most expensive choice.
+D=Trusted Advisor: its Lambda checks look at existing usage patterns (errors, timeouts, and memory recommendations imported from Compute Optimizer). It never invokes the function across a range of memory settings to measure cost and duration.
+T: To find the best Lambda memory size, measure it: Power Tuning runs the function at many sizes and charts cost against duration, while bigger memory is not automatically cheaper.
+
+@ Q000740 explain
+G: ## CloudWatch Logs subscription filters
+A **subscription filter** attaches to a log group and delivers matching log events in near real time to a destination such as a Lambda function, a Kinesis data stream or an Amazon Data Firehose stream. The filter uses a **filter pattern**, so only matching events are sent.
+- Pattern `FATAL` matches any event whose message contains the term FATAL.
+- Lambda receives the events base64-encoded and gzip-compressed in `awslogs.data`, decodes them and can open an incident right away.
+- CloudWatch Logs needs permission to invoke the function (a resource-based policy on the Lambda function).
+Events that do not match stay in the log group as usual; they are simply not forwarded.
+W: Subscription filter on FATAL: it pushes only events that match the pattern to the Lambda function as they are ingested, which is both near real time and selective, with no polling or scanning of other log lines.
+X: A=Scheduled Logs Insights query: a query run every minute scans the log group each time and returns results in batches, adding delay and query cost. It polls instead of streaming each FATAL event as it arrives.
+B=S3 export notification: exporting a log group to S3 is a batch task that can take a long time to complete and copies all events in the time range, not just FATAL ones, so it is neither near real time nor selective.
+D=X-Ray sampling rule: sampling rules decide which requests X-Ray records as traces. They do not read CloudWatch Logs or trigger functions from log content.
+T: To react to specific log lines as they arrive, use a subscription filter with a pattern; queries and exports are for later analysis.
+
+@ Q000741 explain
+G: ## The CloudFront cache key
+CloudFront stores one cached object per **cache key**. By default the key is basically the URL path (plus host). Anything else, such as headers, cookies or query strings, is part of the key only if the **cache policy** includes it.
+If an origin returns German for `Accept-Language: de` and English for `en`, but the header is not in the cache key, the first response cached for `/products` is served to everyone, so some users get the wrong language.
+## Fixing it
+- Add `Accept-Language` to the cache policy's headers. Headers in the cache key are also forwarded to the origin.
+- Browsers send many variations (`de-DE,de;q=0.9,en;q=0.8`), which fragments the cache. Normalizing the header to a few values, for example with a CloudFront Function, keeps the hit ratio high.
+W: Accept-Language in the cache key: including the header in the cache policy makes CloudFront keep a separate cached object per language value, so each user receives the variant that matches the header they sent.
+X: B=Cache-Control no-store: it stops caching the responses, which fixes the wrong language only by sending every request to the origin, throwing away the performance and offload CloudFront is there for.
+C=Disable compression: compression only changes how bytes are encoded on the wire. It does not create separate cache entries per language, so the wrong variant is still served.
+D=ETag headers: an ETag identifies a version of a response for conditional revalidation (`If-None-Match`). It does not change the cache key, so different languages still share one cached object.
+T: If the origin varies responses by a header, that header must be in the CloudFront cache key; disabling caching or relying on ETags does not separate the variants.
+
+@ Q000742 explain
+G: ## What Performance Insights shows
+Amazon RDS Performance Insights measures **database load** as average active sessions (AAS): how many sessions are running or waiting at each moment. The load chart can be sliced by:
+- **Waits**: what sessions are waiting on, such as CPU, disk I/O, or row locks.
+- **Top SQL**: which statements contribute most of the load, with their wait breakdown and per-statement statistics.
+- Hosts, users and databases.
+AWS has moved the Performance Insights console experience into **Amazon CloudWatch Database Insights**, which shows the same load, wait and top SQL views; the Performance Insights API remains available.
+## Using it during peaks
+Example: at 12:00 load jumps to 8 AAS on a 4-vCPU instance, and one `SELECT ... WHERE customer_id = ?` accounts for most of it, waiting on I/O. That points to a missing index or an inefficient plan: running `EXPLAIN` and adding an index on `customer_id` can remove the bottleneck without paying for a larger instance.
+W: Examine top SQL waits and optimize or index: the tool already shows a few statements causing most of the load; drilling into their wait events explains why they are slow (I/O, locks, CPU), and tuning or indexing those queries fixes the root cause.
+X: B=Disable Performance Insights: its purpose is to connect load to specific SQL and waits, which is the cause, not a symptom. Turning it off removes the best diagnostic data right when it is needed.
+C=Delete slow query log entries: deleting log records does not change the queries or the load; it only destroys evidence. No metric becomes more accurate by hiding slow queries.
+D=Increase instance size immediately: scaling up costs more and may only mask an inefficient query, for example a full table scan still grows with the data. Diagnose and fix the top statements before resizing.
+T: When a few queries dominate database load, fix those queries (waits, plans, indexes) before throwing hardware at the problem.
+
+@ Q000743 explain
+G: ## Two caching layers for an API
+- **API Gateway caching** (REST APIs) is enabled per **stage**. API Gateway provisions a dedicated cache (0.5 GB to 237 GB) in the API's Region; responses are stored by method and optional cache key parameters, with a TTL of up to 3600 seconds. A hit saves a backend call, but the user's request still travels to that Region.
+- **Amazon CloudFront** caches at edge locations around the world. Put in front of an API Gateway endpoint, it serves cached responses from an edge close to the user, cutting both latency and backend load.
+Even an edge-optimized API Gateway endpoint, which routes through CloudFront's network, uses the stage cache in the Region; you configure a separate CloudFront distribution when you want edge caching under your own control.
+W: Stage-level Regional cache versus edge cache: API Gateway's cache belongs to one stage and lives in the API's Region, while CloudFront caches at edge locations near users, which is the real difference in scope.
+X: A=Reversed scope: the statement swaps the two. API Gateway's cache is Regional per stage, and CloudFront is a global edge network, not limited to one Region.
+C=CloudFront only for static S3 content: CloudFront can use any HTTP origin, including API Gateway, Application Load Balancers and custom servers, and can cache dynamic API responses according to its cache policy.
+D=Functionally identical: they differ in where the cache lives (Region versus edge), how it is configured (stage settings versus cache policies) and how it is billed (per cache-size hour versus per request and data transfer).
+T: API Gateway caching is a Regional per-stage cache; CloudFront caches at global edges and can sit in front of an API.
+
+@ Q000744 explain
+G: ## CloudWatch Logs filter pattern syntax
+Filter patterns for unstructured log lines are built from terms:
+- `ERROR` matches events containing the term ERROR.
+- `ERROR WARN` (terms separated by a space) matches events containing **both** terms.
+- `?ERROR ?WARN` (terms prefixed with `?`) matches events containing **either** term.
+- A `-` prefix excludes a term, for example `ERROR -DEBUG` matches ERROR events that do not contain DEBUG.
+## What a subscription filter does with the pattern
+A subscription filter delivers only matching events to its destination, here a Kinesis data stream. Non-matching events are not sent, but they are not changed either: every event stays in the log group for its retention period.
+Example: `ERROR db timeout` and `WARN slow request` reach Kinesis; `INFO user login` does not, yet remains searchable in CloudWatch Logs.
+W: Only events with ERROR or WARN: the `?` prefix turns the terms into an OR, so any event containing at least one of them is forwarded, once, and all other events are skipped.
+X: A=Both terms required: requiring both would be written `ERROR WARN` without question marks. The `?` operator means either term matches.
+B=All events with duplicates: a subscription filter sends only events that match its pattern, and each matching event is delivered once, not duplicated per matching term.
+D=Non-matching events deleted: filters are read-only views over ingestion. Events that do not match stay in the log group; only retention settings remove log data.
+T: In CloudWatch Logs filter patterns, space means AND and `?` means OR; filters select what is forwarded but never delete anything.
+
+@ Q000745 explain
+G: ## Profiling versus tracing and metrics
+A **profiler** samples a running process many times per second and records which call stack is on the CPU or waiting. Aggregated, this shows which methods consume the most CPU time and wall-clock latency.
+**Amazon CodeGuru Profiler** does this continuously for JVM (Java, Kotlin, Scala) and Python applications on EC2, ECS, EKS, Lambda or on premises:
+- An agent samples in the background with low overhead, suitable for production.
+- Results appear as **flame graphs**: wide frames are the methods using the most time.
+- It adds recommendation reports for costly patterns it detects in the profile.
+Example: a flame graph shows 40% of CPU inside a JSON serializer called in a loop, which tells the team exactly which code to optimize.
+W: CodeGuru Profiler: it continuously samples the running Java service in production with low overhead and attributes CPU and latency to individual methods, which is exactly the hotspot information the team needs.
+X: A=Container Insights: it collects CPU, memory, network and restart metrics per cluster, service, task or pod. It can confirm that CPU is high but cannot say which methods inside the JVM use it.
+B=X-Ray service map: X-Ray traces requests across services and shows latency per service or downstream call. It does not sample call stacks, so it cannot rank methods by CPU usage.
+C=Amazon Inspector: it scans EC2 instances, container images and Lambda functions for software vulnerabilities and network exposure. It does not measure runtime performance.
+T: For method-level CPU and latency hotspots in production, use a continuous profiler (CodeGuru Profiler); X-Ray and Container Insights work at request or resource level.
+
+@ Q002093 explain
+G: ## At-least-once delivery
+An SQS **standard queue** guarantees at-least-once delivery: occasionally a message is delivered more than once, for example when a copy was stored on a server that was briefly unavailable, or when a visibility timeout expires before the consumer deletes the message. Consumers must therefore be **idempotent**: processing the same message twice has the same effect as processing it once.
+## A conditional write as an idempotency guard
+- Choose a key that is unique per business operation, such as `paymentId` or an idempotency key sent by the client.
+- Before charging, write to a DynamoDB table with `ConditionExpression: attribute_not_exists(paymentId)`.
+- If the write fails with `ConditionalCheckFailedException`, the payment was already handled, so skip the charge.
+Powertools for AWS Lambda offers an idempotency utility that implements this pattern. Passing the same key to the payment provider as its idempotency key adds another safety net.
+W: Idempotent handler with a conditional write on a payment key: it makes duplicate deliveries harmless whatever their cause, because only the first write for a given payment key succeeds and later copies are detected and skipped.
+X: B=Faster runtime: startup speed changes latency and cost, not delivery semantics. SQS can still deliver the same message twice, and the handler would charge twice.
+C=Batch size of 1: it changes how many messages arrive per invocation, not whether a message is delivered again. A duplicate copy still arrives as its own single-message batch.
+D=Longer retention period: retention only controls how long unprocessed messages are kept (up to 14 days). It has no effect on duplicate delivery.
+T: Standard SQS delivers at least once, so make consumers idempotent with a unique key and a conditional write; tuning batch size, runtime or retention does not remove duplicates.
+
+@ Q002094 explain
+G: ## The lost update problem
+Two users read the same item, each changes it locally, and both write it back. The second `PutItem` or `UpdateItem` silently replaces the first user's changes because DynamoDB applies writes in arrival order.
+## Optimistic locking
+Add a `version` number to the item and make every write conditional on the version you read:
+- Read the item and note `version = 7`.
+- Write with `ConditionExpression: version = :expected` (`:expected = 7`) and set `version = 8`.
+- If someone else already wrote version 8, the condition fails with `ConditionalCheckFailedException`; the application rereads and retries or shows a conflict.
+No lock is held while users edit, so reads stay fast and conflicts are only detected at write time. The DynamoDB Enhanced Client for Java supports this with a version attribute annotation.
+W: Optimistic locking with a version attribute and a condition: the conditional write succeeds only if the item still has the version the user read, so a stale update is rejected instead of silently overwriting newer data, and no locking is needed.
+X: B=BatchWriteItem: it groups puts and deletes for efficiency but does not support condition expressions at all, so it cannot reject stale writes and would make overwrites easier, not safer.
+C=Strongly consistent reads: they return the latest committed value at read time, but another user can still write between that read and your write. Without a conditional write the overwrite still happens.
+D=DynamoDB Streams: a stream records changes after they are committed. It could detect an overwrite later, but it cannot prevent or reject the stale write.
+T: Prevent lost updates with a conditional write on a version attribute (optimistic locking); consistent reads and streams do not stop a concurrent overwrite.
+
+@ Q002095 explain
+G: ## Adding a new access pattern to a DynamoDB table
+A `Query` needs a partition key value. With `orderId` as the table's partition key, finding orders by `customerId` would require a `Scan`. Secondary indexes provide another key:
+- **Global secondary index (GSI)**: any attribute as partition key and optional sort key, for example `customerId` + `orderDate`. It can be added to an existing table at any time and has its own throughput.
+- **Local secondary index (LSI)**: same partition key as the table, different sort key, and can only be created together with the table.
+## Consistency of GSI reads
+DynamoDB updates a GSI asynchronously from the base table. Queries on a GSI therefore support **only eventually consistent** reads; `ConsistentRead: true` is rejected.
+Example: `Query` on index `CustomerDateIndex` with `customerId = :c` and `ScanIndexForward: false` returns a customer's newest orders first.
+W: D=GSI on customerId and orderDate: a global secondary index with `customerId` as partition key and `orderDate` as sort key lets the application query one customer's orders already sorted by date, and it can be added to the existing table.
+E=GSI reads are eventually consistent: index entries are propagated asynchronously, so a GSI query supports only eventually consistent reads and a very recent write may briefly be missing from the results.
+X: A=LSI added later with a new partition key: an LSI must use the table's partition key (`orderId`), and it can only be defined when the table is created, so it fails on both counts.
+B=GSIs share the table's partition key: that describes an LSI. A GSI can use any attribute as its partition key, which is exactly why it fits a new access pattern.
+C=Scan with a filter is as efficient: a Scan reads every item in the table and applies the filter afterward, consuming read capacity for all of them, while a Query on an index reads only the matching partition.
+T: For a new access pattern on an existing table, add a GSI with the needed keys, and remember that GSI queries are only eventually consistent.
+
+@ Q002096 explain
+G: ## How Lambda handles SQS batches
+With an SQS event source mapping, Lambda receives a batch (here 10 messages). By default the batch succeeds or fails as a whole: if the function throws an error, none of the messages are deleted, and all 10 become visible again after the visibility timeout, including the 9 that were already processed.
+## Partial batch responses
+Enable `ReportBatchItemFailures` in the mapping's `FunctionResponseTypes`. The function then catches per-message errors and returns only the failures:
+- Return `{"batchItemFailures": [{"itemIdentifier": "<messageId>"}]}` for each failed message.
+- Lambda deletes the successful messages and leaves only the listed ones to be retried, and after `maxReceiveCount` attempts they move to the dead-letter queue.
+- An empty list means the whole batch succeeded.
+W: ReportBatchItemFailures with failed IDs: the function reports exactly which messages failed, so Lambda deletes the rest and retries only the failures instead of reprocessing the whole batch.
+X: A=FIFO queue: FIFO adds ordering and deduplication of sends, but without partial batch responses a failure still returns the whole batch to the queue, and later messages in the same group are held back until it succeeds.
+C=Delete all messages first: deleting before processing means a message that then fails is gone and never retried, trading duplicate processing for silent data loss.
+D=12-hour visibility timeout: it only delays when the failed batch reappears. The whole batch, including the successful messages, is still reprocessed, just much later.
+T: Use ReportBatchItemFailures to retry only the failed messages in an SQS batch; FIFO or timeouts do not stop successful messages from being reprocessed.
+
+@ Q002097 explain
+G: ## Standard versus Express workflows
+AWS Step Functions offers two workflow types:
+- **Standard**: runs up to one year, **exactly-once** execution, full execution history in the console, priced per state transition. Suited to long-running, auditable business processes, with lower start rates.
+- **Express**: runs up to five minutes, **at-least-once** execution (asynchronous mode), much higher start rates, priced by number of requests plus duration and memory. Execution history goes to CloudWatch Logs if enabled.
+## Cost at high volume
+A 3-step workflow at 50,000 events per second means a very large number of state transitions. Under Standard pricing each transition is billed; under Express you pay per execution and for less than 2 seconds of duration each, which is far cheaper for short, high-volume flows. Express also has far higher start-rate quotas than Standard (both can be raised on request), so the event rate is realistic only with Express.
+W: Express workflows: they are built for short (under five minutes), high-volume event processing, accept at-least-once semantics and are billed by requests and duration, which fits 50,000 workflows per second that each finish in under 2 seconds at the lowest cost.
+X: A=AWS Batch: it schedules containerized batch jobs onto compute environments, with job startup measured in seconds to minutes. It is not designed to orchestrate tens of thousands of short, two-second workflows per second.
+B=Standard workflows: they provide exactly-once execution and long durations that this use case does not need, charge per state transition, and have much lower start-rate quotas, so they cost more and may throttle.
+D=Custom scheduler on EC2: the team would have to build retries, state tracking, scaling and high availability themselves and pay for instances around the clock, which is more cost and effort than a managed workflow.
+T: For short, high-volume workflows that tolerate at-least-once execution, choose Step Functions Express; Standard is for long-running, exactly-once processes.
+
+@ Q002098 explain
+G: ## Authorizer options for API Gateway HTTP APIs
+HTTP APIs support three kinds of access control: **JWT authorizers**, **Lambda authorizers** and **IAM** (SigV4).
+A **JWT authorizer** validates OAuth 2.0 / OpenID Connect tokens natively:
+- **Issuer**: for Cognito, `https://cognito-idp.<region>.amazonaws.com/<userPoolId>`.
+- **Audience**: the user pool app client ID.
+- API Gateway fetches the pool's public keys, checks the signature, expiry, issuer and audience, and can require scopes per route.
+The single-page app signs users in with Cognito and sends the token as `Authorization: Bearer <token>`. Requests with a missing or invalid token are rejected with 401 before any backend runs, and validated claims are passed to the integration.
+W: JWT authorizer with the user pool as issuer: it is a built-in HTTP API feature that verifies Cognito tokens without any custom code, rejecting requests that lack a valid token.
+X: B=Lambda authorizer: it can validate the token, but only with code the team writes and maintains (key fetching, signature and claim checks), plus an extra function to run, which breaks the no custom code requirement.
+C=API key on every route: API keys identify calling applications for usage plans and are not proof of a user's identity; HTTP APIs do not even support API keys, and a key embedded in a browser app is visible to anyone.
+D=IAM authorization with SigV4 in the browser: it requires AWS credentials in the browser (for example from a Cognito identity pool) and request signing logic, which is more complex and not needed when the app already has user pool tokens.
+T: Cognito user pool tokens plus an HTTP API: use the native JWT authorizer; Lambda authorizers need code and API keys do not authenticate users.
+
+@ Q002099 explain
+G: ## Why KMS Encrypt fails on large data
+The KMS `Encrypt` API accepts at most **4,096 bytes** of plaintext. It is meant for small secrets such as passwords or keys, and every call is a network request to KMS. A 5 MB file is far over that limit.
+## Envelope encryption
+- Call `GenerateDataKey` on the KMS key. KMS returns a data key twice: in plaintext and encrypted under the KMS key.
+- Encrypt the file locally with the plaintext data key (for example AES-256-GCM), then discard the plaintext key from memory.
+- Store the encrypted data key next to the ciphertext.
+- To decrypt, call KMS `Decrypt` on the small encrypted data key, then decrypt the file locally.
+The AWS Encryption SDK implements this pattern and stores the encrypted data key inside the ciphertext message.
+W: Envelope encryption with a GenerateDataKey data key: KMS only protects the small data key, while the 5 MB file is encrypted locally with it, avoiding the 4 KB limit and keeping calls to KMS to one per file.
+X: A=Quota increase for the payload size: the 4 KB plaintext limit of `Encrypt` is a fixed limit of the API, not an adjustable quota, so it cannot be raised.
+B=Asymmetric KMS key: asymmetric RSA keys can encrypt even less data per call (a few hundred bytes depending on key size and padding), so they make the problem worse.
+D=4 KB chunks with Encrypt: a 5 MB file would need over a thousand KMS calls per file, adding latency, cost and request-quota pressure, and the application would have to manage chunk ordering itself. Envelope encryption is the intended design.
+T: KMS Encrypt handles at most 4 KB; encrypt large data locally with a data key from GenerateDataKey (envelope encryption).
+
+@ Q002100 explain
+G: ## Reading secrets efficiently in Lambda
+Calling `GetSecretValue` on every invocation adds a network round trip and a per-call charge, and heavy traffic can approach the API's request quotas. Because a warm execution environment is reused, the value can be cached in memory:
+- **AWS Parameters and Secrets Lambda Extension**: added as a layer, it runs a local HTTP cache inside the environment. The function calls `localhost:2773` with the secret name and a session token header; the extension returns the cached value and refreshes it after a configurable TTL.
+- **Caching client libraries** (for example the Secrets Manager caching library for Java or Python, or Powertools for AWS Lambda) keep the secret in process memory with a refresh interval.
+## Handling rotation
+Monthly rotation is compatible with a TTL of minutes: after the cache expires, the next read gets the new version. With the alternating-users rotation strategy the previous credentials keep working for a while, and on an authentication failure code can force a cache refresh.
+W: Cache the secret with a TTL: most invocations read from a warm in-memory cache instead of calling Secrets Manager, cutting latency and API cost, while the TTL ensures a rotated password is picked up soon after rotation.
+X: B=Hardcode in an environment variable: the value is fixed at deployment, so monthly rotation would break the function until someone redeploys, and the plaintext password is visible to anyone who can read the function configuration.
+C=Store in the deployment package: the password becomes part of an artifact that is copied and versioned, anyone with access to the package can read it, and it also goes stale on every rotation.
+D=More memory: extra memory gives more CPU but the latency is a network call to Secrets Manager, and the number of API calls and their cost stay exactly the same.
+T: Cache secrets in the execution environment with a TTL (extension or caching client) instead of fetching every time or baking them into configuration.
+
+@ Q002101 explain
+G: ## Presigned URLs
+A **presigned URL** is an S3 URL signed with the credentials of the backend's IAM role. It carries the bucket, key, operation (for example `PutObject`), expiry and signature in its query string. Anyone holding the URL can perform exactly that operation until it expires, with the signer's permissions.
+Upload flow:
+- The authenticated user asks the backend for an upload URL.
+- The backend checks the user and generates a URL for `uploads/<userId>/<fileId>` valid for, say, 5 minutes.
+- The browser sends the file with an HTTP `PUT` directly to S3; the bucket's CORS configuration must allow the app's origin.
+A single `PUT` can carry up to 5 GB, so 100 MB is fine; larger files can use presigned multipart uploads.
+W: Short-lived presigned URL: the browser uploads directly to the private bucket using a URL scoped to one object and a short expiry, so file bytes bypass the backend and users never receive AWS credentials.
+X: A=Public write for an hour a day: anyone on the internet could write or overwrite objects during that window, and S3 Block Public Access is designed to prevent exactly this. It also breaks the private bucket requirement.
+B=Through API Gateway and Lambda: it routes the bytes through the backend, which the requirement excludes, and hits payload limits (10 MB for API Gateway, 6 MB for synchronous Lambda invocations) well below 100 MB.
+C=IAM access key in the bundle: every user could extract the long-term key from the JavaScript and use it outside the app, which is the same as giving users AWS credentials.
+T: For direct browser uploads to a private bucket, hand out short-lived presigned URLs from the backend; never public buckets or embedded keys.
+
+@ Q002102 explain
+G: ## CORS has two parts
+A browser making a cross-origin request with custom headers first sends a **preflight** `OPTIONS` request, then the real request. Both responses must contain CORS headers; for the real response the key one is `Access-Control-Allow-Origin`.
+## Who adds the headers
+- Enabling CORS in the API Gateway console for a REST API creates an `OPTIONS` method (a mock integration) that answers the preflight.
+- With **Lambda proxy integration**, API Gateway passes the function's response through unchanged. The function must add the headers itself, for example `headers: {"Access-Control-Allow-Origin": "https://app.example.com"}` in the returned object.
+So preflight succeeds but the `GET` is blocked by the browser, even though the function ran and returned 200.
+W: Missing Access-Control-Allow-Origin on the response: with proxy integration the console CORS setup covers only the preflight, so the Lambda function must include the header in every response or the browser blocks it.
+X: A=Stage caching disabled: caching affects backend load and latency, not response headers. CORS works the same with caching on or off.
+B=Lambda timeout too short: a timeout makes API Gateway return a 5xx error for the affected requests only; it does not explain a missing CORS header on responses where the function ran and returned 200.
+D=Browser requires an API key: API keys are an API Gateway feature for usage plans; a missing key yields a 403 from API Gateway, not a CORS error from the browser's origin check.
+T: With Lambda proxy integration, the function must return the CORS headers on the real response; console CORS settings only handle the preflight.
+
+@ Q002103 explain
+G: ## Speeding up the serverless inner loop
+A full `sam deploy` builds a change set and waits for CloudFormation to update the stack, which can take minutes even for a one-line code change.
+**`sam sync`** is meant for development stacks:
+- For code changes it updates resources directly with service APIs, such as uploading new Lambda code or updating a Step Functions definition, skipping the CloudFormation deployment, often in seconds.
+- Infrastructure changes still go through CloudFormation.
+- With `--watch`, it monitors local files and syncs each change automatically, so testing against real cloud resources feels close to local development.
+Because it bypasses CloudFormation, `sam sync` introduces drift and should not be used for production stacks; production still uses `sam deploy` from a pipeline.
+W: sam sync --watch to the dev stack: it detects local edits and pushes code and definition updates directly to the dev account's resources, avoiding a full CloudFormation deployment for every change.
+X: A=Longer Lambda timeout: it changes how long a function may run, not how long deployments take, so the iteration cycle is unchanged.
+C=Delete and recreate the stack each time: deleting and creating every resource is slower than even a normal update and wipes any data or state in the dev stack.
+D=sam deploy with --no-execute-changeset: it only creates the change set for review without applying it, so nothing reaches the cloud until it is executed later, which adds a step instead of saving time.
+T: For fast dev-account iteration use `sam sync --watch`; `sam deploy` through CloudFormation stays the path for production.
+
+@ Q002104 explain
+G: ## Elastic Beanstalk deployment policies
+- **All at once**: updates every instance simultaneously; fastest, but causes downtime and a failure affects everything.
+- **Rolling**: updates batches of existing instances in turn, so capacity is reduced while a batch is out of service.
+- **Rolling with an additional batch**: launches an extra batch first so capacity stays full, but still updates the existing instances in place; rolling back means redeploying the old version the same way.
+- **Immutable**: launches a full set of new instances with the new version in a temporary Auto Scaling group. Only when they pass health checks are they moved into the original group and the old instances are terminated.
+- **Traffic splitting**: like immutable, but sends a percentage of traffic to the new instances for an evaluation period.
+With immutable, a failed deployment is rolled back simply by terminating the new instances; the original instances were never touched.
+W: Immutable: the new version runs on fresh instances next to the existing ones, so capacity never drops, and if they fail health checks they are discarded, leaving the existing instances unchanged and making rollback quick.
+X: B=Rolling with an additional batch: it keeps full capacity, but it modifies existing instances in place, so a failure leaves some instances on the new version and rollback needs another rolling deployment.
+C=All at once: every instance is updated together, causing downtime during deployment, and a failure takes the whole environment down.
+D=Rolling: each batch is taken out of service while it updates, reducing capacity, and a failure midway leaves a mix of versions on existing instances.
+T: Immutable deployments keep full capacity and roll back by discarding new instances; rolling policies modify existing instances in place.
+
+@ Q002105 explain
+G: ## Sharing values between CloudFormation stacks
+A **cross-stack reference** lets one stack publish a value and others consume it:
+- The network stack adds an `Outputs` entry with `Export: Name: network-PrivateSubnetIds`.
+- An application stack reads it with `Fn::ImportValue: network-PrivateSubnetIds`.
+Export names must be unique in the account and Region.
+## The side effect
+While any stack imports an export, CloudFormation protects it:
+- The exporting stack cannot delete the output or change its value.
+- The exporting stack cannot be deleted.
+To change the subnets, first update the importing stacks to stop using the export. This protection prevents breaking dependent stacks, but it couples their lifecycles. Alternatives such as SSM Parameter Store parameters trade this protection for looser coupling.
+W: Export and ImportValue with locked exports: exports make subnet IDs available by name without hardcoding, and CloudFormation blocks changing or deleting an export that another stack imports, which is the side effect to plan for.
+X: A=Fn::GetAtt across stacks: `Fn::GetAtt` only reads attributes of resources in the same template, and the claim that the network stack can be deleted freely contradicts how exported references protect dependencies.
+C=Parameters with console-copied defaults: default values are static text in the template; nothing updates them automatically when the VPC changes, which is just hardcoding with extra steps.
+D=Mappings in the application stacks: mappings are fixed lookup tables written into the template. They never change unless someone edits them, so they cannot track a VPC recreated by another stack.
+T: Cross-stack sharing uses Outputs with Export and Fn::ImportValue, and an export in use cannot be modified or deleted.
+
+@ Q002106 explain
+G: ## Lambda deployment size limits
+Lambda has two packaging formats with different limits:
+- **.zip archive**: 50 MB zipped for direct upload, and **250 MB unzipped** for the function code plus all its layers combined (at most five layers).
+- **Container image**: up to **10 GB**, stored in Amazon ECR and built from an AWS base image or any image implementing the Lambda Runtime API.
+A 1.8 GB set of ML libraries cannot fit in the zip format however it is split. Packaged as an image, for example `FROM public.ecr.aws/lambda/python:3.12` plus `pip install` of the libraries, it deploys normally, and Lambda caches image layers to reduce cold start impact.
+W: Container image in ECR: the 10 GB image limit comfortably holds 1.8 GB of libraries, while the zip format and layers are capped at 250 MB unzipped in total.
+X: A=Higher zip compression: the 250 MB limit applies to the unzipped size, so better compression only shrinks the upload, not the 1.8 GB that must be extracted.
+B=Five Lambda layers: the 250 MB unzipped limit covers the function and all its layers together, so splitting libraries across layers does not add capacity.
+D=10 GB ephemeral storage: ephemeral storage is `/tmp` space available at run time. It does not change deployment package limits, and loading 1.8 GB into it on each cold start would be slow and awkward.
+T: When dependencies exceed the 250 MB zip-plus-layers limit, package the function as a container image (up to 10 GB).
+
+@ Q002107 explain
+G: ## Annotations versus metadata in X-Ray
+Both attach extra data to a segment or subsegment, but only one is indexed:
+- **Annotations**: key-value pairs with string, number or boolean values, indexed for search. You can filter traces with an expression like `annotation.customerId = "C1234"` in the console or the `GetTraceSummaries` API, and use them in groups. Up to 50 annotations per trace.
+- **Metadata**: any key-value data, including objects and lists, stored with the trace for viewing but **not indexed**, so you cannot search by it.
+Example in Python: `xray_recorder.put_annotation("customerId", customer_id)` inside the request handler, so support can find all traces of one customer.
+W: Annotation: X-Ray indexes annotations, so adding `customerId` as one lets developers filter traces with a filter expression and quickly find the requests of a specific customer.
+X: B=Log to stdout only: the value ends up in CloudWatch Logs but not in the trace, so it cannot be used to filter traces in X-Ray.
+C=Metadata: metadata is stored with the segment but not indexed, so filter expressions cannot search on it.
+D=Segment name: the segment name identifies the service and groups nodes in the trace map. Putting a customer ID there would create a separate node per customer and misuse the field instead of making it searchable.
+T: Put values you need to search by in X-Ray annotations (indexed); metadata is only for extra detail you view inside a trace.
+
+@ Q002108 explain
+G: ## The shared concurrency pool
+All functions in an account and Region share one concurrency quota (1,000 by default). Functions without a reservation draw from the **unreserved pool** first come, first served, so one busy function can consume nearly all of it and cause others to be throttled.
+## Reserved concurrency
+Setting **reserved concurrency** on a function sets aside that many concurrent executions only for it:
+- Other functions can never use that capacity, so it is guaranteed.
+- It is also the maximum for that function.
+- Lambda always keeps at least 100 concurrency unreserved for other functions.
+Example: with a 1,000 limit, reserving 300 for `processOrder` means the reporting job can use at most the remaining 700, and orders always have 300 available. Setting reserved concurrency on the reporting function instead would cap it directly.
+W: Reserved concurrency on the order function: it guarantees the critical function a fixed amount of concurrency that the batch-reporting function cannot consume, so orders are not throttled when reporting spikes.
+X: A=More memory: memory changes CPU and cost per invocation but does not reserve any share of the account's concurrency, so reporting can still take it all.
+B=Provisioned concurrency on reporting: it pre-warms environments for the reporting function, which makes that function better at consuming concurrency and does nothing to protect the order function.
+C=Longer timeout: it lets each invocation run longer, which can hold concurrency longer and make throttling worse; it guarantees nothing.
+T: To guarantee capacity for a critical Lambda function, give it reserved concurrency; memory, timeouts and provisioned concurrency elsewhere do not protect it.

@@ -8,9 +8,9 @@ When an object is uploaded, S3 invokes the function asynchronously and passes an
 - `Records[0].s3.object.size`
 ## Testing without a real upload
 Because the handler only depends on that JSON, you can hand it a hand-made copy of the same shape:
-- In the Lambda console, create a test event from the `s3-put` template and edit the bucket and key.
-- With the SAM CLI, run `sam local generate-event s3 put` and pipe the output into `sam local invoke`.
-- With the AWS CLI, call `aws lambda invoke --payload file://event.json`.
+- In the Lambda console, create a test event from the S3 Put template and edit the bucket and key.
+- With the SAM CLI, save the output of `sam local generate-event s3 put` to a file and run `sam local invoke -e event.json`.
+- With the AWS CLI, call `aws lambda invoke --payload fileb://event.json` (CLI v2 treats `file://` blobs as base64 unless you add `--cli-binary-format raw-in-base64-out`).
 Point the key at a small object that already exists in a dev bucket if the code downloads it.
 W: Sample S3 event payload: the function's logic is driven entirely by the event document, so invoking it with a realistic S3 event JSON exercises the same code path as a real upload, repeatably and without touching the trigger.
 X: A=No input payload: the handler would receive an empty event, and code that reads `Records[0].s3.object.key` would throw before any real logic runs, so the test proves nothing about the S3 path.
@@ -20,11 +20,11 @@ T: Lambda code is driven by the event JSON, so test it by invoking with a realis
 
 @ Q000688 explain
 G: ## Why API Gateway shows only 500
-When the Lambda integration fails, API Gateway usually returns a generic `500 Internal Server Error` to the client. The real cause lives further back in the request path, so you need tools that look inside it.
+When the Lambda integration fails, the client often sees only a generic 5xx error such as `500 Internal Server Error` or `502 Bad Gateway`. The real cause lives further back in the request path, so you need tools that look inside it.
 ## Logs versus traces
 - **CloudWatch Logs**: the function's log group (`/aws/lambda/<name>`) holds `console.log` output, stack traces, timeouts and `REPORT` lines with duration and memory. API Gateway execution logging can also show what it sent to and received from the integration.
 - **AWS X-Ray**: with active tracing on the stage and the function, each request becomes a trace with segments for API Gateway, Lambda and instrumented downstream calls (DynamoDB, HTTP APIs). The service map and trace timeline show which hop failed or was slow.
-Example: a trace shows the Lambda segment succeeded but a DynamoDB subsegment threw `ProvisionedThroughputExceededException`; the log for that request ID shows the unhandled error.
+Example: a trace shows the Lambda segment marked as a fault, with a DynamoDB subsegment that returned `ProvisionedThroughputExceededException`; the log for that request ID shows the unhandled error and stack trace.
 W: CloudWatch Logs plus X-Ray: X-Ray shows where in the request chain the error happens, and the logs give the exact error message and stack trace for that request, which together pinpoint intermittent failures.
 X: A=Route 53 health checks: they only report whether the endpoint answers health probes; they say nothing about which component inside a failing request produced the 500.
 C=S3 server access logs only: these record requests made to an S3 bucket, not API Gateway or Lambda invocations, so they cannot show where an API request failed.
@@ -46,7 +46,7 @@ T: Use `sam sync` (optionally `--watch`) for quick dev iterations and `sam deplo
 
 @ Q000690 explain
 G: ## Stage variables
-A **stage variable** is a name/value pair stored on an API Gateway stage (for REST APIs). The same API definition can reference it, and each stage supplies its own value.
+A **stage variable** is a name/value pair stored on an API Gateway stage. The same API definition can reference it, and each stage supplies its own value.
 ## Pointing each stage at a Lambda alias
 Set the integration's function ARN to include a stage variable, for example:
 - `arn:aws:lambda:us-east-1:123456789012:function:orders:${stageVariables.lambdaAlias}`
@@ -80,7 +80,7 @@ The SAM CLI can run Lambda functions on your machine in Docker containers that m
 - `sam local start-api`: starts a local HTTP server (port 3000 by default) that serves every API route defined in the template. Each request is turned into an API Gateway-style event and passed to the matching function.
 - `sam local start-lambda`: emulates the Lambda Invoke API for SDK or CLI clients.
 ## Example
-After `sam local start-api`, `curl http://127.0.0.1:3000/orders/42` runs the `GET /orders/{id}` handler locally. Edits to function code are picked up on the next request without restarting the server (compiled languages need `sam build` first).
+After `sam local start-api`, `curl http://127.0.0.1:3000/orders/42` runs the `GET /orders/{id}` handler locally. For interpreted runtimes, edits to function code are picked up on the next request without restarting the server; if you build with `sam build`, rerun it after changes.
 W: sam local start-api: it serves the template's API routes over HTTP on your machine and routes each request to local function code, which is exactly the local API testing loop described.
 X: A=sam logs --tail: it streams CloudWatch Logs from deployed functions in AWS; it does not serve or run anything locally.
 B=sam sync against production: it deploys to a real AWS stack, and pointing it at production is the opposite of safe local testing.
@@ -109,7 +109,8 @@ CloudFormation plans updates against its recorded state, not the live resource. 
 - Detect it with **Detect stack drift** (`DetectStackDrift`), which lists each drifted resource and the property differences.
 - Fix it by putting the manual change into the template, or reverting the resource, then redeploy.
 - Prevent it by making all changes through the template and pipeline.
-W: Drift: a manual console change means the live resources no longer match what CloudFormation recorded, which is the typical cause of update conflicts on a previously hand-edited stack.
+A simple property edit such as an environment variable is often just overwritten by the next update, but out-of-band changes are still the first thing to check when a stack that was edited by hand starts failing to update.
+W: Drift: a manual console change means the live resources no longer match what CloudFormation recorded, which is the most likely explanation for update failures on a previously hand-edited stack.
 X: A=SAM CLI cannot update stacks: `sam deploy` routinely updates existing stacks through change sets; updating is its normal job.
 C=API stage deleted by another deployment: nothing in the scenario suggests that, and the stated history (a manual console edit) points to drift instead.
 D=Reserved concurrency exceeded: concurrency limits throttle invocations at runtime; they have no effect on whether a CloudFormation stack update succeeds.
@@ -279,7 +280,7 @@ A 1.2 GB set of dependencies (for example ML libraries) cannot fit the zip model
 Lambda caches image layers and loads image content lazily, so large images start much faster than their size suggests. Keeping a stable base image and putting rarely changed dependencies in lower layers helps caching further.
 W: Container image in ECR: the 10 GB image limit fits 1.2 GB of dependencies, and Lambda's image caching keeps cold starts reasonable without runtime downloads.
 X: A=Increase ephemeral storage: `/tmp` can grow to 10 GB, but that is scratch space at runtime; it does not raise the deployment package limit, and something would still have to download the files into it.
-B=Download from S3 every invocation: pulling over a gigabyte at runtime adds long delays and data transfer on every cold start (and more if done per invocation).
+B=Download from S3 every invocation: pulling over a gigabyte on each invocation adds long delays to every request and repeated data transfer, and still needs enlarged ephemeral storage to hold the files.
 D=Split into five layers: the 250 MB unzipped limit covers the function and all its layers together, so splitting does not help.
 T: When dependencies exceed the 250 MB zip-plus-layers limit, package the function as a container image (up to 10 GB).
 
@@ -301,20 +302,20 @@ G: ## Blue/green
 Two full environments exist: **blue** (current) and **green** (new version). You deploy and test green, then switch traffic, usually all at once, by changing a load balancer target, DNS record or alias. Rollback means switching back to blue, which is still running.
 ## Canary
 The new version first receives a small share of traffic, for example 10% for 10 minutes. If metrics and alarms stay healthy, the rest is shifted; if not, traffic returns to the old version.
-Example with CodeDeploy on Lambda: `LambdaCanary10Percent10Minutes` sends 10% to the new version, then 100% after 10 minutes.
+Example with CodeDeploy on Lambda: `CodeDeployDefault.LambdaCanary10Percent10Minutes` sends 10% to the new version, then 100% after 10 minutes.
 The two can be combined: a blue/green deployment can shift traffic to green in canary steps.
 W: Separate environment versus small share first: blue/green is about switching between two environments, while canary is about gradually exposing a small percentage of traffic to the new version before full rollout.
 X: B=Canary always replaces infrastructure: canary is about how traffic is shifted, not about rebuilding infrastructure; blue/green is the one that stands up a separate environment.
 C=Same technique: they differ in what changes (whole environment switch versus gradual share of traffic), and they are often combined precisely because they differ.
-D=Lambda only versus EC2 only: both strategies apply to Lambda, ECS and EC2; CodeDeploy supports traffic shifting options for each.
+D=Lambda only versus EC2 only: neither strategy is tied to one compute type; both are used with Lambda, ECS and EC2 (for example with weighted load balancer target groups).
 T: Blue/green switches between two complete environments; canary sends a small slice of traffic to the new version first.
 
 @ Q000709 explain
 G: ## How CodePipeline detects source changes
 - **Polling**: CodePipeline periodically checks the repository for new commits. This is the legacy method, and a change can wait a while before it is noticed. You cannot set a polling interval.
-- **Event-based detection**: for a CodeCommit source, an **EventBridge rule** matches the repository's `CodeCommit Repository State Change` event for the branch and starts the pipeline right away. For GitHub, Bitbucket or GitLab sources, CodeConnections uses webhooks in the same way.
+- **Event-based detection**: for a CodeCommit source, an **EventBridge rule** matches the repository's `CodeCommit Repository State Change` event for the branch and starts the pipeline right away. For GitHub, Bitbucket or GitLab sources connected through CodeConnections, change detection is event-driven by default as well.
 ## Migrating
-Set `PollForSourceChanges` to `false` on the source action and add the EventBridge rule (the console, `aws codepipeline` migration steps or CloudFormation templates can create it). Commits now start the pipeline within seconds.
+Set `PollForSourceChanges` to `false` on the source action and add the EventBridge rule (the console can create it when you edit the source action, or you can define it in CloudFormation). Commits now start the pipeline within seconds.
 W: EventBridge-based change detection: each commit emits an event that immediately starts the pipeline, removing the polling delay entirely.
 X: A=Poll every second: the polling interval is not configurable, and very frequent polling would be wasteful even if it were; events are the supported solution.
 B=Scheduled StartPipelineExecution every 5 minutes: runs would start whether or not code changed, and a commit could still wait up to 5 minutes.
@@ -337,7 +338,7 @@ T: Put a CodePipeline manual approval action between test and prod deployments t
 
 @ Q000711 explain
 G: ## How CodeDeploy shifts Lambda traffic
-For Lambda, CodeDeploy moves an alias from the old version to the new one using a deployment configuration such as `Canary10Percent5Minutes` or `Linear10PercentEvery1Minute`. It can also run pre-traffic and post-traffic hook functions.
+For Lambda, CodeDeploy moves an alias from the old version to the new one using a deployment configuration such as `CodeDeployDefault.LambdaCanary10Percent5Minutes` or `CodeDeployDefault.LambdaLinear10PercentEvery1Minute`. It can also run pre-traffic and post-traffic hook functions.
 ## Alarms and automatic rollback
 You can attach CloudWatch alarms to the deployment group, for example on the new version's `Errors` metric. With automatic rollback enabled for alarms:
 - If an alarm enters `ALARM` during the deployment, CodeDeploy stops the deployment.

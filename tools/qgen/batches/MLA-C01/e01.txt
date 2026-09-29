@@ -1,0 +1,369 @@
+# MLA-C01 detailed explanations, e01 (explanation-only rewrites; letters are the published ones)
+
+@ Q000853 explain
+G: ## Row formats versus columnar formats
+CSV, JSON Lines and Avro are **row-based**: each record is stored whole, so a query that needs 3 of 200 columns still reads all 200 from disk.
+**Parquet** is **columnar**: values of one column are stored together in column chunks inside row groups, each with min/max statistics.
+- Athena reads only the columns named in the query and skips row groups whose statistics cannot match a filter.
+- Columnar data compresses well because similar values sit next to each other.
+## Partitioning
+Partitioning writes data into S3 prefixes such as `s3://bucket/train/event_date=2026-09-01/`. A query with `WHERE event_date = '2026-09-01'` scans only that prefix. Athena charges per byte scanned, so fewer columns and fewer partitions mean both faster and cheaper queries.
+Example: exploring 4 columns of a 3 TB, 200-column CSV set scans all 3 TB; the same query on partitioned Parquet may scan a few GB. SageMaker training and processing jobs can read the same Parquet files.
+W: Partitioned Parquet: column pruning, row-group skipping and partition pruning cut Athena scan volume and cost, and the files remain a standard input for SageMaker jobs.
+X: A=Single Avro file: Avro is row-based, so Athena still reads every column, and one huge object limits how work can be spread across files, for example when training data is sharded by S3 object.
+B=JSON Lines with Snappy: JSON repeats every field name in every record and is row-based, and compressing record by record gives a poor ratio compared with column-level compression.
+C=Gzipped CSV in 1 GB files: splitting helps parallelism a little, but CSV is still row-based with no statistics, so every query reads all columns, and gzip must be decompressed by one reader per file.
+T: For "a few columns at a time" analytics on large S3 data, choose a columnar format (Parquet) plus partitioning; row formats scan everything no matter how they are compressed or split.
+
+@ Q000854 explain
+G: ## Two columnar formats
+**Apache ORC** came from the Hive ecosystem; **Apache Parquet** came from the wider Hadoop and Spark ecosystem. Technically they are close relatives:
+- Both store data by column, compress each column (for example Snappy or Zstandard), and keep statistics so engines can skip data that cannot match a filter (predicate pushdown).
+- Both support nested and complex types such as structs, lists and maps.
+## Where they differ in practice
+Athena, Amazon EMR, AWS Glue and Redshift Spectrum read both formats. Parquet, however, is the default or most common choice across many other tools: Spark writes Parquet by default, SageMaker Feature Store writes its offline store as Parquet, Data Wrangler and many Python libraries (pandas, PyArrow) read it natively, and Redshift `UNLOAD` can export to it.
+So a move from ORC to Parquet is mostly about ecosystem compatibility, not a jump in query performance.
+W: Both columnar, Parquet more widely supported: the formats share compression and pushdown, and the practical gain from switching is broader tool and service compatibility.
+X: B=Both row-based: ORC and Parquet are both columnar; that is the main reason they are used for analytics instead of CSV or JSON.
+C=ORC is Hadoop-only: AWS services such as Athena, Glue, EMR, Redshift Spectrum and Firehose record format conversion all handle ORC.
+D=Parquet cannot store nested data: Parquet was designed with nested data in mind (it uses repetition and definition levels to encode structs and lists), so this is false.
+T: ORC and Parquet are both columnar with compression and pushdown; choose Parquet mainly because more AWS and ML tools read and write it natively.
+
+@ Q000855 explain
+G: ## Input formats for the built-in image classification algorithm
+The SageMaker built-in image classification algorithm accepts several content types, and the fastest for large datasets is **RecordIO** (`application/x-recordio`).
+- A RecordIO file packs many images, each with its label, into one large binary file of back-to-back records.
+- The MXNet tool `im2rec` builds it from a `.lst` list file that holds an index, a label and a relative image path per line.
+- Reading a few large sequential files is far faster than opening millions of small JPEG objects from S3.
+The algorithm can also take raw images with `.lst` files, or an augmented manifest in Pipe mode, but the question asks specifically for MXNet RecordIO.
+## Do not confuse with RecordIO-protobuf
+**RecordIO-protobuf** (`application/x-recordio-protobuf`) wraps numeric tensors in protobuf messages and is used by algorithms such as Linear Learner, k-means and Factorization Machines. It is a different format from the MXNet image RecordIO.
+W: RecordIO with im2rec: this packs images and their labels into the MXNet RecordIO format that the algorithm reads with the highest I/O throughput.
+X: A=Pipe mode with a CSV manifest: Pipe mode is a way of streaming data, not a file format, and a CSV manifest alone does not package the images and labels into RecordIO.
+B=Parquet by class label: Parquet is a columnar format for tabular data, and the image classification algorithm does not accept Parquet as input.
+D=RecordIO-protobuf with JSON arrays: RecordIO-protobuf is the tensor format for other built-in algorithms, and encoding pixels as JSON arrays would be large and slow; it is not the MXNet image RecordIO the question asks for.
+T: Image classification at maximum throughput means MXNet RecordIO built with im2rec; RecordIO-protobuf is a different format for numeric tabular algorithms.
+
+@ Q000856 explain
+G: ## What schema evolution means
+A schema lists fields and their types. Schema evolution is the ability to change it over time, for example adding an optional field `device_os`, without breaking readers of older or newer data.
+## How Avro handles it
+**Apache Avro** is a compact binary, row-based format. Every Avro file carries its writer schema in the file header.
+- When a reader uses a newer schema, Avro resolves the two: fields missing in old data get the declared default, and fields the reader does not know are skipped.
+- Adding a field with a default value is a backward-compatible change, so older Spark jobs keep working.
+- Records are binary, so they are much smaller than text formats such as JSON or CSV.
+Streaming pipelines often pair Avro with a schema registry, such as the AWS Glue Schema Registry, which checks new schema versions for compatibility before producers use them.
+W: Avro: it embeds the schema with the data, resolves differences between writer and reader schemas, and serializes records in a compact binary encoding.
+X: B=CSV: CSV has no schema at all, only column positions, so a new column shifts or breaks parsing, and it is text rather than compact binary.
+C=Plain text logs: without a schema, every consumer must write its own parser, and any new field changes the layout those parsers expect.
+D=BMP images: BMP is a bitmap image format for pixels and cannot represent structured event records or their schemas.
+T: For an evolving event schema in a compact binary form, use Avro (ideally with a schema registry); text formats without a schema break when fields are added.
+
+@ Q000857 explain
+G: ## Storage types for training
+- **Object storage (Amazon S3)** stores whole objects behind an API. It is not a POSIX file system: there are no in-place writes, file locks or directory renames.
+- **Shared file systems** can be mounted by many instances at once and behave like local directories. AWS offers Amazon EFS and the Amazon FSx family.
+## Amazon FSx for NetApp ONTAP
+FSx for NetApp ONTAP is a fully managed file system that runs NetApp's ONTAP software. It serves NFS, SMB and iSCSI, delivers low-latency SSD performance, and keeps ONTAP features that on-premises NetApp teams already use:
+- **Snapshots** for point-in-time copies of a volume.
+- **FlexClone** to make instant, space-efficient writable copies, for example one clone of a dataset per experiment.
+- **SnapMirror** to replicate volumes from on-premises NetApp to AWS.
+Compute instances in the VPC mount the same volume over NFS, so many training nodes can share one dataset copy.
+W: FSx for NetApp ONTAP: it is a shared POSIX file system with low latency that keeps native NetApp snapshots, cloning and replication, so the existing workflows carry over unchanged.
+X: A=S3 Glacier Instant Retrieval: this is an archive storage class of S3 for rarely accessed data, so it is object storage, not a mountable POSIX file system, and has no NetApp features.
+B=S3 Standard: S3 is object storage accessed by API; it cannot provide a POSIX file system with NetApp snapshot and clone workflows.
+D=Amazon EFS: EFS is a shared POSIX NFS file system, but it does not run ONTAP, so NetApp snapshots, FlexClone and SnapMirror workflows would have to be rebuilt.
+T: When the requirement mentions existing NetApp tools (snapshots, cloning, SnapMirror), pick FSx for NetApp ONTAP; EFS is shared POSIX storage without those features.
+
+@ Q000858 explain
+G: ## The pieces of an AWS data lake for ML
+- **Amazon S3** holds raw and curated data as objects. It is durable, scales without capacity planning, and Athena, EMR, Glue and SageMaker all read from it directly.
+- **S3 Lifecycle rules** move objects to cheaper storage classes, such as S3 Standard-IA or S3 Glacier, as they age.
+- **AWS Glue Data Catalog** stores table definitions (schema, format, S3 location, partitions), so every engine sees the same tables.
+- **AWS Lake Formation** adds fine-grained permissions on top of the catalog: grants at database, table, column, row and cell level, enforced for integrated services such as Athena, EMR and Redshift Spectrum.
+## Example
+Raw clickstream lands in `s3://lake/raw/`, a Glue job writes Parquet to `s3://lake/curated/`, a crawler registers the tables, and Lake Formation lets analysts see only non-PII columns while the ML team trains on the full curated table.
+W: S3 data lake with Glue Data Catalog and Lake Formation: one copy of the data is shared by all engines, lifecycle rules tier it to cheaper classes, and Lake Formation provides table and column permissions.
+X: B=EFS with a copy per team: every copy costs storage and drifts out of sync, EFS has no table catalog or table-level permissions, and engines such as Athena query S3, not EFS.
+C=One shared EBS volume: an EBS volume lives in one Availability Zone and is normally attached to one instance; Multi-Attach works only for some volume types, a limited number of instances and with a cluster-aware file system, and managed services cannot read it.
+D=RDS for every dataset: a relational database is not built to hold large raw files such as images or logs, costs far more per GB than S3, and Athena and SageMaker training do not read training data from RDS tables directly.
+T: A shared ML data platform is S3 plus a shared catalog (Glue) plus central permissions (Lake Formation); block, file or database stores do not give all engines one governed copy.
+
+@ Q000859 explain
+G: ## Streams versus queues
+- **A queue** (Amazon SQS) hands each message to one consumer. After the consumer processes it and deletes it, the message is gone. Queues suit task distribution, not replay.
+- **A stream** (Amazon Kinesis Data Streams) is an ordered, append-only log. Records stay for the retention period (24 hours by default, extendable up to 365 days) no matter how many applications read them.
+## How Kinesis Data Streams works
+A stream is split into shards; a partition key such as `user_id` decides the shard, so each user's events stay in order. Every consumer tracks its own position (sequence number), so it can:
+- read in real time alongside other consumers (enhanced fan-out gives each consumer its own throughput),
+- rewind to an earlier point and replay events, for example to rebuild a feature after a bug fix.
+Example: a fraud model's feature job, an S3 archiver and an alerting app can all read the same clickstream independently.
+W: Kinesis Data Streams: it ingests events in real time, keeps them for a configurable retention period, and lets several consumers read and replay the same records independently.
+X: A=SQS Standard queue: a message is meant for one consumer and is deleted after processing, and Standard queues do not guarantee order, so multiple applications cannot each replay the history.
+B=Glue crawler: a crawler scans data at rest and writes table definitions to the Data Catalog; it does not ingest or store streaming events.
+C=S3 Transfer Acceleration: it speeds up uploads of objects to S3 over long distances using edge locations; it is not a streaming service and has no consumers or replay.
+T: Multiple consumers plus replay means a stream (Kinesis Data Streams) with retention, not a queue whose messages disappear once processed.
+
+@ Q000860 explain
+G: ## Managed Kafka on AWS
+**Amazon Managed Streaming for Apache Kafka (Amazon MSK)** runs open-source Apache Kafka for you.
+- **MSK provisioned** manages brokers, KRaft or ZooKeeper nodes, patching and failure replacement; you choose broker size and count.
+- **MSK Serverless** removes capacity planning entirely.
+- The Kafka API is unchanged, so existing producers, consumers, Kafka Connect connectors and Kafka Streams apps only need new bootstrap broker addresses (and authentication settings).
+## Why not rebuild on Kinesis
+Kinesis Data Streams is a different API (shards, `PutRecords`, KCL). Moving Kafka workloads to it means rewriting every producer and consumer. When the goal is "keep the Kafka API, drop the cluster operations", MSK is the direct fit; tools such as Kafka MirrorMaker 2 can copy topics from the on-premises cluster during migration.
+W: Amazon MSK: it provides managed Apache Kafka that keeps the Kafka API, so the on-premises producers and consumers move with minimal change while AWS runs the brokers.
+X: A=Redshift streaming ingestion: this lets Redshift consume from Kinesis or MSK into materialized views; it is a destination for a stream, not a Kafka cluster that producers can write to.
+B=Firehose only: Amazon Data Firehose delivers streams to destinations such as S3 or Redshift, but it does not expose the Kafka protocol, so Kafka clients cannot produce to or consume from it.
+C=Glue Data Catalog: it stores table metadata for data lakes and does not ingest or transport any streaming data.
+T: Existing Kafka plus low operations means Amazon MSK; Kinesis or Firehose would force a rewrite of every Kafka client.
+
+@ Q000861 explain
+G: ## Stateful stream processing
+A rolling feature such as "average transaction amount over the last 5 minutes per card" needs **state**: the processor must remember recent events per key and update the result as new events arrive.
+## Amazon Managed Service for Apache Flink
+This service (formerly Kinesis Data Analytics for Apache Flink) runs Apache Flink applications without managing servers.
+- Flink supports tumbling, sliding and session **windows**, keyed state and event-time processing with watermarks for late data.
+- **Checkpoints** save state regularly so a failed application restarts where it left off, giving exactly-once state consistency; with transactional sinks, end-to-end exactly-once output is possible.
+- It has a native connector for Kinesis Data Streams as a source.
+Example: `SELECT card_id, AVG(amount) ... GROUP BY card_id, HOP(event_time, INTERVAL '1' MINUTE, INTERVAL '5' MINUTE)` in Flink SQL emits a 5-minute moving average every minute.
+W: Managed Service for Apache Flink: it runs stateful windowed aggregations on a Kinesis stream in real time and uses checkpoints for exactly-once state consistency.
+X: A=Glue DataBrew: DataBrew runs visual recipe jobs on data at rest in batches, so it cannot keep continuous windows over a live stream.
+C=Amazon Athena: Athena runs SQL on data already stored in S3 and other sources, so results arrive only when a query is run, not as a continuous per-event computation.
+D=AWS Batch: Batch schedules finite containerized jobs; a stream needs a long-running application that keeps state between events, which Batch does not provide.
+T: Real-time windows with exactly-once state on a stream call for Managed Service for Apache Flink; batch and query tools only work on data at rest.
+
+@ Q000862 explain
+G: ## Amazon Data Firehose
+Firehose (formerly Kinesis Data Firehose) is a fully managed delivery service: producers or a Kinesis stream send records, and Firehose buffers and writes them to destinations such as S3, Redshift or OpenSearch. There is no consumer code to run or scale.
+- **Buffering hints** set how much data (MB) or how much time passes before a file is written.
+- **Record format conversion** turns JSON records into **Apache Parquet** or **Apache ORC** using a table schema from the AWS Glue Data Catalog.
+- **Dynamic partitioning** can write into prefixes such as `device_type=thermostat/`.
+Example: IoT sensors send JSON to a Firehose stream; every few minutes Firehose writes Parquet files under `s3://lake/iot/`, and a Glue ETL job later turns them into training features.
+W: Firehose with format conversion: it batches incoming records and writes them to S3 as Parquet using a Glue schema, with no custom consumer code.
+X: A=DataSync scheduled transfers: DataSync copies files and objects between storage systems on a schedule; it does not receive a stream of records or convert them to Parquet.
+B=SNS topic subscriptions: SNS fans out messages to subscribers; it does not batch messages into files or convert them to Parquet by itself, so another delivery step would still be needed.
+D=Kinesis Data Streams alone: a data stream stores records but does not write them to S3; you would need to build and run a consumer to batch, convert and deliver them.
+T: "Deliver a stream to S3 as Parquet without writing consumers" means Firehose with record format conversion; a data stream alone still needs a consumer.
+
+@ Q000863 explain
+G: ## EBS volume families
+- **SSD volumes** are rated by IOPS (small random reads and writes). **General Purpose SSD** (`gp3`, `gp2`) balances price and performance; **Provisioned IOPS SSD** (`io1`, `io2` Block Express) lets you set the exact IOPS you need.
+- **HDD volumes** are rated by throughput for large sequential reads. `st1` is for frequently accessed sequential data, `sc1` for cold data at the lowest price.
+## Why provisioned IOPS
+With `io1` or `io2` you specify, for example, 40,000 IOPS when creating the volume, and EBS is designed to deliver that level consistently with low latency. `io2` Block Express supports the highest IOPS and throughput of any EBS volume and higher durability.
+`gp2` ties IOPS to volume size and uses burst credits on small volumes, so performance can drop when credits run out. `gp3` starts at a 3,000 IOPS baseline and lets you provision more IOPS separately from size, but the question states its default performance was not enough and asks for the family built to guarantee a specified high IOPS level.
+Reading shuffled training batches is random I/O, which is exactly what IOPS measures.
+W: Provisioned IOPS SSD (io1/io2): you specify the IOPS level, and the volume is designed to sustain it consistently, which fits random reads of shuffled batches.
+X: A=Throughput Optimized HDD (st1): st1 is built for large sequential reads, and its IOPS for small random reads are far lower than any SSD volume.
+C=gp2 only: gp2 performance scales with volume size and small volumes rely on burst credits, so it cannot guarantee a specific high IOPS level; it is also older than gp3, which was already insufficient.
+D=Cold HDD (sc1): sc1 is the lowest-cost, lowest-performance volume, meant for rarely accessed data, and is the worst fit for high random IOPS.
+T: When a workload needs a guaranteed, consistently high IOPS level, choose Provisioned IOPS SSD (io1/io2); gp volumes are general purpose and HDD volumes favor sequential throughput.
+
+@ Q000864 explain
+G: ## SageMaker Data Wrangler
+Data Wrangler is SageMaker's visual data preparation tool, now used from within **SageMaker Canvas**. A data flow is built step by step in a UI:
+- **Import** from S3, Athena, Redshift, Snowflake and other sources, and join datasets visually.
+- **Transform** with hundreds of built-in steps such as encoding categories, handling missing values, scaling and date parsing, or add custom code only if you want to.
+- **Analyze** with the Data Quality and Insights report and a **Quick Model** that trains a fast model and shows feature importance, to check whether features carry signal.
+- **Export** the flow to a SageMaker Processing job, SageMaker Pipelines, Feature Store or a Python script.
+Example: join an S3 customer table with Redshift orders, one-hot encode the region, impute missing income, see that `tenure_months` ranks high in the Quick Model, then export the flow as a pipeline step.
+W: SageMaker Data Wrangler: it joins sources visually, offers built-in transforms and a Quick Model for feature importance, and exports the flow to SageMaker Pipelines without writing Spark.
+X: A=Glue Studio with custom PySpark scripts: custom PySpark means writing Spark code, which the team wants to avoid, and Glue Studio has no quick-model feature importance or direct export to SageMaker Pipelines.
+B=Ground Truth labeling jobs: Ground Truth creates labels for data using human workers and automation; it does not join, transform or analyze features.
+D=Athena saved SQL queries: Athena can join and filter with SQL, but it has no built-in ML transforms, no quick model or feature importance, and no export of a flow to SageMaker Pipelines.
+T: Visual ML data prep with built-in transforms, quick model insight and pipeline export is Data Wrangler; Glue scripts need code and Athena is SQL only.
+
+@ Q000865 explain
+G: ## Training/serving skew
+If features are computed one way in a training notebook and another way in the inference service, the model sees different values in production than it was trained on. This **training/serving skew** silently reduces accuracy.
+## SageMaker Feature Store
+Feature Store is a central repository for engineered features, organized in **feature groups** (for example `customer_features` keyed by `customer_id`, with an event time column).
+- The **online store** keeps the latest value for each record and returns it with low latency, for example from a `GetRecord` call made by a real-time endpoint.
+- The **offline store** keeps the full history in S3 for building training sets, including point-in-time correct joins.
+- Features are written once through ingestion and then reused by every model and team that needs them.
+Because training and inference read the same feature definitions and values, both see consistent features.
+W: SageMaker Feature Store: it shares engineered features across models through the offline store for training and serves the same features with low latency from the online store for inference.
+X: A=SageMaker Clarify: Clarify detects bias and explains predictions (for example SHAP values); it does not store or serve features.
+B=SageMaker Model Registry: the registry catalogs model versions, approval status and metadata; it holds models, not the feature values they consume.
+C=SageMaker Data Wrangler: Data Wrangler builds and runs feature transformations, but it has no low-latency store for serving feature values to endpoints; it can export to Feature Store instead.
+T: Reusing features across models and serving them consistently at inference time is the job of Feature Store (offline plus online stores); other SageMaker tools prepare data or manage models.
+
+@ Q000866 explain
+G: ## Two stores in one feature group
+A SageMaker Feature Store feature group can have an **online store**, an **offline store**, or both.
+- The **online store** holds only the latest record per identifier and is built for millisecond reads. A `PutRecord` call writes to it synchronously, so the value can be read right away.
+- The **offline store** is an append-only history in your S3 bucket, written in Parquet (or as Apache Iceberg tables) and by default registered in the Glue Data Catalog so it can be queried with Athena or Spark.
+- Feature Store copies new records to the offline store **asynchronously** in batches, so they typically appear there after a delay of minutes, not instantly.
+Example: a feature written at 10:00:00 can be read by an endpoint at 10:00:01, but an Athena query to build a training set may only see it some minutes later.
+W: Online low-latency, offline asynchronous: the online store serves the new value immediately, while the S3-based offline store is filled in batches in the background, which causes the delay.
+X: B=Both update at the same time: the stores are intentionally different; only the online write is synchronous, and replication to the offline store happens later.
+C=Swapped storage: it is the reverse; the offline store is in S3 and the online store is the low-latency store for real-time reads.
+D=Offline store cannot be queried: the offline store is registered in the Glue Data Catalog and is queried with Athena or Spark to build training datasets.
+T: Online store = latest values, immediately readable for inference; offline store = full history in S3, written asynchronously for training.
+
+@ Q000867 explain
+G: ## Input modes for SageMaker training
+- **File mode** downloads the whole dataset from S3 to the instance's storage volume before training starts. Start-up time and disk size grow with the dataset.
+- **Pipe mode** streams data from S3 into the algorithm through a Unix named pipe (FIFO) while training runs. Training starts almost at once and the local volume can stay small.
+- **FastFile mode** presents S3 objects as files and streams them on demand; for many workloads it is now the easier choice than Pipe mode.
+## The trade-off
+A pipe is read **sequentially**: the algorithm cannot jump back or randomly pick records. Shuffling is limited to what SageMaker can do when it streams (such as shuffling the order of S3 objects with a shuffle configuration) or what fits in a buffer, not a full random shuffle of every record. Each epoch reopens the stream.
+Linear Learner supports Pipe mode with `application/x-recordio-protobuf` and CSV.
+W: Pipe mode trade-off: streaming gives faster start and needs less disk, but records arrive sequentially, which limits random access patterns such as a full shuffle of the dataset.
+X: A=Must fit in memory: Pipe mode streams data as it is consumed, so the dataset does not need to fit in memory; that is one of its main benefits.
+B=CSV only: Pipe mode is commonly used with RecordIO-protobuf, which is the recommended format for many built-in algorithms including Linear Learner.
+D=File mode always faster: for large datasets, File mode must download everything before training begins, so Pipe or FastFile mode usually shortens the total job time.
+T: Pipe mode trades random access for streaming speed: quick start and small disks, but sequential reads and limited shuffling.
+
+@ Q000868 explain
+G: ## Choosing a format for small metadata
+Pipeline steps often pass small artifacts: hyperparameters, a list of feature names and types, or evaluation metrics. The needs are different from training data:
+- people should be able to read and review it,
+- any language and library should be able to parse it,
+- Git diffs should show exactly which value changed.
+**JSON** meets all three. Example `config.json`:
+- `{"learning_rate": 0.05, "max_depth": 6, "features": ["age", "tenure_months"]}`
+SageMaker itself uses JSON for hyperparameters, evaluation reports read by condition steps (through `JsonGet` in SageMaker Pipelines) and many API payloads.
+Binary formats such as Parquet or RecordIO-protobuf are designed for millions of rows, not for a handful of settings, and they cannot be read or diffed as text.
+W: JSON: it is human-readable text, every standard library can parse it, and Git shows line-level changes, which is exactly what small configuration and schema metadata need.
+X: B=Pickled Python object: pickle is a binary, Python-only format, and loading a pickle from an untrusted source can execute arbitrary code, so it is neither portable nor safe for sharing.
+C=RecordIO-protobuf: this is a binary format for streaming training records into built-in algorithms; people cannot read it and Git cannot show useful diffs.
+D=Parquet: Parquet is a binary columnar format optimized for large tables; for a few settings it adds overhead and is not human-readable or diff-friendly.
+T: Small, human-reviewed configuration belongs in a text format like JSON; binary formats such as Parquet, RecordIO-protobuf and pickle are for bulk data or single-language objects.
+
+@ Q000869 explain
+G: ## Batch versus streaming ingestion
+- **Batch**: data lands in S3 and a scheduled job (for example a Glue ETL job every hour) processes it. It is simple and cost-efficient, but feature freshness is limited by the schedule plus job run time, typically minutes to hours.
+- **Streaming**: events go to Kinesis Data Streams and consumers (Managed Service for Apache Flink, Lambda, or a Glue streaming job) process them continuously. Features can update within seconds.
+## The cost of freshness
+Streaming systems run all the time, so you pay for shards or stream capacity and for always-on processing. They also add operational work: scaling shards, handling late or duplicate events, checkpointing state and monitoring consumer lag.
+Example: an hourly batch job means a user's click at 10:05 influences recommendations only after 11:00; a streaming pipeline could update the feature by 10:05:03, at a higher running cost.
+W: Streaming with Kinesis: continuous processing meets the within-seconds freshness requirement, and the trade-off is more operational complexity and always-on compute cost.
+X: A=Neither can reach sub-minute freshness: streaming pipelines with Kinesis and Flink routinely process events within seconds, so sub-minute freshness is achievable.
+C=Glue ETL every second at no extra cost: Glue jobs have start-up time and are billed by DPU usage for each run, and time-based Glue schedules have a minimum precision of 5 minutes, so running a batch job every second is neither practical nor free.
+D=Batch always cheaper and equally timely: batch is often cheaper, but freshness is bounded by the schedule interval, so it cannot match a seconds-level requirement.
+T: Seconds-level feature freshness requires streaming ingestion, and you pay for it in operational complexity and continuous compute.
+
+@ Q000870 explain
+G: ## Choosing an imputation value
+- **Mean**: fine for symmetric data, but pulled toward extreme values when the distribution is skewed or has outliers.
+- **Median**: the middle value, which outliers barely move, so it better represents a typical value for skewed data.
+Example: incomes 30k, 35k, 40k, 45k and 2,000k have a mean of 430k but a median of 40k.
+## Data leakage in preprocessing
+Imputation values, scalers and encoders are learned from data. If they are learned from the full dataset, statistics from the validation and test rows flow into training, and evaluation looks better than real-world performance.
+The correct order:
+- split the data first,
+- fit the imputer on the training split only,
+- apply that same fitted imputer to validation, test and later to production data.
+Adding a binary `income_missing` indicator feature can also help the model learn whether missingness itself carries signal.
+W: Median fit on training data only: the median is robust to skew and outliers, and fitting it on the training split keeps validation information out of the model.
+X: B=Drop rows with missing values: this throws away at least 15% of the data (more if other columns also have gaps), which wastes information and can bias the sample.
+C=Mean on the full dataset: the mean is distorted by the outliers, and computing it over all rows leaks validation statistics into training.
+D=Replace with zero: zero is an arbitrary value that may not be meaningful for this feature, so it creates a false spike in the distribution and misleads the model.
+T: For skewed numeric data with random gaps, impute with the median and fit every preprocessing step on the training split only to avoid leakage.
+
+@ Q000871 explain
+G: ## Not every outlier is an error
+An outlier is a value far from the rest. It can come from two very different sources:
+- **Data errors**: a sensor glitch, a unit mix-up or a logging bug, for example a temperature of `-9999`, which is a sentinel value.
+- **Real rare events**: the machine truly overheated before failing. In failure prediction these are often exactly the patterns the model must learn.
+## A careful approach
+- Flag candidate outliers with statistics (z-scores, IQR) and domain rules (physical limits, sensor error codes).
+- Check them against other evidence, such as maintenance logs or neighboring sensors.
+- Remove or correct confirmed glitches (for example, set them to missing and impute); keep genuine events.
+- If extreme but real values hurt training, consider robust scaling, clipping or tree-based models rather than deleting them.
+W: Flag, then keep real events and fix glitches: this uses domain knowledge to separate errors from the rare failures, so the model learns the real signal without learning from bad data.
+X: B=Remove everything beyond three standard deviations: a blanket rule deletes the genuine failure events along with the glitches, removing the very cases the model needs to learn.
+C=One-hot encode numeric values: one-hot encoding is for categories; turning continuous readings into one column per value creates huge sparse data and does nothing to separate glitches from failures.
+D=Min-max scale so outliers disappear: scaling is linear, so outliers remain outliers after scaling, and they squeeze the normal values into a narrow range.
+T: Handle outliers with domain judgment: correct errors, keep real rare events; blanket removal or scaling does not tell the two apart.
+
+@ Q000872 explain
+G: ## AWS Glue DataBrew
+DataBrew is a visual data preparation service for cleaning and normalizing data without writing code.
+- You connect a **dataset** (S3, Glue Data Catalog tables, Redshift and others) and build a **recipe** of steps in a grid view.
+- It has hundreds of built-in transformations, including changing case, trimming spaces, fixing formats and removing duplicate rows or values.
+- A **data profile** job shows missing values, distinct counts and duplicates, and the recipe then runs as a job on the full dataset.
+## Example
+Records from a CRM and a billing system contain `Jane.Doe@Example.com` and `jane.doe@example.com `. Recipe steps convert the email column to lowercase, trim whitespace and remove duplicate rows by `email`, then write the cleaned output as Parquet to S3 for feature engineering.
+W: Glue DataBrew: it offers a no-code visual interface with built-in steps to standardize text such as email case and to detect and remove duplicate records.
+X: A=Redshift Spectrum: Spectrum lets Redshift run SQL on data in S3; it is a query feature, not a visual tool with cleaning recipes.
+C=Kinesis Data Analytics: this is the former name of Managed Service for Apache Flink, which processes streaming data with Flink application code or Flink SQL, not a no-code visual cleaning tool for a stored dataset.
+D=Lambda only: Lambda runs functions you write, so every cleaning and matching rule would need custom code, and a single invocation is limited in time and memory for large datasets.
+T: Visual, no-code cleaning such as deduplication and text standardization is DataBrew; query engines, stream processors and Lambda all need you to write the logic.
+
+@ Q000873 explain
+G: ## Distributed processing with Spark on EMR
+Apache Spark splits data into partitions and processes them in parallel across a cluster, so it handles datasets of many terabytes.
+- It supports complex logic in code: multi-way joins, `dropDuplicates`, window functions such as `row_number() OVER (PARTITION BY customer_id ORDER BY updated_at DESC)`, and custom Python or Scala functions.
+- **Amazon EMR** runs Spark on managed clusters (on EC2, on EKS or as EMR Serverless), reads and writes S3 directly, and can use Spot Instances to reduce cost.
+Example: read 20 TB of raw events from S3, keep the latest record per customer with a window function, join with orders and devices, and write partitioned Parquet for training.
+## Visual tools versus code
+Visual tools such as DataBrew are quick for standard steps, but long chains of custom joins and window logic are easier to write, test and version as Spark code. AWS Glue ETL (managed Spark) would be another code-based option.
+W: Spark on Amazon EMR: it scales horizontally across a cluster for 20 TB and expresses multi-step joins, deduplication and window functions directly in code.
+X: B=SageMaker Ground Truth: Ground Truth labels data with human workers and automation; it does not run joins or cleaning logic.
+C=DataBrew visual recipes only: DataBrew is designed around predefined recipe steps, so complex custom multi-step joins and window logic are hard to express there, which the question rules out.
+D=Amazon Comprehend: Comprehend is an NLP service that extracts entities, sentiment and key phrases from text; it is not a general data transformation engine.
+T: Large-scale, complex, code-driven cleaning belongs in Spark (EMR or Glue ETL); visual recipe tools fit standard transformations.
+
+@ Q000874 explain
+G: ## Why scale features
+Models that use distances or gradients, such as k-NN, SVM, linear or logistic regression with regularization, and neural networks, are **scale-sensitive**. A feature ranging to 1,000,000 dominates one ranging to 1 simply because of its units.
+## Standardization (z-score)
+Each value is transformed as `z = (x - mean) / std`, using the mean and standard deviation from the training data.
+- The result has mean 0 and standard deviation 1, which is exactly the requirement in the question.
+- Values are not bounded: a value 3 standard deviations above the mean becomes 3.
+Example: with mean 50,000 and standard deviation 20,000, an income of 90,000 becomes 2.0.
+## How it differs from min-max normalization
+Min-max scaling maps values to a fixed range such as 0 to 1 with `(x - min) / (max - min)`. It does not give zero mean and unit variance, and a single extreme value changes `max` for every row.
+W: Standardization (z-score): subtracting the mean and dividing by the standard deviation produces features with zero mean and unit variance, putting both features on a comparable scale.
+X: B=Min-max normalization: it rescales to a fixed range such as 0 to 1, but the result does not have zero mean and unit variance, and it is strongly affected by extreme values.
+C=Quantile binning: binning replaces values with bucket labels, losing detail within each bucket, and it does not produce a zero-mean, unit-variance feature.
+D=One-hot encoding: one-hot encoding turns categories into binary columns; applied to continuous numbers it would create a column per distinct value, not a scaled feature.
+T: "Zero mean and unit variance" means z-score standardization; min-max gives a bounded range instead.
+
+@ Q000875 explain
+G: ## Binning (discretization)
+Binning turns a continuous feature into ranges. For age, analysts might define `18-24`, `25-34`, `35-49`, `50-64` and `65+`, matching life stages such as students, young families and retirees.
+- Each bin becomes a category, usually one-hot encoded, so a linear model can learn a separate effect per life stage.
+- This captures **step-like** relationships: churn risk that jumps at retirement, rather than changing smoothly with each year.
+- Results are easy to explain: "customers aged 65+ have higher churn risk than 35-49."
+## Trade-offs
+Binning loses detail inside each range and depends on where the edges are placed, so edges should come from domain knowledge or data analysis. Very narrow bins create sparse categories with few examples.
+W: Binning into meaningful ranges: it models the step changes the analysts expect and produces life-stage segments that are simple to explain.
+X: B=Tokenizing age into characters: tokenization splits text into pieces for NLP; splitting "42" into "4" and "2" destroys the numeric meaning of age.
+C=Z-score standardization: it only rescales age and keeps it continuous, so a linear model still sees a smooth trend instead of step changes per life stage.
+D=One-hot per distinct age: this creates dozens of sparse columns with few examples each, which is noisy and much harder to explain than a few life-stage groups.
+T: When a numeric feature acts in steps and results must be explained per segment, bin it into meaningful ranges rather than rescaling it.
+
+@ Q000876 explain
+G: ## Min-max normalization
+Min-max normalization maps each value to a fixed range with `x_scaled = (x - min) / (max - min)`, using `min` and `max` from the training data.
+- The smallest training value becomes 0 and the largest becomes 1; everything else falls in between.
+- Example: with min 20 and max 220, the value 120 becomes `(120 - 20) / 200 = 0.5`.
+- A target range such as -1 to 1 can be produced with a simple extra rescale.
+Values in new data outside the training range can land slightly below 0 or above 1, so some pipelines clip them.
+## Compared with other transforms
+- **Z-score standardization** centers on 0 with unit variance but has no upper or lower bound.
+- **Log transforms** reduce skew but do not map to a fixed range.
+- **Label encoding** assigns integers to categories and does not scale numbers at all.
+W: Min-max normalization: it linearly rescales each feature using its minimum and maximum, so all values fall in the bounded 0 to 1 range the network expects.
+X: A=Log transformation only: a log compresses large values and reduces skew, but the output range still depends on the data and is not bounded to 0 to 1.
+C=Z-score standardization: z-scores have mean 0 and unit variance but can be any real number, including negative values and values above 1.
+D=Label encoding: label encoding maps categories to integers such as 0, 1, 2; it is for categorical data and does not rescale numeric features into a range.
+T: A required bounded range such as 0 to 1 calls for min-max normalization; standardization and log transforms do not bound the output.
+
+@ Q000877 explain
+G: ## Why outliers break min-max scaling
+Min-max uses `(x - min) / (max - min)`, so the entire scale is set by the two most extreme values.
+Example: most values are between 10 and 100, but one value is 100,000. After scaling, 10 becomes about 0 and 100 becomes about 0.0009, while the outlier becomes 1. Almost all the data now sits in a tiny band near 0, and the model can barely tell those values apart.
+## Remedies
+- **Standardization** (`(x - mean) / std`) is not bounded, so outliers do not force all other values into a fixed range, though they still affect the mean and standard deviation.
+- **Robust scaling** uses the median and the interquartile range, `(x - median) / IQR`, which outliers barely influence.
+- **Clipping or winsorizing** caps extreme values (for example at the 1st and 99th percentiles) before scaling, and a **log transform** can reduce heavy right skew.
+W: Global min/max is dominated by outliers: a few extreme values stretch the range, compressing everything else near 0, so switching to standard or robust scaling (or clipping first) restores useful spread.
+X: B=Min-max is not affected by outliers: min-max depends directly on the minimum and maximum, so it is the scaler most affected by outliers, and outliers are not necessarily entry errors.
+C=Normalization always compresses data this way: with well-behaved data min-max spreads values evenly across 0 to 1; the compression happens only because of the extreme values.
+D=Too many decimal places: precision is not the cause; rounding would actually merge the compressed values further and lose even more information.
+T: Min-max scaling is dominated by extreme values; use robust scaling, standardization or clipping when a feature has outliers.

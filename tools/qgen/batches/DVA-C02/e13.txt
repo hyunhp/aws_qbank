@@ -1,0 +1,250 @@
+# DVA-C02 detailed explanations, e13 (explanation-only rewrites; letters are the published ones)
+
+@ Q003410 explain
+G: ## How S3 objects become public
+An object in S3 is private by default. It becomes public only when something grants access to everyone, for example:
+- a **bucket policy** with `"Principal": "*"` and `s3:GetObject`;
+- an **ACL** that grants read to the `AllUsers` group (ACLs are disabled by default on new buckets, but can be re-enabled).
+## What Block Public Access does
+S3 Block Public Access is a set of four switches (`BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`) that you can set on a bucket or for the whole account. When on, S3 rejects new public ACLs and public bucket policies, ignores public ACLs that already exist, and limits access through an existing public policy to AWS services and principals in the owning account. S3 applies the most restrictive combination of the bucket and account settings, so a developer who later writes a careless bucket policy still cannot expose uploads. New buckets have all four switches on by default.
+W: Block Public Access on bucket and account: it is a guardrail that overrides public ACLs and public bucket policies, so a mistake in a policy or ACL cannot make uploaded objects readable by the internet.
+X: A=Larger multipart part size: part size only controls how a large upload is split into chunks for throughput and retries; it has no effect on who can read the finished object.
+C=Requester Pays: it changes who pays for requests and data transfer (the requester instead of the bucket owner); it does not block public bucket policies or ACLs, so objects could still be exposed.
+D=Transfer Acceleration: it routes uploads through CloudFront edge locations for faster long-distance transfers; access permissions stay exactly the same.
+T: Public exposure is prevented by Block Public Access at bucket and account level; performance or billing features like multipart, Transfer Acceleration and Requester Pays do not change who can read objects.
+
+@ Q003411 explain
+G: ## Temporary credentials from AWS STS
+When an application calls `sts:AssumeRole`, AWS STS returns three values: an access key ID, a secret access key and a **session token**, plus an `Expiration` time. The default session lasts one hour; the role's maximum session duration can be set between 1 and 12 hours (role chaining is capped at 1 hour).
+After expiration, any request signed with those credentials fails with an error such as `ExpiredToken`.
+## How applications keep working
+- The AWS SDKs use **credential providers**. When the credentials come from an EC2 instance profile, an ECS task role or a profile with `role_arn` in `~/.aws/config`, the SDK automatically fetches fresh credentials before the old ones expire. In Lambda, the service itself supplies the execution role's credentials to each environment.
+- If the code calls `AssumeRole` itself, it must call it again (or wrap it in a refreshing provider, such as the SDK's STS assume-role provider) before expiry.
+W: Call AssumeRole again or let the SDK refresh: temporary credentials are meant to be replaced, and requesting a new set is the only way to keep calling AWS without long-term keys.
+X: B=Keep using expired credentials: AWS never accepts them again; every signed request after the expiration time is rejected with an expired-token error.
+C=Root user access keys: root credentials have unrestricted access and cannot be limited by IAM policies; AWS recommends not creating root access keys at all, and storing them on a server is a serious security risk.
+D=New IAM user per expiration: creating users with permanent access keys replaces short-lived credentials with long-lived secrets that must be rotated and can leak, and it adds users endlessly.
+T: Expired STS credentials are replaced, not reused: let the SDK credential provider refresh them or call AssumeRole again; never fall back to long-term or root keys.
+
+@ Q003412 explain
+G: ## The AWS SAM deployment workflow
+AWS SAM extends CloudFormation with short resource types such as `AWS::Serverless::Function`. Getting code from a laptop to AWS usually takes two commands:
+- `sam build` reads `template.yaml`, installs each function's dependencies (for example `pip install -r requirements.txt` or `npm install`) and writes ready-to-deploy artifacts and a built template to `.aws-sam/build`.
+- `sam deploy` zips the built code (or pushes container images to ECR), uploads the artifacts to an S3 bucket (SAM can create a managed one), rewrites the template to point at those uploads and creates or updates the CloudFormation stack through a change set.
+Running `sam deploy --guided` the first time saves settings such as stack name and Region into `samconfig.toml`.
+W: sam build, then sam deploy: build packages the function with its dependencies, and deploy uploads the artifacts and deploys the stack, which is exactly what the question asks for.
+X: A=sam init, then sam delete: `sam init` scaffolds a new project from a template and `sam delete` removes a deployed stack and its artifacts; neither builds or uploads the function.
+B=sam logs, then sam sync --watch: `sam logs` fetches CloudWatch Logs for a deployed function, and `sam sync --watch` is a development shortcut that pushes changes to a dev stack; it is not the standard packaging-and-deploy workflow for release.
+C=sam validate, then aws s3 rb: `sam validate` only checks the template for errors, and `aws s3 rb` removes an S3 bucket; nothing is built or deployed.
+T: The standard SAM path is build (install dependencies and produce artifacts) then deploy (upload to S3 and run CloudFormation).
+
+@ Q003413 explain
+G: ## Why normal deployments feel slow in development
+`sam deploy` always goes through CloudFormation: it creates a change set, waits for it and applies it. That is safe for production but can take minutes for a one-line code change.
+## What sam sync does
+`sam sync` is built for development stacks:
+- For code-only changes (function code, layers, Step Functions definitions, API definitions) it calls service APIs directly, such as Lambda `UpdateFunctionCode`, skipping CloudFormation, so updates land in seconds.
+- For infrastructure changes it still deploys through CloudFormation.
+- With `--watch`, it monitors local files and syncs automatically every time you save.
+Because direct updates cause drift from the CloudFormation template, AWS recommends `sam sync` only for development, not production.
+W: sam sync --watch: it watches the project and pushes code changes straight to the dev stack in seconds, giving rapid feedback without a full redeploy each time.
+X: A=sam package only: it uploads artifacts to S3 and outputs a template that references them, but it does not deploy anything, so no changes reach the stack.
+B=delete-stack: it removes the entire stack and its resources; that is the opposite of iterating quickly on a running development environment.
+D=cdk bootstrap only: it provisions the CDK toolkit resources (such as the assets bucket and deployment roles) in an account and Region once; it does not deploy or sync application code.
+T: For fast iteration on a dev stack use `sam sync --watch`; package, bootstrap and delete-stack do not push code changes.
+
+@ Q003414 explain
+G: ## CodeDeploy for Lambda
+With the Lambda compute platform, CodeDeploy does not copy files to servers. It shifts an **alias** (for example `live`) from the current version to a new version, either all at once, in a canary pattern (such as 10% then 100% after 5 minutes) or linearly.
+## Lifecycle hooks for Lambda deployments
+The AppSpec file for Lambda supports two hooks, each pointing to a Lambda function you write:
+- `BeforeAllowTraffic`: runs before any traffic moves to the new version, for example to invoke it with test events.
+- `AfterAllowTraffic`: runs after all traffic has shifted.
+The hook function reports the result with `PutLifecycleEventHookExecutionStatus`. If it reports `Failed`, the deployment fails; for `BeforeAllowTraffic` that happens before any traffic reaches the new version.
+W: BeforeAllowTraffic hook: it runs a validation Lambda function against the new version before the alias shifts any traffic, and a failure stops the deployment.
+X: A=Lambda layer version: layers package shared libraries or runtimes for functions; they have nothing to do with deployment lifecycle events or test runs.
+B=AfterInstall hook on EC2: `AfterInstall` is a hook of the EC2/on-premises platform, run after files are copied to an instance; Lambda deployments do not have an install step or this hook.
+C=CloudFormation Output: outputs expose values from a stack (and can be exported for other stacks); they cannot run code during a CodeDeploy traffic shift.
+T: Lambda deployments in CodeDeploy have only BeforeAllowTraffic and AfterAllowTraffic hooks; test before shifting with BeforeAllowTraffic, not with EC2 hooks.
+
+@ Q003415 explain
+G: ## What reproducible deployments mean
+A deployment is reproducible when dev, test and prod end up running the same code on the same kind of infrastructure, so a test result in one environment predicts the result in another.
+## Two habits that make it work
+- **Build once, promote the artifact**: the pipeline builds a single artifact (a zip, JAR or container image with a fixed digest) and deploys that exact artifact to each stage. Only configuration changes between stages.
+- **Parameterized infrastructure as code**: one CloudFormation, SAM or CDK template describes all resources, and parameters such as `EnvName=prod` or instance size change per environment.
+Example: image `app@sha256:ab12...` passes tests in staging and the same digest is deployed to production with `EnvName=prod`.
+W: A=Build once and promote: deploying the same tested artifact everywhere removes the chance that a rebuild picks up different code or dependencies.
+E=Parameterized IaC: one template with parameters creates matching infrastructure in every environment, with differences stated explicitly as parameter values.
+X: B=Latest dependencies at deploy time: floating versions mean each deployment can pull different library versions, so what was tested is not what runs.
+C=Rebuild per environment: each rebuild can resolve dependencies or build tools differently, producing artifacts that were never tested as a whole.
+D=Manual console changes in production: hand changes are not recorded in the template, cause drift and cannot be repeated reliably in other environments.
+T: Reproducibility comes from one immutable artifact plus parameterized infrastructure as code, not from rebuilding or hand-editing per environment.
+
+@ Q003416 explain
+G: ## Levels of container hosting on AWS
+Running a web container can mean managing a lot or very little:
+- **EC2**: you manage instances, the OS, Docker, the load balancer and scaling.
+- **ECS or EKS**: you define clusters, services and tasks, and usually attach a load balancer and scaling policies yourself.
+- **AWS App Runner**: you give it a container image (from ECR) or a source repository, plus a port and CPU/memory settings. It provides an HTTPS URL, TLS certificate, load balancing and request-based auto scaling, and can redeploy automatically when a new image is pushed.
+App Runner is aimed at web apps and APIs where the team wants the least infrastructure configuration. Note: since April 30, 2026 App Runner no longer accepts new customers (existing customers can keep using it), and AWS suggests Amazon ECS Express Mode for new workloads of this kind.
+W: AWS App Runner: it runs containerized web apps with built-in load balancing, TLS and auto scaling, and needs almost no configuration beyond the image and port.
+X: A=EC2 only: you would have to install the runtime, create and wire a load balancer, and set up Auto Scaling groups yourself, which is the opposite of minimal configuration.
+B=AWS Batch: it schedules finite batch and compute jobs from a queue; it does not serve long-running web traffic behind a load balancer.
+D=EMR on EKS: it runs Spark and other big data frameworks on an EKS cluster; it is for data processing jobs, not hosting a web application.
+T: For a container web app with managed load balancing and scaling and minimal setup, App Runner fits; EC2, Batch and EMR are for self-managed servers, jobs or big data.
+
+@ Q003417 explain
+G: ## Lambda versions and aliases
+Publishing a Lambda **version** freezes the code and configuration under a number (1, 2, 3...). An **alias** such as `prod` is a named pointer to a version, and callers invoke the alias ARN, for example `arn:aws:lambda:us-east-1:111122223333:function:orders:prod`.
+## Weighted aliases
+An alias can point to two versions at once with a weight on the second one (its routing configuration). Example: `prod` sends 90% of invocations to version 5 and 10% to version 6. If version 6 looks healthy you raise its weight to 100%; if not, you set it back to 0%. CodeDeploy canary and linear deployments for Lambda use this same mechanism under the hood.
+W: Weighted alias routing: an alias with a routing configuration splits invocations between two versions by percentage, which is exactly the 90/10 split described.
+X: A=Function URL routing: a function URL is a dedicated HTTPS endpoint for a function or alias; it does not itself split traffic between versions.
+C=Provisioned concurrency: it keeps a set number of execution environments initialized to avoid cold starts; it does not decide which version receives a request.
+D=Reserved concurrency: it guarantees and caps the maximum concurrent executions for a function; it controls capacity, not traffic distribution between versions.
+T: Splitting traffic between two Lambda versions is done with a weighted alias; concurrency settings control capacity, not routing.
+
+@ Q003418 explain
+G: ## Roles of the AWS developer tools
+In a CodePipeline workflow each stage calls a service that does one job:
+- **Source**: a repository such as GitHub (through a CodeConnections connection) or CodeCommit.
+- **Build/Test**: **AWS CodeBuild** starts a managed container, runs the commands in `buildspec.yml` (for example `npm ci` then `npm test`) and fails the action if a command fails. It can also publish JUnit-style test reports.
+- **Deploy**: CodeDeploy, CloudFormation, ECS or others.
+Running tests on pull requests is commonly done with a CodeBuild webhook on PR events or a pipeline trigger on pull requests, and in both cases CodeBuild executes the tests.
+W: AWS CodeBuild: it is the managed build service that actually runs test commands from the buildspec and reports pass or fail back to the workflow.
+X: A=Amazon ECR: it is a registry for container images; it can scan images for vulnerabilities but does not run unit tests.
+C=AWS CodeDeploy: it deploys application revisions to EC2, on-premises servers, Lambda or ECS; its hooks run during deployment, not as a build-and-test step for pull requests.
+D=AWS CodeArtifact: it is a package repository for npm, Maven, PyPI and similar dependencies; it stores packages but does not execute code.
+T: CodeBuild runs builds and tests; ECR and CodeArtifact store artifacts and CodeDeploy deploys them.
+
+@ Q003419 explain
+G: ## Why S3 bucket names collide
+S3 bucket names are globally unique across all AWS accounts in a partition. If a template hard-codes `BucketName: my-app-uploads`, the second stack that uses it fails with an "already exists" error.
+## Ways to get unique names in CloudFormation
+- **Omit `BucketName`**: CloudFormation generates a name from the stack name, logical ID and a random suffix, such as `mystack-uploadsbucket-1a2b3c4d5e6f`.
+- **Pseudo parameters**: build the name with values like `AWS::StackName`, `AWS::AccountId` and `AWS::Region`, for example with `Fn::Sub` to produce `${AWS::StackName}-uploads-${AWS::AccountId}` (names must still be lowercase and within 63 characters).
+Other resources get the name through `Ref` on the bucket.
+W: Omit the name or use pseudo parameters: a generated name or a name built from stack, account and Region values is unique per stack without any manual step.
+X: B=Create the bucket outside CloudFormation: the bucket is no longer managed by the stack, so it is not created, updated or deleted with it, and naming is still a manual problem.
+C=Type a unique name manually: relying on people for uniqueness is error-prone and breaks automated pipelines that deploy without a human.
+D=Hard-coded fixed name: the name is global, so only the first stack succeeds and every other deployment fails with a name conflict.
+T: Let CloudFormation generate bucket names or derive them from pseudo parameters; fixed names collide because S3 names are globally unique.
+
+@ Q003420 explain
+G: ## How Lambda reads from SQS
+Lambda polls the queue and receives a batch of messages. While Lambda works on them, the messages are hidden from other consumers for the queue's **visibility timeout**. If the function succeeds, Lambda deletes the messages; if it errors or times out, the messages become visible again and are retried. After `maxReceiveCount` attempts, the redrive policy moves them to the DLQ.
+## Why timeouts cause loops
+If the function timeout is too short for the work, every attempt fails the same way. If the visibility timeout is shorter than the function timeout, a message can reappear and be processed again while the first invocation is still running.
+AWS recommends a visibility timeout of at least six times the function timeout. Example: function timeout 60 seconds, visibility timeout 360 seconds.
+W: Function timeout and visibility timeout together: give the function enough time to finish the batch, then set the queue's visibility timeout well above that value so messages are not returned while still being processed.
+X: A=Switch to FIFO: FIFO adds ordering and exactly-once processing, but a function that times out still fails, and messages still go back and eventually to the DLQ.
+B=Reserved concurrency zero: this throttles the function completely so no messages are processed at all; it stops the loop by stopping the application.
+C=Retention of fourteen days: retention only controls how long unprocessed messages stay in the queue; the function would keep timing out on every attempt.
+T: SQS messages loop to the DLQ when Lambda times out; fix the function timeout and keep the visibility timeout well above it.
+
+@ Q003421 explain
+G: ## AWS X-Ray and Lambda
+X-Ray records **traces**: the path of a request through services, with timing for each segment, errors and faults. A trace lets you see, for example, that a function spent 20 ms initializing and 400 ms waiting on DynamoDB.
+## Active tracing
+Setting the function's tracing mode to `Active` (console toggle, `TracingConfig: Mode: Active` in CloudFormation or `Tracing: Active` in SAM) makes the Lambda service sample invocations and send segments for them to X-Ray. The execution role needs permission to write to X-Ray, which the `AWSXRayDaemonWriteAccess` managed policy provides.
+No code change is required for these basic segments. Adding the X-Ray SDK or OpenTelemetry later gives more detail, such as subsegments for downstream AWS calls.
+W: Active tracing on the Lambda function: it is a configuration setting that makes Lambda send trace data for sampled invocations to X-Ray without touching the function code.
+X: A=VPC Flow Logs: they record IP traffic metadata (source, destination, ports, accept or reject) for network interfaces; they do not show request timing or errors inside a function.
+B=EC2 detailed monitoring: it sends EC2 instance metrics to CloudWatch every minute instead of every five; Lambda functions are not EC2 instances you manage, and metrics are not traces.
+D=CloudTrail data events for Lambda: they log `Invoke` API calls (who called the function and when) for auditing; they do not trace the request through the function and downstream services.
+T: For X-Ray traces from Lambda without code changes, turn on active tracing; flow logs, instance metrics and CloudTrail are network, metric and audit data, not traces.
+
+@ Q003422 explain
+G: ## Caching repeated calls
+When an application sends the same request again and again, and the answer only changes every hour, most of those calls return data it already had. Each one costs network latency and possibly per-call fees.
+## How a cache helps
+Store the response keyed by the request parameters and give it a **time to live (TTL)** that matches how long the data stays valid.
+- First request: cache miss, call the API, store the result with a TTL of up to 3600 seconds.
+- Later requests within the hour: cache hit, answer from memory or from a shared cache such as ElastiCache in milliseconds.
+- After the TTL expires, the next request fetches fresh data.
+For Lambda, a simple in-memory cache outside the handler survives between invocations of the same execution environment; a shared cache is needed across environments.
+W: Cache responses for up to an hour: requests within the freshness window are served locally, which cuts both latency and the number of billed API calls while keeping data acceptably current.
+X: A=Disable retries: retries only happen on failures, so removing them does not speed up successful calls and makes the application less reliable during transient errors.
+B=Call twice and compare: this doubles the number of calls, increasing both cost and load without making responses faster.
+D=Increase the client timeout: a longer timeout only lets slow calls wait longer before failing; it does not reduce how long or how often the API is called.
+T: When data changes on a known schedule, cache it with a matching TTL; timeouts and retries do not reduce the number of calls.
+
+@ Q003423 explain
+G: ## Where Lambda time goes
+Lambda bills by duration (per millisecond) times the memory size. Time spent waiting for a network response is billed just like time spent computing.
+## Sequential versus concurrent I/O
+If a function calls three independent services one after another, and each takes 300 ms, the waits add up to about 900 ms. Because the calls do not depend on each other's results, they can be started together:
+- JavaScript: `await Promise.all([callA(), callB(), callC()])`
+- Python: `asyncio.gather(...)` or a thread pool
+The total wait becomes about the slowest call, roughly 300 ms, cutting duration and cost by about two thirds in this example.
+W: Make the independent calls concurrently: overlapping the waits reduces total duration to about the longest single call, which lowers both latency and the billed duration.
+X: B=Increase the timeout: the timeout is only the maximum allowed run time; raising it does not make the function finish sooner and can allow even longer billed runs.
+C=More environment variables: they only pass configuration values to the code; they have no effect on how long network calls take.
+D=Reduce memory: memory also sets the CPU share, so less memory does not shorten network waits and can slow any processing, while the sequential waiting remains.
+T: Waiting on independent network calls one by one wastes billed time; run them in parallel instead of changing timeout or memory.
+
+@ Q003424 explain
+G: ## Troubleshooting failed API Gateway requests
+When a client gets a 4xx or 5xx from API Gateway, you need to see what happened inside the request. Two built-in tools help:
+- **CloudWatch execution logs** (REST APIs, per stage, `ERROR` or `INFO` level): show each step, such as authorizer results, the request sent to the integration, the integration response and mapping template output. A line like `Execution failed due to configuration error` or a Lambda timeout points directly to the cause. (Access logs, a separate feature, record one summary line per request.)
+- **AWS X-Ray tracing** (enabled per stage): shows the request as a trace across API Gateway and downstream services such as Lambda or DynamoDB, with timing and which segment returned the error.
+W: D=Execution logs in CloudWatch: they record the detailed processing of each request, including integration errors and authorizer failures, so you can see where it failed.
+E=X-Ray traces for the stage: they show the end-to-end path and latency of the request across services, pinpointing which component returned the error or was slow.
+X: A=S3 server access logs: they record requests made to an S3 bucket; they contain nothing about requests handled by API Gateway unless the integration itself calls S3.
+B=AWS Budgets alerts: they notify when cost or usage crosses a threshold; they have no per-request error information.
+C=Flow logs for unrelated subnets: flow logs record IP traffic metadata for network interfaces, and subnets not involved in the request cannot show anything about it.
+T: Debug API Gateway failures with stage execution logs for request details and X-Ray traces for the path across services.
+
+@ Q003425 explain
+G: ## Referencing resources across stacks
+Inside one template, `Ref` and `Fn::GetAtt` refer to resources by their logical IDs. Those logical IDs mean nothing in another stack.
+## Exports and imports
+To share a value between stacks in the same account and Region:
+- The producing stack declares an output with an `Export` name, for example output `VpcId` with `Export: Name: network-VpcId`.
+- The consuming stack reads it with `Fn::ImportValue: network-VpcId`.
+Export names must be unique in the account and Region. While another stack imports a value, CloudFormation will not let you delete the exporting stack or change or remove that export, which protects the dependency.
+W: Export an output and use Fn::ImportValue: this is the built-in cross-stack reference mechanism, and it keeps the VPC ID in sync without copying it by hand.
+X: A=Ref on the other stack's logical ID: `Ref` resolves only logical IDs defined in the same template, so the template fails validation because the resource does not exist there.
+C=Fn::GetAtt on the other stack's resource: like `Ref`, `Fn::GetAtt` only works for resources declared in the same template.
+D=Hard-coded VPC ID: it works once but breaks silently when the VPC is replaced or the template is deployed to another account or Region, and CloudFormation does not track the dependency.
+T: Within a template use Ref and GetAtt; across stacks in the same Region use an exported output plus Fn::ImportValue.
+
+@ Q003426 explain
+G: ## Unit tests versus integration tests
+- **Unit tests** check code in isolation with mocked dependencies. They are fast but cannot catch problems like missing IAM permissions, wrong queue URLs or DynamoDB key mistakes.
+- **Integration tests** call real services, so they need real SQS queues and DynamoDB tables.
+## Ephemeral test environments
+A common pipeline pattern is to deploy a short-lived copy of the stack for each run, for example `sam deploy --stack-name app-ci-1234` in a dedicated test account, run the integration tests against its queue and table, then delete the stack. Resources get unique names, test data never touches production, and IAM boundaries between accounts limit what the tests can reach.
+W: Temporary test resources in a separate account or stack: the tests exercise real SQS and DynamoDB behavior while being fully isolated from production data and traffic.
+X: A=Manual laptop tests against production: they are not automated in CI, depend on one developer's machine and can create or delete real production messages and items.
+B=Only unit tests with mocks: mocks confirm your own logic but cannot detect integration issues such as permissions, service limits or real API behavior.
+C=Point tests at the production queue and table: test messages would be processed by the live system and test writes could corrupt or leak real data.
+T: Real integration tests belong in isolated, disposable environments, not in production and not replaced by mocks alone.
+
+@ Q003427 explain
+G: ## Elastic Beanstalk deployment policies
+Beanstalk offers several ways to roll out a new application version:
+- **All at once**: every instance is updated together; fastest, but the app is briefly unavailable.
+- **Rolling**: instances are updated in batches (by count or percentage); each batch is taken out of service while it updates, so capacity drops during the deployment.
+- **Rolling with additional batch**: Beanstalk first launches an extra batch of instances, then updates in batches, so the number of serving instances stays at full capacity. The extra batch is removed at the end.
+- **Immutable** and **traffic splitting**: deploy to a fresh set of instances.
+Example: 10 instances with a 20% batch size means 2 new instances are added first, and 10 instances keep serving throughout.
+W: Rolling with additional batch: it updates in percentage-based batches while temporarily adding instances, so full capacity is maintained.
+X: B=All at once: it updates every instance simultaneously, causing a short outage, and does not use batches at all.
+C=Manual in-place update: it is not a Beanstalk deployment policy; updating instances by hand bypasses Beanstalk's health tracking and is slow and error-prone.
+D=Rolling without extra batch: it does use batches, but each batch is out of service during its update, so capacity drops, which fails the requirement.
+T: Batches plus no capacity loss means rolling with additional batch; plain rolling reduces capacity and all at once causes downtime.
+
+@ Q003428 explain
+G: ## How CloudFormation handles failed updates
+A stack update applies many resource changes. If one fails, for example a new security group rule references a missing group, CloudFormation by default rolls back: it returns every changed resource to its last known working configuration and the stack ends in `UPDATE_ROLLBACK_COMPLETE`.
+## Controlling rollback
+- It is on by default; `--disable-rollback` (or preserving successfully provisioned resources) turns it off for debugging.
+- **Rollback triggers** can watch CloudWatch alarms during and shortly after the update and roll back if an alarm fires.
+In CodePipeline, the CloudFormation deploy action simply reports the failure; the rollback itself is done by CloudFormation, so no extra pipeline logic is needed.
+W: CloudFormation automatic rollback: on a failed update, CloudFormation restores the previous working state of the stack by itself, which is exactly the required behavior.
+X: A=CodeBuild phase that deletes the stack: deleting removes all resources and data instead of restoring the previous version, causing an outage.
+B=Manual approval action: it pauses the pipeline for a person to approve; placed after deployment it cannot undo a failure that already happened, and it is not automatic.
+D=S3 lifecycle rule on artifacts: it only transitions or expires objects in the artifact bucket; it has no effect on the state of a CloudFormation stack.
+T: CloudFormation rolls back failed stack updates on its own; deleting stacks, approvals or S3 rules do not restore the previous state.

@@ -1,0 +1,347 @@
+# MLA-C01 detailed explanations, e03 (explanation-only rewrites; letters are the published ones)
+
+@ Q000903 explain
+G: ## Data quality gates before training
+A training pipeline should refuse bad input instead of silently training on it. The gate checks the data against written rules and fails the step when a rule is broken.
+## AWS Glue Data Quality and DQDL
+AWS Glue Data Quality evaluates a dataset against rules written in the **Data Quality Definition Language (DQDL)**. Rules are short declarative lines, for example:
+- `Completeness "customer_id" > 0.99` fails if more than 1% of rows have a null ID.
+- `ColumnValues "label" in ["churn", "stay"]` fails if an unexpected label appears.
+A ruleset runs inside a Glue ETL job or against a Data Catalog table and returns a pass/fail result per rule plus an overall score. The job can then stop, or an orchestrator such as Step Functions or a SageMaker pipeline condition can branch on the result, so no model is trained on data that broke a rule.
+W: Glue Data Quality rules: a few DQDL lines express both conditions (null ratio on `customer_id`, allowed values in the label column), and the result can stop the pipeline before training, with no custom validation code.
+X: B=CloudWatch alarms on bucket size: bucket size and object count say nothing about the contents of rows, so neither the null-ID ratio nor invalid labels would ever trigger the alarm.
+C=Manual notebook checks: a person has to remember to run them for every execution, they cannot block an automated pipeline, and the check logic still has to be written by hand, which is more code and less reliable.
+D=Model Monitor data quality: Model Monitor compares data captured at a deployed endpoint (or batch transform) against a baseline to detect drift after deployment. It is not designed as a rule-based gate on raw training data before a training job starts.
+T: To block training on bad data with minimal code, declare the rules in DQDL and gate on Glue Data Quality results; monitoring bucket metrics or deployed-model drift does not validate training rows.
+
+@ Q000904 explain
+G: ## What AWS Glue DataBrew is
+AWS Glue DataBrew is a visual, no-code data preparation service. You point a **dataset** at data in S3, a Data Catalog table or a database, and work with it in a browser grid.
+## Profiling vs recipes
+- A **profile job** scans the dataset (or a sample) and produces a data profile: per-column statistics such as value distributions, min/max, distinct and missing value counts, correlations between columns, and dataset-level findings such as duplicate rows. It can also run data quality rules.
+- A **recipe job** applies a recorded list of transformation steps (a recipe) and writes the cleaned output; it can run on demand or on a schedule.
+Example: before designing features, a data scientist runs a profile job on a new `transactions` dataset and sees that `zip_code` is 12% missing and 3% of rows are duplicates, without writing a line of code.
+W: DataBrew data profiling jobs: they generate exactly the visual profile asked for, covering distributions, missing values and duplicate rows, from the console with no code.
+X: B=Glue Studio job bookmarks: bookmarks track which data an ETL job has already processed so reruns handle only new data. They produce no statistics about the data.
+C=Recipe job scheduling only: scheduling runs transformation recipes at set times. Running transforms does not by itself produce a profile of distributions and quality issues; that is the job of a profile job.
+D=Data Catalog table versioning: versioning records changes to a table's schema and metadata over time. It never reads the data values, so it cannot show distributions or missing counts.
+T: In DataBrew, profile jobs describe the data (statistics, missing values, duplicates) while recipe jobs change it; Glue bookmarks and catalog versions are about job state and metadata.
+
+@ Q000905 explain
+G: ## Gradient-boosted trees for tabular data
+Tabular problems (rows of numeric and categorical columns, such as churn) are where tree ensembles usually win. **XGBoost** builds many shallow decision trees one after another; each new tree corrects the errors of the ones before it.
+Why it is a strong first choice:
+- High accuracy on tabular data with modest tuning, and fast training on millions of rows.
+- Native handling of missing values: at each split the algorithm learns a default direction for rows whose value is missing.
+- Built-in feature importance (gain, cover, weight), which is useful for explaining churn drivers.
+SageMaker provides XGBoost as a built-in algorithm and framework container, so it can train on 2 million rows with 80 features on a single CPU instance or a few instances. Categorical features are typically encoded first (for example one-hot or target encoding).
+W: SageMaker XGBoost: gradient-boosted trees give strong accuracy on tabular churn data quickly, deal with missing values natively and report feature importance out of the box.
+X: A=Deep CNN: convolutional networks exploit spatial structure in images or signals. Tabular columns have no such structure, and a CNN would need far more tuning and compute while offering no native feature importance.
+C=K-means clustering: k-means is unsupervised; it groups similar rows but never learns from the churn label, so it cannot predict who will churn.
+D=DeepAR forecasting: DeepAR forecasts future values of time series. Churn here is a classification of each customer, not a forecast of a series over time.
+T: For supervised tabular classification with missing values and a need for feature importance, start with gradient-boosted trees such as XGBoost rather than deep, unsupervised or forecasting models.
+
+@ Q000906 explain
+G: ## Speech-to-text on AWS
+Amazon Transcribe is a managed automatic speech recognition (ASR) service: you give it audio (batch files in S3 or a real-time stream) and it returns a transcript with timestamps.
+Features relevant to contact centers:
+- **Speaker diarization** (speaker labels) marks which speaker said each segment, for example `spk_0` as the agent and `spk_1` as the customer.
+- **Channel identification** separates speakers recorded on different stereo channels.
+- **Transcribe Call Analytics** adds call-specific insights such as sentiment and issue detection.
+- Custom vocabularies improve recognition of product names.
+A typical pipeline: call recordings land in S3, a `StartTranscriptionJob` request produces a JSON transcript, and a downstream NLP model (or Amazon Comprehend) analyzes sentiment per speaker turn.
+W: Amazon Transcribe: it converts recorded calls into text with speaker labels as a managed API call, so no speech model has to be built.
+X: A=Amazon Comprehend: Comprehend analyzes text (sentiment, entities, key phrases). It cannot take audio as input, so it would need a transcript first.
+B=Amazon Translate: Translate converts text from one language to another. It neither accepts audio nor produces transcripts.
+C=Amazon Polly: Polly does the reverse direction, turning text into spoken audio (text-to-speech).
+T: Transcribe turns speech into text (with speaker labels); Polly turns text into speech, and Comprehend and Translate only work on text that already exists.
+
+@ Q000907 explain
+G: ## Pre-trained vision APIs vs custom models
+Amazon Rekognition is a managed computer vision service with ready-made APIs, so common image tasks need no training data.
+**Content moderation** is one of them: `DetectModerationLabels` returns labels such as explicit nudity, suggestive content or violence, each with a confidence score and a place in a label hierarchy.
+Example publishing flow:
+- A user uploads an image to S3, which triggers a Lambda function.
+- The function calls `DetectModerationLabels`; if any label is above, say, 80% confidence, the image is held for human review instead of being published.
+- Amazon Augmented AI (A2I) can route borderline cases to reviewers.
+Other Rekognition APIs detect objects, faces, text in images and celebrities; Custom Labels exists for domain-specific classes when the ready-made labels are not enough.
+W: Amazon Rekognition: its content moderation API flags explicit and suggestive images out of the box, with no custom model to train or host.
+X: A=Amazon Textract: Textract extracts printed and handwritten text, forms and tables from documents. It does not judge whether an image's visual content is explicit.
+C=Amazon Comprehend: Comprehend is a natural language service; it works on text and cannot analyze image pixels.
+D=SageMaker semantic segmentation: it is a built-in algorithm that must be trained on labeled pixel masks, which is exactly the custom model work the requirement wants to avoid, and it outputs pixel classes rather than moderation labels.
+T: For moderation of images without training anything, use Rekognition's moderation labels; Textract reads text and SageMaker built-in algorithms need your own training.
+
+@ Q000908 explain
+G: ## Machine translation with controlled terms
+Amazon Translate is a managed neural machine translation service. `TranslateText` translates text in real time; batch jobs translate documents stored in S3.
+## Custom terminology
+A **custom terminology** is a file (CSV, TMX or TSV) that lists source terms and how they must appear in the target language. You pass its name in the `TerminologyNames` parameter of the request.
+- To keep a product name unchanged, map it to itself, for example `CloudPilot` -> `CloudPilot`.
+- To enforce a company phrase, map `ticket` -> a specific approved translation.
+Translate then uses these entries for every request, so brand names are never translated literally and terms stay consistent across tickets. For broader style adaptation there is also Active Custom Translation with parallel data.
+W: Translate with custom terminology: real-time translation to English with a terminology file that pins product names and company terms, all managed and without training a model.
+X: A=Comprehend custom entities: custom entity recognition can find product names in text, but Comprehend does not translate anything.
+B=Transcribe custom vocabularies: custom vocabularies improve speech recognition of unusual words in audio. The tickets are already text, and Transcribe does not translate.
+C=Seq2seq from scratch: training a translation model needs large parallel corpora, GPUs and months of work, and would still need extra logic to protect product names. A managed service already solves this.
+T: Consistent handling of brand names in translation is what Translate custom terminology is for; Comprehend and Transcribe customizations serve entity detection and speech recognition.
+
+@ Q000909 explain
+G: ## Using foundation models without infrastructure
+A foundation model (FM) is a large model pre-trained on broad data that can summarize, answer questions and generate text with just a prompt.
+**Amazon Bedrock** offers FMs from Amazon and third-party providers through one serverless API (for example `InvokeModel` or the `Converse` API). There are no instances to provision; you pay per input and output token (or reserve throughput).
+Bedrock also adds building blocks around the model:
+- **Knowledge Bases** for retrieval-augmented generation, so answers are grounded in the company's own documents.
+- **Guardrails** to filter harmful content and sensitive data.
+- Optional fine-tuning of some models when prompting is not enough.
+Example: the app sends a document and the instruction "Summarize in five bullet points" to a model through `Converse` and shows the response.
+W: Amazon Bedrock: summarization and question answering become API calls to an existing foundation model, with no GPUs to manage and no model training.
+X: B=Custom transformer in script mode: this means training a large model yourself on GPU training instances, which is the cost and effort the startup wants to avoid.
+C=Built-in Seq2Seq: the SageMaker Seq2Seq algorithm must be trained on your own paired data and hosted on instances; it is not a general pre-trained generative model.
+D=Self-managed LLM on EC2 GPUs: even with open-source weights, the team would have to provision, scale, patch and pay for GPU instances around the clock.
+T: When the need is generative text without training or GPU management, call a foundation model through Bedrock instead of training or self-hosting one.
+
+@ Q000910 explain
+G: ## Interpretability in regulated decisions
+Credit decisions often have to be explained: lenders must tell applicants the main reasons for a denial, and regulators expect to understand how the model behaves.
+- **Logistic regression** is inherently interpretable. Each feature has one coefficient; its sign and size show how that feature raises or lowers the log-odds of approval. A reason such as "debt-to-income ratio too high" comes straight from the model.
+- A **deep neural network** spreads its logic over many layers of weights. Post-hoc tools such as SHAP (used by SageMaker Clarify) can approximate feature contributions, but the explanation is an approximation of a complex function.
+When two models have similar validation accuracy, the simpler, explainable model usually wins because it carries lower regulatory and trust risk for the same performance.
+W: Logistic regression is easier to explain: with equal accuracy, transparent coefficients that map directly to reasons for a decision are the deciding factor for a regulated loan approval.
+X: A=DNN always generalizes better: no model family always generalizes better; here the validation results are already similar, and deep models often overfit more on tabular data.
+B=DNN needs no feature engineering: deep networks can learn some representations, but tabular credit data still needs cleaning and encoding. Either way, less feature work does not outweigh the explanation requirement.
+D=Logistic regression cannot be deployed: SageMaker endpoints can host logistic regression, for example with the built-in Linear Learner or a scikit-learn container.
+T: When accuracy is comparable and decisions must be explained, choose the inherently interpretable model; deep networks need post-hoc approximations of their reasoning.
+
+@ Q000911 explain
+G: ## Unsupervised anomaly detection
+Without labels you cannot train a classifier to recognize "anomalous". Instead, an unsupervised model learns what normal data looks like and scores how unusual each new point is.
+## Random Cut Forest (RCF)
+SageMaker's built-in Random Cut Forest builds many random trees, each by repeatedly cutting a sample of the data at random points. A point that is isolated with only a few cuts sits far from the rest of the data and gets a high **anomaly score**.
+For a time series of request rates, the values are often grouped into short windows (shingling) so the model sees the recent shape of the curve, not a single number. A sudden spike then produces a score well above the typical range, for example more than three standard deviations above the mean score, and can raise an alert.
+W: Random Cut Forest: it is SageMaker's built-in unsupervised anomaly detection algorithm, giving each data point an anomaly score without needing labeled anomalies.
+X: B=Factorization Machines: FM is a supervised algorithm for sparse data such as click prediction and recommendations; it needs labels and does not score anomalies.
+C=Linear Learner: Linear Learner trains supervised regression or classification models, so it would need examples already labeled as anomalous.
+D=K-Means: k-means groups data into clusters; distance to a centroid can be used as a rough outlier signal, but it is a clustering algorithm, not the built-in algorithm designed to produce anomaly scores.
+T: Unlabeled spikes in metrics call for an anomaly scorer such as Random Cut Forest; supervised learners need labels and k-means only clusters.
+
+@ Q000912 explain
+G: ## SageMaker JumpStart
+SageMaker JumpStart is a model hub inside SageMaker. It lists hundreds of pre-trained models, both open-weight models (for example from Hugging Face and other providers) and proprietary ones, grouped by task such as text classification, summarization or image classification.
+For each model JumpStart offers:
+- **Deploy**: one click (or one SDK call) creates a SageMaker endpoint in your own account.
+- **Fine-tune**: point it at your labeled data in S3 and it launches a training job with sensible default hyperparameters.
+- Example notebooks that show evaluation and inference.
+So a team can deploy three candidate text classifiers, compare them on a test set, fine-tune the best one on its own tickets and deploy the result, with everything running on its own SageMaker resources.
+W: SageMaker JumpStart: it provides pre-trained open models to try, built-in fine-tuning on your data and one-click deployment, all in your own account.
+X: A=Feature Store: Feature Store stores and serves engineered features for training and inference; it holds no pre-trained models.
+B=Ground Truth: Ground Truth is for labeling data with human workers. It can help create training labels, but it does not provide or deploy models.
+D=SageMaker Neo: Neo compiles an already trained model for efficient inference on specific hardware; it does not offer a catalog of models to try or fine-tune.
+T: A catalog of pre-trained models with fine-tuning and one-click deployment is JumpStart; Feature Store, Ground Truth and Neo handle features, labels and compilation.
+
+@ Q000913 explain
+G: ## Two kinds of embeddings
+An embedding is a vector of numbers that places similar items close together.
+- **BlazingText** is SageMaker's optimized implementation of Word2Vec (and a text classifier). In Word2Vec mode it learns one vector per word from a large corpus, using fast multi-core CPU or GPU training. Words that appear in similar contexts, such as "refund" and "reimbursement", get similar vectors, which help downstream text classification.
+- **Object2Vec** is a general-purpose embedding algorithm that learns from **pairs** of objects and a label or score for each pair. The objects can be tokens, sentences or IDs. Example: pairs of `(customer_id, product_id)` with a purchase or rating signal, so related customers and products end up close in the vector space.
+The key difference is the input: word embeddings come from raw word context in text, while Object2Vec needs explicit pairs and their relationship.
+W: BlazingText for words, Object2Vec for pairs: BlazingText trains word vectors efficiently on a large corpus, while Object2Vec learns embeddings from relationships between pairs of arbitrary objects.
+X: A=Object2Vec for both: Object2Vec could embed words only if given labeled pairs, and it is not the optimized word-embedding tool for a large raw corpus.
+C=Swapped pairing: this reverses the roles; BlazingText cannot learn from customer-product pairs, and Object2Vec is not the efficient word-vector trainer.
+D=BlazingText for both: BlazingText learns from word context in text and has no way to model a relationship label between two arbitrary objects such as a customer and a product.
+T: Word vectors from text are BlazingText's job; embeddings from labeled pairs of arbitrary objects are Object2Vec's.
+
+@ Q000914 explain
+G: ## Total cost of ownership for ML
+Total cost of ownership (TCO) is not only the compute bill. It also includes people to build the model, labeled data, experiments, deployment, monitoring and retraining.
+**Amazon Comprehend** offers pre-trained NLP APIs, including sentiment. A call to `DetectSentiment` (or a batch sentiment job over files in S3) returns `POSITIVE`, `NEGATIVE`, `NEUTRAL` or `MIXED` with confidence scores. There is no infrastructure, you pay per unit of text analyzed, and the model is maintained by AWS.
+Example: a nightly batch job analyzes the day's product reviews and writes results to S3 for a dashboard; the only code is the API call and the report.
+For a team with no ML engineers and a tight budget, a managed AI service avoids nearly all the fixed costs of building a model.
+W: Amazon Comprehend sentiment API: pay-per-use, pre-trained sentiment analysis with no models, instances or ML staff to maintain, which gives the lowest TCO.
+X: A=GPU fleet to train a transformer: training from scratch needs large labeled data, expensive GPUs and expertise the team does not have, and still leaves hosting and maintenance.
+B=Hire ML engineers: salaries alone exceed the cost of a managed API for a common task like sentiment, and development time delays results.
+C=Custom SageMaker model with tuning: it still requires labeled data, ML skills, training and tuning jobs and a hosted endpoint; tuning improves accuracy but adds cost.
+T: For a standard NLP task with little budget and no ML team, a managed AI service like Comprehend beats building, tuning and hosting a custom model.
+
+@ Q000915 explain
+G: ## Sparse, high-cardinality features
+Click prediction data is often one-hot encoded: with 1 million users and 100,000 items, each row has two 1s among over a million columns. Almost all values are zero (sparse).
+## Factorization Machines (FM)
+SageMaker's built-in Factorization Machines algorithm extends a linear model with **pairwise interactions** between features. Instead of learning a separate weight for every user-item pair (most pairs are never seen), it learns a small latent vector for each feature and models an interaction as the dot product of two vectors.
+- A user and an item never seen together still get a sensible interaction score through their vectors.
+- It accepts sparse input in `recordIO-protobuf` format with float32 values, so memory and compute stay efficient.
+- It supports binary classification (click or no click) and regression.
+W: Factorization Machines: designed for sparse, high-dimensional data, it captures user-item interactions through latent factors, which is the standard approach for click-through prediction.
+X: B=Linear Learner: it can train on sparse data, but it learns one weight per feature and no interactions, so it cannot capture that a particular user likes a particular kind of item.
+C=Semantic Segmentation: it labels each pixel of an image; it has nothing to do with tabular click data.
+D=DeepAR: DeepAR forecasts time series; click probability for a user-ad pair is a classification problem, not a forecast.
+T: Sparse ID features with important pairwise interactions (clicks, recommendations) point to Factorization Machines; Linear Learner models only individual feature effects.
+
+@ Q000916 explain
+G: ## Three levels of computer vision output
+- **Image classification** answers "what is in this image?" with one or more labels for the whole image.
+- **Object detection** answers "where?" with a bounding box and a class for each object.
+- **Semantic segmentation** answers "which pixels?" by assigning a class to every pixel, producing a mask.
+SageMaker's built-in **Semantic Segmentation** algorithm (based on MXNet with fully convolutional network, PSP and DeepLabV3 architectures) trains on images paired with pixel-level annotation masks and outputs a mask per image.
+Example: for a scratched panel, a bounding box would also include lots of undamaged surface around a thin diagonal scratch, while a segmentation mask marks only the scratched pixels, so the exact defect shape and area can be measured.
+W: Semantic Segmentation: it classifies every pixel, so it outputs the exact boundary of each defect rather than a label or a box.
+X: B=Object Detection: it returns rectangular bounding boxes, which include surrounding pixels and cannot trace an irregular defect outline.
+C=BlazingText: BlazingText trains word embeddings and text classifiers; it does not process images.
+D=Image Classification: it only says whether the image contains a defect class, with no location at all.
+T: Pixel-level boundaries require semantic segmentation; detection gives boxes and classification gives only labels.
+
+@ Q000917 explain
+G: ## Forecasting many related series
+Classical methods fit one model per series. With 20,000 products, many with little history, that works poorly: a new product has too few points to learn from.
+## DeepAR
+SageMaker's built-in **DeepAR** is a recurrent neural network trained on all series together. It learns patterns shared across products (seasonality, promotions, trends), so a new product can borrow strength from similar items, especially when category features are supplied.
+It is **probabilistic**: instead of a single number it predicts a distribution, returned as quantiles such as `p10`, `p50` and `p90`.
+Example: for next week a product forecast might be p10 = 80, p50 = 120, p90 = 190 units. Planners can stock to the p90 for key items to avoid stockouts, or to p50 where overstock is costly.
+W: DeepAR with quantile forecasts: one global model learns across 20,000 related products, handles items with short history, and returns prediction intervals for inventory planning.
+X: B=K-means on sales: clustering groups similar products but produces no forecast and no uncertainty range.
+C=XGBoost point estimates: a single predicted value per product gives no prediction interval, which the planners explicitly need.
+D=Linear regression per product: 20,000 separate models cannot share information, so products with little history get unreliable fits, and it adds a large maintenance burden.
+T: Many related series, cold-start items and a need for intervals point to a global probabilistic forecaster like DeepAR, not per-item or point-estimate models.
+
+@ Q000918 explain
+G: ## Levels of control in SageMaker training
+SageMaker offers several ways to train, trading convenience for control:
+- **Built-in algorithms** (XGBoost, Linear Learner and so on): you set hyperparameters only; the code is fixed.
+- **Script mode**: you write your own training script and run it in an AWS-managed framework container (PyTorch, TensorFlow, scikit-learn), optionally adding pip packages.
+- **Bring your own container (BYOC)**: you build a Docker image with any code, libraries and system dependencies, push it to Amazon ECR, and reference it in the training job. SageMaker still provides the instances, data channels, logs and model artifact upload.
+Example: a research algorithm needing a custom CUDA extension and a specific library version is packaged in an image whose entry point starts training; SageMaker mounts the data under `/opt/ml/input/data` and uploads what is saved in `/opt/ml/model`.
+W: Bring your own Docker container: it gives full control over the training code and every dependency, so an algorithm that SageMaker does not offer can still run as a managed training job.
+X: A=JumpStart pretrained model: JumpStart offers existing pre-trained models; a novel research algorithm is not in its catalog.
+C=Linear Learner with tuned hyperparameters: changing hyperparameters does not change the algorithm; it remains a linear model, not the new research method.
+D=Autopilot: Autopilot chooses among its own set of algorithms and generates candidates automatically; it cannot run the team's custom algorithm and reduces control.
+T: When the algorithm itself is new, use custom code (a BYOC container for full dependency control) instead of options that only pick or tune existing algorithms.
+
+@ Q000919 explain
+G: ## Transfer learning for small image datasets
+Training an image classifier from scratch usually needs many thousands of labeled images. **Transfer learning** starts from a model already trained on millions of images and adapts it to new classes, so a few hundred examples can be enough.
+## Rekognition Custom Labels
+Amazon Rekognition Custom Labels applies this idea as a managed service:
+- Upload labeled images (for example `genuine` and `counterfeit` packaging) or label them in the console.
+- Start training; the service chooses the model and training settings automatically.
+- Review evaluation metrics such as precision and recall, then start the model and call `DetectCustomLabels`.
+Little ML knowledge is required, and the service is designed to work with small datasets, often tens to hundreds of images per label.
+W: Rekognition Custom Labels: it uses transfer learning to build a custom image classifier from a few hundred labeled images, with minimal ML expertise and development time.
+X: B=CNN from scratch in script mode: a network trained from random weights on a few hundred images will overfit, and it requires writing, tuning and hosting the model yourself.
+C=Amazon Comprehend: Comprehend analyzes text; it cannot classify images.
+D=Hand-engineered pixel features: designing features manually is slow, needs vision expertise and rarely captures the subtle print and texture differences that separate counterfeit packaging.
+T: Few labeled images plus little ML expertise points to a managed transfer-learning service like Rekognition Custom Labels, not training from scratch.
+
+@ Q000920 explain
+G: ## Multi-class vs multi-label classification
+- **Multi-class** classification picks exactly one class per image: the defect is either type 3 or type 7.
+- **Multi-label** classification gives an independent yes/no for every class, so one image can be tagged with type 3 and type 7 at the same time. Technically the output layer uses a sigmoid per class instead of one softmax over all classes, and training uses one label vector per image, for example `[0,0,1,0,0,0,1,0,0,0,0,0]`.
+Choosing the task by the question asked:
+- "Which defects are present?" is classification.
+- "Where are they?" is object detection (boxes).
+- "Which pixels?" is semantic segmentation.
+The SageMaker built-in image classification algorithm supports a multi-label mode, and Rekognition Custom Labels also supports multi-label image classification.
+W: Multi-label image classification: it reports, for each of the 12 defect types, whether it appears anywhere in the image, allows several at once and needs no location labels.
+X: A=Object detection: it requires bounding-box annotations for every defect and outputs locations, which the factory explicitly does not need; it costs more to label and train.
+B=Semantic segmentation: it needs pixel-level masks and predicts a class for every pixel, far more detail and labeling effort than a presence check needs.
+C=BlazingText on file names: file names say nothing about what is visible in the image, and BlazingText is a text algorithm that never sees pixels.
+T: "Which types are present, possibly several, without location" is multi-label classification; boxes and masks answer "where", which costs more to label.
+
+@ Q000921 explain
+G: ## Epochs, batches and iterations
+- An **epoch** is one full pass through the entire training dataset.
+- A **batch** (mini-batch) is the group of examples used to compute one gradient.
+- An **iteration** (step) is one weight update, made after each batch.
+So: updates per epoch = examples / batch size, and total updates = updates per epoch x epochs.
+Worked example with the numbers given:
+- 1,000,000 examples / 500 per batch = 2,000 batches, so 2,000 updates per epoch.
+- 2,000 updates x 10 epochs = 20,000 updates in total.
+The batch size therefore controls how many updates happen per epoch: halving it to 250 would double the updates to 40,000, with each update based on fewer examples.
+W: 20,000 updates; an epoch is one full pass: 1,000,000 / 500 = 2,000 updates per epoch, times 10 epochs gives 20,000, and an epoch means going through all training examples once.
+X: A=2,000 updates; epoch is a layer: 2,000 is the update count for one epoch only, not ten, and an epoch has nothing to do with network layers.
+B=10 updates; epoch is one update: that would be full-batch training; with mini-batches of 500 there are many updates inside each epoch.
+C=500 updates; epoch is one batch: 500 is the batch size, not the number of updates, and an epoch covers all 2,000 batches, not one.
+T: Updates = (examples / batch size) x epochs, and an epoch is one full pass over the data, not one batch or one update.
+
+@ Q000922 explain
+G: ## What uses GPU memory during training
+During training, GPU memory holds:
+- The model parameters, their gradients and the optimizer state (fixed for a given architecture).
+- The **activations** of every layer for every example in the batch, kept for backpropagation. This part grows roughly linearly with batch size.
+So if the model and data are fixed, batch size is the main lever. Example: if a batch of 64 images fails with `CUDA out of memory`, a batch of 16 needs roughly a quarter of the activation memory.
+Side effects to handle:
+- Smaller batches give noisier gradients; the learning rate is often lowered in proportion.
+- **Gradient accumulation** sums gradients over several small batches before one update, reproducing the effective batch size of the original.
+- Mixed precision (FP16/BF16) also cuts activation memory.
+W: Reduce the batch size: activation memory scales with the number of examples per batch, so a smaller batch lowers peak GPU memory without changing the model, the data or the instance.
+X: A=Add more convolutional layers: extra layers add parameters and activations, increasing memory use and making the error worse.
+B=Increase the learning rate: the learning rate changes the size of each weight update, not how much memory a step needs, so the error remains.
+C=Increase the number of epochs: epochs repeat the same steps more times; peak memory per step stays identical, and the job fails at the same point.
+T: Out-of-memory with a fixed model and data is solved by shrinking the batch (optionally with gradient accumulation), not by changing learning rate or epochs.
+
+@ Q000923 explain
+G: ## Reading the loss curves
+When training loss keeps falling but validation loss stops improving (or starts rising), the model is memorizing the training data instead of learning patterns that generalize: it is **overfitting**. Further epochs cost compute and make the model worse on new data.
+## Early stopping with checkpoints
+- **Early stopping** watches a validation metric and ends training when it has not improved for a set number of epochs (the patience), for example 5.
+- **Checkpointing** saves the model whenever the validation metric reaches a new best, so the saved model is from epoch 12, not the last epoch run.
+In SageMaker, frameworks such as Keras (`EarlyStopping`, `ModelCheckpoint`) and PyTorch Lightning provide callbacks, checkpoints can be written to S3, and Automatic Model Tuning can stop poorly performing training jobs early.
+Here, stopping around epoch 17 instead of 100 saves most of the compute cost.
+W: Early stopping with the best checkpoint: training ends once validation loss stops improving, which saves the remaining epochs' cost, and the checkpoint keeps the epoch-12 model with the best validation loss.
+X: A=More training epochs: the model already converged on validation data; more epochs only deepen overfitting and increase cost.
+B=Higher learning rate at the end: the issue is overfitting, not being stuck on a plateau; larger steps would destabilize training without improving generalization.
+D=Remove the validation set: without validation data there is no way to detect overfitting or choose the best epoch, so the problem becomes invisible rather than fixed.
+T: Diverging training and validation loss means overfitting: stop early and keep the best checkpoint instead of training longer.
+
+@ Q000924 explain
+G: ## Two ways to split training across GPUs
+- **Data parallelism**: every GPU holds a full copy of the model and processes a different slice of each batch; gradients are averaged across GPUs. It speeds up training but requires that the whole model fits on one GPU.
+- **Model parallelism**: the model itself is divided across GPUs. Pipeline parallelism places different layers on different GPUs; tensor parallelism splits individual large layers (matrix operations) across GPUs; sharded approaches split parameters, gradients and optimizer state.
+Example: a model whose parameters and optimizer state need about 300 GB cannot live on one 80 GB GPU even with a batch of one, but spread across eight GPUs each holds about an eighth.
+On SageMaker, the SageMaker model parallelism library and techniques such as fully sharded data parallel (FSDP) implement these splits.
+W: Model parallelism: splitting the model's layers or tensors across devices means no single GPU has to hold all the parameters, which is exactly the constraint described.
+X: A=Data parallelism: it replicates the full model on every device, so a model that does not fit on one GPU still does not fit on any of them.
+B=Fewer epochs: the number of epochs affects total training time, not how much memory the model needs at any moment.
+D=Larger batch on one GPU: a larger batch adds activation memory, making the out-of-memory problem worse; the model does not fit even at batch size one.
+T: If the model does not fit on one GPU, split the model (model parallelism or sharding); data parallelism only splits the data and still needs a full copy per device.
+
+@ Q000925 explain
+G: ## Dropout
+Dropout is a regularization technique for neural networks. During each training step, every neuron in a dropout layer is switched off with probability `p` (for example 0.5): its output is set to zero for that step.
+Why it helps:
+- The network cannot rely on a few specific neurons co-adapting, so it learns redundant, more general features.
+- It acts like training many smaller networks and averaging them.
+## Training vs inference
+At inference time dropout is **turned off**: all neurons are used so predictions are deterministic. Frameworks scale activations (typically during training, "inverted dropout") so the expected output is the same in both modes; in PyTorch, `model.train()` and `model.eval()` switch this behavior.
+A 99% vs 78% gap between training and validation accuracy is classic overfitting, which dropout aims to reduce.
+W: Dropout, active only during training: it randomly disables neurons during training steps to reduce overfitting and is switched off at inference so every neuron contributes.
+X: A=Data augmentation on weights: augmentation creates varied copies of the input data (flips, crops, noise); it is not applied to weights and does not disable neurons.
+C=Early stopping on neurons: early stopping ends training based on a validation metric; it works on the whole training run, not on individual neurons.
+D=Batch normalization during inference only: batch norm normalizes layer inputs using batch statistics during training and stored running statistics at inference; it is active in both phases and does not disable neurons.
+T: Randomly switching neurons off is dropout, used during training only; batch norm, augmentation and early stopping regularize in different ways.
+
+@ Q000926 explain
+G: ## L1 and L2 penalties
+Regularization adds a penalty on weight size to the loss, discouraging overly complex models.
+- **L1 (lasso)** adds `lambda x sum(|w|)`. Its pull toward zero has the same strength no matter how small a weight already is, so weights of weak features are pushed all the way to **exactly zero**. The result is a sparse model that effectively selects features.
+- **L2 (ridge, weight decay)** adds `lambda x sum(w^2)`. Its pull is proportional to the weight, so it becomes weaker as a weight gets small: weights shrink toward zero but usually stay nonzero.
+Example: with 200 features and a strong L1 penalty, a linear model might keep 25 nonzero weights, revealing which features matter; with L2 all 200 stay small but nonzero.
+Elastic net combines both. SageMaker Linear Learner exposes them as the `l1` and `wd` hyperparameters, and XGBoost as `alpha` and `lambda`.
+W: L1 regularization: its absolute-value penalty drives the weights of unhelpful features to exactly zero, which performs feature selection.
+X: A=Dropout: dropout randomly disables neurons during training; it does not drive specific weights to zero permanently or select features.
+B=Early stopping: it limits training time based on validation performance and does not force any weight to be exactly zero.
+D=L2 regularization: the squared penalty shrinks all weights toward small values but rarely makes them exactly zero, which is the behavior the team wants to avoid.
+T: L1 produces sparse weights (feature selection); L2 shrinks all weights but keeps them nonzero.
+
+@ Q000927 explain
+G: ## SageMaker Automatic Model Tuning (AMT)
+AMT runs many training jobs with different hyperparameter values and keeps the one with the best objective metric, such as `validation:auc` for XGBoost. You define ranges (for example `eta` 0.01-0.3, `max_depth` 3-10), the metric, and how many jobs to run in total and in parallel.
+## Search strategies
+- **Grid**: tries every combination of listed categorical values; exhaustive and quickly too expensive in large spaces.
+- **Random**: samples combinations independently; simple and parallel-friendly, but does not learn from results.
+- **Bayesian**: builds a probabilistic model of how hyperparameters relate to the metric from completed jobs and picks the next values most likely to improve it.
+- **Hyperband**: stops weak jobs early and gives more resources to promising ones.
+Bayesian search usually needs fewer jobs to reach a good result, at the cost of less parallelism because each choice depends on earlier results.
+W: AMT with Bayesian search: it uses results of completed training jobs to choose more promising hyperparameter values next, the "learns from previous results" behavior described.
+X: A=Autopilot with random selection: Autopilot is AutoML that builds and chooses whole candidate pipelines, and random selection by definition ignores what earlier jobs revealed.
+B=SageMaker Debugger: Debugger captures tensors and system metrics during training to find problems such as vanishing gradients; it does not search hyperparameters.
+D=AMT with grid search: grid search tests every combination exhaustively without learning from earlier jobs, which is costly for a large space.
+T: For an efficient search that learns from earlier trials, use Bayesian strategy in Automatic Model Tuning; grid and random search do not adapt.

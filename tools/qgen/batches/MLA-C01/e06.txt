@@ -1,0 +1,352 @@
+# MLA-C01 detailed explanations, e06 (explanation-only rewrites; letters are the published ones)
+
+@ Q000978 explain
+G: ## Two common Git branching models
+- **Gitflow** keeps a long-lived `main` (what is released) and `develop` (integration) branch. Features branch off `develop`; when a release is due, a `release/x.y` branch is cut for stabilization (bug fixes only, no new features), then merged to `main` and tagged. Urgent production fixes use `hotfix/*` branches cut from `main`.
+- **GitHub Flow** has one long-lived branch, `main`, which is always deployable. Each change is a short-lived branch, reviewed through a pull request, merged, and deployed right away.
+## Matching model to release cadence
+A team that ships a model every quarter, freezes it for a stabilization period and patches production separately needs the release and hotfix branches Gitflow provides. A team that deploys many times a week gains nothing from those extra branches; they only slow merges and create long-running divergence.
+Example: the quarterly team cuts `release/2026-Q4`, retrains and validates on it for two weeks while new feature work continues on `develop`.
+W: Gitflow for quarterly, GitHub Flow for continuous: Gitflow's release branches give the quarterly team a stabilization window and hotfix branches for production fixes, while GitHub Flow's short-lived branches merged straight to an always-deployable `main` fit continuous delivery.
+X: A=Gitflow for both: both models use pull requests, so that is not a reason to choose Gitflow; its long-lived `develop` and release branches add ceremony and merge delay that a continuously deploying team does not need.
+B=Swapped assignment: GitHub Flow has no release or hotfix branches for a stabilization period, and Gitflow's release cycle slows a team that wants every merged change deployed.
+C=Commit directly to main: without branches there is no pull-request review, no isolation of unfinished work and no place to stabilize a release, which fails both teams.
+T: Scheduled releases with stabilization and hotfixes suit Gitflow; continuous deployment suits GitHub Flow's short branches into an always-deployable main.
+
+@ Q000979 explain
+G: ## Event-driven pipeline starts
+Amazon S3 can send its bucket events to Amazon EventBridge once **EventBridge notifications** are turned on for the bucket. Each new object then produces an `Object Created` event that includes the bucket name and object key.
+An EventBridge rule matches those events with an event pattern, for example:
+- `source` = `aws.s3`, `detail-type` = `Object Created`
+- `detail.bucket.name` = `ml-data` and `detail.object.key` with prefix `labeled/`
+A SageMaker pipeline can be the rule's target directly, and the rule can pass pipeline parameters (such as the S3 URI of the new data). Every upload under `labeled/` then calls `StartPipelineExecution` with no person involved. The rule's IAM role needs permission to start that pipeline.
+Tip: if many files arrive per batch, upload a marker file (such as `_SUCCESS` or `manifest.json`) last and match only that key, so one batch starts one execution rather than one per file.
+W: EventBridge rule on S3 object-created: S3 emits an event for each new object, the rule filters by bucket and prefix, and its SageMaker pipeline target starts an execution automatically.
+X: A=Manually run notebook: a person has to notice the upload and run it, which is exactly the manual intervention the team wants to remove.
+C=Billing alarm: a billing alarm fires on estimated charges, which have nothing to do with the arrival of labeled data, so it would start the pipeline at the wrong times or never.
+D=IAM policy as trigger: IAM policies only allow or deny API calls; they never run anything, and a permission change is not a data-arrival event.
+T: Data-arrival triggers belong in an EventBridge rule on S3 Object Created events targeting the pipeline; IAM and billing tools do not start workflows.
+
+@ Q000980 explain
+G: ## What SageMaker Pipelines does
+SageMaker Pipelines is the SageMaker service for defining an ML workflow as code (usually with the SageMaker Python SDK). The pipeline is a directed acyclic graph of steps, for example:
+- `ProcessingStep` for cleaning and feature engineering
+- `TrainingStep` or `TuningStep` for training
+- a processing step that writes evaluation metrics
+- `ConditionStep` that checks a metric (such as AUC >= 0.85) and only then registers the model with `ModelStep` into the Model Registry
+## Why it is reproducible
+The definition is stored as JSON and versioned with your code. **Parameters** let you rerun it with a different data location or instance type. **Step caching** skips a step whose inputs and configuration have not changed, reusing the previous output. Each execution records its artifacts, so **lineage** shows which data and code produced each model.
+W: SageMaker Pipelines: it defines processing, training, evaluation and conditional registration as a coded DAG with parameters, step caching and lineage tracking, which is exactly the list of requirements.
+X: A=Notebooks run by hand: cells run in whatever order a person chooses, with no built-in step caching, conditions or execution history, so runs are hard to reproduce or audit.
+C=Ground Truth: Ground Truth creates labeled datasets with human or automated labeling; it does not orchestrate processing, training and registration steps.
+D=Feature Store: Feature Store stores and serves features for training and inference; it can feed a pipeline but does not define or run workflow steps.
+T: Workflow as code with conditions, caching and lineage is SageMaker Pipelines; Ground Truth labels data and Feature Store stores features.
+
+@ Q000981 explain
+G: ## Test levels in an ML CI/CD pipeline
+- A **unit test** checks one small piece of code in isolation, with its dependencies replaced by fakes. Example: call a `scale_features()` function on a three-row DataFrame and assert the output columns and values. It runs in seconds inside CodeBuild and needs no AWS resources.
+- An **integration test** checks that several pieces work together, often against real resources. Example: after deploying to a staging endpoint, send sample records through the preprocessing code and the endpoint and assert that the response has the expected format and plausible predictions.
+## Why both are needed
+Unit tests catch logic bugs early and cheaply. Integration tests catch problems that only appear at the boundaries, such as a feature order the model does not expect, a wrong content type or missing permissions. A typical pipeline runs unit tests on every commit and integration tests after the staging deployment, before promotion.
+W: One component versus components together: a unit test isolates a single function or module, while an integration test verifies that multiple components (code, model, endpoint, data format) work correctly when combined.
+X: A=Same tests at different stages: they differ in scope, not just timing; a unit test isolates one piece, while an integration test exercises the connections between pieces.
+B=Unit tests need an endpoint: the reverse is true; unit tests should not depend on deployed infrastructure, and integration tests are the ones that commonly call a staging endpoint.
+C=Split by infrastructure versus model code: both kinds of test apply to any code; model preprocessing functions have unit tests, and infrastructure is also integration tested.
+T: Unit tests check one component in isolation; integration tests check that components work together, often against a staging endpoint.
+
+@ Q000982 explain
+G: ## Training-serving skew
+A model learns from features in a specific shape: a set of columns, in a fixed order, with specific encodings and types. At inference time the endpoint must receive exactly the same shape. When the preprocessing used for training differs from the code that builds inference requests, the result is **training-serving skew**.
+Example: training preprocessing one-hot encodes `region` into 5 columns and drops `customer_id`, but the integration test's input builder sends raw `region` strings and keeps `customer_id`. The model container then rejects the request or reports a feature count or schema mismatch.
+## Why unit tests miss it
+Unit tests check each preprocessing function alone, so each passes. Only the integration test sends real records end to end to the deployed endpoint, which is where two different feature pipelines meet.
+The usual fix is to share one preprocessing module (or a SageMaker inference pipeline model, or Feature Store features) between training and inference.
+W: Mismatched preprocessing: a schema mismatch on input features at the endpoint means the records being sent do not match what the model was trained on, which comes from training and inference preprocessing diverging.
+X: B=CodePipeline cannot call CodeBuild: a permissions error would stop the pipeline at the build or test action with an access-denied error, before any endpoint is invoked, not produce a feature schema mismatch.
+C=Undersized training instance: a too-small instance causes slow training or out-of-memory failures during training; it does not change the input schema the deployed model expects.
+D=Auto scaling misconfigured: scaling changes the number of instances serving requests and could cause throttling or latency, but not a schema mismatch on the input features.
+T: When a model rejects inputs with a schema mismatch, suspect preprocessing that differs between training and inference, not permissions, instance size or scaling.
+
+@ Q000983 explain
+G: ## Two kinds of retraining triggers
+- **Scheduled**: an EventBridge schedule (EventBridge Scheduler or a scheduled rule with `cron(0 3 ? * MON *)` or `rate(7 days)`) starts the retraining pipeline every week.
+- **Event-driven**: SageMaker Model Monitor can publish its results as CloudWatch metrics. A CloudWatch alarm on a drift metric changes to `ALARM` when drift is significant, and each alarm state change is sent to EventBridge. A rule matching `CloudWatch Alarm State Change` for that alarm starts the same pipeline out of cycle.
+Both rules can target the SageMaker pipeline directly and pass parameters, for example `trigger=schedule` or `trigger=drift`, so each execution records why it ran.
+Example: weekly retraining runs every Monday; on a Thursday Model Monitor detects a large shift in `transaction_amount`, the alarm fires and a retraining run starts within minutes.
+W: Weekly EventBridge schedule plus drift-alarm rule: a scheduled rule handles routine weekly retraining, and a second rule on the Model Monitor drift alarm's state change starts an extra run whenever drift is detected, all without manual steps.
+X: A=Run-once CloudFormation template: a stack deployment creates resources once; it neither repeats on a schedule nor reacts to drift alarms.
+C=IAM policy retraining on sign-in: IAM policies only permit or deny actions and cannot start jobs, and user sign-ins are unrelated to model drift.
+D=Manual weekly start from Studio: it depends on someone remembering every week and gives no automatic response to drift, which fails both requirements.
+T: Combine an EventBridge schedule for routine retraining with an EventBridge rule on a drift alarm for out-of-cycle retraining.
+
+@ Q000984 explain
+G: ## Model traceability
+Auditors want to follow a production model back to its sources: the **code** (Git commit), the **data** (dataset version or S3 object version) and the **process** (pipeline execution). This only works if those identifiers are recorded on the model version itself when it is created.
+## How to record it in SageMaker
+- Register each model as a **model package** in the SageMaker Model Registry; each registration gets a new version number.
+- Attach the Git commit hash, the dataset version and the pipeline execution ARN as tags or `CustomerMetadataProperties` on the model package.
+- SageMaker Pipelines and ML Lineage Tracking also link the execution, its input datasets and the resulting model artifacts.
+Example: model package version 14 carries `git_commit=3f9c2ab`, `data_version=2026-09-01` and the execution ARN of the run that trained it. The deployed endpoint points to version 14, so the whole chain can be traced.
+W: Tag the model package with commit and run IDs: metadata stored on the registered model version ties the exact code, data and pipeline run to the model that is deployed, and it stays with that version permanently.
+X: A=One overwritten S3 key: every new model replaces the previous artifact, so history is lost and there is nothing to link to a commit or run.
+C=Skip version control: SageMaker records pipeline lineage, but it cannot know the Git commit or dataset version unless you track code in Git and pass those identifiers in.
+D=Shared spreadsheet: it is updated by hand, is disconnected from the actual artifacts and easily goes stale or wrong, which does not satisfy an audit.
+T: Traceability comes from recording commit, data version and pipeline run IDs on the registered model version, not from overwritten files or manual spreadsheets.
+
+@ Q000985 explain
+G: ## Data drift versus concept drift
+A model learns a mapping from inputs X to a target y.
+- **Data drift** (covariate shift): the distribution of X changes, for example customers suddenly come from a new region. Input distribution checks detect it without labels.
+- **Concept drift**: the relationship between X and y changes while X can look the same. The same inputs now lead to different outcomes.
+Example: a competitor enters the market. Store traffic, prices and seasonality features still look normal, but for the same inputs actual demand is lower because some customers go to the competitor. The model keeps predicting the old demand.
+## How to detect it
+Because inputs look unchanged, input monitoring stays quiet. The problem only appears when predictions are compared with real outcomes (ground truth). SageMaker Model Monitor **model quality monitoring** merges captured predictions with ground truth labels and tracks metrics such as MAE or RMSE for regression, alerting when they degrade.
+W: Concept drift detected with model quality monitoring: the input distributions are stable but accuracy falls, which means the input-to-target relationship changed; only comparing predictions with ground truth labels can reveal that.
+X: A=Data drift via input checks: data drift means the input distributions change, but the stem says they look unchanged, so input distribution checks would not flag anything.
+B=Latency drift: adding instances addresses slow responses, not a gradual loss of accuracy caused by a changed market.
+D=Hardware drift: instance type affects speed and cost; the model computes the same predictions on any hardware, so changing it cannot restore accuracy.
+T: Same inputs, different outcomes is concept drift, caught by model quality monitoring against ground truth, not by input distribution checks.
+
+@ Q000986 explain
+G: ## Model Monitor data quality monitoring
+SageMaker Model Monitor watches a deployed endpoint on a schedule. **Data quality monitoring** focuses on the input features.
+- **Baseline**: a baselining job runs on the training dataset and writes `statistics.json` (per-feature distributions, missing values) and `constraints.json` (expected types, completeness and drift thresholds).
+- **Data capture**: the endpoint saves a sample of requests and responses to S3.
+- **Monitoring schedule**: for example hourly, a job compares the captured inputs with the baseline and writes a violations report (such as `baseline_drift_check` when a feature's distribution distance exceeds its threshold).
+- **Alerting**: with CloudWatch metrics enabled, the job publishes per-feature metrics, and CloudWatch alarms on them notify the team.
+No ground truth labels are needed, because only inputs are compared.
+W: Model Monitor data quality monitoring: it compares live input feature distributions from data capture with a training baseline, reports drift violations, and publishes metrics that CloudWatch alarms can watch.
+X: B=Autopilot: Autopilot is AutoML that builds and tunes candidate models from a tabular dataset; it does not monitor a deployed endpoint's inputs.
+C=Ground Truth: Ground Truth produces labeled data with human or automated labeling; it does not compare production input distributions with a baseline.
+D=Debugger: Debugger inspects tensors and system resources during training jobs (for example vanishing gradients); it does not run on live endpoint traffic.
+T: Input feature drift at an endpoint is detected by Model Monitor data quality monitoring against a training baseline, alarmed through CloudWatch.
+
+@ Q000987 explain
+G: ## What model quality monitoring needs
+Model quality monitoring measures how good predictions are: accuracy, precision, recall or F1 for classification, MAE or RMSE for regression. To compute any of these, each prediction must be paired with the true outcome.
+The flow is:
+- **Data capture** stores each request and prediction with an event or inference ID.
+- **Ground truth ingestion**: your application later uploads the real labels to an S3 location, each record carrying the same ID.
+- The scheduled job **merges** predictions and labels by ID, then computes the metrics and compares them with the baseline constraints.
+Example: a churn model predicts `churn=1` for customer 123 on 1 September. On 30 September your job writes `{"groundTruthData": {"data": "0"}, "eventMetadata": {"eventId": "abc-123"}}` to the ground truth S3 prefix. Without such uploads, the merge finds no matched pairs and the job reports it has nothing to evaluate.
+W: Ground truth labels not merged: data capture supplies predictions, but without labels uploaded to the ground truth S3 location with matching IDs, the job cannot compute accuracy or other quality metrics.
+X: A=Short CloudWatch Logs retention: Model Monitor reads captured data and labels from S3, not from CloudWatch Logs, so log retention has no effect on whether metrics can be computed.
+B=Endpoint instance too small: an undersized endpoint shows latency or errors, and captured data exists here, so the endpoint is clearly serving; the missing piece is the labels.
+C=Invalid cron expression: an invalid schedule would be rejected when created or would never run; here the executions do run and report insufficient data.
+T: Model quality monitoring cannot compute accuracy without ground truth labels merged with captured predictions; data capture alone is not enough.
+
+@ Q000988 explain
+G: ## Two monitors, two inputs
+- **Data quality monitoring** looks only at what the endpoint receives. It compares captured input features with a training baseline (distributions, missing values, types). It needs data capture and a baseline, but no labels, so it can run hourly from day one.
+- **Model quality monitoring** judges predictions against reality. It merges captured predictions with ground truth labels that you upload later, then computes metrics such as accuracy or RMSE.
+Both are defined as monitoring schedules and run automatically.
+## When labels arrive late
+If ground truth arrives three weeks after inference, model quality metrics for a given day can only be computed three weeks later. Data quality monitoring gives an early warning in the meantime: if inputs shift, you learn about it immediately, even before accuracy can be measured.
+A common design runs both: data quality hourly for fast signals, model quality daily over whatever labeled records have arrived.
+W: Data quality now, model quality after labels: data quality monitoring compares inputs with the baseline immediately, while model quality monitoring must wait until the delayed ground truth labels are ingested and merged.
+X: B=Reversed timing: model quality is the one that needs labels, so it cannot run on this data until three weeks later; data quality needs no labels.
+C=Both need labels: only model quality compares predictions with ground truth; data quality compares inputs with a statistical baseline.
+D=Neither can be scheduled: both are configured as monitoring schedules (for example hourly or daily cron expressions) and run automatically.
+T: Data quality monitoring works on inputs right away; model quality monitoring waits for ground truth, so delayed labels delay only model quality metrics.
+
+@ Q000989 explain
+G: ## Endpoint metrics in CloudWatch
+SageMaker endpoints publish metrics to CloudWatch in the `AWS/SageMaker` namespace, per endpoint and variant, including:
+- `ModelLatency`: time the model container takes to respond, in microseconds.
+- `Invocations`, `Invocation4XXErrors`, `Invocation5XXErrors`.
+## Two types of alarm
+- A **static threshold alarm** fits a known limit. Use the `p99` statistic on `ModelLatency`, a 1-minute period, threshold `500000` microseconds (500 ms) and 5 of 5 datapoints breaching, so it fires only when p99 stays high for 5 minutes.
+- An **anomaly detection alarm** fits "above normal". CloudWatch trains a model on the metric's history, builds an expected band that follows daily and weekly patterns, and alarms when `Invocation5XXErrors` goes above the band.
+Both alarms can notify an SNS topic.
+W: CloudWatch alarms including anomaly detection: a static alarm on p99 `ModelLatency` covers the fixed 500 ms for 5 minutes rule, and an anomaly detection alarm on invocation errors catches spikes relative to normal patterns.
+X: B=Macie findings: Macie discovers sensitive data such as PII in S3 buckets; it does not track endpoint latency or error rates.
+C=AWS Config rules: Config evaluates whether resource configurations comply with rules; it does not watch runtime performance metrics.
+D=Trusted Advisor checks: Trusted Advisor gives account-level best-practice recommendations for cost, security and limits; it does not alarm on per-minute endpoint latency.
+T: Runtime endpoint alerts use CloudWatch alarms: static thresholds for known limits and anomaly detection for deviations from normal.
+
+@ Q000990 explain
+G: ## CloudWatch anomaly detection
+With a static alarm you pick one number, for example alert when `InvocationsPerInstance` drops below 100. A metric with a daily or weekly rhythm makes that hard: 100 might be normal at 3 AM but a serious problem at noon.
+**Anomaly detection** applies machine learning to the metric's history (up to two weeks) and builds an expected range, called a band, that follows hourly, daily and weekly patterns. You set a band width in standard deviations (for example 2) and create an alarm that fires when the metric goes above the band, below it, or outside it on either side.
+Example: invocations normally peak at 5,000 per instance at 10 AM and fall to 300 overnight. An anomaly detection alarm stays quiet at 300 at 2 AM but alarms if the count is 300 at 10 AM.
+The model keeps updating as new data arrives, and you can exclude periods (such as a known outage) from training.
+W: Anomaly detection alarm: it learns the metric's seasonal pattern automatically and alarms only when the value falls outside the expected band, with no hand-set static threshold.
+X: A=Logs Insights queries: Logs Insights runs interactive queries over log events; it does not learn a metric's normal pattern or alarm on it.
+B=Static threshold alarm: a single fixed value cannot follow seasonal highs and lows, so it either alarms falsely at quiet times or misses drops at busy times.
+C=Contributor Insights: it analyzes log data to show top contributors (such as the busiest IP addresses); it does not model a metric's expected range over time.
+T: For seasonal metrics, use a CloudWatch anomaly detection alarm that learns the expected band instead of a fixed threshold.
+
+@ Q000991 explain
+G: ## Bias drift monitoring
+SageMaker Clarify measures bias with respect to a **facet**, a sensitive attribute such as `age_group`. Clarify integrates with SageMaker Model Monitor as a **model bias monitor**:
+- A baselining job computes bias metrics on the training or validation data, such as DPPL (difference in positive proportions in predicted labels) between facet groups, and suggests constraints.
+- On a schedule, the monitor runs on data captured from the endpoint (with ground truth merged in, for the label-based metrics) and recomputes the same bias metrics.
+- If a metric moves outside its allowed range, it reports a violation and publishes CloudWatch metrics you can alarm on.
+Example: at training, approval rates for applicants under 25 and over 25 differ by 0.03. After the applicant mix shifts in production, the gap grows to 0.15 and the monitor flags bias drift.
+W: Clarify bias drift with Model Monitor: it computes bias metrics for the sensitive facet on production data and compares them with the training baseline, which directly detects changes that introduce bias drift.
+X: A=DataBrew data quality rules: DataBrew validates datasets during data preparation (nulls, value ranges); it does not monitor live endpoint traffic or compute bias metrics for facet groups.
+B=Model Registry approval: approval gates control which model version may be deployed; they do nothing to watch data after deployment.
+C=Neo compilation: Neo optimizes a trained model to run faster on target hardware; it has no view of production data or fairness.
+T: Changes in bias for a sensitive group in production are caught by Clarify bias drift monitoring scheduled through Model Monitor.
+
+@ Q000992 explain
+G: ## Two different drift signals
+- **Data quality drift** (Model Monitor data quality): compares the values of each input feature in production with the training baseline, for example the average `income` rises or a category appears more often.
+- **Feature attribution drift** (Clarify with Model Monitor): compares how much each feature influences predictions. Clarify computes SHAP values, which assign each feature a share of a prediction. The monitor compares the ranking of feature importance in production with the baseline ranking, using a score called NDCG.
+## Why both matter
+They can disagree. Feature values can stay stable while the model starts relying on different features, or a feature can shift in value without changing its influence.
+Example: at training, `payment_history` was the most important feature for a credit model. In production, `zip_code` becomes the top contributor. Input distributions look normal, but attribution drift reveals the model is now leaning on a proxy feature.
+Neither monitor requires ground truth labels; both use captured inference data.
+W: Attribution drift tracks influence, data drift tracks values: attribution drift monitors changes in SHAP-based feature importance, while data quality drift monitors changes in the input feature distributions themselves.
+X: B=Same capability: they measure different things (feature influence versus feature values) and are configured as separate monitor types with separate baselines.
+C=Reversed data needs: data quality monitoring needs no ground truth, and attribution drift monitoring runs on captured inference data, which it needs to compute SHAP values.
+D=Only linear regression: Clarify's SHAP (Kernel SHAP) is model-agnostic and works with classification and regression models of any type, including tree ensembles and neural networks.
+T: Feature attribution drift watches changes in feature importance (SHAP); data quality drift watches changes in feature values.
+
+@ Q000993 explain
+G: ## Production variants and weighted traffic
+A SageMaker endpoint can host several **production variants**, each a model on its own instances. Each variant has a weight, and SageMaker splits incoming requests in proportion to the weights. Weights 9 and 1 (or 0.9 and 0.1) send about 90% of traffic to the current model and 10% to the challenger.
+Key properties:
+- Both variants return real responses to real users, so the business effects of the challenger (conversion, fraud caught, revenue) can be measured.
+- CloudWatch reports metrics per variant, such as `Invocations` and `ModelLatency`.
+- You can shift weights gradually with `UpdateEndpointWeightsAndCapacities` without redeploying, and move to 100% once the challenger wins.
+- A caller can target a variant with the `TargetVariant` parameter when needed.
+Example: a recommendation model runs at 90/10 for two weeks; the challenger's click-through rate is 4% higher, so weights move to 0/100.
+W: Two production variants weighted 90/10: live users receive the challenger's predictions on 10% of traffic, so real business outcomes can be compared before switching, all managed by the endpoint.
+X: B=Batch Transform on old data: offline scoring measures prediction accuracy on past data but cannot show how users or the business react to the challenger's predictions.
+C=Shadow variant: a shadow receives copies of requests but its responses are never returned to users, so it cannot affect or measure business outcomes.
+D=Second endpoint chosen by clients: splitting traffic in client code is inconsistent across clients, hard to change and outside SageMaker's per-variant metrics and weight controls.
+T: To measure business impact on a slice of live traffic, use weighted production variants (A/B testing); shadow tests never show results to users.
+
+@ Q000994 explain
+G: ## Shadow testing versus A/B testing
+- **A/B testing** with production variants sends a share of real requests to the challenger, and those users actually receive the challenger's predictions. It measures business impact, but it also exposes customers to the challenger's mistakes.
+- **Shadow testing** (SageMaker shadow tests or a shadow variant) copies live requests to the challenger. Only the production model's response is returned; the shadow's responses are logged for comparison.
+## Why shadow fits fraud detection
+A new fraud model might block legitimate payments or miss real fraud. In shadow mode it sees the same real transactions as production, and you can compare its decisions, latency and errors with production on real data, but no customer is affected.
+Example: for two weeks the shadow model scores every transaction; analysts find it would have caught 12% more fraud with a similar false-positive rate, and only then is it promoted.
+W: Real traffic, no customer impact: shadow testing evaluates the challenger on actual production requests while only the production model's responses reach customers, which is the deciding advantage for a risky fraud model.
+X: A=Faster significance: shadow testing does not make statistics converge faster, and because its predictions never reach users it cannot measure outcome differences at all.
+B=Retrains the champion: shadow testing only invokes the challenger and records its outputs; it does not retrain or modify the production model.
+D=Measure business KPIs: business effects require users to receive the challenger's predictions, which is what A/B testing does and shadow testing avoids, so this favors A/B testing.
+T: Shadow testing validates a challenger on real traffic without customer impact; A/B testing is for measuring business outcomes.
+
+@ Q000995 explain
+G: ## How the baseline drives violations
+Model Monitor judges production data against a **baseline**: `statistics.json` (distributions of each feature) and `constraints.json` (rules such as data types, completeness and drift thresholds). The baseline is suggested by a baselining job, usually `suggest_baseline()` run on a dataset.
+If that dataset is tiny or unrepresentative, the baseline describes a narrow slice of reality. Normal production traffic then looks like drift on every run.
+Example: the baseline came from 500 records from one week in July. In production, `order_value` covers a much wider range and categories that never appeared in the sample, so every hourly run reports `baseline_drift_check` and categorical violations.
+## Fix
+- Rerun baselining on the full, representative training dataset (the data the model actually learned from).
+- Review the suggested constraints and adjust thresholds or completeness requirements that are too strict.
+- Update the monitoring schedule to use the new baseline files.
+W: Re-baseline on representative data: violations are only meaningful when the baseline reflects normal data, so regenerating statistics and constraints from the full training set stops the false alarms while keeping real drift detection.
+X: B=Disable monitoring: the model has not changed and retraining would not fix a bad baseline, while turning monitoring off leaves the endpoint unmonitored in the meantime.
+C=Delete all constraints: with no constraints nothing is checked, so real drift would go unnoticed along with the false alarms.
+D=Run every minute: running more often only produces the same false violations more often; it does not change what they are compared against.
+T: Constant violations on normal traffic point to a bad baseline; rebuild it from representative training data rather than silencing the monitor.
+
+@ Q000996 explain
+G: ## Data capture: the input of every monitor
+Model Monitor does not intercept traffic itself. It analyzes records that the endpoint has written to S3 through **data capture**, which is configured in the endpoint configuration (`DataCaptureConfig`):
+- `EnableCapture`: turn capture on.
+- `InitialSamplingPercentage`: for example 20 to capture one request in five.
+- `CaptureOptions`: capture `Input`, `Output` or both.
+- `DestinationS3Uri`: where the JSON Lines capture files are written, organized by endpoint, variant and hour.
+Each monitoring execution reads the capture files for its time window from that location. If capture is off, or points to a different S3 path than the one the monitor uses, the job finds no data and fails.
+Because an endpoint configuration cannot be edited in place, you enable capture by creating a new endpoint configuration with `DataCaptureConfig` and updating the endpoint to use it.
+W: Data capture not enabled: without `DataCaptureConfig` in the endpoint configuration, no requests or responses are written to S3, so the monitoring job finds no captured data for its window.
+X: A=Wrong training IAM role: the training job's role only mattered while training; it has no effect on whether a running endpoint writes capture files.
+C=Invalid cron expression: an invalid schedule would be rejected or never start; here executions do run and fail specifically because no captured data exists.
+D=Model not registered: the Model Registry manages versions and approvals; an endpoint can serve and capture data from a model that was never registered.
+T: Model Monitor analyzes only what data capture writes to S3; no capture configuration means no data to monitor.
+
+@ Q000997 explain
+G: ## Pipeline events in EventBridge
+SageMaker Pipelines sends events to Amazon EventBridge automatically, with no extra setup:
+- `SageMaker Model Building Pipeline Execution Status Change`: the whole execution moves between states such as `Executing`, `Succeeded`, `Failed` or `Stopped`.
+- `SageMaker Model Building Pipeline Execution Step Status Change`: an individual step changes state, including `Failed`.
+An EventBridge rule matches these events (for example `source` = `aws.sagemaker` and the two detail types above, optionally filtered to `Failed`) and sends them to an Amazon SNS topic. SNS then delivers email, SMS or a message to a chat integration. An input transformer can turn the event into a readable message with the pipeline name, step name and failure reason.
+Example: the nightly scoring pipeline's processing step fails at 02:14; within seconds the on-call engineer receives an email naming the failed step.
+W: EventBridge on pipeline status changes to SNS: SageMaker emits execution and step status change events, an EventBridge rule filters them, and SNS delivers the notification automatically.
+X: A=Trusted Advisor checks: Trusted Advisor gives periodic best-practice recommendations for the account; it does not observe individual pipeline executions or step failures.
+B=Cost anomaly detection: Cost Explorer anomaly detection flags unusual spending, often a day or more later, and cannot tell that a particular step failed or a status changed.
+C=Macie alerts: Macie finds sensitive data such as PII in S3; it has no knowledge of pipeline execution states.
+T: Pipeline and step status changes go to EventBridge, where a rule routes them to SNS for notifications.
+
+@ Q000998 explain
+G: ## Schema checks in data quality monitoring
+When Model Monitor builds a data quality baseline, it records the **schema** of the inputs: the list of features, their names and types. Each run then checks captured data against it with several checks, including:
+- `missing_column_check`: a column in the baseline is absent from captured data.
+- `extra_column_check`: captured data has a column the baseline does not have.
+- `data_type_check`, `completeness_check`, `baseline_drift_check` for types, nulls and distributions.
+Missing and extra column violations on every run mean the structure of the captured records differs from the baseline.
+Example: a client application added a new field `device_type` and renamed `acct_age` to `account_age` in requests. The model container ignores extras or handles them, so predictions still look fine, but the monitor sees one extra and one missing column each time. Another cause is a baseline built from data with different columns (such as including the label) than the requests actually sent.
+W: Schema mismatch with the baseline: missing and extra column violations mean the captured inputs no longer have the same columns as the baseline, typically because the request format or the baseline dataset changed.
+X: B=Logs Insights syntax error: data quality monitoring reads captured data from S3 and does not use CloudWatch Logs Insights queries, so a query error cannot produce column violations.
+C=Missing S3 permission: if the monitoring job could not read S3, it would fail with an access error rather than complete and report column-level violations.
+D=Under-provisioned endpoint: dropping requests reduces the amount of captured data but does not add or remove columns in the records that are captured.
+T: Missing and extra column violations mean captured input schema differs from the baseline, not a capacity or permission problem.
+
+@ Q000999 explain
+G: ## Continuous fairness monitoring
+In a clinical setting, a model might start predicting a positive outcome (such as "needs follow-up") at very different rates for different demographic groups as the patient population changes. That needs to be watched continuously, not audited once.
+SageMaker Clarify integrates with Model Monitor for **bias drift monitoring**:
+- A baseline computes bias metrics for the facet (for example `ethnicity` or `age_group`), such as DPPL, the difference in positive prediction rates between groups, and sets allowed ranges.
+- A monitoring schedule (for example daily) recomputes the metrics on captured endpoint data, merged with ground truth for the label-based metrics.
+- Violations are reported to S3, and metrics are published to CloudWatch, where alarms notify the team.
+Example: at deployment, positive prediction rates for two groups differ by 0.02; three months later the gap is 0.11, the bias metric crosses its threshold and an alarm fires.
+W: Clarify bias drift monitoring with Model Monitor: it recomputes group bias metrics such as the difference in positive prediction rates on production data on a schedule and raises alerts when they exceed the baseline limits.
+X: A=Monthly JumpStart model evaluation: JumpStart evaluations assess foundation models on benchmark datasets; a monthly run is neither continuous nor based on this model's production predictions.
+B=Feature Store online queries: the online store serves feature values with low latency; it does not compute disparities in predictions or raise alerts.
+D=Ground Truth Plus reviews: Ground Truth Plus is a managed labeling service that produces training labels; it does not measure bias in deployed model predictions.
+T: Growing disparity in production predictions between groups is caught continuously by Clarify bias drift monitoring through Model Monitor, with CloudWatch alarms.
+
+@ Q001000 explain
+G: ## Breaking down endpoint latency
+When a client calls `InvokeEndpoint`, the time spent on the SageMaker side has two parts, each published to CloudWatch in microseconds:
+- `ModelLatency`: time inside your model container, from when SageMaker sends the request to when the container responds (preprocessing plus inference).
+- `OverheadLatency`: time SageMaker adds on top, such as routing, authentication and request handling.
+Endpoint instance metrics (in the `/aws/sagemaker/Endpoints` namespace) show saturation: `CPUUtilization`, `MemoryUtilization`, `GPUUtilization`, `GPUMemoryUtilization`, `DiskUtilization`.
+## Reading them together
+- High `ModelLatency` with high CPU or GPU utilization: the instances are saturated; scale out or use a larger instance.
+- High `ModelLatency` with low utilization: the model code is slow; optimize it.
+- High `OverheadLatency`: look at request size, payload handling or the network path.
+- Both normal: the delay is on the client or network side.
+W: ModelLatency, OverheadLatency and utilization: the two latency metrics separate container compute time from SageMaker overhead, and utilization metrics show whether the instances are saturated.
+X: A=Invocations and TrainingJobStatus: invocation counts show traffic volume but not where time is spent, and training job status is about training, not endpoint serving.
+C=NumberOfHumanWorkersActivated: this relates to human review workflows, not to endpoint response time or instance saturation.
+D=S3 artifact size: the model artifact is loaded when an instance starts, so its size does not explain per-request latency during normal serving.
+T: To locate endpoint slowness, compare ModelLatency with OverheadLatency and check instance utilization for saturation.
+
+@ Q001001 explain
+G: ## Availability from invocation metrics
+SageMaker publishes per-endpoint invocation metrics to CloudWatch:
+- `Invocations`: number of requests sent to the model.
+- `Invocation4XXErrors`: requests that failed because of the client (for example bad input).
+- `Invocation5XXErrors`: requests that failed on the server side (the model container or SageMaker).
+Availability as a success rate is usually computed from server-side failures, because client errors are not the service's fault:
+`availability = 1 - (Invocation5XXErrors / Invocations)`
+In CloudWatch you do this with **metric math**: add both metrics with the `Sum` statistic over a 1-hour period and define an expression such as `100 * (1 - m2/m1)`. The result can be graphed on a dashboard, alarmed on or used as a service level indicator.
+Example: 120,000 invocations and 60 5XX errors in an hour gives 1 - 60/120,000 = 99.95% availability.
+W: Invocations and Invocation5XXErrors: the error count divided by total invocations gives the failure ratio, and one minus that ratio is the percentage of successful invocations over the hour.
+X: A=CPU and memory utilization: they measure how busy the instances are, not how many requests succeeded or failed.
+C=Latency metrics only: they measure how long requests take, and a request can be fast and still fail, so they cannot give a success rate.
+D=GPU and disk utilization: these are resource usage figures and contain no count of successful or failed requests.
+T: Endpoint availability is 1 minus 5XX errors divided by invocations, computed with CloudWatch metric math.
+
+@ Q001002 explain
+G: ## CloudWatch Lambda Insights
+By default, Lambda publishes basic metrics such as `Invocations`, `Duration`, `Errors` and `Throttles`. They do not show memory or CPU use inside the function.
+**Lambda Insights** adds that detail. You enable it on the function (in the console or by adding the Lambda Insights extension layer and the `CloudWatchLambdaInsightsExecutionRolePolicy` managed policy to the role). The extension then collects system-level metrics per invocation, with no code changes:
+- `memory_utilization` and `used_memory_max`
+- `cpu_total_time`
+- `init_duration`, which shows cold starts
+- network and `/tmp` usage
+CloudWatch provides ready-made dashboards for a single function and across functions.
+Example: timeouts coincide with `used_memory_max` near the configured 512 MB and high CPU time, so raising memory (which also raises CPU share) fixes them. Or they coincide with long `init_duration`, pointing to cold starts from a heavy dependency load.
+W: CloudWatch Lambda Insights: it collects memory, CPU and cold start (init duration) metrics for the function automatically once enabled, so no custom metrics code is needed to diagnose the timeouts.
+X: A=Config rules: Config checks whether resource configurations comply with rules; it records settings, not runtime memory or CPU use per invocation.
+B=SageMaker Debugger: Debugger analyzes SageMaker training jobs (tensors and system resources); it does not instrument Lambda functions.
+C=Trusted Advisor: it gives account-level recommendations on cost, security and limits and does not provide per-invocation performance metrics.
+T: For memory, CPU and cold start detail on a Lambda function, enable CloudWatch Lambda Insights instead of writing custom metrics.

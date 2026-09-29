@@ -1,0 +1,340 @@
+# DVA-C02 detailed explanations, e10 (explanation-only rewrites; letters are the published ones)
+
+@ Q003335 explain
+G: ## Testing a Lambda function on your own machine
+The AWS SAM CLI can run a Lambda function locally inside a Docker container that mimics the Lambda runtime. You pass it an event document, and your handler receives exactly that JSON, as if S3, SQS or API Gateway had invoked it.
+- `sam local generate-event s3 put --bucket my-bucket --key photo.jpg > event.json` creates a realistic S3 notification payload.
+- `sam local invoke ImageFunction -e event.json` starts a container for the function defined in your `template.yaml`, runs the handler once and prints its logs and return value.
+## Why this matters
+Nothing is deployed and no real bucket is touched, so you can iterate quickly and safely. The function still uses your local AWS credentials if the code calls other AWS services, so point it at test resources.
+W: sam local invoke with an event file: it runs the handler locally in a Lambda-like container and feeds it the sample S3 event, which is exactly "invoke locally before deploying".
+X: B=Upload to production with aws s3 cp: this triggers the deployed function in production with a real object. It is neither local nor safe, and it only works after the code is already deployed.
+C=aws lambda publish-version: this creates an immutable numbered version of code that is already in Lambda. It is a release step in the cloud and does not execute anything with a test event.
+D=cdk destroy: this deletes a deployed CDK stack and its resources in your account. There is no local environment to reset, and it runs nothing.
+T: Local, pre-deployment Lambda testing with a sample event is `sam local invoke -e event.json`; anything that uploads, publishes or destroys acts on the real cloud.
+
+@ Q003336 explain
+G: ## Ephemeral environments with infrastructure as code
+When a serverless API is defined as a template (SAM, CDK or CloudFormation), creating a full copy of it is just "deploy the template again with a different stack name". Teams use this for **per-branch environments**:
+- A pipeline run for branch `feature-login` deploys stack `api-feature-login` with its own API, functions and tables.
+- Tests run against that stack's endpoint, isolated from every other branch.
+- When the branch is merged or deleted, the pipeline runs `aws cloudformation delete-stack` (or `sam delete`) so the resources stop costing money.
+## Why isolation matters
+If branches share one environment, a deployment from one branch overwrites another's code mid-test, and failures cannot be traced to a specific change. Separate stacks give each branch a clean, reproducible copy.
+W: Separate stack per branch, deleted after merge: the pipeline creates isolated copies from the same template automatically and cleans them up, which meets both "isolated" and "created and destroyed automatically".
+X: A=Test in production after merging: bugs reach real users before they are found, and there is no per-branch isolation at all; the testing happens only after the code is already live.
+B=Manual console resources per branch: clicking resources together is slow, differs from what the template defines, and nobody reliably deletes them, so it fails "automatic" and leaks cost.
+D=One shared test stack: each branch deployment overwrites the previous one, so two branches cannot be tested at the same time and a failure may come from someone else's change.
+T: Per-branch environments are separate IaC stacks created and deleted by the pipeline; a shared stack or manual resources give neither isolation nor automation.
+
+@ Q003337 explain
+G: ## What a mock integration is
+Every API Gateway method has an **integration**: the backend it forwards requests to (Lambda, HTTP, an AWS service). A REST API method can instead use integration type `MOCK`, where API Gateway never calls a backend and builds the response itself.
+- The integration request template selects a status code, for example `{"statusCode": 200}`.
+- The integration response mapping template returns a fixed body, such as `{"id": 1, "name": "sample"}`, plus any headers you set.
+## Why teams use it
+Front-end developers and API consumers can call the real endpoint URL, with its real paths, methods, authorizers and CORS headers, while the Lambda functions are still being written. Later you swap the integration to Lambda without changing the API contract.
+W: API Gateway mock integrations: the method returns a configured static response without invoking any backend, so the API can be tested before the Lambda functions exist.
+X: A=Custom domains: a custom domain maps a friendly host name such as `api.example.com` to a stage. It changes the URL, not what happens when the backend is missing.
+C=Client certificates: API Gateway presents these to an HTTP backend so the backend can verify requests came from API Gateway. They still need a backend and return no mock data.
+D=Usage plans: usage plans attach throttling and quota limits to API keys for clients. They control how often clients may call, not what the API returns.
+T: To test an API contract before the backend exists, use a `MOCK` integration; domains, certificates and usage plans all assume a working backend.
+
+@ Q003338 explain
+G: ## How a pipeline gates a release
+AWS CodePipeline is a sequence of **stages** (Source, Build, Test, Deploy-Staging, Deploy-Prod). Each stage runs actions, and a stage must succeed before the next one starts.
+- A test action can be a CodeBuild project whose `buildspec.yml` runs the integration test suite against the staging endpoint.
+- If any test command exits with a non-zero code, the CodeBuild build fails, the action fails, and the pipeline stops before the production stage.
+## Example
+Source, then Build, then Deploy to staging, then an **IntegrationTest** stage (CodeBuild runs `npm run test:integration` against `https://staging.example.com`), then Deploy to production. A failed test means the production deployment never starts for that revision.
+W: CodePipeline test stage with CodeBuild before production: the test action runs automatically on every release, and a failure stops the pipeline so the bad revision never reaches production.
+X: A=Skip integration tests because unit tests passed: unit tests mock dependencies, so broken permissions, wrong endpoints or schema mismatches between services go undetected until production.
+C=Deploy to production first, test afterwards: users are already exposed to the release when tests fail, so nothing is stopped; you can only roll back after the damage.
+D=Run tests manually when there is time: tests are skipped under deadline pressure and nothing in the pipeline enforces them, so releases proceed even when tests would fail.
+T: A failing automated test stage placed before production is what stops a release; unit-only, post-release or manual testing cannot block it.
+
+@ Q003339 explain
+G: ## Canary deployments for Lambda
+Callers invoke a Lambda **alias** (such as `live`) that points to a numbered version. An alias can split traffic between two versions with weights, and AWS CodeDeploy automates changing those weights.
+- A deployment configuration such as `CodeDeployDefault.LambdaCanary10Percent10Minutes` sends 10% of invocations to the new version, waits 10 minutes, then shifts the remaining 90%.
+- You attach CloudWatch alarms (for example on the new version's `Errors` metric). If an alarm fires during the deployment, CodeDeploy sets the alias back to 100% on the old version.
+## In practice
+With AWS SAM this is a few lines: `AutoPublishAlias: live` plus `DeploymentPreference` with `Type: Canary10Percent10Minutes` and an `Alarms` list.
+W: CodeDeploy canary on a Lambda alias with CloudWatch alarms: it shifts exactly 10% for 10 minutes and rolls back automatically when the alarms detect errors.
+X: A=Clients choose a version at random: the split is uncontrolled, there is no fixed 10% share or time window, and nothing rolls clients back when the new version fails.
+B=Point the alias to the new version all at once: 100% of traffic moves immediately, so a bad version hits every user, and any rollback is a manual step after the fact.
+D=New function name and update clients: every caller must be redeployed, there is no gradual shift, and going back means updating all clients again.
+T: Gradual shifting with automatic rollback for Lambda is CodeDeploy plus a weighted alias plus CloudWatch alarms; manual or client-side switching has no safety net.
+
+@ Q003340 explain
+G: ## The appspec hook order on EC2
+For EC2 and on-premises in-place deployments without a load balancer, the CodeDeploy agent runs lifecycle events in this order, and you can attach scripts in `appspec.yml` to most of them:
+- `ApplicationStop`: stop the currently running version.
+- `DownloadBundle`: the agent copies the revision to the instance (reserved, no scripts).
+- `BeforeInstall`: tasks before files are copied, such as backups.
+- `Install`: the agent copies files (reserved, no scripts).
+- `AfterInstall`: configure files, set permissions.
+- `ApplicationStart`: start the service.
+- `ValidateService`: check that the new version works.
+## Example
+Under `ValidateService` you might run `scripts/health_check.sh` that calls `curl -f http://localhost/health`. If it exits non-zero, the deployment to that instance fails and can trigger a rollback.
+W: ValidateService: it runs right after `ApplicationStart` (it is the last hook when no load balancer is involved), so a validation script there checks the application that has just started.
+X: B=DownloadBundle: this event is reserved for the CodeDeploy agent to fetch the revision; you cannot attach scripts to it, and the application has not even been installed yet.
+C=ApplicationStop: this runs at the beginning to stop the old version, before the new files exist, so there is nothing new to validate.
+D=BeforeInstall: this runs before the new files are copied, so the new application is neither installed nor started when its scripts run.
+T: Post-start checks belong in `ValidateService`; `ApplicationStop`, `DownloadBundle` and `BeforeInstall` all happen before the new version is running.
+
+@ Q003341 explain
+G: ## Elastic Beanstalk deployment policies
+Elastic Beanstalk offers several ways to replace application versions on an environment's instances:
+- **All at once**: every instance updates together, which is fast but causes a brief outage.
+- **Rolling**: instances update in batches, so the batch being updated is out of service and capacity drops.
+- **Rolling with additional batch**: launches an extra batch first to keep capacity during the roll.
+- **Immutable**: launches a full set of new instances in a temporary Auto Scaling group next to the old ones. Only when they pass health checks are they moved in and the old instances terminated.
+- **Traffic splitting**: sends a percentage of traffic to new instances for canary testing.
+## Rollback
+With immutable, the old instances keep serving until the new ones are healthy. If the new version fails, Beanstalk simply terminates the new instances, and the original fleet was never touched.
+W: Immutable deployment: the old fleet stays at full capacity while a complete new fleet is launched and checked, and rollback just discards the new instances.
+X: A=Rolling: each batch is taken out of service while it updates, so capacity drops, and rolling back means rolling the old version through every batch again.
+B=Single batch update: updating everything as one batch is effectively all at once; every instance is down together and a rollback requires another full deployment.
+C=All at once: all instances update simultaneously, causing downtime, and a failed version leaves the whole environment broken until you redeploy the old one.
+T: Full capacity plus fast rollback in Elastic Beanstalk means immutable (new fleet beside the old); rolling and all-at-once modify the instances that are serving.
+
+@ Q003342 explain
+G: ## Blue/green for Amazon ECS
+In a blue/green deployment, the current version (**blue**) keeps running while a complete new set of tasks (**green**) starts beside it. With CodeDeploy for ECS the setup is:
+- An Application or Network Load Balancer with a production listener, plus two target groups, one for blue tasks and one for green tasks.
+- CodeDeploy starts green tasks from the new task definition and registers them in the second target group.
+- After optional test traffic and hooks, the production listener is switched to the green target group.
+## Rollback
+The blue tasks stay running for a configurable wait time. If alarms fire or you stop the deployment, the listener is pointed back to the blue target group, which takes seconds because no tasks need to start.
+W: CodeDeploy blue/green for ECS with two target groups: new tasks start before traffic moves, so there is no downtime, and switching the listener back restores the old version instantly.
+X: A=Stop all tasks, then start new ones: between stopping and the new tasks passing health checks nothing serves traffic, and returning to the old version means another full restart.
+B=Different Region plus DNS change: DNS changes depend on TTLs and client caching, so the switch and any switch back are neither instant nor predictable, and it duplicates a whole Region's setup.
+D=Update task definition and restart cluster instances: restarting container instances kills running tasks and causes disruption, and there is no retained old environment to fall back to.
+T: Zero-downtime ECS releases with instant rollback use blue/green with two target groups; restarts and DNS changes cannot switch back in seconds.
+
+@ Q003343 explain
+G: ## Versions and aliases in Lambda
+- A **version** (`1`, `2`, `3`) is an immutable snapshot of a function's code and configuration, created by publishing.
+- `$LATEST` is the editable working copy; it changes every time code is updated.
+- An **alias** such as `prod` is a named pointer to one version (optionally with weighted routing to a second version). It has its own ARN, for example `arn:aws:lambda:us-east-1:111122223333:function:orders:prod`.
+## Releasing through an alias
+Callers, event source mappings and API Gateway integrations use the alias ARN. To release, you publish version `8` and run `aws lambda update-alias --function-name orders --name prod --function-version 8`. Callers keep the same ARN and immediately get the new code; rolling back is the same command with the previous version.
+W: Point the prod alias to the new version: callers keep invoking the same alias ARN, and only the pointer behind it changes.
+X: A=Callers invoke $LATEST: it requires changing every caller, and `$LATEST` is mutable, so any untested code update would reach production immediately with no version to roll back to.
+B=Put the version in the function name: this creates a different function with a different ARN, so every caller must be changed, which is the opposite of the requirement.
+C=Change memory to force reload: a configuration change affects the function (or `$LATEST`) but does not move the `prod` alias to a new published version.
+T: Aliases decouple callers from versions: publish a new version and update the alias; do not make callers track `$LATEST` or new names.
+
+@ Q003344 explain
+G: ## Stage variables in API Gateway
+A REST API is deployed to **stages** (`dev`, `prod`). Each stage can define **stage variables**: name-value pairs such as `lambdaAlias=dev` on the dev stage and `lambdaAlias=prod` on the prod stage.
+The integration refers to the variable instead of a fixed value, for example the Lambda function ARN `arn:aws:lambda:us-east-1:111122223333:function:orders:${stageVariables.lambdaAlias}`. One API definition is deployed to both stages, and each stage resolves the variable to its own alias at request time.
+- The function's resource-based policy must allow API Gateway to invoke each alias used.
+- Stage variables can also hold HTTP backend URLs or other per-stage values.
+W: Stage variables in the integration: one API definition resolves a different Lambda alias per stage, so dev and prod call different backends without duplicating the API.
+X: A=Usage plans with different throttling: usage plans set rate limits and quotas for API keys; they cannot change which Lambda alias an integration calls.
+C=Separate API copies per environment: this duplicates the definition, which the requirement forbids, and the copies drift apart as changes are made to one but not the other.
+D=Request validators with different schemas: validators reject requests with missing parameters or invalid bodies before integration; they have no influence on the backend target.
+T: Per-stage backends in one API come from `${stageVariables.name}` in the integration; usage plans and validators control clients and inputs, not routing.
+
+@ Q003345 explain
+G: ## The files that drive the AWS developer tools
+- **`buildspec.yml`** tells AWS CodeBuild what to do: `phases` such as `install`, `pre_build`, `build` and `post_build` with shell commands, plus `artifacts` to keep and optional `reports` and `cache` settings.
+- **`appspec.yml`** tells AWS CodeDeploy how to deploy: for EC2 it lists `files` to copy and `hooks` (for example `ValidateService`) with scripts; for Lambda and ECS it names the target version or task definition and traffic-shifting hooks.
+## Other familiar files
+`package.json` describes a Node.js project's dependencies, a `Dockerfile` builds a container image, and `template.yaml` is the default name of an AWS SAM template. They can appear in a pipeline, but none of them belongs to the service it is paired with here.
+W: A=buildspec.yml for CodeBuild: it is the build specification CodeBuild reads from the source root by default to run the build commands.
+E=appspec.yml for CodeDeploy: it is the application specification CodeDeploy uses to know what to deploy and which lifecycle hook scripts to run.
+X: B=package.json for Amazon S3: `package.json` is an npm manifest for Node.js; S3 stores objects and reads no such file to configure anything.
+C=Dockerfile for CloudTrail: a Dockerfile builds container images; CloudTrail records API activity and is configured as trails or event data stores, not from a Dockerfile.
+D=template.yaml for AWS Budgets: `template.yaml` is conventionally a SAM template; Budgets are created in the console, CLI or API, and have no deployment file of their own.
+T: CodeBuild reads `buildspec.yml` and CodeDeploy reads `appspec.yml`; the other pairs join a real file name to a service that does not use it.
+
+@ Q003346 explain
+G: ## Safe Lambda releases with CodeDeploy
+CodeDeploy can release a new Lambda version behind an alias in three styles: **canary** (for example 10% for 5 minutes, then the rest), **linear** (for example 10% more every minute) or **all at once**. Two safety mechanisms make it low-risk:
+- **Traffic shifting with alarms**: CloudWatch alarms such as the new version's error rate are watched during the shift; if one fires, the alias goes back to the old version automatically.
+- **Lifecycle hooks**: a `BeforeAllowTraffic` hook (SAM calls it `PreTraffic`) runs a Lambda function that tests the new version before any user traffic reaches it; `AfterAllowTraffic` checks it after the shift. A hook that reports failure stops the deployment and rolls back.
+W: C=Gradual traffic shifting with automatic rollback: only a small share of users see a bad version, and alarms return the alias to the old version without manual work.
+E=Pre-traffic hooks: the new version is tested with real calls before it gets any production traffic, so obvious failures are caught with zero user impact.
+X: A=Disable alarms during deployments: alarms are exactly what trigger automatic rollback, so disabling them removes the safety net at the riskiest moment.
+B=Deploy all functions at once without testing: every user gets untested code simultaneously, maximizing the blast radius of any bug.
+D=Deploy directly to $LATEST: `$LATEST` is mutable and cannot be traffic-shifted, so there is no gradual release and no fixed version to roll back to.
+T: Lower Lambda release risk by testing before traffic (pre-traffic hooks) and shifting gradually with alarm-driven rollback; removing alarms, tests or versions increases it.
+
+@ Q003347 explain
+G: ## The AWS CDK workflow
+The AWS Cloud Development Kit lets you define infrastructure in TypeScript, Python, Java, C# or Go. The CDK CLI turns that code into CloudFormation:
+- `cdk synth` produces the CloudFormation template from your code.
+- `cdk diff` compares the synthesized template with the deployed stack and lists what would be added, modified or removed, including IAM and security group changes.
+- `cdk deploy` deploys the stack through CloudFormation (and by default asks for confirmation when security-related changes are broadening).
+## Example
+After changing a bucket's removal policy in `lib/storage-stack.ts`, `cdk diff StorageStack` shows the property change; if it looks right, `cdk deploy StorageStack` applies it.
+W: cdk diff, then cdk deploy: the first previews the exact changes against the deployed stack, the second applies them, which matches "TypeScript infrastructure, preview, then apply".
+X: A=sam build, then aws s3 sync: `sam build` prepares SAM function artifacts and `s3 sync` copies files to a bucket; neither reads CDK code, previews changes or deploys a stack.
+B=aws configure, then cdk init: these set credentials and scaffold a new CDK project; they are one-time setup steps and neither preview nor deploy anything.
+C=cfn-lint, then aws iam list: `cfn-lint` checks CloudFormation templates for errors and the IAM command only lists resources; no change preview and no deployment happen.
+T: For CDK, preview with `cdk diff` and apply with `cdk deploy`; setup, linting and SAM or S3 commands do neither.
+
+@ Q003348 explain
+G: ## Lambda package size limits
+A Lambda function can be packaged in two ways:
+- **.zip archive**: up to 50 MB zipped when uploaded directly, and up to 250 MB unzipped for the function code plus all its layers. Large ML libraries such as PyTorch or TensorFlow often exceed this.
+- **Container image**: up to 10 GB uncompressed, built from an AWS base image or any image implementing the Lambda Runtime API, pushed to Amazon ECR and referenced by the function.
+## Example
+A Python inference function uses `FROM public.ecr.aws/lambda/python:3.12`, copies the model libraries and handler, and sets `CMD ["app.handler"]`. It is pushed to ECR and deployed with `PackageType: Image`. The invocation model, timeout and memory settings stay the same as for .zip functions.
+W: Container image up to 10 GB: container packaging raises the size limit far beyond the 250 MB unzipped .zip limit, so the large ML libraries fit.
+X: A=Libraries in the description field: the description is a short text label limited to a few hundred characters; Lambda never loads code from it.
+C=Code split across environment variables: all environment variables together are limited to 4 KB, and they hold configuration strings, not executable libraries.
+D=More memory to raise the package limit: memory (128 MB to 10,240 MB) sets RAM and proportional CPU; the deployment package limits do not change with it.
+T: When a .zip package exceeds 250 MB unzipped, switch to a container image (up to 10 GB); memory, descriptions and environment variables do not change package limits.
+
+@ Q003349 explain
+G: ## Reusing one CloudFormation template
+A CloudFormation template can declare **Parameters**: inputs supplied when a stack is created or updated.
+- Declare `InstanceType` with `Type: String`, a `Default: t3.micro` and `AllowedValues: [t3.micro, t3.large, m5.xlarge]`.
+- Reference it in the resource: `InstanceType: !Ref InstanceType`.
+- Deploy per environment with different values, for example `aws cloudformation deploy --stack-name app-prod --parameter-overrides InstanceType=m5.xlarge`, or from a pipeline configuration file per stage.
+## Related features
+**Mappings** plus a single `Environment` parameter are another common pattern (`!FindInMap [EnvSizes, !Ref Environment, InstanceType]`). **Outputs** are the opposite direction: they publish values from a stack for people or other stacks.
+W: Parameters with per-environment values: one template takes the instance size as input, so dev, test and prod differ only in the values passed at deployment.
+X: B=Three hand-edited copies: every fix must be repeated in three files, and the copies inevitably drift so environments stop matching.
+C=Outputs define the sizes: outputs return values after a stack is created (for display or cross-stack exports); they cannot feed input into the same stack's resources.
+D=Hard-coded sizes edited before each deployment: manual edits are error-prone, leave the template in whichever state was deployed last, and are easy to forget in prod.
+T: Environment differences go into Parameters (or Mappings) of one template; Outputs export values and copies or manual edits drift.
+
+@ Q003350 explain
+G: ## Manual approval in CodePipeline
+CodePipeline has an **approval** action category with one provider, **Manual**. When the pipeline reaches it, execution pauses until an authorized person clicks Approve or Reject.
+- You can attach an Amazon SNS topic so approvers get an email or chat notification, plus a URL to review (for example the staging site) and comments.
+- Only IAM principals allowed to call `codepipeline:PutApprovalResult` can respond.
+- If nobody responds within 7 days, the action fails and the pipeline stops.
+## Typical placement
+Deploy to staging, run tests, then a **ManagerApproval** stage, then deploy to production. Rejecting stops that revision from reaching production.
+W: Manual approval action: it pauses the pipeline until a named person approves or rejects, which is exactly a human gate before production.
+X: A=CodeBuild phase that waits one hour: a timed wait continues automatically whether or not anyone looked, so no approval decision is recorded or enforced.
+B=Lambda that deletes failed builds: this is a cleanup task and runs after failures; it never pauses the pipeline or asks anyone for a decision.
+C=S3 lifecycle rule on artifacts: lifecycle rules expire or transition stored objects over days; they have no link to pipeline flow or approvals.
+T: A human gate in CodePipeline is the manual approval action; waits and cleanups do not require anyone's decision.
+
+@ Q003351 explain
+G: ## Lambda timeouts
+Each Lambda function has a **timeout**: the maximum time one invocation may run. The default is 3 seconds and the maximum is 900 seconds (15 minutes). When the limit is reached, Lambda stops the invocation and logs `Task timed out after 3.00 seconds`.
+## Why external calls cause it
+Time spent waiting for a network response counts toward the timeout. If a third-party API takes 4 seconds to answer, a function with the default 3-second timeout fails every time.
+- Check the external API's latency (logs, X-Ray subsegments, the provider's status).
+- Raise the timeout to a value that covers the realistic response time, for example 15 seconds.
+- Set a client-side timeout on the HTTP call shorter than the function timeout, so the code can handle slowness gracefully.
+W: Timeout setting and external API response time: the error message matches the 3-second default exactly, and a slow downstream call is the usual reason an invocation runs that long.
+X: A=Environment variable names and ordering: names and order have no effect on run time; a wrong variable causes a configuration error, not a timeout at exactly 3 seconds.
+C=Number of layers: layers are extracted when the execution environment starts; their count does not make a running call to an external API take longer.
+D=Reserved concurrency: this limits how many copies run at once; exceeding it causes throttling errors, not an invocation that runs past its timeout.
+T: `Task timed out after 3.00 seconds` means the 3-second default timeout was hit; check the timeout setting and downstream latency first.
+
+@ Q003352 explain
+G: ## How a VPC-attached Lambda function reaches networks
+When a function is attached to a VPC, Lambda places elastic network interfaces in the subnets you choose. Those interfaces have only **private IP addresses**, even in a subnet with a route to an internet gateway.
+- Traffic to resources inside the VPC, such as an RDS database, works through local routing.
+- Traffic to the internet needs the subnets' route table to send `0.0.0.0/0` to a **NAT gateway**, which sits in a public subnet and translates to its Elastic IP.
+## Example
+Function subnets `10.0.1.0/24` and `10.0.2.0/24` get a route `0.0.0.0/0 -> nat-0abc...`; the NAT gateway in a public subnet routes onward to the internet gateway. The third-party API then sees the NAT gateway's static public IP.
+W: Subnets lack a route to a NAT gateway: RDS works because it is inside the VPC, while internet destinations need a NAT path because the function's interfaces have no public IP.
+X: A=Execution role lacks rds:Connect: RDS access already works, and the IAM action for database access is `rds-db:connect`, used only for IAM database authentication; IAM permissions do not control reaching a public API.
+B=Memory too low to open connections: memory sets RAM and CPU; it has no effect on routing, and the function already opens connections to RDS successfully.
+D=Function needs an Elastic IP: you cannot assign an Elastic IP to a Lambda function's network interfaces; a fixed public source IP comes from the NAT gateway's Elastic IP.
+T: A VPC Lambda that reaches in-VPC resources but not the internet is missing a private-subnet route to a NAT gateway; roles, memory and Elastic IPs are not the fix.
+
+@ Q003353 explain
+G: ## API Gateway integration timeout
+API Gateway waits a limited time for the backend (the integration) to respond. For REST APIs the default maximum integration timeout is **29 seconds**. When the backend has not answered by then, API Gateway stops waiting and returns **504 Gateway Timeout** to the client, even if the backend later finishes.
+- For Regional and private REST APIs, the timeout can be raised above 29 seconds through a service quota request, possibly with a lower account throttle; edge-optimized APIs stay at 29 seconds.
+- A common design fix is to make long work asynchronous: accept the request, return `202` with a job id, process in the background (SQS, Step Functions) and let the client poll or receive a callback.
+W: Integration timeout exceeded: a 45-second backend is longer than the 29-second default, which is exactly when API Gateway returns 504.
+X: B=Missing API key: an API that requires keys rejects the request immediately with 403 Forbidden; it never waits 29 seconds or returns 504.
+C=CORS blocks slow responses: CORS is enforced by the browser based on response headers, and it has nothing to do with response time or a 504 status.
+D=Stage cache disabled: without caching every request goes to the backend, which is the normal behavior; caching could hide latency for repeated requests but does not create timeouts.
+T: A 504 from API Gateway on requests near or above 29 seconds is the integration timeout; 403 means auth or keys, and CORS or caching do not produce 504.
+
+@ Q003354 explain
+G: ## What HTTP 429 means in API Gateway
+`429 Too Many Requests` is API Gateway's throttling response. API Gateway uses a token-bucket algorithm with a steady-state rate and a burst size at several levels:
+- An account-level limit per Region shared by all APIs.
+- Stage or method-level throttling you configure.
+- Per-client limits from a **usage plan** tied to an API key.
+When requests arrive faster than the applicable bucket allows, excess requests get 429 without reaching the backend.
+## What to do
+Clients should retry with exponential backoff and jitter. On the server side, raise stage or usage plan limits, request a higher account quota, or add caching to reduce calls. During peak hours, a jump in 429s is the signature of throttling.
+W: Throttling limits exceeded: 429 is specifically the throttling status, and peak-hour timing matches traffic exceeding the stage, usage plan or account rate.
+X: A=Lambda syntax error: a failing backend function surfaces as a 5XX error (such as 502 with a proxy integration), not 429, and would fail at all hours.
+C=Expired TLS certificate: clients would fail the TLS handshake before any HTTP response, so they would never receive a 429 status code.
+D=Unexpected JSON from the database: a malformed backend response causes a 5XX (such as 502 for a proxy integration) or a mapping error, not a throttling response.
+T: 429 from API Gateway means throttled by rate limits; backend and format problems show up as 5XX, and TLS failures before HTTP.
+
+@ Q003355 explain
+G: ## Distributed tracing with AWS X-Ray
+X-Ray follows one request across services. Each service records a **segment** with its start and end time, and the SDK records **subsegments** for each downstream call, such as a DynamoDB `GetItem` or an HTTP call to a partner API.
+- The **trace map** shows the services a request passed through, with latency and error rates.
+- The **trace timeline** shows each subsegment as a bar, so you can see that `GetItem` took 12 ms while the partner call took 850 ms.
+## Enabling it
+Turn on active tracing for the Lambda function, and use the X-Ray SDK or AWS Distro for OpenTelemetry to instrument the AWS SDK and HTTP clients so their calls become subsegments.
+W: X-Ray tracing with subsegments: it times each downstream call inside a request, directly showing which one adds the most latency.
+X: A=CloudTrail management events: CloudTrail records who called which control-plane API and when, for auditing; it records no per-request latency across Lambda, DynamoDB and HTTP calls.
+B=Inspector vulnerability scans: Inspector finds software vulnerabilities and network exposure in EC2, ECR images and Lambda; it does not measure request timing.
+D=Config configuration history: Config tracks how resource settings changed over time; it has no data about individual requests or their latency.
+T: Per-call latency across a distributed request is an X-Ray trace with subsegments; CloudTrail, Inspector and Config audit, scan or record configuration.
+
+@ Q003356 explain
+G: ## Annotations versus metadata in X-Ray
+You can attach your own data to X-Ray segments and subsegments in two ways:
+- **Annotations**: key-value pairs (string, number or boolean) that X-Ray **indexes**. You can use them in filter expressions and groups, for example `annotation.tier = "gold"`. Up to 50 annotations are allowed per trace.
+- **Metadata**: key-value pairs of any type, including objects and lists, that are stored with the trace and visible in its details but **not indexed**, so you cannot search by them.
+## Example
+In the handler, call `xray_recorder.put_annotation("tier", customer.tier)`. In the console, filter traces with `annotation.tier = "enterprise"` to compare latency by tier.
+W: Annotations: they are indexed, so recording the tier as an annotation lets you filter traces by it.
+X: A=Segments: a segment is the record of work by one service for a request; it is the container you add data to, not a searchable custom field.
+B=Sampling rules: these decide which requests are traced (for example 5% of `/checkout`); they do not attach the customer tier to the recorded traces.
+C=Metadata: metadata is stored with the trace but not indexed, so it cannot be used in filter expressions to find traces by tier.
+T: If you need to search or filter traces by a value, record it as an annotation; metadata is only for viewing details.
+
+@ Q003357 explain
+G: ## CloudWatch Embedded Metric Format
+Embedded Metric Format (EMF) is a JSON log structure. When a Lambda function writes such a log line, CloudWatch Logs extracts the metric values automatically and publishes them as custom metrics.
+- The log contains an `_aws` object with `CloudWatchMetrics` that names the namespace, dimensions and metrics, plus the values, for example `"OrdersPlaced": 3`.
+- The function just prints to standard output; Lambda already ships that to CloudWatch Logs, so there is no extra API call and no added latency.
+- The same line stays searchable in the log, with extra fields such as `orderId`.
+Libraries such as Powertools for AWS Lambda (Metrics utility) and the `aws-embedded-metrics` client generate the format for you.
+W: Embedded Metric Format in logs: metrics are extracted asynchronously from log lines the function already writes, so no `PutMetricData` calls are needed.
+X: B=DynamoDB plus manual graphs: this adds a write call per metric, provides no CloudWatch alarms or dashboards, and someone must build graphs by hand.
+C=Synchronous PutMetricData per request: this is an extra API call on every invocation, adding latency, cost and throttling risk, which the requirement explicitly avoids.
+D=Daily email to operations: this is not a metric at all; nothing can graph, alarm or act on it, and it is a day late.
+T: Custom metrics from Lambda without extra API calls come from EMF log lines; `PutMetricData` is the extra call you are avoiding.
+
+@ Q003358 explain
+G: ## CloudWatch Logs Insights
+Logs Insights is an interactive query language over CloudWatch log groups. For JSON logs it discovers fields automatically, so a line like `{"path":"/orders","duration":812}` has a queryable `duration` field.
+## Example query
+Choose the application's log group and a 1-day time range, then run:
+- `fields @timestamp, path, duration`
+- `| sort duration desc`
+- `| limit 20`
+The result is the 20 slowest requests with their timestamps and paths. You can also use `stats avg(duration), pct(duration, 99) by path` to find slow endpoints.
+W: Logs Insights sorted by duration: it queries the structured application logs directly and can sort and limit results to the 20 slowest requests.
+X: A=CloudTrail event history by user name: CloudTrail records AWS API calls made by users and services, not your application's own request durations.
+C=VPC Flow Logs by destination port: flow logs record IP addresses, ports, bytes and accept/reject decisions; they contain no request duration from the application.
+D=Config advanced queries: these run SQL-like queries over current resource configurations, such as instance types, not over log data.
+T: To query and sort your own structured logs, use CloudWatch Logs Insights; CloudTrail, Flow Logs and Config hold other kinds of data.
+
+@ Q003359 explain
+G: ## How Lambda assigns CPU
+Lambda has one performance setting: **memory**, from 128 MB to 10,240 MB. CPU is allocated in proportion to memory.
+- At about 1,769 MB a function gets the equivalent of one full vCPU.
+- At the maximum of 10,240 MB it can use up to 6 vCPUs, which helps only if the code uses multiple threads or processes.
+## Cost effect
+Price is per GB-second, so doubling memory doubles the per-millisecond rate. For CPU-bound code, however, more CPU often cuts duration enough that the total cost stays similar or even drops. Tools such as AWS Lambda Power Tuning measure this across memory settings.
+W: Increase the memory setting: memory is the only knob that controls Lambda CPU, so more memory directly gives a CPU-bound function more processing power.
+X: A=More environment variables: they are configuration strings passed to the code and have no effect on the compute allocated.
+B=Longer timeout: this only lets the function run longer before being stopped; it runs just as slowly with the same CPU.
+D=Attach to a VPC subnet: this changes network placement to reach private resources; it adds no CPU and can require NAT for internet access.
+T: Lambda CPU scales with memory; timeout, environment variables and VPC settings do not make code run faster.

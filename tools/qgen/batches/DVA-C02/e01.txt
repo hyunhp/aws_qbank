@@ -37,7 +37,7 @@ If the backend has not answered in time, API Gateway gives up and returns `504 G
 - The error is `504`, which means "the backend did not respond in time", not "the backend returned an error" (`502`) or "you were throttled" (`429`).
 Typical fixes: cache the third-party result, make the lookup asynchronous and return a job ID, or tighten the call with its own shorter timeout and a fallback.
 W: Integration timeout exceeded: the slow lookup pushes total backend time past API Gateway's 29-second limit, so the gateway returns `504` for exactly that subset of requests.
-X: A=Reserved concurrency too high: a high reserved concurrency only allows more parallel executions. Running out of concurrency causes throttling (`429`/`502`-style errors), not timeouts on slow requests.
+X: A=Reserved concurrency too high: a high reserved concurrency only allows more parallel executions. Running out of concurrency causes throttling (Lambda rejects invocations with `TooManyRequestsException`), not timeouts limited to slow requests.
 B=Memory too high: more memory also gives more CPU, which makes startup and execution faster, not slower. It cannot explain timeouts limited to the slow lookup path.
 C=DynamoDB throttling: the scenario points to a slow third-party call, and SDK throttling usually surfaces as retried `ProvisionedThroughputExceededException` errors, not as a timeout pattern tied to one external dependency.
 T: A `504` from API Gateway means the backend exceeded the integration timeout; fix the slow path, do not tune unrelated Lambda settings.
@@ -85,19 +85,6 @@ C=Test account and manual invokes: this deploys to AWS and incurs cost, which th
 D=X-Ray in production: tracing shows latency and call paths of real requests; it does not validate business rules, and testing in production is the opposite of pre-deployment unit testing.
 T: Unit test Lambda logic locally with a test framework and mocked AWS SDK clients; reserve deployed tests for integration.
 
-@ Q000593 explain
-G: ## Standard versus FIFO queues
-- **Standard queues**: nearly unlimited throughput, but delivery is **at least once** (a message can arrive twice) and ordering is best effort.
-- **FIFO queues**: strict ordering within a **message group** (`MessageGroupId`) and **exactly-once processing** through deduplication, with lower throughput (300 API calls per second per action, higher with batching or high-throughput mode).
-## Deduplication in FIFO
-SQS drops a message that has the same deduplication ID as one sent in the last 5 minutes. The ID comes either from `MessageDeduplicationId` set by the producer or, with **content-based deduplication**, from a SHA-256 hash of the message body.
-Example: a producer retries `SendMessage` after a network error; with content-based deduplication the second copy of the same order body is discarded, so the order is enqueued only once. Consumers still must delete each message before its visibility timeout ends.
-W: FIFO queue with content-based deduplication: FIFO guarantees ordering and the dedup hash removes duplicate sends within the 5-minute window, which together deliver in-order, exactly-once processing at the accepted lower throughput.
-X: A=FIFO with 14-day retention: retention only controls how long unprocessed messages are kept; it contributes nothing to preventing duplicates, which is the other half of the requirement.
-C=Standard queue, short visibility timeout: a standard queue gives no ordering guarantee, and a short visibility timeout makes duplicates more likely because messages reappear before processing finishes.
-D=Standard queue with a DLQ: a dead-letter queue only captures messages that fail repeatedly; it does not add ordering or stop at-least-once duplicate delivery.
-T: Ordered, exactly-once processing needs a FIFO queue with deduplication; standard queues are at-least-once and unordered no matter how they are tuned.
-
 @ Q000594 explain
 G: ## Transient errors and throttling
 Some API errors are **transient**: the same request would succeed if sent a little later. DynamoDB throttling (`ProvisionedThroughputExceededException`, `ThrottlingException`), `5xx` service errors and brief network failures are typical examples.
@@ -124,7 +111,7 @@ A **queue** (SQS) hands each message to one consumer, and the message is deleted
 Example: a real-time dashboard, a fraud detector and a Firehose delivery to S3 all read the same clickstream, and a buggy consumer can reprocess the last 6 hours after a fix.
 W: Kinesis Data Streams: it handles high-volume ingestion, keeps data for replay within the retention window, lets multiple consumers read independently, and preserves order per partition key.
 X: A=SQS standard: each message goes to one consumer and is deleted after processing, so there is no replay or independent multi-app reading, and ordering is not guaranteed.
-C=SNS: SNS pushes messages to subscribers but does not store them for replay; a subscriber that was down or wants to reprocess cannot read the history.
+C=SNS: SNS pushes each message to its subscribers; standard topics keep no history, and even FIFO topic archiving only redelivers to subscriptions, so independent applications cannot each read the stream at their own position.
 D=SQS FIFO: it orders messages per group, but consumed messages are deleted and cannot be replayed by several independent applications, and its throughput is limited for millions of visitors.
 T: Choose Kinesis Data Streams when many consumers must read and replay the same ordered data; choose SQS when each message is work for one consumer.
 

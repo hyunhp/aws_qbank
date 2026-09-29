@@ -1,0 +1,396 @@
+# DVA-C02 detailed explanations, e08 (explanation-only rewrites; letters are the published ones)
+
+@ Q002109 explain
+G: ## Memory is also the CPU dial in Lambda
+Lambda has one performance setting: memory, from 128 MB to 10,240 MB. CPU is allocated in proportion to memory (around 1,769 MB gives the equivalent of one full vCPU), so a CPU-bound function usually runs faster when you give it more memory.
+## How Lambda compute cost is calculated
+You pay per request plus per **GB-second**: configured memory multiplied by billed duration.
+- 512 MB for 8 s = 0.5 GB x 8 s = 4 GB-s.
+- If 1,024 MB cuts the run to 3.5 s, that is 1 GB x 3.5 s = 3.5 GB-s: faster **and** cheaper.
+- If duration barely drops, extra memory just costs more.
+You only know which case applies by measuring.
+## AWS Lambda Power Tuning
+An open-source tool from AWS, deployed as a Step Functions state machine (for example from the Serverless Application Repository). It invokes your function many times at each memory size you list, collects duration and cost, and reports the best setting for cost, speed or a balance of both, with a chart.
+W: Lambda Power Tuning: it runs the real function at several memory sizes and reports measured duration and cost for each, which is exactly the data the team asked for instead of guessing.
+X: A=X-Ray sets memory: X-Ray traces requests and shows where time is spent, but it never changes a function's memory configuration.
+C=Always minimum memory: cost is memory multiplied by duration, so a CPU-starved function at low memory can run so long that it costs more than a larger setting.
+D=15-minute timeout: the timeout only caps how long an invocation may run; it does not make the function faster or cheaper, and the function already finishes in 8 seconds.
+T: Lambda cost is memory x duration and CPU scales with memory, so measure memory settings with Power Tuning instead of assuming the smallest is cheapest.
+
+@ Q002110 explain
+G: ## Two ways to fill a cache
+- **Lazy loading (cache-aside)**: on a read, check the cache; on a miss, read the database and store the result. Only data someone asks for is cached, but a cached value is not refreshed when the database changes, so it stays stale until it expires or is evicted.
+- **Write-through**: every time the application writes to the database, it also writes the new value to the cache. Cached data is always current, but items that are written and never read also land in the cache.
+## Why add a TTL
+A time to live (for example `SET price:123 19.99 EX 300` in Redis or Valkey) makes each key expire after a set time.
+- Keys written through but never read disappear on their own, so the cache does not fill with unused data.
+- If a write path ever misses the cache update, the stale value lives only until the TTL, not forever.
+Combining write-through with a TTL (and lazy loading for misses) is the standard pattern when both freshness and cache size matter.
+W: Write-through plus a TTL: updating the cache whenever a price changes removes the one-hour staleness, and the TTL expires keys nobody reads, so the cache does not keep growing.
+X: A=Lazy loading, no TTL: this is the cause of the problem; with no expiry a changed price stays stale until eviction, and unused keys accumulate.
+B=Disable caching for prices: prices would always be fresh, but every read would hit the database again, throwing away the performance the cache was added for.
+D=Bigger cache node: more memory holds more keys but does nothing to refresh values that changed in the database.
+T: Lazy loading alone serves stale data after updates; write-through keeps values fresh and a TTL cleans out keys nobody reads.
+
+@ Q002111 explain
+G: ## CloudWatch Logs Insights
+Logs Insights runs queries, written in its own query language, directly against CloudWatch Logs log groups, such as `/aws/lambda/my-function`. It automatically discovers fields in JSON log events, so a field like `errorCode` can be used in a query without any setup.
+## Aggregating with stats
+For "top 5 error codes in the last hour", set the time range to 1 hour and run:
+- `filter ispresent(errorCode)`
+- `| stats count(*) as errors by errorCode`
+- `| sort errors desc`
+- `| limit 5`
+The result is a small table of error codes and counts, returned in seconds and billed by the amount of log data scanned. You can also add the result to a CloudWatch dashboard.
+## Other log tools
+- **CloudTrail** records AWS API calls (who called `UpdateFunctionCode`), not what the function writes to its logs.
+- **Lambda metrics** such as `Errors` count failed invocations, without looking inside the log messages.
+W: Logs Insights stats query: it reads the JSON log events in place and groups them with `stats count(*) by errorCode`, giving the top error codes and counts directly from the logs.
+X: A=S3 export and script: exporting log data to S3 is an asynchronous task that takes time and needs extra code to parse and count, when a query can do the same aggregation in place.
+B=CloudTrail event history: CloudTrail records management API calls made against the function, not the error events the function code writes to CloudWatch Logs.
+D=Lambda Monitor tab: it shows metrics such as invocations, duration and error counts, but it does not group errors by a field inside the log payload such as `errorCode`.
+T: To count and rank values inside log events, run a Logs Insights `stats ... by field` query; CloudTrail and metrics do not look inside your application logs.
+
+@ Q003288 explain
+G: ## How Lambda reads from SQS
+With an SQS event source mapping, Lambda polls the queue and invokes the function with a batch of messages (up to 10 for this setup). By default the batch succeeds or fails as a unit:
+- If the function returns normally, Lambda deletes every message in the batch.
+- If the function throws, no message is deleted; after the visibility timeout the whole batch becomes visible again and is retried, including messages that were already processed successfully.
+## Partial batch responses
+Turn on `ReportBatchItemFailures` in the event source mapping's function response types. The function then returns a list of only the failed message IDs:
+- `{"batchItemFailures": [{"itemIdentifier": "<messageId>"}]}`
+Lambda deletes the successful messages and returns only the listed ones to the queue. After `maxReceiveCount` attempts, a failing message moves to the dead-letter queue, where it can be inspected.
+W: ReportBatchItemFailures: the function reports only the failed message IDs, so Lambda deletes the successful messages and retries just the failures instead of the whole batch.
+X: A=Batch size of 10,000: a much larger batch means one bad message causes even more successful messages to be retried; the batch size does not change the all-or-nothing behavior.
+B=Delete the dead-letter queue: without a DLQ, repeatedly failing messages are not set aside for inspection; they keep being retried until the retention period expires and are then lost, and successful messages are still reprocessed.
+C=15-minute timeout: the duplicates come from a message failing, not from running out of time, so a longer timeout still returns the whole batch when one message throws.
+T: With SQS and Lambda, enable partial batch responses so one failed message does not force the successful ones in its batch to be processed again.
+
+@ Q003289 explain
+G: ## The Lambda execution environment lifecycle
+Lambda runs your code in an execution environment that is reused across many invocations.
+- **Init phase**: runs once when a new environment starts (a cold start). Code at module level, outside the handler, runs here.
+- **Invoke phase**: runs the handler once per event. Warm invocations skip init and go straight to the handler.
+## What belongs outside the handler
+Put anything expensive and reusable at module level:
+- SDK clients, database connections or connection pools
+- configuration files, secrets and models loaded into memory
+Example in Python: `conn = connect(DB_URL)` and `config = load("config.json")` at the top of the file, then the handler uses `conn` and `config`. Later invocations in the same environment reuse them. Code should still check that a reused connection is alive and reconnect if needed. Data written to `/tmp` also survives between invocations in the same environment.
+W: Move initialization outside the handler: module-level code runs once per execution environment, so warm invocations reuse the connection and loaded configuration instead of rebuilding them each time.
+X: A=Sleep at handler start: sleeping only adds waiting time; the resources would still be created on every invocation, so latency gets worse, not better.
+B=New function per invocation: you cannot and would not create a function per request; every invocation would be a cold start, which is the opposite of reusing initialized state.
+C=Longer timeout: a longer timeout lets slow invocations finish, but the connection and file load still repeat every time, so the added latency remains.
+T: Initialize connections and configuration outside the Lambda handler so warm invocations reuse them; the handler should do only per-event work.
+
+@ Q003290 explain
+G: ## Lambda layers
+A layer is a .zip archive of libraries, a custom runtime or other files that is published separately from function code and can be attached to many functions.
+- Lambda extracts layer content into `/opt` in the execution environment, where runtimes find it on their paths (for example `/opt/python` for Python packages, `/opt/nodejs/node_modules` for Node.js).
+- Layers are versioned: publishing an update creates a new layer version, and each function chooses which version ARN to use.
+- A function can use up to 5 layers, and function code plus all layers must fit within the 250 MB unzipped deployment limit.
+## Example
+Publish `shared-libs` containing `requests` and a logging library, then add `arn:aws:lambda:us-east-1:111122223333:layer:shared-libs:3` to ten functions. Upgrading the libraries means publishing version 4 and updating the functions, instead of re-packaging ten deployment bundles.
+Container image functions do not use layers; they share code through base images instead.
+W: Lambda layers: shared libraries are packaged once as a versioned layer and attached to every function that needs them, so they are managed in one place.
+X: A=Lambda destinations: destinations send the result of an asynchronous invocation to another service; they do not package or share code.
+B=Lambda aliases: an alias is a named pointer such as `prod` to a function version, used for deployments and traffic shifting, not for sharing libraries.
+C=Lambda function URLs: a function URL gives one function a dedicated HTTPS endpoint; it has nothing to do with dependencies.
+T: Share libraries across Lambda functions with layers; aliases point to versions, destinations route async results, and function URLs expose HTTPS endpoints.
+
+@ Q003291 explain
+G: ## Asynchronous invocation in Lambda
+When a service such as S3 or EventBridge invokes a function asynchronously, Lambda queues the event and returns immediately. The caller never sees the result, and Lambda retries failures (up to two extra attempts by default).
+## Lambda destinations
+Destinations tell Lambda where to send a record of each asynchronous invocation, with no code in the function:
+- **On success**: sent when the function returns normally.
+- **On failure**: sent after all retries fail or the event is too old.
+- Targets: SQS queue, SNS topic, another Lambda function or an EventBridge event bus (S3 buckets are also supported for failures).
+The record includes the original event, the response or error details and metadata such as the request ID.
+## Example
+On success, send to `orders-ok` (SQS); on failure, send to `orders-failed` (SQS). Unlike a classic dead-letter queue, which receives only failures and only the event, destinations cover both outcomes and include the result.
+W: Lambda destinations: on-success and on-failure destinations route each asynchronous invocation's record to separate SQS queues purely by configuration, with no code changes.
+X: A=Layers with SQS libraries: a layer only makes code available; the function would still need new code to send messages, which the requirement rules out.
+B=CloudWatch alarm on errors: an alarm fires on a metric threshold and can notify, but it does not deliver individual event details for either successes or failures.
+C=S3 event notification: S3 notifications report changes to objects in a bucket; they are not triggered by Lambda invocations and cannot describe their results.
+T: For asynchronous Lambda invocations, destinations route success and failure records to targets such as SQS without code changes.
+
+@ Q003292 explain
+G: ## Where a Lambda function can write files
+Each execution environment has an ephemeral file system mounted at `/tmp`.
+- Default size is 512 MB; you can configure it anywhere up to 10,240 MB (10 GB) with the function's ephemeral storage setting (`EphemeralStorage` in the API).
+- Storage above 512 MB is billed by the GB-second, like memory.
+- Contents are private to the environment, may survive between warm invocations and are lost when the environment is recycled, so it is scratch space, not durable storage.
+## Other options for bigger or shared data
+- **Amazon EFS**: mount a file system for data that must persist or be shared between functions.
+- **Amazon S3**: stream objects in and out for durable storage.
+## Example
+A video transcoding function downloads a 4 GB file, processes it into `/tmp/out.mp4` and uploads the result to S3. Setting ephemeral storage to 6 GB gives it room for both files.
+W: Increase ephemeral /tmp storage: `/tmp` can be configured up to 10 GB, which is enough for 5 GB temporary files and needs no extra services.
+X: A=Environment variables: all of a function's environment variables together are limited to 4 KB, and they hold configuration strings, not file data.
+B=10 GB of memory: memory is RAM used by the running process, not a file system; it does not enlarge `/tmp`, which has its own size setting.
+C=Mount EBS: Lambda cannot attach EBS volumes; the file system options are `/tmp` and Amazon EFS.
+T: For large temporary files in Lambda, raise ephemeral `/tmp` storage (up to 10 GB); use EFS or S3 when the data must outlive the environment.
+
+@ Q003293 explain
+G: ## Environment variables in Lambda
+Environment variables are key-value pairs stored in the function configuration and read by code at runtime, for example `os.environ["TABLE_NAME"]` in Python.
+- The same code package can run as `orders-dev` with `TABLE_NAME=orders-dev` and as `orders-prod` with `TABLE_NAME=orders-prod`.
+- When you publish a version, its environment variables are locked with it, so version 7 used by the `prod` alias keeps its own values.
+- Values are encrypted at rest with AWS KMS; total size is limited to 4 KB.
+## Keeping secrets out of variables
+For passwords and API keys, store the value in Secrets Manager or Systems Manager Parameter Store and put only its name in an environment variable, such as `DB_SECRET_ID=prod/orders/db`. Infrastructure as code tools (CloudFormation, SAM, CDK) can set different values per stage from parameters.
+W: Environment variables per version or stage: each environment gets its own values in the function configuration, so the same code reads different settings in dev and prod without being changed.
+X: A=Values in the package name: a deployment package name is just a file or object key; code cannot sensibly read settings from it, and changing a value would mean repackaging.
+B=Separate code copies: maintaining one copy of source per environment means every change must be made twice, and the copies drift apart, which is what configuration is meant to avoid.
+C=Hard-coded values by time: the current time says nothing about which environment the function runs in, and hard-coded values still require code changes to update.
+T: Keep one code package and vary configuration per environment with Lambda environment variables, pointing to Parameter Store or Secrets Manager for secrets.
+
+@ Q003294 explain
+G: ## DynamoDB keys and queries
+A `Query` must name a partition key value. With `CustomerId` as the partition key you can fetch one customer's orders, but "all orders with `Status = SHIPPED`" is not a query on that table.
+## Secondary indexes
+- **Global secondary index (GSI)**: its own partition key (and optional sort key), any attributes. Can be added to or deleted from an existing table at any time. Reads are eventually consistent; it has its own throughput.
+- **Local secondary index (LSI)**: same partition key as the table, different sort key. Must be defined when the table is created and cannot be added later.
+## Example
+Add GSI `StatusIndex` with partition key `Status` and sort key `OrderDate`, then query `Status = "PENDING"` sorted by date. Because `Status` has few distinct values, heavy write volume can make a status partition hot; a common refinement is to shard the key, such as `PENDING#3`.
+W: Global secondary index on Status: a GSI can use a completely different partition key and can be added to the existing table, so the application can query orders by status across all customers.
+X: A=Change the partition key in place: a table's key schema is fixed at creation; changing it means creating a new table and migrating the data.
+B=Scan and filter: a scan reads and bills for every item in the table before filtering, so it gets slower and more expensive as the table grows.
+C=LSI with Status as partition key: an LSI must keep the table's partition key (`CustomerId`) and can only be created with the table, so it cannot provide a Status partition key.
+T: To query by a different partition key, add a GSI; an LSI keeps the table's partition key and only changes the sort key.
+
+@ Q003295 explain
+G: ## The lost update problem
+Two clients read the same item (`quantity = 10`), each change it in memory and each write it back. The second write overwrites the first, so one change silently disappears.
+## Optimistic locking in DynamoDB
+Give each item a version number and make every write conditional on it:
+- Read the item: `version = 5`.
+- Write with `ConditionExpression: "version = :v"`, `:v = 5`, and set `version = 6`.
+- If another client already wrote version 6, the condition fails with `ConditionalCheckFailedException`; the client re-reads the item and applies its change again.
+DynamoDB checks the condition and performs the write as one atomic operation, so no other write can slip in between. SDK helpers support this, for example `@DynamoDbVersionAttribute` in the Java enhanced client.
+It is called optimistic because nothing is locked in advance; conflicts are detected when they happen.
+W: Optimistic locking with a conditional write: the write succeeds only if the version is unchanged since it was read, so a concurrent update causes a detectable failure instead of a silent overwrite.
+X: A=More write capacity: capacity controls how many writes per second the table accepts; two writes to the same item can still race and overwrite each other no matter how fast they run.
+B=Eventually consistent reads: these can return older data than a strongly consistent read, which makes it more likely an update is based on a stale value.
+C=Read twice before writing: another client can still write between the second read and your write; only a condition checked atomically with the write closes that gap.
+T: Prevent lost updates with a version attribute and a conditional write; faster or repeated reads cannot close the gap between read and write.
+
+@ Q003296 explain
+G: ## Ways to read DynamoDB items
+- **GetItem**: one item by its full primary key.
+- **Query**: items that share one partition key value.
+- **Scan**: reads every item in the table (or index).
+- **BatchGetItem**: up to 100 items by full primary key, from one or more tables, in a single request (up to 16 MB of data).
+## How BatchGetItem behaves
+The items are read in parallel on the service side and returned in no particular order. If the response would exceed limits or some reads are throttled, the keys that were not read come back in `UnprocessedKeys`, and the client should retry just those, ideally with exponential backoff. Reads are eventually consistent by default; set `ConsistentRead` per table if needed.
+## Example
+Fetch 50 product IDs from a shopping cart: one `BatchGetItem` call with 50 keys instead of 50 separate `GetItem` or `Query` calls.
+W: BatchGetItem: it retrieves up to 100 items by primary key in one request, so all 50 known items can be read with a single call (plus retries for any `UnprocessedKeys`).
+X: A=PutItem per item: PutItem creates or replaces items; it writes data and cannot read anything back.
+B=Query per key: each Query call targets one partition key value, so this needs 50 requests instead of one.
+C=Scan with filter: a scan reads the whole table and applies the filter afterwards, consuming capacity for every item and taking far longer than direct key lookups.
+T: To read many known keys at once, use BatchGetItem (up to 100 keys per call) and retry any UnprocessedKeys.
+
+@ Q003297 explain
+G: ## DynamoDB transactions
+`TransactWriteItems` groups up to 100 write actions (`Put`, `Update`, `Delete`, `ConditionCheck`) across one or more tables in the same account and Region into one all-or-nothing operation.
+- If any action's condition fails or any error occurs, none of the writes are applied.
+- Transactions consume about twice the write capacity of the same writes done normally, because of the extra coordination.
+- A client token makes the request idempotent, so a retried transaction is not applied twice.
+## Example: a transfer
+- `Update` account A: `SET balance = balance - :amt` with `ConditionExpression: balance >= :amt`
+- `Update` account B: `SET balance = balance + :amt`
+Either both balances change, or the transaction is cancelled (for example `TransactionCanceledException` because A had insufficient funds) and both stay as they were.
+`TransactGetItems` provides the same guarantee for reading several items as a consistent set.
+W: TransactWriteItems: it applies the debit and the credit as a single atomic transaction, so both succeed or neither is written.
+X: B=UpdateItem retries: each UpdateItem is atomic only for its own item; retrying can finish a failed step later, but in between (or if retries give up) one account is changed and the other is not.
+C=BatchWriteItem: it sends many writes in one call, but each succeeds or fails independently and it supports only puts and deletes, not conditional updates, so it is not all-or-nothing.
+D=Two PutItem calls: two separate requests can leave the first applied and the second failed, which is exactly the partial transfer that must be avoided.
+T: For all-or-nothing writes across items, use TransactWriteItems; BatchWriteItem only saves round trips and is not atomic.
+
+@ Q003298 explain
+G: ## Two expressions that sound similar
+- **Projection expression** (`ProjectionExpression`): chooses which **attributes** are returned for each item. Example: `ProjectionExpression: "OrderId, Total"` returns only those two attributes.
+- **Filter expression** (`FilterExpression`): chooses which **items** are returned, after DynamoDB has read them. Example: `FilterExpression: "Total > :min"` drops orders below the minimum.
+## What each one saves
+A projection makes responses smaller, which means less data over the network and less for the application to deserialize. Read capacity is still charged on the size of the items read, so it reduces payload, not RCU.
+A filter also does not reduce RCU: the items are read and charged before the filter removes them.
+To lower read cost as well, you can create a secondary index that projects only the needed attributes and query that index.
+W: Projection expression: listing just the two needed attributes makes DynamoDB return only those attributes for each item, shrinking the data returned to the application.
+X: B=Filter expression: a filter decides which items are included, not which attributes; every matching item still comes back with all its attributes.
+C=Parallel Scan: a scan reads the entire table instead of one partition, so it returns more data, not less, and still returns whole items.
+D=DynamoDB Streams: streams deliver a log of item changes to consumers; they do not change what a query returns.
+T: A projection expression selects attributes; a filter expression selects items after they are read.
+
+@ Q003299 explain
+G: ## Partitions and hot keys
+DynamoDB spreads data across partitions by hashing the partition key. Each partition can handle up to about 1,000 write units and 3,000 read units per second.
+If the partition key is today's date, every write on a given day has the same key, lands in the same partition and is limited by that one partition, no matter how much capacity the table has overall. This is a **hot partition**.
+## Fixing it
+- **High-cardinality key**: use a key with many distinct, evenly accessed values, such as `OrderId` or `DeviceId`.
+- **Write sharding**: add a suffix to spread one logical key over many physical ones, for example `2026-09-29#0` to `2026-09-29#9` chosen at random or by hashing an ID. To read the whole day, query all 10 suffixes and merge the results.
+Adaptive capacity helps uneven workloads, but it cannot lift one key above the per-partition limit.
+W: High-cardinality key or random suffix: spreading writes across many partition key values puts them on many partitions, so no single partition takes all of the day's writes.
+X: A=More provisioned WCU: table capacity is spread across partitions, and a single partition key value is still limited by one partition's throughput, so the date key keeps throttling.
+B=LSI on the date: an LSI shares the table's partition key and can only be created with the table; it adds writes to the same partition instead of spreading them.
+C=Eventually consistent reads: they halve the read capacity used, but the throttling here is on writes, which read settings do not affect.
+T: Throttling on one key value is a hot partition; fix the key design (high cardinality or write sharding) rather than adding table capacity.
+
+@ Q003300 explain
+G: ## DynamoDB Time to Live (TTL)
+TTL lets DynamoDB delete items for you once they expire.
+- Enable TTL on the table and name an attribute, for example `expiresAt`.
+- Store in that attribute a Unix epoch time in **seconds**, as a Number. For a session created now: `expiresAt = now + 86400` (24 hours).
+- A background process removes expired items without consuming write capacity and at no extra charge.
+## Things to know
+- Deletion is not instant; it usually happens within a few days of expiry. Expired items can still appear in reads until removed, so filter on `expiresAt > :now` when that matters.
+- Items without the attribute, or with a non-number value, never expire.
+- TTL deletions appear in DynamoDB Streams, marked as deleted by the DynamoDB service, so you can archive expired items if needed.
+W: TTL on an expiration attribute: DynamoDB deletes each session automatically after the stored expiry time, with no code to run and no write capacity consumed.
+X: A=Point-in-time recovery: PITR keeps continuous backups for restoring a table to an earlier moment; it does not delete items, and it has its own charge.
+B=Scheduled Lambda scanning: this works but costs read capacity for every scan, write capacity for every delete and Lambda run time, and it is code you must maintain.
+C=Streams delete trigger: streams report changes after they happen; nothing in a stream fires 24 hours after an item was created, and the deletes would still consume capacity.
+T: Expire items automatically and for free with DynamoDB TTL on an epoch-seconds attribute instead of scanning and deleting.
+
+@ Q003301 explain
+G: ## Short polling vs long polling in SQS
+- **Short polling** (the default, `WaitTimeSeconds = 0`): `ReceiveMessage` returns immediately, even if the queue is empty. On a quiet queue most calls return nothing, but each is still a billed request.
+- **Long polling** (`WaitTimeSeconds` 1-20): the call waits up to that many seconds and returns as soon as a message arrives. Empty responses happen only when the wait expires with no message.
+## How to turn it on
+- Per call: pass `WaitTimeSeconds=20` to `ReceiveMessage`.
+- Per queue: set the queue attribute `ReceiveMessageWaitTimeSeconds` to 20 so every receive uses it by default.
+Long polling also queries all SQS servers instead of a sample, which reduces false empty responses. Make sure the client's HTTP timeout is longer than the wait time.
+## Example
+A consumer polling every second on an idle queue makes about 86,400 calls a day; with 20-second long polls it makes about 4,320.
+W: Long polling with WaitTimeSeconds up to 20: each receive waits for messages instead of returning empty right away, which cuts the number of empty responses and billed requests.
+X: B=FIFO queue: FIFO adds ordering and exactly-once processing, but short polling a FIFO queue still returns empty responses when no messages are waiting.
+C=Poll more often: a tighter loop makes even more calls to an empty queue, increasing empty responses and cost.
+D=Visibility timeout of zero: visibility timeout controls how long a received message stays hidden; setting it to zero causes duplicate processing and does nothing about empty receives.
+T: Empty receives on a quiet SQS queue are fixed with long polling (`WaitTimeSeconds` up to 20), not with more frequent polling.
+
+@ Q003302 explain
+G: ## The visibility timeout
+When a consumer receives an SQS message, the message is not deleted; it becomes invisible for the queue's visibility timeout (default 30 seconds, maximum 12 hours). The consumer must call `DeleteMessage` before the timeout ends.
+If processing takes longer, the message becomes visible again and another consumer (or the same one) receives it, so the work is done twice.
+## Setting it correctly
+- Set the queue's `VisibilityTimeout` longer than the longest expected processing time, for example 6-10 minutes for a 5-minute job.
+- For jobs with unpredictable duration, the consumer can extend the timeout while it works with `ChangeMessageVisibility`.
+- For a Lambda consumer, AWS recommends a visibility timeout of at least six times the function timeout.
+Standard queues can still occasionally deliver a message more than once, so processing should be idempotent.
+W: Visibility timeout longer than processing time: messages stay hidden until the worker finishes and deletes them, so they do not reappear for a second consumer mid-processing.
+X: A=Shorter retention: retention controls how long unprocessed messages are kept before SQS deletes them; it does not stop an in-flight message from becoming visible again.
+B=Larger maximum message size: message size limits what a message may contain; the duplicates are about timing, not payload size.
+C=Long polling: long polling changes how receive calls wait for messages, not how long a received message stays hidden.
+T: If SQS messages are processed twice, the visibility timeout is shorter than the processing time; lengthen it or extend it with ChangeMessageVisibility.
+
+@ Q003303 explain
+G: ## SQS message size limits
+Each queue has a maximum message size (the `MaximumMessageSize` attribute). The service maximum was 256 KB for many years and is now 1 MiB, so a queue can be raised to accept payloads up to 1 MiB, but that is still far below the size of large files or documents, and payloads with no fixed upper bound need a different approach.
+## The claim-check pattern
+For payloads that do not fit, store the data elsewhere and send only a reference:
+- The producer writes the payload to S3, for example `s3://orders-payloads/2026/09/29/abc.json`.
+- It sends a small SQS message containing the bucket and key.
+- The consumer receives the message, reads the object from S3 and processes it.
+## SQS Extended Client Library
+AWS provides this pattern as a library (for example for Java and Python). Above a size threshold, it automatically uploads the body to S3 and sends a pointer; the receiving side transparently fetches it, and it can delete the S3 object when the message is deleted. Payloads up to 2 GB are supported, with no custom code for storing or fetching the data.
+W: S3 plus the SQS Extended Client Library: large payloads are stored in S3 and only a pointer travels through SQS, so message size is no longer limited by the queue.
+X: B=Raise the queue limit to 2 GB: `MaximumMessageSize` can only be set up to the service maximum (1 MiB today); no queue setting allows gigabyte-sized messages.
+C=Custom compression: compression ratios depend on the data, so some payloads will still exceed the limit, and every producer and consumer must share and maintain the custom code.
+D=Split without tracking: without sequence numbers and a reassembly step, consumers cannot tell which pieces belong together or whether any are missing, and standard queues do not preserve order.
+T: For SQS payloads beyond the message size limit, store the data in S3 and send a pointer, which the Extended Client Library automates.
+
+@ Q003304 explain
+G: ## Kinesis Data Streams write limits
+In provisioned mode, each shard accepts up to **1 MB/s or 1,000 records/s** of writes. Records are assigned to shards by hashing their partition key. When a burst sends more to a shard than it can accept, `PutRecord` or `PutRecords` fails with `ProvisionedThroughputExceededException`.
+## Two complementary fixes
+- **Add capacity**: increase the shard count with `UpdateShardCount`, or switch the stream to **on-demand** mode, which scales write capacity automatically with traffic.
+- **Retry well**: producers should retry throttled records with exponential backoff and jitter. With `PutRecords`, check `FailedRecordCount` and resend only the failed records. The AWS SDKs and the Kinesis Producer Library help with this.
+Also choose partition keys with many distinct values so records spread evenly over shards instead of piling onto one hot shard.
+W: A=Exponential backoff retries: backing off and retrying smooths short bursts so throttled records succeed on a later attempt instead of being lost.
+E=More shards or on-demand mode: more shards (or automatic on-demand scaling) raise the stream's write capacity so bursts are less likely to exceed it.
+X: B=Shorter retention: retention sets how long records stay readable in the stream; it does not change how fast producers can write.
+C=Disable encryption: server-side encryption does not reduce a shard's write limit, so turning it off does not stop throttling and weakens security.
+D=Remove the partition key: every record requires a partition key, because Kinesis uses it to choose the shard; a write without one is rejected.
+T: Kinesis write throttling is solved with more capacity (shards or on-demand) plus producer retries with exponential backoff.
+
+@ Q003305 explain
+G: ## Throttling errors
+AWS APIs limit request rates. When you exceed them, calls fail with errors such as `ThrottlingException`, `TooManyRequestsException` or HTTP 429. These are **transient**: the same call usually succeeds a moment later.
+## Exponential backoff with jitter
+Wait longer after each failed attempt and add randomness:
+- attempt 1 fails: wait a random time up to 100 ms
+- attempt 2 fails: a random time up to 200 ms
+- attempt 3 fails: a random time up to 400 ms, and so on up to a cap and a maximum number of attempts
+The growing wait gives the service room to recover. Jitter stops many clients from retrying at the same instant and causing another spike.
+## Built into the AWS SDKs
+The SDKs retry throttling and other transient errors automatically with backoff and jitter. You can tune this, for example the retry mode (`standard` or `adaptive`, which also rate-limits the client) and `max_attempts`. If retries are exhausted, the error is raised so the application can handle it.
+W: SDK retries with backoff and jitter: the SDK's built-in retry logic waits progressively longer, with randomness, between attempts, which is the AWS-recommended way to absorb occasional throttling.
+X: A=Switch Region per retry: data and resources usually live in one Region, so another Region may not have them, and this does not address the cause of throttling.
+B=Silently ignore the error: the work in the failed call is lost without anyone knowing, even though a retry would most likely have succeeded.
+C=Immediate retry loop: retrying instantly and endlessly adds more load to a service that is already throttling you, making throttling worse for you and others.
+T: Handle AWS throttling with retries using exponential backoff and jitter, which the SDKs provide; never retry in a tight loop or drop the call.
+
+@ Q003306 explain
+G: ## Lambda proxy integration
+With a Lambda proxy integration, API Gateway passes the whole HTTP request to the function as an event and expects the function to return the HTTP response in a specific JSON shape:
+- `statusCode` (a number such as 200)
+- `headers` (optional object) and `multiValueHeaders`
+- `body` (a **string**; serialize objects with `JSON.stringify` or `json.dumps`)
+- `isBase64Encoded` (optional, for binary bodies)
+## When the shape is wrong
+If the function returns something else, such as a plain object `{"message": "ok"}` or a `body` that is an object instead of a string, API Gateway cannot build an HTTP response. It returns **502 Bad Gateway** with `Internal server error`, and the execution log shows `Malformed Lambda proxy response`, even though the function itself ran without errors.
+## Other status codes to recognize
+- 429: throttling (stage, method or usage plan limits).
+- 504: integration timeout.
+- 502 can also mean the function threw an unhandled error, which the stem rules out.
+W: Response not in proxy format: when the function's return value lacks the expected `statusCode`/`body` structure, API Gateway cannot map it to an HTTP response and returns 502, even though the function succeeded.
+X: B=HTTP/2 from the client: the HTTP version is negotiated between the client and the API endpoint; it has no effect on how API Gateway parses the function's return value, so it does not explain a 502 after a successful invocation.
+C=Stage throttling: requests over the throttling limits are rejected with 429 Too Many Requests before reaching the function, not 502.
+D=High reserved concurrency: reserved concurrency guarantees capacity for the function; a high value does not cause errors. Too little concurrency causes throttling, not malformed responses.
+T: A 502 from a Lambda proxy integration with a successful function almost always means the returned object is not in the `statusCode`/`headers`/`body` proxy format.
+
+@ Q003307 explain
+G: ## The same-origin policy and CORS
+Browsers block JavaScript on one origin (for example `https://app.example.com`) from reading responses from another origin (`https://abc123.execute-api.us-east-1.amazonaws.com`) unless the server allows it with **Cross-Origin Resource Sharing (CORS)** headers.
+- For non-simple requests (custom headers such as `Authorization`, or methods like `PUT`), the browser first sends an `OPTIONS` **preflight**.
+- The response must include headers such as `Access-Control-Allow-Origin: https://app.example.com`, `Access-Control-Allow-Methods` and `Access-Control-Allow-Headers`.
+## CORS in API Gateway REST APIs
+- **Enable CORS** on a resource creates an `OPTIONS` method (a mock integration) that returns the preflight headers.
+- With a Lambda **proxy** integration, the function must also include `Access-Control-Allow-Origin` in its own responses, because API Gateway passes them through unchanged.
+- Add CORS headers to gateway responses (such as 4XX and 5XX) so browser errors are readable too.
+CORS is enforced by the browser; tools like `curl` work without it, which is why the API seems fine outside the browser.
+W: Enable CORS and return the headers: the browser needs the preflight response and the `Access-Control-Allow-*` headers from the API before it lets the page on another domain read the responses.
+X: A=Stage caching: caching stores responses to reduce backend calls; cached responses still lack CORS headers, so the browser keeps blocking them.
+B=Switch to edge-optimized: the endpoint type only changes how traffic reaches the API (through CloudFront or directly in the Region); the origin is still different, and no CORS headers are added.
+C=Higher throttling limits: throttling produces 429 errors under load; the browser errors are about missing cross-origin permission, not rate limits.
+T: Cross-origin browser errors mean the API is missing CORS headers; enable CORS (and return the headers from proxy-integrated Lambda functions).
+
+@ Q003308 explain
+G: ## API Gateway caching
+For REST APIs, you can enable a cache on a **stage**. API Gateway then stores endpoint responses and serves repeated requests from the cache without calling the backend.
+- Choose a cache size (from 0.5 GB upward); the cache is billed per hour by size.
+- Responses are kept for a **TTL**: default 300 seconds, maximum 3,600 seconds, and 0 disables caching. You can override it per method.
+- Cache keys are built from the method and path, and you can add query strings or headers as cache key parameters so, for example, `?category=books` and `?category=toys` are cached separately.
+- Clients can bypass the cache with `Cache-Control: max-age=0` if you allow it (ideally requiring authorization), and you can flush the whole cache.
+## Example
+A product catalog endpoint that changes a few times a day is called thousands of times per minute. With caching and a 3,600-second TTL, the backend handles one call per cache key per hour instead of thousands.
+W: Stage caching with a TTL: API Gateway returns stored responses for repeated requests during the TTL, so the backend is called far less for data that rarely changes.
+X: B=Usage plans with API keys: usage plans set throttling and quotas per client; they limit how many requests each client may make but still send every allowed request to the backend.
+C=Request validators: validators reject requests with invalid parameters or bodies before the integration; valid repeated requests still reach the backend every time.
+D=Custom domain names: a custom domain only gives the API a friendly hostname such as `api.example.com`; it does not store or reuse responses.
+T: To serve repeated, rarely changing responses without hitting the backend, enable API Gateway stage caching with a suitable TTL.
+
+@ Q003309 explain
+G: ## DynamoDB Streams
+A stream is a time-ordered log of item-level changes to a table. Each record says whether an item was inserted (`INSERT`), updated (`MODIFY`) or deleted (`REMOVE`), and can include the item's data according to the **stream view type**: `KEYS_ONLY`, `NEW_IMAGE`, `OLD_IMAGE` or `NEW_AND_OLD_IMAGES`. Records are kept for 24 hours.
+## Triggering Lambda
+Create an event source mapping from the stream to a Lambda function. Lambda polls the stream shards and invokes the function with batches of records, in order per item.
+- Use event filtering, for example on `eventName` = `INSERT`, so the function runs only for new items.
+- Configure retries, bisect-on-error and an on-failure destination so a bad record does not block the shard.
+## Example
+When an order item is written to `Orders`, the function receives the `NEW_IMAGE` and sends a confirmation email, typically within seconds of the write.
+W: DynamoDB Streams with a Lambda event source mapping: the stream captures every new item and Lambda is invoked with those records automatically, so code runs on each write without polling the table.
+X: A=S3 event notification: S3 notifications are configured on S3 buckets for object events; DynamoDB tables cannot emit them.
+B=Scheduled scan every minute: scanning the whole table each minute costs read capacity for every item, adds up to a minute of delay and needs your own logic to work out which items are new.
+C=Alarm on item count: an alarm only changes state when a metric crosses a threshold; it does not fire once per write and never delivers the items that were written, so the code would not know what to process.
+T: To run code on each DynamoDB write, enable Streams and attach Lambda with an event source mapping instead of polling the table.

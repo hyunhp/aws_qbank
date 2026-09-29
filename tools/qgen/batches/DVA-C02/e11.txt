@@ -1,0 +1,331 @@
+# DVA-C02 detailed explanations, e11 (explanation-only rewrites; letters are the published ones)
+
+@ Q003360 explain
+G: ## Why repeated reads get expensive
+Every `GetItem` or `Query` against DynamoDB consumes read capacity (or on-demand read request units) and makes a network round trip to the table, usually single-digit milliseconds. If the same few "hot" items are read thousands of times a minute, you pay for every one of those identical reads.
+## Caching options
+- **DynamoDB Accelerator (DAX)** is an in-memory, write-through cache that is API-compatible with DynamoDB. Eventually consistent `GetItem`, `BatchGetItem` and `Query` calls can be served from the item and query caches in microseconds, and cache hits do not consume table read capacity.
+- An **application cache** (for example Amazon ElastiCache or an in-process cache with a short TTL) gives the same benefit when you manage the cache logic yourself.
+Example: a product catalog API reads `product#123` 5,000 times a minute; with DAX, only cache misses and TTL refreshes reach the table.
+W: DAX or application cache: hot items are answered from memory, so most reads never reach the table. That cuts consumed read capacity (cost) and brings latency from milliseconds down to microseconds.
+X: A=Ten times more read capacity: extra provisioned RCUs only prevent throttling; you pay for them every hour whether used or not, and each read still makes the same round trip, so cost goes up and latency does not improve.
+B=Scan instead of GetItem: a `Scan` reads every item in the table (or segment) and charges for all the data read, even items it filters out, so it is far slower and more expensive than a direct key lookup.
+C=Strongly consistent reads: a strongly consistent read consumes twice the capacity of an eventually consistent one, and DAX passes strongly consistent reads straight through to the table, so this raises cost without any caching benefit.
+T: Repeated reads of the same items call for a cache such as DAX, not more capacity or stronger (more expensive) read modes.
+
+@ Q003361 explain
+G: ## What a cold start is
+When Lambda has no idle execution environment for a request, it must create one: download the code, start the runtime and run your initialization code (outside the handler). That extra time is the **cold start**. Later requests reuse the warm environment and skip it.
+## Provisioned concurrency
+Provisioned concurrency tells Lambda to create and initialize a set number of environments in advance and keep them ready.
+- It is configured on a published **version** or an **alias** (not on `$LATEST`).
+- Requests up to that number start on pre-initialized environments with no cold start; traffic above it falls back to on-demand environments.
+- You pay for the configured concurrency for as long as it is enabled, and Application Auto Scaling can adjust it on a schedule or by utilization.
+Example: an API alias `live` with provisioned concurrency of 50 serves 50 concurrent requests with consistently low latency.
+W: Provisioned concurrency on the alias: environments are initialized before requests arrive, so the customer-facing API avoids the initialization delay entirely for the configured concurrency.
+X: B=Reserved concurrency of zero: reserved concurrency caps how many environments a function can use; setting it to zero throttles every invocation, so the function stops serving requests instead of starting faster.
+C=Shorter timeout: the timeout only limits how long an invocation may run before Lambda stops it. It has no effect on how long environment creation and initialization take.
+D=More environment variables: environment variables are just configuration values passed to the runtime; adding more does nothing to pre-warm environments and cannot shorten initialization.
+T: Provisioned concurrency pre-initializes environments to remove cold starts; reserved concurrency only guarantees or caps capacity.
+
+@ Q003362 explain
+G: ## How a Lambda function gets AWS permissions
+Each Lambda function has an **execution role**, an IAM role that Lambda assumes when it runs. The AWS SDK inside the function signs requests with that role's temporary credentials, so what the function may do is decided by the role's policies.
+- A write to DynamoDB needs actions such as `dynamodb:PutItem` or `dynamodb:UpdateItem` allowed on the table ARN, for example `arn:aws:dynamodb:us-east-1:111122223333:table/Orders`.
+- An `AccessDeniedException` means the request was signed with valid credentials but was not authorized: a missing allow, a wrong resource ARN, or an explicit deny somewhere (for example a table resource policy or a VPC endpoint policy).
+Example: a role that allows only `dynamodb:GetItem` succeeds on reads and fails with `AccessDeniedException` on `PutItem`.
+W: Execution role permissions: the function calls DynamoDB with its execution role, so the role must allow the write actions on the correct table ARN. This is the first place to look when the error is an authorization failure.
+X: A=Point-in-time recovery: PITR controls continuous backups and restore of the table. It does not grant or deny any API call, so it cannot cause an authorization error.
+B=Reserved concurrency: reserved concurrency limits how many copies of the function run at once. Hitting it causes throttling of invocations, not an `AccessDeniedException` from DynamoDB.
+D=Memory and timeout: these settings affect performance and how long an invocation may run. They have nothing to do with IAM authorization of the calls the function makes.
+T: An `AccessDeniedException` is an IAM problem, so check the execution role's policy for the needed actions on the table ARN, not performance settings.
+
+@ Q003363 explain
+G: ## How DynamoDB spreads throughput
+A DynamoDB table stores data in **partitions**. The partition key's hash decides which partition holds an item, and each partition can serve at most about 3,000 read capacity units and 1,000 write capacity units per second.
+- Table-level provisioned capacity is spread across partitions. Adaptive capacity shifts unused capacity toward busy partitions, but traffic for a single partition key value still cannot exceed those per-partition limits.
+- If most requests use the same key (for example `status = "ACTIVE"` or today's date), one partition takes the load while the others sit idle.
+Example: a table provisioned at 10,000 WCU where 80% of writes go to one key can be throttled even though CloudWatch shows total consumption well below 10,000.
+W: Hot partition key: throttling while total consumption is below provisioned capacity is the classic sign of uneven traffic. The fix is a higher-cardinality key or write sharding (for example appending a random or calculated suffix).
+X: A=Projection expressions: a projection only chooses which attributes are returned. Read capacity is based on the item size read, so it neither adds load nor causes throttling.
+C=Too many GSIs: the number of indexes by itself does not cause throttling. An individual GSI with too little write capacity can throttle writes to the base table, but that is about one index's capacity, not how many indexes exist.
+D=Wrong TTL attribute: TTL only marks items for background deletion, which consumes no provisioned capacity. A misconfigured TTL means items are not deleted, not that requests are throttled.
+T: Throttling below total capacity points to a hot partition key; spread traffic across more key values instead of just adding capacity.
+
+@ Q003364 explain
+G: ## Observability for serverless applications
+Serverless apps are made of many small managed pieces (API Gateway, Lambda, queues, tables), so problems are hard to find without good telemetry.
+- **Amazon CloudWatch metrics and alarms**: Lambda publishes `Errors`, `Throttles`, `Duration` and `Invocations`. An alarm watches a metric (or a metric math expression) and notifies you, for example through SNS, when it crosses a threshold.
+- **AWS X-Ray tracing**: with active tracing enabled, each request gets a trace showing every hop (API Gateway, Lambda, downstream calls such as DynamoDB) with its latency and errors, so you can see where time is spent.
+- **Logs** in CloudWatch Logs give the detail behind an error; retention settings control storage cost.
+Example: an alarm on `Throttles > 0` for five minutes pages the team, and the X-Ray service map shows the slow downstream call.
+W: D=CloudWatch alarms on errors and throttles: alarms turn metrics into timely notifications, so failures and throttling are noticed instead of silently dropping or delaying requests.
+E=X-Ray tracing: traces follow each request across services, showing which component adds latency or returns errors in a distributed serverless flow.
+X: A=Ignore throttles: throttled synchronous calls fail back to the caller and throttled async events are retried and may eventually be dropped, so throttles are a signal to investigate, not something to ignore.
+B=Remove metrics: fewer metrics means less visibility; cluttered dashboards are better fixed by organizing them, not by deleting the data you need for troubleshooting.
+C=Disable logging: without logs you cannot see error details. Storage cost is controlled by setting a log group retention period or lowering log levels, not by turning logging off.
+T: Monitor serverless apps with alarms on key metrics and X-Ray traces; cut cost with retention settings, not by removing visibility.
+
+@ Q003365 explain
+G: ## Where a Java cold start spends time
+A cold start has two main parts: preparing the environment (downloading and unpacking the code) and the **init phase**, where the JVM starts, classes load and your static initialization runs (SDK clients, frameworks, dependency injection). For Java, init is often the largest part.
+## Two ways to shrink it
+- **Lambda SnapStart**: when you publish a version, Lambda runs init once, takes a snapshot of the initialized memory and disk state, and caches it. New environments are restored from the snapshot instead of running init again. It applies to published versions and aliases.
+- **Lean packages and init code**: fewer dependencies, a smaller deployment package, and lighter startup logic (for example avoiding classpath scanning or lazy-loading rarely used clients) mean less to load and run.
+Example: a Spring-based function whose init takes several seconds can restore from a SnapStart snapshot in a fraction of that time.
+W: A=SnapStart: new environments are resumed from a snapshot of an already-initialized runtime, so the expensive JVM and framework startup is not repeated on each cold start.
+E=Smaller package, less init work: less code to download and fewer classes and objects to create during init directly shortens the cold start.
+X: B=More VPC subnets: subnets decide where the function's network interfaces live for private access. Adding subnets does not make the runtime or your code start faster.
+C=More environment variables and layers: layers are extracted into the environment and add to what is loaded, so extra layers and dependencies tend to lengthen, not shorten, startup.
+D=Maximum timeout: the timeout only limits how long an invocation may run. A cold start takes the same time whether the limit is 3 seconds or 15 minutes.
+T: Speed Java cold starts by skipping init with SnapStart and making init itself smaller; network and timeout settings do not help.
+
+@ Q003366 explain
+G: ## Paying for the same S3 object again and again
+Amazon S3 charges per request (for example per 1,000 `GET` requests) plus data transfer out. Each request also has a network round trip. When clients fetch the same objects repeatedly, every fetch is billed and waits on S3.
+## Caching in front of S3
+- **Amazon CloudFront** caches objects at edge locations close to users. After the first request, repeats are served from the edge until the cache TTL expires, so fewer requests reach the bucket and responses arrive faster. Origin access control keeps the bucket private.
+- An **application cache** (in-memory or ElastiCache) does the same for server-side code that reads the same objects.
+Example: a product image read 100,000 times a day is fetched from S3 only when the CloudFront cache expires.
+W: CloudFront or application cache: repeated reads are served from a cache near the user or the app, which reduces S3 request charges and removes most round trips to the bucket.
+X: A=Object Lock: Object Lock provides write-once-read-many retention that stops objects from being deleted or overwritten. It does nothing to reduce the number of reads or speed them up.
+B=Glacier Deep Archive: objects in Deep Archive must be restored before they can be read, which takes hours, and restores add request and retrieval charges. It suits rarely accessed archives, not hot data.
+C=Requester Pays: Requester Pays only moves the request and data-transfer charges to the requester's account; the same number of requests still hits S3 with the same latency.
+T: Frequently read objects belong behind a cache such as CloudFront; storage classes and billing options do not reduce repeated requests.
+
+@ Q003367 explain
+G: ## The shared concurrency pool
+Lambda concurrency is the number of requests being handled at the same moment. All functions in an account share a per-Region concurrency quota (1,000 by default in most accounts, raisable through a quota increase).
+- Without limits, one busy function can use most of the pool, and other functions start getting throttled.
+- **Reserved concurrency** sets aside a fixed amount for one function. That amount is guaranteed to that function and is also its maximum, and other functions can no longer use it.
+- Lambda always keeps at least 100 units unreserved for functions without reservations.
+Example: with a quota of 1,000, reserving 300 for `checkout` guarantees it 300 concurrent executions even when a batch function spikes, and the batch function cannot consume those 300.
+W: Reserved concurrency for critical functions: it partitions the shared pool so a spike in one function cannot starve the critical ones, and it can also cap the noisy function so it cannot grab the whole pool.
+X: A=Delete log groups: CloudWatch log groups only store output. Deleting them loses diagnostic data and has no effect on how concurrency is shared or throttled.
+C=More memory everywhere: memory changes CPU and speed per invocation. It can shorten durations a little, but it does not reserve or limit concurrency, so one function can still consume the shared pool.
+D=Longer timeouts everywhere: longer timeouts let invocations run longer, which can actually keep more environments busy and make throttling worse, and they do nothing to isolate functions.
+T: Isolate functions from each other's spikes with reserved concurrency; memory and timeout settings do not change how the shared pool is divided.
+
+@ Q003368 explain
+G: ## Alarming on a ratio instead of a count
+A CloudWatch alarm normally watches one metric, for example Lambda `Errors`. A raw count is misleading: 50 errors is serious at 100 invocations but negligible at 100,000.
+**Metric math** lets an alarm evaluate an expression built from several metrics. You add the metrics as queries with ids, then an expression, and the alarm watches the result.
+- `m1` = `Errors` (Sum), `m2` = `Invocations` (Sum)
+- `e1` = `100 * m1 / m2`, returned as the alarm's value
+- Alarm when `e1 > 5` for, say, 3 of 5 one-minute periods.
+Metric math also supports functions such as `FILL` or `IF` to handle periods with no invocations.
+W: Metric math expression: the alarm computes errors divided by invocations for each period and compares the percentage with the 5% threshold, which is exactly the error-rate condition asked for.
+X: B=CloudTrail data events: CloudTrail records who called which API (for example Lambda `Invoke` data events). It does not compute metrics or raise CloudWatch alarms on ratios.
+C=S3 event notification on logs: S3 notifications fire when objects are created or deleted in a bucket. They cannot calculate an error rate, and Lambda metrics are not stored as S3 objects anyway.
+D=Log retention setting: retention only decides how long log events are kept in a log group before deletion. It does not measure anything or trigger alarms.
+T: To alarm on a rate such as errors per invocation, use a metric math expression in the CloudWatch alarm rather than a raw metric count.
+
+@ Q003369 explain
+G: ## Temporary access to private objects
+A bucket can stay fully private while specific users get short-lived access through a **presigned URL**. Your backend, which has permission to read the object, signs a URL for one operation on one object (for example `GetObject` on `reports/q3.pdf`) with an expiration time.
+- Anyone holding the URL can perform that one operation until it expires; after that, S3 rejects it.
+- The URL carries the permissions of the signer, so the signer's credentials must allow `s3:GetObject`. If signed with temporary credentials, it also stops working when those credentials expire.
+Example: the SDK call `generate_presigned_url('get_object', Params={...}, ExpiresIn=600)` returns a link valid for 10 minutes that the web app hands to the logged-in user.
+W: Presigned GET URLs with 10-minute expiry: each user gets a link to one private object that stops working after 10 minutes, with no public bucket and no credentials shared.
+X: A=Requester Pays: Requester Pays only changes who is billed for requests and data transfer; it does not grant anyone access, and requesters must still be authenticated AWS principals.
+B=Public objects deleted later: while public, anyone can download and share the objects, and deleting them afterward does not remove copies. It also destroys the files the app is supposed to keep serving.
+D=Share owner credentials: handing out long-term credentials gives users full access to everything the owner can do, cannot be limited to 10 minutes and must be rotated afterward. It breaks every security best practice.
+T: Time-limited downloads of private S3 objects are done with presigned URLs, not by changing bucket access or sharing credentials.
+
+@ Q003370 explain
+G: ## At-least-once delivery
+S3 event notifications are designed to be delivered at least once, and occasionally the same event arrives twice. The same is true of SQS standard queues and many other AWS event sources. Code that must have an effect "exactly once" therefore has to be **idempotent**: running it twice for the same input gives the same result as running it once.
+## A common pattern
+- Build an idempotency key from the event, for example bucket + object key + `versionId` or the event's `sequencer` value.
+- Before doing the work, write that key to a DynamoDB table with a condition such as `attribute_not_exists(pk)`.
+- If the write succeeds, process the object; if it fails with `ConditionalCheckFailedException`, the event is a duplicate and is skipped.
+The conditional write is atomic, so two concurrent deliveries cannot both win.
+W: Idempotent processing with a conditional write: recording processed keys atomically means a duplicate notification is detected and skipped, so each object's effect happens once even though delivery is at least once.
+X: A=Users email object keys: manual reporting is slow, error-prone and can itself produce duplicates or missed objects. It removes automation without guaranteeing exactly-once processing.
+C=Assume exactly-once delivery: S3 does not guarantee single delivery, so skipping duplicate checks means duplicates will occasionally cause double processing, such as a customer being charged twice.
+D=Process twice and compare: doing the work twice doubles cost and still applies side effects twice. Comparing outputs cannot tell whether a notification was a duplicate.
+T: With at-least-once event delivery, get exactly-once effects through idempotent handlers, typically a conditional write on an idempotency key.
+
+@ Q003371 explain
+G: ## Fan-out with publish/subscribe
+Amazon SNS is a publish/subscribe service. A producer publishes a message once to a **topic**, and SNS pushes a copy to every **subscription** on that topic.
+- Supported subscription types include Amazon SQS queues, AWS Lambda functions, email, HTTP/S endpoints, SMS, mobile push and Amazon Data Firehose.
+- Each subscriber receives its own copy independently, so a slow or failing subscriber does not stop the others.
+- Email subscriptions must be confirmed by the recipient before they receive messages.
+Example: an `order-created` topic with three subscriptions sends the same event to a fulfillment queue, an audit Lambda function and an operations mailbox.
+W: SNS topic with multiple subscriptions: one publish is pushed to every subscriber, and SNS natively supports SQS, Lambda and email endpoints, so no extra code is needed.
+X: B=Step Functions Express workflow: Step Functions orchestrates steps you define. You could build a state machine that calls each target, but that is custom orchestration, not native one-to-many message delivery, and it has no built-in email subscription.
+C=Kinesis stream with one shard: Kinesis stores records for consumers to pull. Lambda can read it, but SQS and email cannot subscribe to a stream, so it does not deliver to all three targets.
+D=SQS queue with multiple consumers: a queue gives each message to only one consumer, which then deletes it. Consumers compete for messages, so they do not each receive a copy.
+T: Delivering one message to many different endpoints is SNS fan-out; a queue hands each message to just one consumer.
+
+@ Q003372 explain
+G: ## SNS subscription filter policies
+By default every subscriber to an SNS topic receives every message. A **filter policy** is a JSON document attached to one subscription that says which messages that subscriber wants.
+- The filter can match message attributes (the default scope) or, with filter policy scope `MessageBody`, fields in a JSON message body.
+- SNS evaluates the policy before delivery; messages that do not match are simply not delivered to that subscription, and other subscriptions are unaffected.
+Example: the priority queue's subscription uses the policy `{"orderType": ["priority"]}`, while the other queues have no filter and still get all orders.
+W: Subscription filter policy: SNS itself drops non-matching messages for that one subscription, so the priority queue receives only `orderType = priority` without extra code or topics.
+X: A=Dead-letter queue: a DLQ holds messages that could not be delivered or processed after retries. It does not decide which messages a subscriber should receive.
+B=Lambda deletes non-priority messages: every message would still be delivered to the queue and then processed again just to be removed, adding cost, latency and a component that can fail.
+D=A topic per order type: publishers would need to choose the topic, and each new order type would need a new topic and subscriptions. This adds complexity that one topic with filter policies avoids.
+T: To send only some messages to one subscriber, attach a filter policy to that subscription instead of filtering after delivery or multiplying topics.
+
+@ Q003373 explain
+G: ## Three different "wait" settings in SQS
+- **Delay** (delay queue or per-message `DelaySeconds`): a new message stays invisible to consumers for a set time after it is sent, from 0 to 900 seconds (15 minutes). A queue-level default delays every message; per-message delay works on standard queues (FIFO queues support only the queue-level delay).
+- **Visibility timeout**: after a consumer receives a message, it is hidden from other consumers for this long while it is being processed.
+- **Long polling** (`WaitTimeSeconds` up to 20): how long a `ReceiveMessage` call waits for messages to arrive before returning empty.
+Example: setting `DelaySeconds=60` on a queue means a message sent at 12:00:00 cannot be received before 12:01:00.
+W: Delay queue or per-message delay: this is the setting that postpones delivery of each newly sent message, and 60 seconds is well within the 15-minute maximum.
+X: A=Longer visibility timeout: visibility timeout only starts after a consumer receives the message. New messages are still available immediately, so processing is not delayed.
+B=DLQ with max receives: a redrive policy moves a message to a dead-letter queue after it is received too many times without being deleted. It handles failures, not a planned wait.
+C=Long polling of 20 seconds: long polling reduces empty responses by letting a receive call wait for messages, but a message that is already available is returned right away.
+T: Delay applies before a message is first received; visibility timeout applies after it is received; long polling only affects how receive calls wait.
+
+@ Q003374 explain
+G: ## Deduplication in SQS FIFO queues
+FIFO queues provide exactly-once processing within a **5-minute deduplication interval**. When a producer sends a message, SQS checks its **deduplication ID**. If a message with the same ID was accepted in the last 5 minutes, the new send succeeds but the message is not added again.
+- **Explicit ID**: the producer sets `MessageDeduplicationId`, for example the order number `ORD-10045`, on every attempt.
+- **Content-based deduplication**: enabled on the queue, SQS uses a SHA-256 hash of the message body as the ID, so identical bodies are treated as duplicates.
+Example: a producer times out and resends `ORD-10045` 30 seconds later; the queue still holds only one copy.
+W: Deduplication ID or content-based deduplication: retries of the same order within 5 minutes share an ID, so SQS accepts the retry call but stores only the first message.
+X: B=Longer retention period: retention decides how long unconsumed messages stay in the queue (up to 14 days). It does not compare messages, so duplicates would simply be kept longer.
+C=Larger maximum message size: the size limit only controls how big one message can be. Duplicate small messages would still be accepted.
+D=Long polling on consumers: long polling changes how consumers wait for messages. By the time a consumer polls, a duplicate is already in the queue, so this cannot stop it.
+T: FIFO queues drop producer retries through deduplication IDs (or body hashes) within a 5-minute window; queue sizing and polling settings do not deduplicate.
+
+@ Q003375 explain
+G: ## Content-based routing with EventBridge
+Amazon EventBridge is an event bus. Applications send JSON events with `PutEvents`, and **rules** decide where each event goes.
+- A rule has an **event pattern** that matches fields in the event, such as `source`, `detail-type` or values inside `detail`.
+- Each matching rule sends the event to up to five targets, such as Lambda, SQS, SNS, Step Functions or another event bus, optionally transforming the input.
+Example: the pattern `{"source": ["app.orders"], "detail": {"region": ["EU"]}}` sends EU orders to one queue, while another rule matching `"region": ["US"]` sends US orders to a Lambda function.
+Routing is pure configuration, so adding a new destination means adding a rule, not changing code.
+W: EventBridge rules with event patterns: patterns match on fields inside each event and deliver matches to the chosen targets, giving content-based routing with little or no code.
+X: A=DynamoDB Streams with triggers: streams capture item-level changes to a table. They are not a general event router, and the Lambda consumer would have to contain the routing logic in code.
+C=S3 event notifications only: these fire for object events in one bucket and can filter only by key prefix and suffix, so they cannot route arbitrary application events by their fields.
+D=SQS standard queues with polling: a queue holds messages for consumers but does not inspect content; every consumer would have to receive, examine and forward messages itself.
+T: When events must go to different targets based on their content, use EventBridge rules and patterns rather than custom routing code on a queue or stream.
+
+@ Q003376 explain
+G: ## Orchestrating long-running workflows
+AWS Step Functions runs state machines that call services in order, with built-in `Retry` and `Catch` on each step.
+- **Standard workflows** can run for up to one year and record every step, which suits processes that include waits measured in days.
+- The **callback pattern** (`.waitForTaskToken`) pauses a task and passes a unique task token to something outside, for example an email or ticket sent to an approver. The workflow waits, without running or paying for compute, until code calls `SendTaskSuccess` or `SendTaskFailure` with that token.
+Example: validate order, reserve stock, charge card (each a Lambda function with retries), then pause for manager approval and continue when the approval app returns the token.
+Express workflows run for at most five minutes and do not support `.waitForTaskToken`.
+W: Standard workflow with a callback task token: it sequences the three functions with declarative retries and can pause for days until the approver's response returns the token.
+X: A=SQS queue polled by cron on EC2: this needs custom code to track which step each request is in, handle retries and store approval state, and adds a server to manage. It is not an orchestrator.
+B=Lambda that sleeps: a Lambda invocation can run for at most 15 minutes, so it cannot wait days, and you would pay for all the time spent sleeping.
+D=SNS email and end: SNS can notify the approver, but it has no way to wait for the answer or resume the remaining steps, so the workflow would stop at the notification.
+T: Multi-step processes with retries and human waits of days fit Step Functions Standard with task tokens; Lambda alone is limited to 15 minutes.
+
+@ Q003377 explain
+G: ## Standard vs Express workflows
+Step Functions has two workflow types with different limits and pricing.
+- **Standard**: runs up to one year, exactly-once step execution, full execution history. Priced per **state transition**, and new executions start at a lower rate, which makes it best for long, auditable business processes.
+- **Express**: runs up to five minutes, very high start rates (AWS cites more than 100,000 per second), at-least-once (async) or at-most-once (sync) execution. Priced by **number of executions, duration and memory**, which is much cheaper for short, high-volume work.
+Example: processing IoT or streaming events that each take under a second, at thousands per second, costs far less as Express executions than as Standard state transitions.
+W: Express Workflows: they are designed for high-volume, short-duration event processing, with high start rates and duration-based pricing that stays low for many short executions.
+X: A=AWS Batch: Batch schedules containerized compute jobs through job queues and is aimed at longer-running batch work, with job scheduling overhead that does not suit thousands of tiny executions per second.
+B=Amazon SWF: SWF is a legacy workflow service that needs you to write and run decider and activity workers, adding code and infrastructure. AWS recommends Step Functions for new applications.
+C=Standard Workflows: per-transition pricing becomes expensive at thousands of executions per second, and Standard's start rate is lower, so it is the wrong fit for short, high-volume runs.
+T: Short, high-volume executions belong in Express Workflows; Standard is for long-running, auditable processes.
+
+@ Q003378 explain
+G: ## Read consistency in DynamoDB
+DynamoDB stores each item in multiple copies across Availability Zones. A write is acknowledged once it is durable, and the other copies catch up, usually within a second.
+- **Eventually consistent read** (the default): may be served by a copy that has not received the latest write yet, so a read right after a write can return old data. Costs half a read capacity unit per 4 KB.
+- **Strongly consistent read**: set `ConsistentRead=true` on `GetItem`, `Query` or `Scan`. It returns the result of all writes acknowledged before the read. Costs one full RCU per 4 KB and is available only on the table and local secondary indexes.
+Example: an app writes a new profile photo URL and immediately reloads the profile; with `ConsistentRead=true`, it always sees the new URL.
+W: Strongly consistent reads: they reflect every successful write made before the read, so read-after-write returns the latest data, at the cost of twice the read capacity.
+X: A=More read capacity units: capacity only controls how much throughput is available and whether requests are throttled; eventually consistent reads can still return stale data.
+B=Global secondary index: GSIs are updated asynchronously and support only eventually consistent reads, so reading from one makes staleness more likely, not less.
+D=DynamoDB Streams: streams publish a log of item changes for other consumers. Enabling them has no effect on what a `GetItem` or `Query` returns.
+T: Read-after-write accuracy needs `ConsistentRead=true` on the base table; GSIs are always eventually consistent and capacity does not change consistency.
+
+@ Q003379 explain
+G: ## Query vs Scan vs GetItem
+In a table with a composite key, all items with the same partition key are stored together and sorted by the sort key. That makes range lookups efficient.
+- **Query** requires an equality condition on the partition key and can add one condition on the sort key: `=`, `<`, `>`, `BETWEEN` or `begins_with`. It reads only the matching items.
+- **Scan** reads every item in the table and applies filters afterward.
+- **GetItem** returns exactly one item and needs the full primary key.
+Example: `KeyConditionExpression = "CustomerId = :c AND OrderDate BETWEEN :from AND :to"` with `:c = "C-42"`, `:from = "2026-01-01"`, `:to = "2026-03-31"` returns only that customer's orders for Q1. ISO 8601 date strings sort correctly as text.
+W: Query with a key condition and BETWEEN: it goes straight to the customer's partition and reads just the sort key range between the two dates, so it consumes capacity only for the orders returned.
+X: A=BatchWriteItem: this operation puts or deletes up to 25 items per call. It cannot read data and does not support condition expressions.
+C=Scan with a filter: a Scan reads the entire table and charges for all of it; the filter only removes non-matching items after they are read, so it is slow and costly on a large table.
+D=GetItem with only CustomerId: GetItem needs both the partition key and the sort key for this table and returns a single item, so it cannot fetch a date range.
+T: When the partition key is known and you need a range of sort key values, use Query with a key condition, not Scan or GetItem.
+
+@ Q003380 explain
+G: ## How Scan works
+A `Scan` reads the table sequentially, returning up to 1 MB of data per call, and you follow `LastEvaluatedKey` to fetch the next page. On a large table, one worker walking through pages one at a time is slow no matter how much capacity is provisioned.
+## Parallel Scan
+A parallel scan splits the table into logical **segments**. Each worker calls `Scan` with the same `TotalSegments` value and its own `Segment` number, and they run at the same time.
+- Example: `TotalSegments=8`, with eight threads or Lambda invocations using `Segment=0` through `Segment=7`.
+- Throughput scales with the number of workers, up to the table's read capacity, so size the segment count to avoid starving other traffic.
+W: Parallel Scan with multiple segments: several workers read different parts of the table concurrently, so the whole table is read in a fraction of the time a single sequential scan needs.
+X: A=Filter expression: a filter is applied after items are read, so the scan still reads, and is charged for, the whole table. It reduces the data returned, not the time to read it.
+B=Smaller page size: a lower `Limit` returns fewer items per call, which only adds more round trips and makes the full scan slower.
+C=Strongly consistent Scan: consistent reads use twice the read capacity for the same data and do not make the sequential walk faster; with limited capacity they can make it slower.
+T: To read a large table faster, parallelize the Scan into segments; filters, page size and consistency settings do not speed up reading everything.
+
+@ Q003381 explain
+G: ## Capacity units in DynamoDB
+In provisioned mode, throughput is measured in capacity units, and item size is rounded up to the unit size.
+- **RCU (read capacity unit)**: one strongly consistent read per second of an item up to **4 KB**, or two eventually consistent reads of that size. Transactional reads cost two RCUs per 4 KB.
+- **WCU (write capacity unit)**: one write per second of an item up to **1 KB**. Transactional writes cost two WCUs per 1 KB.
+Examples:
+- Reading a 10 KB item strongly consistently: 10 / 4 rounds up to 3 RCUs; eventually consistent: 1.5 RCUs.
+- Writing a 2.5 KB item: rounds up to 3 WCUs; in a transaction: 6 WCUs.
+W: A=One RCU = one strongly consistent 4 KB read per second: this is the definition of a read capacity unit; larger items use proportionally more.
+E=One WCU = one 1 KB write per second: this is the definition of a write capacity unit; a larger item uses one WCU per started 1 KB.
+X: B=Eventually consistent reads cost double: it is the reverse. An eventually consistent read costs half of a strongly consistent one, so one RCU gives two eventually consistent reads per second.
+C=Transactional writes cost the same: transactional operations do extra work to guarantee all-or-nothing, and they consume twice the capacity of standard writes.
+D=Item size has no effect: capacity is based on size, rounded up to 4 KB for reads and 1 KB for writes, so a 40 KB item needs many more units than a 1 KB item.
+T: Remember the units: 1 RCU = 4 KB strongly consistent read per second (half for eventual, double for transactions), and 1 WCU = 1 KB write per second (double for transactions).
+
+@ Q003382 explain
+G: ## Keep configuration out of the code
+A setting that differs by environment (dev, test, prod) should live outside the deployment artifact, so the same build can run everywhere and values can change without redeploying.
+## AWS Systems Manager Parameter Store
+- Stores values under hierarchical names, such as `/dev/orders/db-url` and `/prod/orders/db-url`.
+- Values can be plain `String` or encrypted `SecureString` (using AWS KMS), and IAM policies control who can read each path.
+- The application reads the value at runtime with `GetParameter` (for example using the environment name to build the path), and can cache it to limit calls.
+Example: a Lambda function with an environment variable `STAGE=prod` reads `/prod/orders/db-url` at startup.
+AWS Secrets Manager is an alternative when you also need automatic rotation of credentials.
+W: Parameter Store: it keeps environment-specific values in a central, access-controlled, optionally encrypted store that the app reads at runtime, so one build works in every environment.
+X: B=Lambda deployment package: values baked into the package require a new build and deployment for every environment or change, and anyone who can download the package sees them.
+C=Source code repository: config in code ties each environment to a code change and exposes connection details, possibly including credentials, to everyone with repo access and in its history.
+D=EC2 user data: user data is a script that runs at instance launch, is readable from the instance metadata by anything on the instance, and does not apply to non-EC2 compute. It is not a runtime configuration store.
+T: Runtime, per-environment settings belong in Parameter Store (or Secrets Manager for secrets needing rotation), not in packages, repos or user data.
+
+@ Q003383 explain
+G: ## Why one bad record blocks a Kinesis shard
+Lambda reads a Kinesis shard through an **event source mapping** and processes records in order. If a batch fails, by default Lambda retries the whole batch until it succeeds or the records expire from the stream, and the shard does not advance meanwhile. One "poison" record can stall that shard for hours or days.
+## Error-handling settings on the event source mapping
+- **Bisect batch on function error**: on failure, the batch is split in half and each half retried, which narrows the failure down to the bad record while the good records get processed.
+- **Maximum retry attempts** and **maximum record age**: limit how long a failing batch is retried.
+- **On-failure destination** (for example an SQS queue or SNS topic): receives details of records that are given up on, so they can be inspected later.
+Partial batch responses (`ReportBatchItemFailures`) are another way to retry only the failed records.
+W: B=Bisect batch on function error: splitting failed batches isolates the bad record, so the healthy records around it are processed instead of being retried with it forever.
+E=Maximum retries with an on-failure destination: after a bounded number of attempts Lambda skips the failing records, sends their details to the destination and lets the shard move on.
+X: A=365-day retention: longer retention only keeps records longer; the failing batch would be retried for even longer, making the blockage worse.
+C=Disable the mapping permanently: this stops processing of every record in the stream, which is the opposite of keeping the pipeline flowing.
+D=Remove the partition key: Kinesis requires a partition key on every `PutRecord` call because it decides the shard. It has nothing to do with a record failing in the function.
+T: Stop poison records from stalling a stream by bisecting failed batches and bounding retries with an on-failure destination.
+
+@ Q003384 explain
+G: ## Filtering S3 event notifications
+An S3 bucket can send event notifications (for example `s3:ObjectCreated:*`) directly to a Lambda function, SQS queue or SNS topic. Each notification configuration can include **filter rules** on the object key:
+- **Prefix**: the key must start with a value, such as `uploads/`.
+- **Suffix**: the key must end with a value, such as `.csv`.
+Only objects matching both rules trigger that configuration, so the function is invoked only for relevant files.
+Example: `reports/2026.csv` and `uploads/image.png` do not trigger it, while `uploads/batch-17.csv` does.
+S3 also needs a resource-based permission on the function that allows `s3.amazonaws.com` to invoke it; the console adds this automatically. For richer matching, S3 events can also be sent to EventBridge.
+W: S3 event notification with prefix and suffix filters: S3 evaluates the key before invoking, so the function runs only for new `.csv` objects under `uploads/` with no extra code or services.
+X: A=SQS queue storing all events: the queue would collect every bucket event, and something would still have to read and discard the non-matching ones; it adds a component without doing the filtering.
+B=Lambda checking every object: listing or inspecting all objects repeatedly is slow and costly and is not event-driven, so new uploads are found late while unrelated objects are processed for nothing.
+D=CloudWatch alarm on object count: the S3 storage metrics for object count are reported daily and say nothing about which object was added, so an alarm cannot identify or react to individual `.csv` uploads.
+T: Limit S3-triggered Lambda invocations with prefix and suffix filters on the event notification, not with extra polling or checking code.

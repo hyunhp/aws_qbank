@@ -1,0 +1,363 @@
+# DVA-C02 detailed explanations, e06 (explanation-only rewrites; letters are the published ones)
+
+@ Q000712 explain
+G: ## Lambda versions and aliases
+Every Lambda function has `$LATEST`, the editable copy you deploy code to. Running `PublishVersion` freezes the current code and configuration into a numbered version (`1`, `2`, `3`...). A published version can never change.
+An **alias** is a named pointer to a version, with its own ARN, for example `arn:aws:lambda:us-east-1:123456789012:function:orders:live`.
+- In this setup, callers (API Gateway, event source mappings, other services) invoke the alias ARN rather than a specific version.
+- A release publishes version `8` and moves `live` from `7` to `8` with `UpdateAlias`.
+- If version `8` misbehaves, moving `live` back to `7` takes effect in seconds, because version `7` still exists unchanged. Nothing is rebuilt or redeployed.
+- An alias can also split traffic between two versions with weights, which is how CodeDeploy does canary and linear shifts for Lambda.
+W: Published versions behind a movable alias: versions are immutable snapshots, so the previous release is always available exactly as it was, and repointing the alias gives an instant rollback while callers keep the same alias ARN.
+X: B=Redeploy the old zip to $LATEST: `$LATEST` is mutable, so rollback means finding, re-uploading and redeploying an old package (and matching its configuration), which is slow and error-prone rather than instant.
+C=New function name per release: each function has its own ARN, so every caller and trigger would have to be updated on each release and again on each rollback, which breaks the "never change the ARN" requirement.
+D=Layers per release: layers package shared libraries or runtimes that a function references; they do not give callers a stable endpoint, and switching the layer version still means updating and redeploying the function configuration.
+T: Immutable published versions plus an alias that callers invoke give instant rollback without changing the caller's ARN; redeploying `$LATEST` or renaming functions does not.
+
+@ Q000713 explain
+G: ## How a CloudFormation stack update behaves
+CloudFormation treats a stack update as one operation that should either finish completely or leave the stack as it was.
+- The update starts with status `UPDATE_IN_PROGRESS` and changes resources one by one.
+- If any resource fails, for example because a property value is invalid, CloudFormation switches to `UPDATE_ROLLBACK_IN_PROGRESS` and reverts the resources it already changed.
+- When that succeeds, the stack ends in `UPDATE_ROLLBACK_COMPLETE`: running again with the last good template and parameters, ready for the next update.
+The stack events tab shows the resource and the exact error that triggered the rollback, which is the first place to look.
+You can change this default. Disabling rollback (the console's "preserve successfully provisioned resources" option, or `--disable-rollback` on the CLI) keeps the partial changes so you can debug them, but that is an explicit choice, not what happens by default.
+W: Rolls back to the previous working state: by default a failed update triggers an automatic rollback that restores the resources to the last successful configuration and ends in `UPDATE_ROLLBACK_COMPLETE`.
+X: A=Left half-updated: a partially updated stack only stays that way if rollback was explicitly disabled for that operation; the default behavior is to roll back automatically.
+C=Marked successful: CloudFormation never reports success when a resource operation fails; the failure is recorded in stack events and the stack moves into a rollback state.
+D=Deletes the whole stack: a failed update does not delete an existing stack or its resources. Deletion on failure applies only to stack creation when the "on failure" behavior is set to delete.
+T: A failed CloudFormation update rolls back to the last working state by default; only an explicitly disabled rollback leaves changes in place, and nothing deletes the stack.
+
+@ Q000714 explain
+G: ## Blue/green on Amazon ECS with CodeDeploy
+In an ECS blue/green deployment, the running tasks (blue) keep serving while a second set of tasks with the new task definition (green) starts next to them.
+With the CodeDeploy ECS compute platform:
+- The ECS service uses the `CODE_DEPLOY` deployment controller, and CodeDeploy creates a replacement task set.
+- An Application or Network Load Balancer has two target groups and a production listener (optionally a test listener). Green tasks register in the second target group.
+- Lifecycle hooks such as `AfterAllowTestTraffic` can run a Lambda function to validate green before production traffic moves.
+- Traffic shifts all at once, in a canary or linearly, and CloudWatch alarms can trigger automatic rollback.
+- After validation and an optional wait time, CodeDeploy terminates the original task set.
+Amazon ECS also offers its own built-in blue/green deployment strategy, but among these choices only CodeDeploy is a deployment service.
+W: CodeDeploy (ECS platform): it is built to run ECS blue/green deployments, creating the replacement task set, shifting load balancer traffic between target groups, running validation hooks and terminating the old task set only after success.
+X: A=AWS Config: Config records resource configurations and evaluates them against rules for compliance; it never deploys tasks or shifts traffic.
+B=AWS Trusted Advisor: Trusted Advisor gives account-level best-practice checks for cost, security, limits and fault tolerance; it has no deployment or traffic-shifting features.
+C=Amazon Inspector: Inspector scans EC2 instances, container images and Lambda functions for software vulnerabilities and network exposure; it does not orchestrate releases.
+T: ECS blue/green with task sets, load balancer traffic shifting and validation hooks is a CodeDeploy job; Config, Trusted Advisor and Inspector audit resources rather than deploy them.
+
+@ Q000715 explain
+G: ## Traffic shifting for Lambda deployments
+CodeDeploy (used directly or through AWS SAM `DeploymentPreference`) shifts traffic on a Lambda alias from the old version to the new one using a deployment configuration:
+- **Canary**, e.g. `LambdaCanary10Percent5Minutes`: 10% goes to the new version, CodeDeploy waits 5 minutes, then shifts the remaining 90% in one step. Only a small slice is exposed during the test window, and the whole deployment is short.
+- **Linear**, e.g. `LambdaLinear10PercentEvery1Minute`: 10% more traffic moves every minute, so full traffic arrives after 10 steps. Each step exposes a little more load, giving many chances to catch problems, but the total rollout takes longer.
+- **AllAtOnce**: everything moves immediately.
+Both canary and linear can be combined with CloudWatch alarms and pre/post traffic hooks; if an alarm fires, CodeDeploy points the alias back to the old version automatically.
+Canary and linear configurations exist for Lambda and Amazon ECS deployments.
+W: Canary vs. linear: canary tests on one small slice and then moves the rest in one step, which is quicker; linear moves traffic in equal increments over many steps, which is slower but ramps up load more gradually.
+X: A=Linear lacks automatic rollback: automatic rollback on CloudWatch alarms or deployment failure is configured on the deployment group and works for linear as well as canary configurations.
+C=Canary only for EC2: canary configurations are defined for the Lambda and ECS compute platforms; EC2/On-Premises deployments use different configurations such as one-at-a-time or half-at-a-time.
+D=Same total time: the duration depends on the configuration. A 10%-then-5-minutes canary finishes in about 5 minutes, while a 10%-every-minute linear rollout needs about 10 minutes.
+T: Canary is two steps (small slice, then everything); linear is many equal steps, slower but more gradual, and both support automatic rollback.
+
+@ Q000716 explain
+G: ## How CloudFormation decides to update Lambda code
+CloudFormation compares the new template with the old one property by property. For `AWS::Lambda::Function`, the code location is the `Code` property: `S3Bucket`, `S3Key` and optionally `S3ObjectVersion`.
+CloudFormation does not look inside the S3 object. If the pipeline uploads a new zip to the same key, for example `builds/app.zip`, the template text is identical, so the change set is empty and the function keeps running the old code.
+Common fixes:
+- Use a unique key per build, such as `builds/app-3f2c9a1.zip` with the commit hash.
+- Enable bucket versioning and pass the new `S3ObjectVersion` as a parameter.
+- Let `sam package` or `aws cloudformation package` upload the artifact; they name it by a content hash, so the key changes whenever the code changes.
+W: New key or object version: an unchanged `S3Key` produces no template difference, so CloudFormation sees nothing to update; changing the key or `S3ObjectVersion` makes the `Code` property differ and triggers a code update.
+X: B=Transfer Acceleration: it only speeds up uploads to S3 over long distances; CloudFormation still compares template properties and still sees the same bucket and key.
+C=Delete and recreate the stack: that forces new code but causes downtime, new resource identities and possible data loss, when simply changing the code reference is enough.
+D=Never updates Lambda code: CloudFormation does update function code whenever the `Code` property (bucket, key or object version, or image URI) changes in the template.
+T: CloudFormation deploys new Lambda code only when the code reference in the template changes, so give each build a unique S3 key or object version.
+
+@ Q000717 explain
+G: ## How a Logs Insights query runs
+A CloudWatch Logs Insights query is a pipeline: each command, separated by `|`, works on the output of the one before it.
+- `fields` chooses the fields to show, such as `@timestamp` and `@message`.
+- `filter` keeps matching events. `like /ERROR/` is a regular expression, so it matches any message that contains `ERROR`. `= "ERROR"` is an exact comparison and matches only a message that is exactly that word.
+- `sort @timestamp desc` puts the newest events first; `asc` puts the oldest first.
+- `limit 20` keeps the first 20 rows of whatever order the pipeline produced.
+- `stats` aggregates, for example `count(*)`, and replaces the individual events with summary rows.
+Order matters: `sort ... asc | limit 20` returns the 20 oldest matches, while `sort ... desc | limit 20` returns the 20 newest.
+W: filter like, sort desc, limit 20: the regex filter keeps every event that contains `ERROR`, the descending sort puts the newest first, and `limit 20` returns exactly the 20 most recent matching events.
+X: A=Ascending sort: filter and limit are fine, but `sort @timestamp asc` orders the results oldest first, so the query returns the 20 oldest errors in the time range instead of the newest.
+B=stats by bin(5m): `stats count(*)` returns counts per 5-minute bucket, not individual log events, and a filter on `@message` placed after `stats` has no message field left to test.
+D=Exact match: `@message = "ERROR"` matches only messages whose entire text is `ERROR`, so real lines like `ERROR payment failed` are missed, and the query has no explicit newest-first sort.
+T: To get the latest matching events, filter with `like`, sort by `@timestamp desc`, then `limit`; exact `=` misses substrings and `asc` returns the oldest.
+
+@ Q000718 explain
+G: ## The AllowTraffic lifecycle event
+In an EC2/On-Premises deployment with a load balancer, CodeDeploy deregisters an instance (`BlockTraffic`), installs the new revision and runs the AppSpec hooks, then re-registers it (`AllowTraffic`).
+`AllowTraffic` succeeds only when the instance becomes healthy in the target group. If the load balancer's health check keeps failing, the event times out, the deployment fails and, with automatic rollback enabled, CodeDeploy redeploys the last good revision.
+Typical causes:
+- The application did not start or listens on a different port than the target group expects.
+- The health check path returns a non-200 code, for example `/health` returning 404.
+- A security group blocks the load balancer from reaching the instance.
+Where to look:
+- CodeDeploy deployment and instance events show which event failed and its error.
+- The target group's target health shows the state and a reason code such as `Target.ResponseCodeMismatch` or `Target.Timeout`.
+W: CodeDeploy events and target health: `AllowTraffic` depends on load balancer health checks, so the failing lifecycle event plus the target's health reason code usually explain directly why instances never received traffic.
+X: A=VPC Flow Logs: flow logs show accepted or rejected packets by IP and port. They can help much later if a network block is suspected, but they do not show HTTP status codes or health-check results, so they are not the first stop.
+B=CloudTrail for the pipeline role: CloudTrail records AWS API calls by that role; the deployment ran, so permissions were not the problem, and CloudTrail says nothing about why targets failed health checks.
+D=S3 access logs for the revision bucket: these show that the revision was downloaded; a failure at `AllowTraffic` happens after download and install, so bucket access logs cannot explain it.
+T: An `AllowTraffic` failure means instances did not pass the load balancer health check, so start with CodeDeploy events and target group health reasons, not network or API audit logs.
+
+@ Q000719 explain
+G: ## Why slow Lambda functions fill an SQS dead-letter queue
+With an SQS event source, Lambda polls the queue and invokes the function with a batch. If the invocation fails or times out, the messages are not deleted; they become visible again after the visibility timeout and are retried. After `maxReceiveCount` receives, SQS moves them to the dead-letter queue.
+So a function that runs close to its timeout can send messages to the DLQ without ever logging an application exception.
+## Finding the slow call with X-Ray
+- Turn on **active tracing** for the function so each invocation produces a trace.
+- Instrument the code with the X-Ray SDK or AWS Distro for OpenTelemetry; outgoing HTTP calls and AWS SDK calls then appear as **subsegments** with their own start and end times.
+- A trace might show a 14.8 s invocation where one `api.partner.example` subsegment took 14.2 s, which confirms the downstream call is the delay.
+W: X-Ray active tracing with subsegments: traces break each invocation into timed subsegments per downstream call, so they show exactly how much of the time near the timeout was spent waiting on the HTTP dependency.
+X: A=Trusted Advisor performance checks: these flag account-level best-practice issues across resources; they do not look inside individual invocations or measure how long a function's outbound calls take.
+C=Contributor Insights: it ranks the top contributors in structured log data, for example the busiest keys or callers; it does not measure how long each step inside one invocation took.
+D=Logs Insights count by log stream: counting events per log stream shows volume per execution environment, not a timing breakdown of the code path, and a count of events contains no per-call durations.
+T: When a function is slow but not erroring, X-Ray subsegments show which downstream call consumes the time; log counts and advisory checks cannot.
+
+@ Q000720 explain
+G: ## CloudWatch dashboards as an incident view
+A CloudWatch dashboard is a set of widgets on one page. Each widget sets its own Region (and optionally account), so one dashboard can combine data from several Regions.
+Useful widgets for incident response:
+- **Metric graphs** for error rate and p99 latency, one line per Region, e.g. `us-east-1`, `eu-west-1`, `ap-northeast-2`.
+- **Alarm status** widgets showing which alarms are in `ALARM`.
+- **Logs Insights** widgets that run a saved query against log groups, such as recent `ERROR` lines.
+- **Deploy markers**, for example vertical annotations on graphs at deployment times, or a custom metric emitted on each deployment.
+- **Text** widgets with runbook links.
+Everyone on call opens one URL and sees the same time range across all widgets, which makes it easy to spot that latency rose in one Region right after a deploy.
+W: Cross-Region CloudWatch dashboard: one dashboard can hold metric, alarm and Logs Insights widgets from all three Regions on a shared time axis, giving engineers a single correlated view while the incident is in progress.
+X: A=S3 export after the incident: exported logs are useful for later analysis, but they arrive after the fact and contain no metrics or deploy markers, so they do not help responders during the incident.
+C=A dashboard per Region side by side: the data is there, but engineers must switch between separate pages with separate time ranges and correlate by eye, which is slow and error-prone when one combined dashboard can do it.
+D=CloudTrail event history: it lists AWS API calls, which can hint at who changed what, but it shows no error rates, latency or application logs, and event history is per Region.
+T: For incident response, put metrics, alarms, deploy markers and log queries from every Region on one CloudWatch dashboard instead of separate pages or after-the-fact exports.
+
+@ Q000721 explain
+G: ## Reading the X-Ray service map
+The X-Ray service map (trace map) draws one node per service or resource that appears in traces, and edges for calls between them. Each node shows the average latency and requests per minute, and a ring colored by response type:
+- Green: successful calls.
+- Red: server faults (5xx responses).
+- Yellow: client errors (4xx responses).
+- Purple: throttling (429 Too Many Requests).
+Latency flows upstream. If the order service waits 3 s for a pricing service that takes 3 s, the order service also looks slow, but its own work is fast. The node that has the high latency and the faults is where to start.
+In the scenario, the client-facing service has normal error rates and elevated latency, while one downstream node is red and much slower than its neighbors: the slowness and failures originate in that dependency and propagate up.
+W: Downstream bottleneck: the red, slow node is where the faults and latency originate, and the client-facing service is only slow because it waits on that dependency.
+X: A=Red means throttling: throttling is shown in purple on the service map; red indicates server faults, and nothing in the map points to API Gateway throttling.
+C=Sampling misconfigured: sampling controls how many requests are traced, but sampled traces still record real timings and status codes, so a consistent slow, faulting node is a real signal, not a sampling artifact.
+D=Client memory leak: a leak in the front service would show as its own latency or errors without a single slow downstream node; here the map points to the dependency instead.
+T: On the X-Ray map, latency propagates upstream, so the slow node shown red (faults) is the bottleneck; purple, not red, means throttling.
+
+@ Q000722 explain
+G: ## Why API Gateway returns 502 for a Lambda backend
+With a Lambda proxy integration, API Gateway expects the function to return an object like `{"statusCode": 200, "headers": {...}, "body": "..."}`. It returns **502 Bad Gateway** when:
+- The function throws an unhandled exception or hits its Lambda timeout. (If API Gateway's own integration timeout is reached first, the client gets 504 instead.)
+- The response is malformed, for example `body` is an object instead of a string or `statusCode` is missing.
+The second case never shows a stack trace in the function logs, which is why only some failures appear there.
+## Correlating one request
+- Enable **execution logging** on the stage (INFO level), plus access logging with `$context.requestId`.
+- API Gateway returns its request ID to the client in the `x-amzn-RequestId` response header, so a failing client call can be tied to a single request ID.
+- The execution log for that ID shows the call to Lambda, the response it got back and errors such as a malformed proxy response, and the Lambda invocation's request ID leads to the matching entry in the function's log group.
+W: Execution logging correlated by request ID: execution logs record what API Gateway sent to and received from Lambda for each request ID, so a client's failed request can be matched to its exact Lambda log entry or to a malformed-response error.
+X: A=Keep retrying: retries may eventually get a success, but they hide the failure and produce no evidence about which request failed or why.
+B=More memory: memory helps CPU-bound or out-of-memory functions, but nothing indicates resource exhaustion, and it does not provide any way to connect a client's failure to a log entry.
+D=Delete older log streams: removing logs destroys evidence and makes correlation harder; recent errors can already be found by filtering on time or request ID.
+T: Intermittent 502s from a Lambda proxy are traced by enabling API Gateway execution logs and following the request ID from the client response to the Lambda log.
+
+@ Q000723 explain
+G: ## Finding the top error source with Logs Insights
+Logs Insights processes events through a pipeline of commands separated by `|`:
+- `filter statusCode >= 500` keeps only server errors (500 to 599).
+- `stats count(*) as errorCount by endpoint` groups the remaining events by endpoint and counts each group, producing one row per endpoint.
+- `sort errorCount desc` puts the endpoint with the most errors at the top; adding `limit 1` would return only that row.
+The query runs over the time range you pick in the console or API, here the last 24 hours.
+Example result:
+- `/checkout` 412
+- `/cart` 57
+- `/search` 3
+Because JSON fields such as `endpoint` and `statusCode` are discovered automatically, numeric comparisons like `>= 500` work directly.
+W: filter, stats count by endpoint, sort desc: filtering to status codes of 500 or above, counting per endpoint and sorting descending ranks endpoints by number of 5xx errors, with the worst one first.
+X: A=Sort by statusCode, limit 1: this returns one single event with the highest status code, not the endpoint with the most errors, because nothing is counted or grouped.
+B=avg(statusCode) by endpoint: the average of status codes mixes successes and errors into a meaningless number; an endpoint with many 5xx errors among many 200s can average lower than one with a few 404s.
+D=filter endpoint like /5/: this matches endpoints whose path contains the digit 5, not responses with 5xx status, and then counts by status code instead of by endpoint.
+T: To rank sources of errors, filter to the error condition, `stats count(*) by` the grouping field, then sort the count descending.
+
+@ Q000724 explain
+G: ## What UPDATE_ROLLBACK_FAILED means
+When an update fails, CloudFormation rolls resources back to their previous state. If a resource cannot be rolled back, the stack stops in `UPDATE_ROLLBACK_FAILED`. A common cause is out-of-band change: someone deleted a resource manually, so CloudFormation cannot restore or update it.
+In this state the stack cannot be updated, and CloudFormation does not retry by itself.
+## Continuing the rollback
+- `ContinueUpdateRollback` (console: "Continue update rollback") tries the rollback again.
+- If a resource still cannot roll back, pass its logical ID in `ResourcesToSkip`. CloudFormation marks it `UPDATE_COMPLETE` without rolling it back and finishes the rest.
+Example: `aws cloudformation continue-update-rollback --stack-name app --resources-to-skip OrdersQueue`
+The stack reaches `UPDATE_ROLLBACK_COMPLETE` and can be updated again. Skipped resources may no longer match the template, so fix or recreate them in a later update.
+W: ContinueUpdateRollback with skipped resources: it resumes the stuck rollback and, by skipping the manually deleted resource, lets the stack reach `UPDATE_ROLLBACK_COMPLETE` without deleting the stack.
+X: A=Edit stack state in the console: the console shows resource status but offers no way to edit CloudFormation's internal record of the stack; changes go through updates, rollbacks or resource import.
+C=Recreate every resource: deleting and rebuilding everything is destructive, can lose data and causes downtime, and it is unnecessary when only one resource blocks the rollback.
+D=Wait for an automatic retry: CloudFormation does not retry a failed rollback by itself; the stack stays in `UPDATE_ROLLBACK_FAILED` until someone continues the rollback or deletes the stack.
+T: A stack stuck in `UPDATE_ROLLBACK_FAILED` is recovered with `ContinueUpdateRollback`, skipping resources that can no longer roll back, rather than waiting or rebuilding.
+
+@ Q000725 explain
+G: ## Two ways to publish custom metrics from Lambda
+- **PutMetricData**: the code calls the CloudWatch API during the invocation. Each call adds network latency, is subject to API throttling and needs `cloudwatch:PutMetricData` permission, and failures must be handled in code.
+- **Embedded Metric Format (EMF)**: the code writes a JSON log line that includes an `_aws` block describing the metrics, for example a `Latency` value with dimension `Service=checkout`. Lambda already sends stdout to CloudWatch Logs, and CloudWatch extracts the metrics from the log event asynchronously.
+With EMF the function only writes to stdout, which is fast; there is no extra API call on the request path. The same log line also keeps the full context (request ID, customer, etc.) for later searching.
+Both paths follow the same CloudWatch metric limits (for example up to 30 dimensions per metric), and both can publish high-resolution metrics. EMF is billed as log ingestion plus custom metrics.
+W: Asynchronous extraction from logs: EMF metrics are pulled out of log events by CloudWatch after the function writes them, so the function makes no `PutMetricData` calls and avoids their latency and throttling.
+X: A=More dimensions: EMF does not raise the per-metric dimension limit; both EMF and `PutMetricData` allow up to 30 dimensions per metric, and EMF produces ordinary CloudWatch metrics.
+C=Creates alarms automatically: EMF only creates metrics; alarms still have to be defined separately on the metrics you want to watch.
+D=Only method for one-second metrics: `PutMetricData` supports high-resolution metrics with `StorageResolution` set to 1 as well, so EMF is not the only way.
+T: EMF turns structured log lines into metrics asynchronously, keeping metric publishing off the request path; it does not add dimensions, alarms or exclusive resolutions.
+
+@ Q000726 explain
+G: ## Where a Lambda authorizer decides
+For a REST API with a Lambda authorizer, API Gateway calls the authorizer before the backend. The authorizer returns an IAM policy that allows or denies `execute-api:Invoke` on the method ARN. If the policy denies, API Gateway returns **403** immediately and the backend function is never invoked, which is why its logs are empty.
+Things that often break after a deployment:
+- The policy allows only one method ARN, for example `.../GET/orders`, and authorizer caching reuses that policy for `POST /orders`, which is then denied.
+- The authorizer code or its configuration changed, such as the token source header.
+- A request to a path or stage that was not deployed also returns 403 (`Missing Authentication Token`).
+## Execution logs
+With execution logging enabled on the stage, CloudWatch logs for each request show the authorizer being called, the policy it returned and the final 403 reason. The authorizer function's own log group shows its code's decisions.
+W: API Gateway execution logs: they record the authorizer invocation, the returned policy and the reason API Gateway rejected the request, which is exactly the step that happens before the backend.
+X: A=AWS Config history: Config shows configuration changes to the API resource over time, which may hint at what changed, but it does not show per-request authorization results or why a request got 403.
+B=Backend Lambda logs: the backend was never invoked because requests were rejected before integration, so its logs contain nothing about these failures.
+D=S3 server access logs: API Gateway stages do not write S3 server access logs; those exist only for S3 buckets and would show nothing about authorizer decisions.
+T: A 403 with no backend invocations means the request stopped at the authorizer, and API Gateway execution logs (plus the authorizer's own logs) show why.
+
+@ Q000727 explain
+G: ## Metrics, logs and traces
+The three kinds of telemetry answer different questions:
+- **Metrics** say *that* something is wrong: p99 latency rose to 8 s. They are aggregates over time, so they cannot follow one request.
+- **Logs** give *details* of events inside one component: a line saying `timeout calling inventory`. But each service logs separately, so it is hard to see which of 6 hops actually used the time.
+- **Traces** show *where* the time went. AWS X-Ray follows one request across all services with a shared trace ID, recording a segment per service and subsegments for downstream calls, each with start time and duration.
+Example: a trace for an 8.1 s request shows API 8.1 s, orders 7.9 s, inventory 7.6 s, and the inventory database call 7.5 s. The slow hop is obvious.
+X-Ray trace filters such as `responsetime > 5` let you pull up just the slow requests.
+W: X-Ray traces per service segment: a trace follows a single request through all 6 services and shows how long each segment took, pinpointing the service responsible for the 8-second delay.
+X: A=CloudTrail data events: data events record API calls on AWS resources such as S3 objects or Lambda invokes; they show who called what, not how the request's time was spread across application services.
+B=1-second metrics: higher resolution makes the spike sharper, but metrics are still aggregates per service and cannot follow one request across the call chain.
+D=Longer log retention: keeping logs longer does not add information; the existing logs already lack a view of the full request path.
+T: Metrics show that something is wrong, logs show what happened in one place, and traces show where the time went across services.
+
+@ Q000728 explain
+G: ## Monitoring versus observability
+**Monitoring** watches for problems you already know about: predefined metrics, threshold alarms and dashboards built for known failure modes. It answers "is X broken?" quickly, but only for the X you thought of.
+**Observability** is the ability to understand *new, unexpected* problems from the telemetry your system already emits, without shipping new code first. It depends on:
+- **Rich events**: structured logs with high-cardinality fields such as `customerId`, `orderId`, version and Region.
+- **Correlation**: the same request ID or trace ID in logs, traces and metrics, so you can jump from a latency spike to the traces and logs of affected requests.
+- **Tools that support ad-hoc questions**, such as CloudWatch Logs Insights queries and X-Ray trace analytics.
+Example: "Why are checkouts slow only for customers on app version 4.2 in one Region?" can only be answered if those fields were already recorded.
+W: Rich, correlated telemetry: emitting detailed, linked logs, traces and metrics lets engineers ask questions nobody anticipated, which is what observability adds on top of monitoring.
+X: A=A bigger dashboard: more panels of existing metrics still show only predefined signals, and a crowded dashboard does not help with a failure mode nobody thought to graph.
+B=Shorter evaluation periods: alarms fire sooner, but only for conditions already defined; faster detection of known problems does not help diagnose an unknown one.
+C=More static threshold alarms: each new alarm covers one more known failure mode; that extends monitoring but still cannot explain a failure nobody predicted.
+T: Monitoring watches known signals; observability means emitting rich, correlated telemetry so you can investigate failures you did not predict.
+
+@ Q000729 explain
+G: ## Custom metrics without slowing requests
+**Embedded Metric Format (EMF)** lets code publish metrics by writing structured JSON log lines. The `_aws` block names the namespace, metric, unit, dimensions and optionally `StorageResolution`.
+Example: a log line that contains `"CheckoutLatency": 183` and `"Environment": "Production"`, with `CheckoutLatency` declared as a metric (unit `Milliseconds`, `StorageResolution` 1) and `Environment` as its dimension.
+CloudWatch Logs extracts the metric from the log event asynchronously. The application only writes a log line, which is fast, so no CloudWatch API call sits on the request path.
+- `StorageResolution` 1 creates a high-resolution metric (1-second granularity), which alarms can evaluate at periods as short as 10 seconds.
+- The default, 60, is standard 1-minute resolution.
+Client libraries (for example the EMF libraries or Powertools for AWS Lambda) produce the right JSON for you.
+W: EMF logs with StorageResolution 1: writing EMF log lines keeps metric publishing asynchronous, and `StorageResolution` 1 plus the `Environment` dimension gives exactly the 1-second `CheckoutLatency` metric required.
+X: A=X-Ray annotations as metrics: annotations are indexed key-value pairs for filtering traces; they are not CloudWatch metrics and cannot provide a 1-second latency metric with dimensions.
+B=Synchronous PutMetricData per request: each call adds network latency to the request and is subject to API throttling at high request rates, which violates the requirement.
+D=Metric filter counting lines: a filter that counts matching log lines publishes how many lines matched, not the `CheckoutLatency` value itself, so it does not produce the required latency metric.
+T: EMF with `StorageResolution` 1 gives high-resolution custom metrics with dimensions while keeping publishing off the request path.
+
+@ Q000730 explain
+G: ## Annotations and metadata in X-Ray
+Code instrumented with the X-Ray SDK can attach extra data to a segment or subsegment in two ways:
+- **Annotations**: simple key-value pairs (string, number or boolean values) that X-Ray **indexes**. You can search on them with filter expressions, for example `annotation.customerId = "C-1042"`, and use them in groups. A trace can have up to 50 annotations.
+- **Metadata**: key-value pairs of any type, including objects and lists, such as a full request payload. Metadata is stored with the trace and visible when you open it, but it is **not indexed**, so you cannot filter traces by it.
+Rule of thumb: put what you search by (customer ID, tenant, order type) in annotations, and the details you only want to read after finding a trace in metadata.
+Subsegments are a different concept: they record timing for a unit of work such as a downstream call.
+W: Annotations: they are indexed key-value pairs, so a filter such as `annotation.customerId = "C-1042"` finds every trace for that customer, unlike metadata, which is only stored for display.
+X: A=Indexed identically: annotations and metadata behave differently; only annotations are indexed and usable in filter expressions.
+C=Metadata indexed: this reverses the two. Metadata can hold rich objects but is not indexed; annotations are the indexed, searchable ones.
+D=Subsegments only: subsegments record timing for units of work such as downstream calls; filtering by custom key-value data is what annotations are for, and they can be attached to segments as well as subsegments.
+T: In X-Ray, annotations are indexed and filterable; metadata is richer but only visible inside a trace.
+
+@ Q000731 explain
+G: ## Structured versus plain-text logs
+A plain-text line such as `2026-09-29 10:15 user 42 checkout failed in 830ms` is easy to read, but to query it you must parse the text with patterns or regular expressions, which break when the wording changes.
+A structured JSON line carries named fields:
+`{"level":"ERROR","userId":42,"action":"checkout","durationMs":830}`
+CloudWatch Logs Insights automatically discovers fields in JSON log events, so you can query them directly:
+- `filter level = "ERROR" and durationMs > 500`
+- `stats avg(durationMs), count(*) by action`
+Numbers stay numbers, fields have stable names, and aggregation is reliable. JSON logs also work well with metric filters and embedded metric format.
+Structured logging changes how logs can be queried; it does not change storage pricing, encryption or retention.
+W: Reliable filtering and aggregation: Logs Insights discovers JSON fields automatically, so queries can filter and aggregate on named, typed fields instead of fragile text parsing.
+X: B=Automatic compression to zero cost: CloudWatch Logs charges for ingestion and storage whatever the format; JSON is usually larger than plain text because of field names.
+C=Automatic customer managed KMS key: log groups are encrypted at rest regardless of format, and using a customer managed KMS key requires associating the key with the log group; the log format has nothing to do with it.
+D=No retention policy needed: retention is a log group setting (the default is to keep logs forever); structured content does not change how long data is kept or what it costs to store.
+T: Structured JSON logs make fields queryable in Logs Insights; they do not change cost, encryption or retention.
+
+@ Q000732 explain
+G: ## Two health checks, two jobs
+- **Container health check** (task definition `healthCheck`): ECS runs a command inside the container, e.g. `CMD-SHELL curl -f http://localhost:8080/live || exit 1`, on an interval with retries and an optional `startPeriod`. If an essential container becomes `UNHEALTHY`, ECS stops the task and the service scheduler starts a replacement. This is **liveness**: is the process still working, or should it be restarted?
+- **Target group health check** (Application Load Balancer): the load balancer calls a path such as `/ready` on each registered task. Unhealthy targets receive no new requests until they pass again. This is **readiness**: should this task get traffic right now?
+Keeping both is normal. A task that is warming up can be alive but not ready. An ECS service can also replace tasks that the load balancer keeps reporting as unhealthy, but the target group check's own purpose is routing.
+W: Liveness vs. readiness: the container check detects a broken container and leads to its replacement, while the target group check decides whether the load balancer sends traffic to a task.
+X: A=Same purpose, remove one: they answer different questions (restart or not, route or not), so removing either loses protection, such as sending traffic to a warming task or keeping a hung process.
+B=Swapped roles: the container health check never decides load balancer routing, and restarting unhealthy containers is the container check's job; the target group check exists to decide routing (ECS may also replace tasks it keeps reporting unhealthy, but that is a side effect). This reverses the two.
+C=Scale-in and IAM: container health does not drive scale-in (that is Service Auto Scaling on metrics), and target group health checks have nothing to do with IAM permissions.
+T: The container health check is about liveness and replacement; the target group health check is about readiness to receive traffic.
+
+@ Q000733 explain
+G: ## Why one failure produces dozens of pages
+When a shared dependency such as a database slows down, every service that calls it breaches its own latency and error alarms. Each alarm pages separately, so engineers get many alerts for one root cause.
+## Two CloudWatch features that cut the noise
+- **Composite alarms** combine existing alarms with a rule, e.g. `ALARM(db-latency) AND ALARM(api-5xx)`. You can page only on the composite alarm and let the underlying alarms change state without notifying. An actions suppressor alarm can also mute a composite alarm during a known event such as a deployment.
+- **Anomaly detection** learns a metric's normal pattern, including daily and weekly cycles, and builds an expected band. The alarm fires only when the value leaves the band, instead of whenever it crosses a fixed number that is normal at peak hours.
+Together they mean fewer, more meaningful pages: one alert for the real incident and none for normal variation.
+W: C=Composite alarms: they roll many related alarms into one rule-based alarm, so the cascade from a single root cause produces one page instead of dozens.
+D=Anomaly detection: alarms based on a learned expected band avoid false alarms from fixed thresholds during normal daily or weekly variation.
+X: A=Shortest evaluation periods: short periods make alarms react to brief spikes, which increases flapping and pages rather than reducing them.
+B=SNS per datapoint: sending a notification for every datapoint multiplies messages and pages, the opposite of reducing noise.
+E=Disable alarms after hours: this silences real incidents along with the noise, so outages outside business hours would go unnoticed.
+T: Reduce alert noise by paging on composite alarms that group related symptoms and by using anomaly detection instead of fixed thresholds.
+
+@ Q000734 explain
+G: ## CloudWatch Application Insights
+CloudWatch Application Insights sets up monitoring for common application stacks with little manual work. You choose a resource group (for example the EC2 instances running IIS and a .NET app, plus SQL Server), and it:
+- Recognizes the application components and recommends metrics, logs and alarms for them, such as SQL Server performance counters, IIS logs and Windows event logs, configured through the CloudWatch agent.
+- Watches those signals for anomalies and errors, such as a SQL Server deadlock, memory pressure or a spike in HTTP 500s.
+- Groups related anomalies and log errors into a **problem**, with an automated dashboard that shows the correlated metrics and logs and suggests likely causes.
+Engineers see a single "SQL deadlocks causing 5xx" problem instead of a scattered set of alarms, without building dashboards or alarms by hand.
+W: CloudWatch Application Insights: it auto-configures monitoring for supported stacks like .NET and SQL Server, detects common problems and groups the correlated metrics and logs into problem views.
+X: B=Config conformance packs: these bundle Config rules to check resource configurations against compliance standards; they do not watch application metrics or logs.
+C=Amazon Inspector: Inspector finds software vulnerabilities and unintended network exposure; it does not detect application performance or runtime problems.
+D=Trusted Advisor: it gives general account-level best-practice recommendations for cost, security, limits and resilience, not app-specific problem detection with correlated telemetry.
+T: For automatic, app-aware problem detection with correlated metrics and logs on stacks such as .NET and SQL Server, use CloudWatch Application Insights.
+
+@ Q000735 explain
+G: ## Standard and high-resolution metrics
+Every custom metric has a storage resolution:
+- **Standard (60)**: the default. Data is stored at 1-minute granularity, and alarms evaluate periods of 60 seconds or multiples of 60.
+- **High resolution (1)**: data is stored at 1-second granularity. Alarms on such metrics can use periods of 10, 20 or 30 seconds, so they can react within seconds.
+You choose it when publishing, e.g. `StorageResolution=1` in `PutMetricData`, or `"StorageResolution": 1` in an embedded metric format log line.
+Example: `aws cloudwatch put-metric-data --namespace Trading --metric-name OrderLag --value 42 --storage-resolution 1`
+High-resolution data is kept at 1-second detail for 3 hours, then aggregated to longer periods. High-resolution alarms (periods under 60 seconds) cost more than standard alarms.
+W: StorageResolution = 1: publishing the metric with storage resolution 1 makes it high-resolution, and only then can an alarm evaluate it with sub-minute periods.
+X: A=Nothing extra needed: custom metrics default to standard resolution (60), stored at 1-minute granularity, so alarms cannot react within seconds without asking for high resolution.
+B=Logs Insights is the only way: Logs Insights is a log query tool, not a metric store for alarms; sub-minute metrics come from publishing with high resolution via the API or EMF.
+D=X-Ray active tracing: tracing records request paths and timings but does not change the resolution of CloudWatch metrics.
+T: For alarms that react within seconds, publish custom metrics with `StorageResolution` 1 (high resolution); the default is 1-minute data.
+
+@ Q000736 explain
+G: ## Liveness is not readiness
+An Application Load Balancer sends traffic to a target as soon as it passes the target group health check. If `/health` returns 200 the moment the web server starts, the task is marked healthy while it is still loading its cache, and early requests fail.
+A readiness-style health check reports healthy only when the task can actually serve requests:
+- The `/ready` endpoint returns 503 until the cache is loaded and required connections (database, config) are available, then returns 200.
+- The target group uses that path, with a sensible healthy threshold and interval.
+- The ECS service's `healthCheckGracePeriodSeconds` gives slow-starting tasks time before failing checks cause replacement.
+With this setup, new tasks join the rotation only when they are ready, and deployments do not send traffic to half-started tasks.
+W: Health check that confirms startup dependencies: if the endpoint returns 200 only after the cache and other dependencies are ready, the load balancer waits to route traffic until the task can actually serve it.
+X: A=Remove the health check: without a meaningful health check the load balancer cannot tell broken or starting tasks from healthy ones, so failures would get worse, not better.
+B=Lower CPU allocation: less CPU makes cache loading slower, not faster, which lengthens the window in which requests fail.
+C=Increase the ALB idle timeout: the idle timeout controls how long idle connections stay open; it has nothing to do with when a new target starts receiving requests.
+T: Make the load balancer health check reflect readiness (dependencies loaded), not just that the process has started.

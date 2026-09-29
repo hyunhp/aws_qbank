@@ -1,0 +1,369 @@
+# DVA-C02 detailed explanations, e12 (explanation-only rewrites; letters are the published ones)
+
+@ Q003385 explain
+G: ## Lambda function URLs
+A function URL is a dedicated HTTPS endpoint built into Lambda itself. You enable it on a function (or on an alias) and Lambda gives you an address like `https://<url-id>.lambda-url.<region>.on.aws`.
+- **Auth type** is either `AWS_IAM` (callers sign requests with SigV4) or `NONE` (public, you check auth in code).
+- CORS settings can be configured on the URL, and responses can be streamed.
+- There are no routes, stages, usage plans or request validation: every request goes to the one function.
+## When to pick it over API Gateway
+Example: a webhook receiver that only needs "POST here, run my code". A function URL is one setting and costs nothing extra beyond the Lambda invocation. When you need many routes, API keys, throttling per client, caching or request transformation, API Gateway is still the better fit.
+W: Lambda function URL: it gives the function its own HTTPS endpoint directly from Lambda, with optional IAM auth and CORS, and nothing to configure in API Gateway.
+X: A=Lambda alias: an alias is just a named pointer to a function version (for example `prod` pointing at version 7). It does not expose anything over HTTPS by itself, although a function URL can be attached to an alias.
+B=Lambda destination: destinations send the result of an asynchronous invocation to SQS, SNS, EventBridge or another function (and failed events also to S3). They handle output routing, not incoming HTTP requests.
+C=Lambda layer ARN: a layer is a zip archive of libraries or runtime files shared across functions. Its ARN identifies packaged code, not a network endpoint anyone can call.
+T: For "one simple HTTPS endpoint for one function", use a function URL; aliases, layers and destinations manage versions, code and results, not inbound traffic.
+
+@ Q003386 explain
+G: ## How asynchronous invocations are retried
+With an asynchronous invocation (S3 events, SNS, EventBridge, `InvocationType=Event`), Lambda puts the event in an internal queue and returns immediately. If the function errors, Lambda retries.
+- Default: **2 retries** (3 attempts in total), with a delay between attempts. You can set this to 0, 1 or 2.
+- **Maximum event age** (up to 6 hours) limits how long an event may wait in the queue.
+- After the last attempt, the event is discarded unless you capture it.
+## Keeping failed events
+- An **on-failure destination** (SQS, SNS, EventBridge, S3 or another function) receives the event plus details about the error.
+- A **dead-letter queue** (SQS or SNS) receives just the original event.
+Example: an image-resize function fails on a corrupt file; after two retries the event lands in an SQS queue where you can inspect and replay it.
+W: Two retries, then destination or DLQ: asynchronous invocations are retried twice by default, and an on-failure destination or DLQ keeps events that still fail so they are not silently dropped.
+X: B=Unlimited retries: Lambda stops after the configured retry count (at most 2) or the maximum event age. Reserved concurrency limits how many copies run at once; it does not stop retries or keep failed events.
+C=Ten retries: the default is two, and the retry setting cannot exceed two. A longer timeout only helps if failures are timeouts, and it does nothing to capture events that fail anyway.
+D=No retries: async invocations are retried by default. Provisioned concurrency keeps environments warm to cut cold starts; it does not store events.
+T: Async Lambda retries twice by default; add an on-failure destination or DLQ so the events that still fail are kept for inspection and replay.
+
+@ Q003387 explain
+G: ## Two concurrency settings that sound alike
+- **Reserved concurrency** sets aside a number of concurrent executions for one function from the account's pool **and** caps the function at that number. Requests beyond it are throttled (synchronous callers get a `429`; async events are retried from the queue).
+- **Provisioned concurrency** keeps a number of execution environments initialized in advance to remove cold starts. It is a performance feature: the function can still scale past that number with on-demand environments unless something else caps it.
+## Protecting a downstream system
+A relational database might accept only a limited number of connections. Setting reserved concurrency to `50` means no more than 50 copies of the function run at once, so no more than roughly 50 connections are opened, no matter how many events arrive.
+Setting reserved concurrency to `0` stops the function from running at all, which is sometimes used as an emergency off switch.
+W: Reserved concurrency of 50: it is the setting that puts a hard upper limit on how many instances of the function run at the same time, which directly bounds the load on the database.
+X: A=Provisioned concurrency of 50: it pre-warms 50 environments for low latency, but the function can still scale beyond 50 with on-demand capacity, so the database is not protected.
+C=Memory of 50 MB: memory controls CPU and RAM per environment, not how many run in parallel. It is also below the Lambda minimum of 128 MB.
+D=Timeout of 50 seconds: the timeout only limits how long one invocation may run. Any number of invocations can still run concurrently.
+T: Reserved concurrency caps a function's parallelism; provisioned concurrency only pre-warms environments and does not cap anything.
+
+@ Q003388 explain
+G: ## The Lambda execution environment is reused
+Lambda runs your code in an execution environment. The first request runs the **init phase** (code outside the handler), then the handler. Later requests routed to the same warm environment run **only the handler**; everything created during init is still in memory.
+## What that means for SDK clients
+An SDK client holds an HTTP connection pool. If you build the client at module level, the TCP and TLS connection it opened on the first request can be reused on the next one, skipping new handshakes.
+- Good: `const s3 = new S3Client({})` at the top of the file, then use `s3` inside the handler.
+- Bad: creating the client inside the handler, so every invocation builds a new pool and new connections.
+The same applies to database connections and loaded configuration. Code must still tolerate a cold start, because environments are not guaranteed to be reused.
+W: Create the SDK client outside the handler: the client and its keep-alive connections are created once per environment during init and reused by every later invocation that lands on that environment.
+X: A=Close all connections: closing connections at the end of each invocation throws away exactly what you want to reuse, forcing a new TCP and TLS handshake on the next call.
+B=Disable keep-alive: keep-alive is what keeps a connection open between requests. Turning it off guarantees a new connection per request, which adds latency.
+D=New client inside the handler: each invocation builds a fresh client with an empty connection pool, so no connection survives between invocations.
+T: Initialize SDK clients once, outside the handler, so warm invocations reuse their open connections instead of reconnecting every time.
+
+@ Q003389 explain
+G: ## AWS AppSync in one paragraph
+AppSync is a managed GraphQL service. You define a schema (types, queries, mutations, subscriptions) and connect fields to data sources such as DynamoDB, Lambda, OpenSearch, Aurora (through the RDS Data API) or HTTP endpoints through resolvers.
+- **Queries and mutations** read and write data with one request that returns exactly the fields the client asked for.
+- **Subscriptions** push changes to connected clients over WebSockets, so a change made on a phone shows up on a tablet in real time.
+## Offline and sync
+Offline support comes from the client side: libraries such as AWS Amplify cache data locally, let the app keep working with no network, and sync changes with the AppSync backend when the device reconnects, including conflict handling.
+Example: a notes app edits a note on a plane; after landing the mutation is sent to AppSync and the user's other devices receive it through a subscription.
+W: AWS AppSync: it provides a managed GraphQL API with real-time subscriptions, and together with its client libraries supports offline use and data sync across a user's devices.
+X: A=Amazon EMR: EMR runs big data frameworks such as Spark and Hadoop on clusters for batch analytics. It has no GraphQL API and nothing to do with syncing app data to devices.
+B=Amazon SQS: SQS is a message queue between backend components. It does not expose GraphQL, push updates to mobile clients, or keep device data in sync.
+C=AWS Glue: Glue is a serverless ETL and data catalog service for preparing data for analytics. It is not an API layer for mobile apps.
+T: GraphQL plus real-time and offline sync for apps points to AppSync; EMR, Glue and SQS are backend data-processing and messaging services.
+
+@ Q003390 explain
+G: ## Request validation in API Gateway REST APIs
+A REST API method can have a **request validator** attached. It runs before the integration is called and can check:
+- **Parameters**: required query string parameters and headers are present.
+- **Body**: the JSON body matches a **model**, which is a JSON Schema you define (required fields, types, patterns).
+If validation fails, API Gateway returns `400 Bad Request` itself, and the backend is never invoked.
+## Why do it at the API layer
+Example: `POST /orders` requires the header `X-Customer-Id` and a body with `productId` and `quantity`. A validator rejects malformed calls up front, so your Lambda function or backend is not billed or loaded by requests it would reject anyway, and its code has less boilerplate checking.
+Validators come in three flavors: body only, parameters only, or both.
+W: Request validators with models: they check required parameters and the request body against a JSON Schema model and reject bad requests with a 400 before the backend is invoked.
+X: B=Stage variables: stage variables are name-value pairs per stage (for example which Lambda alias or backend URL `prod` uses). They configure where requests go, not whether requests are valid.
+C=Canary release settings: a canary sends a percentage of stage traffic to a new deployment to test it. It splits traffic; it never inspects or rejects individual requests.
+D=Usage plans with API keys: usage plans apply throttling and quotas per API key. They limit how often a client calls, not whether a request contains the required parameters.
+T: To reject malformed requests before the backend runs, attach a request validator (with a model for the body); stage variables, canaries and usage plans route or meter traffic.
+
+@ Q003391 explain
+G: ## Proxy versus non-proxy integrations
+- In a **proxy integration** (for example Lambda proxy), API Gateway passes the whole request to the backend in a fixed format and returns the backend's response as is. No transformation happens.
+- In a **non-proxy (custom) integration**, you control the shape of the data in both directions with **mapping templates**.
+## Mapping templates
+A mapping template is written in Velocity Template Language (VTL) and set on the integration request (and optionally the integration response) for a content type such as `application/json`.
+- `$input.json('$.order')` pulls part of the body.
+- `$input.params('id')` reads a path, query or header parameter.
+- `$context.requestId` adds request metadata.
+Example: a client sends `{"order":{"id":7}}`, but the legacy backend expects `{"OrderId":7,"Source":"api"}`. A template builds the second shape from the first, so neither the client nor the backend has to change.
+W: Mapping templates in the integration request: in a non-proxy integration, a VTL template rewrites the incoming request into the format the backend expects before API Gateway forwards it.
+X: A=Custom domain with base path mapping: this maps a friendly domain and path (like `api.example.com/v1`) to an API and stage. It changes the address clients use, not the content of the request.
+C=Client certificates: API Gateway can present a generated client certificate so the backend can verify calls came from API Gateway. It authenticates the connection and leaves the payload untouched.
+D=Lambda proxy integration: proxy integration explicitly skips mapping and passes the request through in a fixed format, which is the opposite of transforming it for a non-proxy backend.
+T: Reshaping request or response payloads is done with VTL mapping templates in a non-proxy integration; proxy integrations pass data through untouched.
+
+@ Q003392 explain
+G: ## Caching query results with ElastiCache
+Amazon ElastiCache runs in-memory engines (Valkey, Redis OSS or Memcached). Reading from memory takes well under a millisecond, far faster than rerunning a heavy SQL query.
+## Lazy loading with a TTL
+The usual pattern is cache-aside:
+- The app looks up a key such as `report:2026-09` in the cache.
+- On a miss, it runs the RDS query, stores the result, and returns it.
+- It stores the value with a **time to live**, for example `SET report:2026-09 <json> EX 300`, so the entry expires after 5 minutes and the next read refreshes it.
+The TTL bounds how stale data can get and stops the cache filling with entries nobody reads anymore. Combined with a `maxmemory` eviction policy, the cache stays within its memory size.
+W: ElastiCache with a TTL: it keeps query results in memory for very fast reads, and per-key TTLs expire entries automatically so data is refreshed from RDS regularly.
+X: A=DynamoDB with provisioned capacity: DynamoDB is a durable key-value database with single-digit millisecond reads, not an in-memory cache, and provisioned capacity is about throughput, not about expiring results. Adding it just creates a second database to keep in sync.
+B=EBS snapshots every minute: snapshots are point-in-time backups of a volume stored in S3. They cannot serve query results to an application and have nothing to do with expiry.
+C=S3 with lifecycle expiration: S3 is durable object storage with much higher latency than memory, and lifecycle rules act on objects in days, not seconds or minutes.
+T: For fast, automatically expiring copies of expensive query results, use an in-memory cache (ElastiCache) with TTLs, not another database or storage service.
+
+@ Q003393 explain
+G: ## Why cache-aside can serve stale data
+In cache-aside (lazy loading), the app reads from the cache first and only loads from the database on a miss. If the database row changes later, the cache still holds the old copy until the entry expires. Users keep seeing old values for up to the full TTL.
+## Keeping the cache fresh
+Two common fixes, often used together:
+- **Invalidate on write**: after updating the database, delete the key (`DEL user:42`). The next read misses and loads the new value.
+- **Write-through**: after updating the database, also write the new value into the cache.
+A modest TTL stays as a safety net, so any entry that was missed by the write logic still refreshes eventually.
+Example: a profile update writes to RDS, then deletes `user:42`; the very next profile view fetches and caches the new name.
+W: Invalidate or update on write: removing or replacing the cache entry whenever the database is written means readers never get a value older than the latest write.
+X: A=TTL of several days: a longer TTL keeps old entries alive longer, so stale reads get worse, not better.
+B=Disable the database: a cache is volatile, typically not the system of record, and may evict or lose data. Serving everything from it risks data loss and does not address consistency.
+D=Read from cache only on DB trouble: this makes the cache a fallback that is used exactly when it is most likely stale, and removes the performance benefit during normal operation.
+T: Stale cache-aside data is fixed by invalidating or updating the cache on each database write, with a TTL only as a backstop.
+
+@ Q003394 explain
+G: ## S3 upload size limits
+- A single `PutObject` can upload an object of up to **5 GB**.
+- **Multipart upload** splits a file into parts (5 MiB to 5 GiB each, up to 10,000 parts) and is required for objects over 5 GB.
+- AWS recommends multipart upload once objects reach about **100 MB**.
+## How multipart works
+`CreateMultipartUpload` returns an upload ID, each part is sent with `UploadPart` (in parallel if you like), and `CompleteMultipartUpload` assembles them. If one part fails, only that part is retried.
+Example: a 3 GB file split into 100 MB parts uploads as 30 parallel requests; a network glitch costs one 100 MB retry instead of restarting the whole 3 GB. The SDK transfer managers do this automatically.
+Tip: a lifecycle rule that aborts incomplete multipart uploads avoids paying for orphaned parts.
+W: Multipart upload: for a 3 GB object it gives parallel part uploads, higher throughput, and retries of individual parts, which is the recommended approach for large objects.
+X: B=Single PutObject: 3 GB is technically under the 5 GB single-PUT limit, but one long request must restart from zero on any failure and cannot be parallelized, so it is not the recommended way for large files.
+C=S3 Select query: S3 Select ran SQL expressions to read a subset of an object's data, and AWS has closed it to new customers. It never uploaded anything.
+D=Object Lambda: S3 Object Lambda runs a function to transform data as it is read through an access point. It changes what readers get, not how a large file is written.
+T: Large uploads use multipart upload (recommended from about 100 MB, required above 5 GB) so parts go in parallel and failures retry only one part.
+
+@ Q003395 explain
+G: ## Two timeouts in one request path
+When API Gateway calls Lambda synchronously, the client waits for both.
+- **Lambda timeout**: up to 15 minutes (900 seconds), so a 10-minute job fits in Lambda itself.
+- **API Gateway integration timeout**: 29 seconds by default for REST APIs, and at most 30 seconds for HTTP APIs. Regional and private REST APIs can request a higher limit, but holding an HTTP connection open for many minutes is still a poor design.
+If the integration times out, the client receives a `504` while the function may still be running.
+## The asynchronous pattern
+Accept the request, start the work in the background, and return right away:
+- API Gateway invokes Lambda asynchronously, or sends a message to SQS or starts a Step Functions execution.
+- Return `202 Accepted` with a job ID.
+- The client polls `GET /jobs/{id}` or is notified (webhook, WebSocket, SNS).
+W: API Gateway integration timeout: the synchronous API call is limited to about 29 to 30 seconds by default, far shorter than 10 minutes of processing, so the caller times out even though Lambda could finish.
+X: A=Lambda limited to five minutes: the maximum Lambda timeout is 15 minutes, so a 10-minute job is within Lambda's limits.
+C=Must be invoked through S3 only: Lambda can be invoked asynchronously in many ways, including directly with the `Event` invocation type, via SQS, EventBridge or Step Functions. S3 is not the only option, and the invocation source is not the problem here.
+D=No same-Region calls: API Gateway invoking a Lambda function in the same Region is the most common serverless setup.
+T: The bottleneck is API Gateway's short integration timeout, not Lambda's 15-minute limit; long work behind an API should be made asynchronous.
+
+@ Q003396 explain
+G: ## The IAM policy simulator
+The policy simulator evaluates IAM policies without making real API calls. You pick a principal (user, group or role) or paste custom policies, choose actions such as `dynamodb:PutItem`, and optionally a resource ARN like `arn:aws:dynamodb:us-east-1:111122223333:table/Orders`.
+- The result for each action is **allowed**, **explicitly denied** or **implicitly denied**, with the statement that caused it.
+- You can add condition context values (source IP, tags, and so on) to test `Condition` blocks.
+- It is available in the console and through the CLI/API: `aws iam simulate-principal-policy` and `aws iam simulate-custom-policy`.
+## Why test before deploying
+A policy change can quietly break an application or grant too much. Running the simulator (for example in a CI step) confirms the intended role can still write to the table, and that other actions are still denied, before the change reaches production.
+W: IAM policy simulator: it evaluates whether a given principal's policies allow a specific action on a specific resource, such as `dynamodb:PutItem` on the table, without calling the real API.
+X: A=AWS Cost Explorer: Cost Explorer visualizes and forecasts spending by service, account or tag. It knows nothing about whether an action is permitted.
+B=Trusted Advisor checks: Trusted Advisor gives account-wide best-practice recommendations (for example open ports or MFA on root). It does not evaluate a particular role against a particular action.
+C=Amazon Inspector: Inspector scans EC2 instances, container images and Lambda functions for software vulnerabilities and network exposure. It does not test IAM authorization decisions.
+T: To check "can this principal do this action on this resource?", use the IAM policy simulator; the other tools cover cost, best practices and vulnerabilities.
+
+@ Q003397 explain
+G: ## How AWS combines policies
+For a request inside an AWS Organizations member account, several policy types are evaluated together: service control policies (SCPs), identity policies, resource policies, permissions boundaries and session policies.
+The core rules:
+- Everything starts as an **implicit deny**.
+- An **allow** is needed from the applicable policies, and SCPs must also allow the action.
+- An **explicit deny** in any applicable policy ends the evaluation: the request is denied, whatever any other policy allows.
+## What an SCP does
+An SCP never grants permissions; it sets the maximum permissions for principals in the accounts it applies to, including the member account's root user. Example: an SCP statement `"Effect":"Deny","Action":"s3:GetObject"` on a bucket beats an identity policy that allows `s3:GetObject` on that bucket.
+W: Explicit deny wins: the SCP's explicit deny overrides the IAM policy's allow, so the request is denied regardless of how the IAM policy is written.
+X: A=Allowed for administrators: SCPs apply to the IAM users and roles in member accounts, including administrators and the root user. Admin permissions cannot override an SCP deny.
+B=Retried until policies change: policy evaluation is a single deterministic decision per request. AWS returns an `AccessDenied` error; nothing is queued or retried.
+D=More specific IAM policy wins: IAM has no "most specific wins" rule. Specificity does not matter; any explicit deny beats any allow.
+T: In AWS policy evaluation an explicit deny anywhere, including an SCP, always overrides an allow, no matter how specific or privileged the allow is.
+
+@ Q003398 explain
+G: ## Two sides of Lambda permissions
+- **Execution role**: what the function is allowed to do once it runs (for example read from S3 or write to DynamoDB).
+- **Resource-based policy** (function policy): who is allowed to invoke the function.
+## Allowing one bucket to invoke
+When S3 sends an event notification, the S3 service calls `lambda:InvokeFunction`. You grant it with a statement on the function, for example:
+`aws lambda add-permission --function-name resize --statement-id s3-uploads --action lambda:InvokeFunction --principal s3.amazonaws.com --source-arn arn:aws:s3:::uploads-bucket --source-account 111122223333`
+- `--source-arn` limits invocation to that one bucket.
+- `--source-account` guards against a bucket with the same name owned by someone else.
+When you set up the trigger in the console, this statement is added automatically.
+W: Resource-based policy with the bucket as source: the function policy grants `lambda:InvokeFunction` to `s3.amazonaws.com` only when the source ARN is that bucket, so no other bucket can trigger it.
+X: A=Security group: security groups filter network traffic for ENIs in a VPC. Invocation is an authorized AWS API call to the Lambda service, not inbound traffic to the function, so a security group cannot restrict who invokes it.
+B=Execution role with s3:*: the execution role governs what the function can do to other services, not who may call the function, and `s3:*` is also far too broad.
+D=Environment variable with bucket name: a variable is just configuration read by your code. It enforces nothing at the Lambda service level; any allowed caller could still invoke the function.
+T: Who may invoke a Lambda function is controlled by its resource-based policy (with a source ARN); the execution role only controls what the function itself may do.
+
+@ Q003399 explain
+G: ## What encryption context is
+Encryption context is a set of non-secret key-value pairs, such as `{"tenantId":"acme"}`, that you pass to KMS operations like `Encrypt` and `GenerateDataKey`.
+- KMS binds it cryptographically to the ciphertext as **additional authenticated data**.
+- `Decrypt` succeeds only if the caller supplies **exactly the same** context. Encrypting with `tenantId=acme` and decrypting with `tenantId=globex` fails.
+- The context appears in CloudTrail logs, which helps auditing ("who decrypted data for which tenant").
+## Using it for tenant isolation
+Key policy or IAM conditions such as `kms:EncryptionContext:tenantId` can limit a tenant's role to decrypting only data encrypted for that tenant, even when all tenants share one KMS key.
+Because the context is not secret, do not put sensitive values in it.
+W: Encryption context on encrypt and decrypt: the ciphertext is bound to the tenant context, so decryption succeeds only when the same tenant ID is supplied, and policies can require that context.
+X: B=AWS managed key per tenant: AWS managed keys are created by AWS services, one per service per account (like `aws/s3`). You cannot create them per tenant or control their key policies.
+C=Alias with tenant ID: an alias is only a friendly name pointing to a key. It does not change how ciphertext is bound or who can decrypt it.
+D=Automatic key rotation: rotation creates new key material on a schedule while old ciphertext stays decryptable. It has nothing to do with restricting decryption to a context.
+T: Encryption context ties ciphertext to non-secret metadata like a tenant ID; decryption fails unless the same context is provided, which aliases and rotation cannot do.
+
+@ Q003400 explain
+G: ## DynamoDB encryption at rest
+All DynamoDB tables are encrypted at rest; you cannot turn it off. You only choose which KMS key protects the table:
+- **AWS owned key** (default): owned and managed by DynamoDB, no charge, not visible in your account.
+- **AWS managed key** (`aws/dynamodb`): created in your account, visible in CloudTrail, KMS charges apply.
+- **Customer managed key**: you create it and control its key policy, rotation and disabling. KMS charges apply.
+You can switch between these key types on an existing table.
+## At rest versus in transit versus access
+- **At rest**: data stored on disk, including backups, streams and global table replicas.
+- **In transit**: data moving over the network, protected by TLS.
+- **Access control**: who may read or write, handled by IAM.
+Only the first answers this question.
+W: D=AWS owned key (default): every table is encrypted at rest with an AWS owned key unless you choose otherwise.
+E=Customer managed KMS key: selecting your own KMS key encrypts the table at rest while giving you control of the key policy, rotation and auditing.
+X: A=TLS from the SDK: TLS encrypts data in transit between the client and the DynamoDB endpoint. It does nothing for data once it is stored.
+B=VPC gateway endpoint: a gateway endpoint keeps DynamoDB traffic on the AWS network without an internet gateway or NAT. It is a network path, not storage encryption.
+C=IAM condition keys only: IAM policies decide who can call which DynamoDB actions. They control access, not whether stored data is encrypted.
+T: DynamoDB at-rest encryption is always on and chosen by key type (AWS owned, AWS managed or customer managed); TLS, endpoints and IAM address transit, network path and access instead.
+
+@ Q003401 explain
+G: ## The ECS `secrets` field
+In an ECS container definition, the `secrets` section maps an environment variable name to a secret reference instead of a value:
+- `name`: the variable the container sees, for example `DB_PASSWORD`.
+- `valueFrom`: the ARN of a Secrets Manager secret (optionally a JSON key in it) or a Systems Manager Parameter Store parameter.
+When the task starts, the ECS agent fetches the value and injects it into the container. The task definition only holds the ARN, so the secret never appears in plaintext in the definition, the console or `DescribeTaskDefinition` output.
+## Permissions and rotation
+The **task execution role** needs `secretsmanager:GetSecretValue` or `ssm:GetParameters`, plus `kms:Decrypt` if a customer managed key is used. Values are read at startup, so after a rotation, new tasks (for example a new deployment) pick up the new value.
+W: Reference secrets in the `secrets` field: ECS resolves the Secrets Manager or Parameter Store reference at task start and injects the value, while the task definition stores only the reference.
+X: A=Public S3 bucket: a public bucket lets anyone on the internet read the secrets, which is a far worse exposure than the plaintext task definition.
+C=Bake secrets into the image: anyone who can pull the image can extract the values from its layers, and rotating a secret requires rebuilding and redeploying the image.
+D=Plaintext environment variables: values in the `environment` section are stored in the task definition in clear text and visible to anyone who can describe it, which is exactly what must be avoided.
+T: Inject ECS secrets through the `secrets` field referencing Secrets Manager or Parameter Store; never put them in images, public storage or plain environment variables.
+
+@ Q003402 explain
+G: ## Incident order for a leaked credential
+Once a secret has been written to a log that many people can read, you must assume someone has copied it. Hiding the log afterward does not undo that.
+The priority is:
+- **Revoke or rotate** the token first, so the leaked value stops working. If it is stored in Secrets Manager, rotate it there and let applications fetch the new value.
+- **Restrict access** to the affected log group with IAM while you clean up.
+- **Clean the data**: CloudWatch Logs cannot delete a single log event, so you may need to delete the affected log stream, or accept the retention period while access is restricted.
+- **Prevent recurrence**: fix the logging code and consider a CloudWatch Logs **data protection policy**, which masks sensitive data such as credentials in log events.
+Also check CloudTrail or the token issuer's logs for use of the leaked token.
+W: Revoke or rotate first, then restrict and clean: invalidating the token removes the real risk immediately; limiting and cleaning the logs then reduces further exposure.
+X: A=Delete only that line: the token stays valid for anyone who already saw it, and CloudWatch Logs does not let you delete an individual log event anyway.
+B=Rename the log group: log groups cannot be renamed, and hiding the name would not change who has permission to read it.
+C=Longer retention: keeping the log longer extends the time the secret is exposed, the opposite of what is needed.
+T: A leaked credential is neutralized by revoking or rotating it first; cleaning or hiding the log alone never makes the copied value useless.
+
+@ Q003403 explain
+G: ## Two basics of Lambda security
+- **Least-privilege execution role per function**: each function gets its own role with only the actions and resources it needs, for example `dynamodb:GetItem` on one table. If that function is compromised (vulnerable dependency, injection), the attacker is limited to that narrow set.
+- **Secrets outside the code**: API keys and database passwords live in Secrets Manager (or Parameter Store SecureString) and are fetched at runtime, ideally with caching or the Parameters and Secrets Lambda extension. They are encrypted with KMS, access is controlled by IAM and logged in CloudTrail, and they can be rotated without redeploying.
+## What to avoid
+Secrets in source code or plain environment variables end up in repositories and deployment packages. A shared admin role means any single bug exposes the whole account. Resource-based policies that let any principal invoke a function open it to abuse and cost attacks.
+W: B=Secrets Manager instead of code: secrets are encrypted, access-controlled and auditable, and can be rotated without changing or redeploying the function.
+E=Separate least-privilege role per function: each function can reach only what it needs, which limits the blast radius if one function is compromised.
+X: A=Public invocation by any principal: letting any AWS principal invoke every function exposes them to misuse, data access and runaway costs.
+C=Log full payloads with passwords: logs are widely readable and retained, so writing passwords to them leaks credentials to everyone with log access.
+D=One shared full-access role: a single broad role gives every function (and any attacker who compromises one) far more permissions than needed.
+T: Secure Lambda with one narrowly scoped execution role per function and secrets fetched from Secrets Manager, not with shared broad roles, public access or logged credentials.
+
+@ Q003404 explain
+G: ## Enforcing HTTPS on S3
+S3 endpoints accept both HTTP and HTTPS. To make sure data is only sent encrypted in transit, add a bucket policy that denies any request not made over TLS, using the global condition key `aws:SecureTransport`:
+- `"Effect": "Deny"`, `"Principal": "*"`, `"Action": "s3:*"`
+- `"Resource"`: both `arn:aws:s3:::my-bucket` and `arn:aws:s3:::my-bucket/*`
+- `"Condition": {"Bool": {"aws:SecureTransport": "false"}}`
+Because it is an explicit deny, it overrides any allow elsewhere. A plain-HTTP `GetObject` receives `403 Access Denied`, while the same call over HTTPS works normally.
+## Going further
+The condition key `s3:TlsVersion` can additionally require a minimum TLS version. AWS Config has a managed rule that flags buckets without an SSL-only policy.
+W: Bucket policy denying when `aws:SecureTransport` is false: the explicit deny rejects every request that is not made over HTTPS, for all principals.
+X: B=Lifecycle rule to Glacier: lifecycle rules move or expire objects by age to manage storage cost. They do not look at how clients connect.
+C=Versioning: versioning keeps previous versions of objects to recover from overwrites and deletions. It has no effect on the transport protocol.
+D=Transfer Acceleration: acceleration routes uploads and downloads through edge locations for speed. It does not reject plain-HTTP requests.
+T: Require HTTPS for S3 with a bucket policy that denies requests where `aws:SecureTransport` is false; lifecycle, versioning and acceleration do not touch transport security.
+
+@ Q003405 explain
+G: ## Groups in Cognito user pools
+A user pool can put users into **groups** such as `admins`. When a user signs in, the ID and access tokens (JWTs) include a `cognito:groups` claim listing their groups, for example `"cognito:groups": ["admins"]`. The token is signed by Cognito, so the user cannot edit it.
+## Two ways to enforce it
+- **Check the claim**: after the token is validated (for example by an API Gateway Cognito or JWT authorizer), a Lambda authorizer or the backend code allows an admin operation only if `admins` is in `cognito:groups`.
+- **Map groups to IAM roles**: a group can carry an IAM role. Through an identity pool, members receive credentials for that role, and IAM authorization on the API allows admin operations only for that role.
+Example: `DELETE /users/{id}` returns `403` unless the caller's token lists `admins`.
+W: Check `cognito:groups` or map groups to IAM roles: group membership is carried in the signed token or turned into role-based credentials, so the API can enforce admin-only access on the server side.
+X: A=Hide admin buttons: hiding UI elements is not access control; any authenticated user can still call the API directly with their token.
+B=Different password length: password policy rules only affect how passwords are set. They say nothing about what a user is allowed to do after signing in.
+D=Word "admin" in usernames: usernames are chosen by users or admins and are not an authorization mechanism; anyone who could pick such a name would become an "admin".
+T: Enforce Cognito-based roles on the server using the signed `cognito:groups` claim or group-mapped IAM roles, never through UI hiding or naming tricks.
+
+@ Q003406 explain
+G: ## Client-side encryption for DynamoDB
+DynamoDB always encrypts data at rest on the server side, but the service can still read your plaintext. With **client-side encryption**, items are encrypted in your application before `PutItem`, so DynamoDB (and anyone with read access to the table) sees only ciphertext.
+## AWS Database Encryption SDK
+This client library (the successor of the DynamoDB Encryption Client) does this for you:
+- You choose per attribute whether to **encrypt and sign**, **sign only** or leave it alone. Key attributes stay plaintext so queries still work.
+- It uses **envelope encryption**: a keyring, such as the AWS KMS keyring or the hierarchical keyring, protects the data keys with KMS keys you manage.
+- Signatures detect tampering, and **beacons** allow limited searching on encrypted fields.
+Example: a `ssn` attribute is encrypted in the app; the table stores an encrypted blob.
+W: AWS Database Encryption SDK: it encrypts and signs item attributes in the client before they reach DynamoDB, using data keys protected by KMS keys you control.
+X: A=DynamoDB TTL: TTL deletes items automatically after an expiry timestamp. It controls data lifetime, not encryption.
+B=Global tables: global tables replicate a table across Regions for multi-Region reads and writes. Replicated data is still in whatever form you wrote it.
+D=DAX: DAX is an in-memory cache in front of DynamoDB for microsecond reads. It does not encrypt items before they are written.
+T: To encrypt DynamoDB data before it leaves the application, use the AWS Database Encryption SDK with KMS-backed keyrings; TTL, global tables and DAX do not encrypt data client-side.
+
+@ Q003407 explain
+G: ## Why runtime retrieval enables rotation
+If a key is compiled into code or a deployment package, changing it means a new deployment. If the function instead fetches the key when it runs, rotating the key only changes the stored value.
+## Secrets Manager with caching
+- Store the API key as a secret, for example `prod/partner-api-key`, encrypted with KMS.
+- Rotate it with a rotation Lambda function on a schedule (or update it yourself when the partner issues a new key).
+- In the function, fetch it with `GetSecretValue` and **cache** it for a few minutes, using the AWS Parameters and Secrets Lambda Extension or a caching client library.
+Caching avoids a Secrets Manager call on every invocation (cost and latency), while the short cache lifetime means rotated values are picked up soon without any redeploy. Code can also refresh the cache immediately if the partner API returns an authentication error.
+W: Secrets Manager with runtime fetch and caching: the function reads the current key at runtime, so a rotated value is picked up after the cache expires with no code change or redeploy.
+X: A=Email the key: email is not a secure channel for credentials and does nothing to get the new key into the function.
+C=Hard-code and redeploy: hard-coding exposes the key in source and packages, and every rotation requires a redeploy, which is exactly what must be avoided.
+D=Key in the function name: function names are visible metadata, not a secret store, and changing them means creating new functions.
+T: Keep rotating secrets in Secrets Manager and fetch them at runtime with caching; baking them into code or configuration forces redeploys and leaks them.
+
+@ Q003408 explain
+G: ## One role per function
+A Lambda function has exactly one execution role, and every invocation gets the same permissions. If one function handles both read-only requests and admin operations, its role must include the admin permissions, so even a simple read request runs with admin rights.
+## Splitting by privilege
+Separate functions let each have a role that fits its job:
+- `orders-read` with `dynamodb:GetItem` and `dynamodb:Query` on the orders table.
+- `orders-admin` with `dynamodb:UpdateItem` and `dynamodb:DeleteItem`, invoked only from an admin-only API route.
+A bug or injection in the public read path can then never modify data, and the admin function can have stricter invocation permissions and monitoring. Shared code can live in a layer or common package, so the split does not duplicate logic.
+W: Separate functions with separate least-privilege roles: each operation runs with only the permissions it needs, so the read-only path can never perform admin actions.
+X: B=Administrator access for simplicity: full admin access violates least privilege and turns any flaw in the read path into full account compromise.
+C=Pass IAM access keys in requests: sending long-term access keys with requests exposes them in transit, logs and clients, and bypasses role-based credentials entirely.
+D=One role with code comments: comments are not enforced by anything. The role still allows admin actions for every invocation.
+T: When operations need different privileges, split them into separate functions, each with its own least-privilege role, instead of one over-privileged function.
+
+@ Q003409 explain
+G: ## The three kinds of KMS keys
+- **Customer managed keys**: you create them and have full control. You set the key policy and grants, enable or disable them, choose automatic rotation (and its period), and can schedule deletion with a 7 to 30 day waiting period. They can be shared with other accounts through the key policy.
+- **AWS managed keys**: created in your account by an AWS service the first time you use its default encryption, with aliases like `aws/s3` or `aws/dynamodb`. You can see them and their use in CloudTrail, but you cannot change their policies, and you cannot delete them. AWS rotates them every year.
+- **AWS owned keys**: owned and managed by a service for use across many accounts. They do not appear in your account and you cannot see or audit them; DynamoDB's default encryption uses one.
+W: D=AWS managed keys created by services: an AWS service creates these keys in your account (for example `aws/ebs`) when you use its default KMS encryption.
+E=Customer managed keys with policies and rotation: these give you control over the key policy, grants and automatic rotation.
+X: A=AWS managed keys deletable anytime: customers cannot delete or schedule deletion of AWS managed keys; only customer managed keys can be scheduled for deletion.
+B=No cross-account use: customer managed keys can be used by other accounts when the key policy allows it and the other account's IAM policies grant access.
+C=AWS owned keys in your key list: AWS owned keys live in AWS service accounts, so they never appear in your account's list of KMS keys.
+T: Customer managed keys give full control (policy, rotation, sharing, deletion); AWS managed keys are service-created and fixed; AWS owned keys are invisible to you.

@@ -1,0 +1,342 @@
+# DVA-C02 detailed explanations, e09 (explanation-only rewrites; letters are the published ones)
+
+@ Q003310 explain
+G: ## Two kinds of secondary index in DynamoDB
+A secondary index lets you query a table by attributes other than its primary key. DynamoDB offers two kinds, and they differ in keys, timing and consistency.
+- A **local secondary index (LSI)** keeps the table's partition key and adds a different sort key. It lives in the same partitions as the base table, so it can serve strongly consistent reads. You can define LSIs only in `CreateTable`; they cannot be added or removed later, and a table allows at most five.
+- A **global secondary index (GSI)** can use a completely different partition key and optional sort key. It is stored separately and updated asynchronously from the table, so reads from it are always eventually consistent. GSIs can be added or deleted at any time with `UpdateTable`.
+## Example
+An `Orders` table keyed on `CustomerId` + `OrderDate` can have an LSI on `CustomerId` + `Total` (same partition key, created with the table) and a GSI on `Status` + `OrderDate` (new partition key, added later).
+W: A=GSIs are eventually consistent only: a GSI is replicated asynchronously from the base table, so a `Query` on it with `ConsistentRead=true` is rejected.
+E=LSIs are defined at creation: LSIs must be declared when the table is created and cannot be added to an existing table.
+X: B=Strong reads on every GSI: no GSI supports strongly consistent reads; only the base table and its LSIs do.
+C=GSI shares the sort key: a GSI can choose any partition key and sort key (or none), which is exactly what makes it "global".
+D=LSI with a different partition key: an LSI must reuse the table's partition key and only varies the sort key; a different partition key requires a GSI.
+T: LSI = same partition key, created with the table, strong reads possible; GSI = any keys, add anytime, eventually consistent reads only.
+
+@ Q003311 explain
+G: ## How Lambda reaches private resources
+By default a Lambda function runs in a network owned by the Lambda service. It can reach public internet endpoints but not resources that only have private IPs inside your VPC, such as an RDS instance in private subnets.
+To reach them, you add a **VPC configuration** to the function:
+- **Subnets**: Lambda creates Hyperplane elastic network interfaces in these subnets, giving the function a private IP path into the VPC. Choose private subnets in at least two Availability Zones for resilience.
+- **Security group**: attached to those interfaces. The database's security group then allows inbound on the DB port (for example `3306` for MySQL) from the function's security group.
+- The execution role needs the EC2 network-interface permissions, which the managed policy `AWSLambdaVPCAccessExecutionRole` provides.
+If the function in the VPC also needs the internet, route its subnets through a NAT gateway or use VPC endpoints for AWS services.
+W: VPC configuration with subnets and a security group: this places network interfaces for the function in the VPC so it can open connections to the database's private endpoint, with security groups controlling the traffic.
+X: A=Public IP on the function: Lambda functions cannot be given public IPs, and a public IP would not help reach a database that only has a private address anyway.
+B=Layer with credentials: a layer only packages code or files; credentials do not create a network path, and secrets belong in Secrets Manager rather than a layer.
+D=Internet gateway on DB subnet: that would move the database toward public exposure, which is the opposite of the goal and still gives the function no private route into the VPC.
+T: Private VPC resources require attaching the function to the VPC (subnets + security group); credentials or public networking do not create that path.
+
+@ Q003312 explain
+G: ## User pools: the user directory for your app
+An **Amazon Cognito user pool** is a managed user directory. It handles sign-up, sign-in with email and password, MFA, password reset, and federation with social providers such as Google, Apple, Facebook or Amazon, and with SAML or OIDC identity providers.
+After sign-in the user pool returns JSON Web Tokens: an ID token, an access token and a refresh token.
+## Connecting it to API Gateway
+In a REST API you add a **Cognito user pool authorizer** (in an HTTP API, a JWT authorizer pointing at the pool). The mobile app sends the token in the `Authorization` header, and API Gateway verifies the signature and expiry before invoking the backend, so unauthenticated calls are rejected with `401` without any custom code.
+- Example flow: user taps "Sign in with Google", Cognito federates and issues tokens, the app calls `GET /orders` with the ID token, the authorizer validates it.
+W: Cognito user pool with a Cognito authorizer: the pool authenticates users (local accounts and Google federation) and the authorizer validates the issued tokens on every API call.
+X: A=Security group for mobile networks: security groups filter by IP and port on VPC resources; they cannot identify a user, and API Gateway's public endpoint is not protected by one.
+B=Per-user API key in the app: API keys identify a client for usage plans and throttling, not a person; a key embedded in an app can be extracted and does not prove who signed in.
+C=IAM user per customer: IAM users are meant for people and workloads administering AWS, have account quotas, and do not provide consumer sign-up or Google sign-in.
+T: End-user sign-in (email or social) is a Cognito user pool job, and API Gateway validates the pool's tokens with a Cognito/JWT authorizer.
+
+@ Q003313 explain
+G: ## Authorizer options in API Gateway
+API Gateway can check who is calling before the request reaches your backend:
+- **IAM authorization**: callers sign with AWS SigV4 credentials.
+- **Cognito user pool / JWT authorizer**: validates tokens issued by Cognito or a standard OIDC issuer.
+- **Lambda authorizer**: runs your own function for any other scheme.
+## How a Lambda authorizer works
+A **token-based** Lambda authorizer receives the bearer token from a header such as `Authorization`. Your code validates it however the third-party system requires (verify a signature, call an introspection endpoint, look up a database) and returns an IAM policy that allows or denies `execute-api:Invoke`, plus an optional context map passed to the backend.
+- Results can be cached by token for a TTL (up to one hour) to avoid re-validating every request.
+- A **request-based** authorizer can instead use headers, query strings and stage variables together.
+W: Lambda authorizer that validates the token: custom logic can understand a proprietary or third-party token format and turn the result into an allow or deny policy for the request.
+X: A=Request validator on body schema: request validation checks required parameters and body shape against a model; it has no idea whether a bearer token is genuine.
+C=Usage plan with API keys: API keys and usage plans meter and throttle clients; they are static strings, not a way to verify tokens issued by an external identity system.
+D=Resource policy allowing all accounts: resource policies control which AWS principals, IPs or VPCs may invoke the API; allowing everyone performs no token validation at all.
+T: When the token format is custom or third-party, use a Lambda authorizer; API keys, validators and resource policies do not authenticate bearer tokens.
+
+@ Q003314 explain
+G: ## Roles instead of stored keys
+An EC2 instance can carry an IAM role through an **instance profile**. AWS then delivers short-lived credentials for that role through the Instance Metadata Service (IMDS, preferably IMDSv2), and rotates them automatically before they expire.
+The AWS SDKs and CLI look for credentials in a fixed **default credential provider chain**; the instance metadata is one of the sources, so code like `boto3.client("dynamodb")` works with no keys in code or on disk.
+- Grant the role only what the app needs, for example `dynamodb:GetItem` and `dynamodb:PutItem` on the table ARN.
+- Nothing long-lived exists to leak, and access can be changed by editing the role.
+W: Instance profile role: the SDK automatically fetches and refreshes temporary credentials from instance metadata, so no secret is stored or distributed.
+X: A=Hard-coded IAM user keys: long-term keys in source code end up in repositories and builds, never expire on their own, and must be rotated by redeploying code.
+B=Root keys in a config file: root credentials have unrestricted access to the whole account and should not have access keys at all; a file on disk can be read by anyone who compromises the instance.
+C=Monthly emailed keys: still long-term keys, now also exposed in email, with a manual, error-prone rotation process.
+T: Workloads on AWS compute get credentials from an attached role; never ship long-term access keys, and never use root keys.
+
+@ Q003315 explain
+G: ## Cross-account access with roles
+To let a service in Account A use resources in Account B without sharing long-term keys, Account B creates an IAM role with:
+- a **trust policy** that names Account A (or a specific role in it) as a principal allowed to call `sts:AssumeRole`;
+- a **permissions policy** listing what the role may do in Account B.
+The service in Account A calls `sts:AssumeRole` with the role ARN, such as `arn:aws:iam::222233334444:role/ReadReports`. The caller's own identity policy must also allow `sts:AssumeRole` on that ARN. STS returns an access key, secret key and session token that expire (by default after one hour), and the service uses them to call Account B.
+W: STS AssumeRole into Account B: it returns temporary credentials for a role whose trust policy accepts Account A, which is exactly cross-account, time-limited access.
+X: A=KMS GenerateDataKey: this creates a data key for envelope encryption; it returns key material, not AWS credentials that grant access to resources.
+B=Cognito AdminCreateUser: this adds a user to a Cognito user pool for application sign-in; it does not grant an AWS service access to another account's resources.
+D=IAM CreateAccessKey: it creates long-term access keys for an IAM user, which do not expire and would have to be shared across accounts, the opposite of temporary access.
+T: Cross-account, temporary access = a role in the target account plus `sts:AssumeRole` from the source; long-term keys are the anti-pattern.
+
+@ Q003316 explain
+G: ## Identity pools turn users into temporary AWS credentials
+An **Amazon Cognito identity pool** exchanges a sign-in token (from a user pool, a social provider, or SAML/OIDC) for temporary AWS credentials for an IAM role. The browser can then call S3 directly with those credentials.
+Each user gets a stable **identity ID**. The role's policy can use the policy variable `${cognito-identity.amazonaws.com:sub}` so one policy gives every user access to only their own prefix:
+- `Resource`: `arn:aws:s3:::uploads-bucket/private/${cognito-identity.amazonaws.com:sub}/*`
+- `Action`: `s3:PutObject` (and `s3:GetObject` if needed)
+A user whose identity ID is `us-east-1:1a2b...` can write to `private/us-east-1:1a2b.../photo.jpg` but gets `AccessDenied` for another user's prefix.
+W: Identity pool with an identity-scoped role: users receive short-lived credentials, and the policy variable limits each one to their own S3 prefix without per-user policies.
+X: B=Public bucket with folder naming: a naming convention is not access control; anyone could read or overwrite any folder, and S3 Block Public Access is designed to prevent exactly this.
+C=Shared embedded IAM user: keys in browser code are visible to every visitor, give all users the same rights, and cannot separate one user's prefix from another's.
+D=Server role credentials sent to browsers: that hands every user the server's full permissions and leaks credentials meant to stay on the instance.
+T: Per-user direct uploads = Cognito identity pool credentials plus a policy variable on the identity ID, not shared or public access.
+
+@ Q003317 explain
+G: ## Why KMS Encrypt has a size limit
+The KMS `Encrypt` API sends your plaintext to KMS and returns ciphertext. It is designed for small secrets such as passwords or keys, and accepts at most **4,096 bytes** of plaintext. A 50 MB file is far over that limit.
+## Envelope encryption
+For larger data, use **envelope encryption**:
+- Call `GenerateDataKey` with the KMS key. KMS returns a plaintext data key and the same data key encrypted under the KMS key.
+- Encrypt the file locally with the plaintext data key (for example AES-256-GCM), then discard the plaintext key from memory.
+- Store the encrypted data key with the encrypted file. To decrypt, call `Decrypt` on the small encrypted key, then decrypt the file locally.
+The AWS Encryption SDK implements this pattern for you.
+W: 4 KB limit, use envelope encryption: `Encrypt` cannot take 50 MB, so the file is encrypted locally with a data key from `GenerateDataKey`, and only the data key is protected by KMS.
+X: A=Upload to S3 first: KMS has no requirement that data be in S3; S3 SSE-KMS itself uses data keys internally, and uploading does not change the direct `Encrypt` limit.
+C=Key is disabled: a disabled key gives a `DisabledException`, not a size error; enabling it would still leave the 50 MB request over the plaintext limit.
+D=Convert to base64: KMS encrypts binary data; base64 encoding makes the payload about a third larger, making the size problem worse.
+T: KMS `Encrypt` is for up to 4 KB; anything larger uses `GenerateDataKey` and local encryption (envelope encryption).
+
+@ Q003318 explain
+G: ## Choosing the key for S3 server-side encryption
+S3 encrypts every new object at rest. By default it uses SSE-S3 (keys managed by S3), but you can ask for **SSE-KMS** so objects are encrypted with a KMS key you control, with key-policy access control and CloudTrail records of key use.
+On a `PutObject` request (or the SDK equivalent) set:
+- `x-amz-server-side-encryption: aws:kms`
+- `x-amz-server-side-encryption-aws-kms-key-id: <key ARN or ID>`
+If the key ID is omitted, S3 uses the AWS managed key `aws/s3`. The uploader needs `kms:GenerateDataKey` on the key (and `kms:Decrypt` for multipart uploads and reads). Alternatively, set bucket default encryption to that key so uploads without headers use it too.
+W: SSE header with aws:kms and key ID: this tells S3 to encrypt the object with SSE-KMS using the named customer managed key instead of the default.
+X: A=Transfer Acceleration: it routes uploads through edge locations to speed long-distance transfers; it has no effect on which key encrypts the object.
+C=Private object ACL: an ACL decides who may access the object; it does not select or apply an encryption key.
+D=Content-Type header: this only describes the media type returned to clients; "application/encrypted" does not trigger any encryption.
+T: To encrypt S3 objects with a specific KMS key, request SSE-KMS (`aws:kms`) with the key ID, or set it as the bucket default.
+
+@ Q003319 explain
+G: ## Certificates for HTTPS on AWS
+To serve HTTPS for `app.example.com`, the load balancer needs an X.509 TLS certificate for that name. **AWS Certificate Manager (ACM)** provides these:
+- Public certificates from ACM are free for use with integrated services such as Application Load Balancers, CloudFront and API Gateway.
+- You prove domain ownership with DNS validation (a CNAME record, easy with Route 53) or email validation.
+- ACM renews DNS-validated certificates automatically, and the ALB picks up the renewed certificate without downtime.
+- You can also import a certificate from another CA into ACM, but then you manage its renewal.
+On the ALB you create an HTTPS listener on port `443` and choose the ACM certificate; multiple certificates are supported through SNI.
+W: AWS Certificate Manager: it issues, stores and auto-renews TLS certificates and attaches directly to an ALB HTTPS listener.
+X: B=Secrets Manager: it stores and rotates secrets such as database passwords and API keys; it does not issue TLS certificates, and an ALB listener cannot reference a certificate from it.
+C=Systems Manager: it provides operations tooling (Parameter Store, patching, Run Command); it is not a certificate authority and is not a certificate source for ALB listeners.
+D=AWS KMS: it manages encryption keys for data encryption; it does not issue X.509 certificates for domain names.
+T: TLS certificates for ALB, CloudFront or API Gateway come from ACM, not from the secrets or key management services.
+
+@ Q003320 explain
+G: ## Two policies must agree for cross-account KMS
+Access to a KMS key is controlled by the **key policy** on the key itself plus IAM policies of the caller. Within one account the key policy can delegate to IAM, but across accounts both sides must say yes:
+- In the key's account, the key policy must allow the external principal, for example the Lambda execution role ARN `arn:aws:iam::111122223333:role/fn-role` (or that whole account), for `kms:Decrypt`.
+- In the function's account, the execution role's IAM policy must allow `kms:Decrypt` on the key's full ARN.
+If either is missing, the call fails with `AccessDeniedException`. When a request must name a key in another account, it has to use the key ARN or alias ARN, not a key ID or alias name. Grants are an alternative way to give scoped, revocable use.
+W: D=Key policy allows the role: the owning account must explicitly trust the external role in the key policy, because no IAM policy in another account can grant access to a key by itself.
+E=Role policy allows kms:Decrypt: the function's own account must also allow the action on that key ARN in the execution role, since cross-account access needs both sides.
+X: A=Elastic IP for KMS: Elastic IPs cannot be attached to Lambda functions, and KMS authorizes by IAM identity, not source IP address.
+B=Security group port 443: network rules may be needed for connectivity from a VPC, but they grant no permission to use the key; authorization comes only from key and IAM policies.
+C=S3 bucket policy: a bucket policy governs access to S3 objects; it has no effect on whether a principal may call `kms:Decrypt` on a KMS key.
+T: Cross-account KMS use needs the key policy to trust the external principal and that principal's IAM policy to allow the KMS action.
+
+@ Q003321 explain
+G: ## Where to keep a rotating password
+**AWS Secrets Manager** stores secrets encrypted with KMS and can **rotate them automatically** on a schedule, such as every 30 days or with a cron expression.
+- For Amazon RDS, Aurora, Redshift and DocumentDB it provides ready-made rotation functions (or fully managed rotation for RDS master passwords); for other secrets you supply a rotation Lambda function.
+- Rotation updates both the database password and the stored secret, using staging labels such as `AWSCURRENT` and `AWSPENDING` so applications keep working during the change.
+- Apps read the current value with `GetSecretValue`, ideally with client-side caching.
+Systems Manager Parameter Store is cheaper and can hold encrypted values, but it has no built-in rotation.
+W: AWS Secrets Manager: it has native scheduled rotation for database credentials, which is exactly the 30-day requirement.
+X: A=S3 object with metadata: S3 can store a file, but it has no concept of a secret or a rotation schedule; you would have to build rotation and access control yourself.
+B=Parameter Store String: a plain String is stored unencrypted, and Parameter Store offers no automatic rotation for any parameter type.
+D=Lambda environment variable: the value is fixed in the function configuration and only changes when someone redeploys it; nothing updates the database password.
+T: Automatic rotation is the deciding feature: choose Secrets Manager; Parameter Store and environment variables do not rotate.
+
+@ Q003322 explain
+G: ## Parameter Store versus Secrets Manager
+Both services keep configuration outside code, but they are priced and featured differently:
+- **Systems Manager Parameter Store**: hierarchical parameters such as `/myapp/prod/db-host`. Standard parameters are free to store (API calls at standard throughput are free too). Types are `String`, `StringList` and `SecureString`, the last encrypted with KMS. No built-in rotation.
+- **AWS Secrets Manager**: charges per secret per month plus per API call, and adds automatic rotation, cross-Region replication and managed database integrations.
+## A cost-aware split
+Store the many ordinary settings as Parameter Store `String` values and the few secrets as `SecureString`, and load them at startup with `GetParametersByPath` using `WithDecryption=true`. Move a secret to Secrets Manager only when it needs rotation or other features.
+W: Parameter Store with SecureString: it covers plain configuration at little or no cost and encrypts the few secrets with KMS, and none of them need rotation.
+X: A=Hard-coded config, plain env secrets: changing configuration requires redeploying code, and secrets in plain environment variables are visible to anyone who can view the configuration.
+B=Secrets Manager for everything: each stored value is billed monthly, so many non-sensitive settings add cost without benefit when rotation is not needed.
+D=Public S3 JSON file: a public bucket exposes every secret to the internet; S3 is also not a configuration or secret store with parameter types and KMS decryption.
+T: Many settings + few non-rotating secrets = Parameter Store (String + SecureString); pay for Secrets Manager when rotation is required.
+
+@ Q003323 explain
+G: ## How Lambda protects environment variables
+Lambda always encrypts environment variables **at rest** with KMS (an AWS managed key by default, or a customer managed key you choose). But anyone with permission to view the function configuration still sees the values in plaintext in the console and API.
+To keep a value hidden you have two options:
+- **Encryption helpers**: encrypt the value client-side with a KMS key before saving it. The console then shows only ciphertext, and the function code calls `kms:Decrypt` at startup; the execution role needs `kms:Decrypt` on that key.
+- **Secrets store**: keep the API key in Secrets Manager (or a Parameter Store `SecureString`) and fetch it at runtime, for example through the AWS Parameters and Secrets Lambda Extension, which caches values.
+The secrets store approach also allows rotation and central auditing.
+W: Encrypt with KMS or use a secrets store: either the variable holds only ciphertext that code decrypts, or the key never sits in the configuration at all.
+X: A=Put it in the description: the description is also visible in the console and API responses, in plaintext, to the same users.
+C=Split into two variables: both halves stay readable in the console, so anyone can simply join them; nothing is encrypted.
+D=Rename the variable: obscurity does not protect data; the value is still plaintext and visible to every console viewer.
+T: Default at-rest encryption does not hide variables in the console; encrypt the value with KMS helpers or fetch it from a secrets store.
+
+@ Q003324 explain
+G: ## Least privilege for Lambda
+A Lambda function gets its AWS permissions from its **execution role**. Least privilege means granting only the actions it needs on only the resources it uses.
+For "read objects from one bucket", a minimal policy statement is:
+- `Effect`: `Allow`
+- `Action`: `s3:GetObject`
+- `Resource`: `arn:aws:s3:::reports-bucket/*`
+Add `s3:ListBucket` on `arn:aws:s3:::reports-bucket` only if the code lists keys. If the objects use SSE-KMS with a customer managed key, add `kms:Decrypt` for that key.
+Broad managed policies are convenient but grant far more than needed, so a bug or a compromised dependency in the function could misuse them. IAM Access Analyzer can generate a policy from actual activity to help narrow permissions.
+W: Execution role with s3:GetObject on that bucket: it grants exactly the one action on exactly the one bucket's objects, nothing more.
+X: B=Public-read bucket policy: this exposes every object to the whole internet instead of only the function, which violates least privilege and S3 Block Public Access guidance.
+C=AdministratorAccess on the role: full control of the entire account is vastly more than reading one bucket; a compromised function could do anything.
+D=AmazonS3FullAccess: it allows every S3 action (including deletes and policy changes) on every bucket in the account, not just reads on one bucket.
+T: Least privilege = the specific action on the specific resource ARN in the execution role, not broad managed or public policies.
+
+@ Q003325 explain
+G: ## At rest versus in transit
+Encryption protects data in two different states:
+- **At rest**: data stored on disk or in a service (EBS volumes, S3 objects, DynamoDB tables). Usually handled with KMS keys, and often enabled by default.
+- **In transit**: data moving over the network between client and server. Protected with **TLS**, which is what HTTPS uses.
+An API such as `https://api.example.com/orders` served by API Gateway, an ALB or CloudFront terminates TLS with a certificate (for example from ACM). API Gateway endpoints accept HTTPS only, and API Gateway custom domains let you pick a minimum TLS security policy. For an ALB, use an HTTPS listener and redirect HTTP to HTTPS.
+Enabling at-rest encryption on storage does nothing for packets on the wire, so the answer must be a transport setting.
+W: HTTPS endpoints with TLS: TLS encrypts the request and response between client and API, which is exactly the in-transit requirement.
+X: A=EBS default encryption: it encrypts new EBS volumes and snapshots at rest; data travelling from clients to the API is unaffected.
+B=DynamoDB encryption at rest: it protects table data stored by DynamoDB (and is always on); it does not encrypt client-to-API network traffic.
+C=S3 default encryption: it encrypts objects stored in S3; it does not secure requests sent to an API.
+T: In-transit protection means TLS (HTTPS); EBS, DynamoDB and S3 encryption settings only cover data at rest.
+
+@ Q003326 explain
+G: ## IAM authorization on API Gateway
+With **IAM authorization** (`AWS_IAM`) on a method, callers must sign each request with **Signature Version 4** using their AWS credentials. API Gateway verifies the signature and then evaluates policies to decide whether `execute-api:Invoke` is allowed.
+A **resource policy** on the API names who may invoke it, for example:
+- `Principal`: `{"AWS": ["arn:aws:iam::111122223333:root", "arn:aws:iam::444455556666:root"]}`
+- `Action`: `execute-api:Invoke`, `Resource`: `execute-api:/*`
+For callers in other accounts, both the API's resource policy and the caller's own IAM policy must allow the invoke. Principals in other, unlisted accounts are denied even with valid AWS credentials.
+W: IAM authorization with a resource policy: SigV4 proves the caller's AWS identity, and the resource policy restricts invocation to principals in the listed accounts.
+X: A=Emailed API keys: API keys are static strings for usage plans; they do not use IAM credentials or verify which account a caller belongs to, and email exposes them.
+B=Cognito user per account: user pools authenticate application users with passwords and tokens, not AWS principals signing with IAM credentials.
+D=Validator requiring an account header: a request validator only checks that a header exists; any caller can type any account ID into it.
+T: To restrict an API to specific AWS accounts' IAM principals, use `AWS_IAM` (SigV4) plus a resource policy listing those accounts.
+
+@ Q003327 explain
+G: ## Keeping sensitive data out of logs
+Logs are copied, retained and read by many people, so card numbers or personal data should never be written in clear text. Use layered controls:
+- **Mask in code**: before logging, redact or truncate fields, for example log `card=****1111` instead of the full number, or use a logger filter that drops known sensitive keys.
+- **CloudWatch Logs data protection policies**: attached to a log group (or account-wide), they use managed data identifiers such as credit card numbers, email addresses and AWS secret keys to detect and **mask** matching data as it is ingested. Only principals with the `logs:Unmask` permission can view the original values, and findings can be reported for auditing.
+This keeps logging useful for troubleshooting while limiting exposure.
+W: Mask in code and use data protection policies: application-side redaction stops most sensitive values at the source, and CloudWatch Logs masking catches anything that slips through.
+X: B=Longer retention: keeping logs longer keeps sensitive data around longer; it neither prevents nor hides it.
+C=Disable production logging: this removes the ability to troubleshoot and audit, while masking would solve the problem without losing observability.
+D=Public bucket for auditors: publishing logs to a public bucket exposes the very data that must be protected to the entire internet.
+T: Protect logs by masking sensitive fields (in code and with CloudWatch Logs data protection), not by hiding, deleting or exposing the logs.
+
+@ Q003328 explain
+G: ## Envelope encryption step by step
+KMS keys never leave KMS unencrypted, and `Encrypt` accepts at most 4 KB. To encrypt large data you wrap a **data key** with the KMS key:
+- Call `GenerateDataKey`. KMS returns a **plaintext data key** and an **encrypted copy** of it (the `CiphertextBlob`).
+- Encrypt the data locally with the plaintext data key, then erase that key from memory.
+- Store the encrypted data key next to the ciphertext, for example as file header or object metadata.
+- To decrypt: send the encrypted data key to KMS `Decrypt`, get the plaintext data key back, decrypt the data locally.
+Only the small data key travels to KMS, so the file size does not matter, and access to the data still depends on permission to use the KMS key.
+W: B=GenerateDataKey returns both copies: the plaintext copy is used to encrypt now, and the encrypted copy is kept so the key can be recovered later through KMS.
+E=Encrypted data key stored with the data: keeping the wrapped key alongside the ciphertext means everything needed for decryption is together, yet it is useless without KMS access.
+X: A=Download the KMS key: KMS keys cannot be exported in plaintext; that is the point of using data keys for local encryption.
+C=Encrypt for multi-gigabyte files: `Encrypt` rejects plaintext over 4,096 bytes, so large files must use data keys.
+D=Store the plaintext data key: anyone who obtains the data could read the key and decrypt it without KMS, defeating the scheme.
+T: Envelope encryption: encrypt locally with a data key, discard its plaintext, and keep only the KMS-encrypted data key with the data.
+
+@ Q003329 explain
+G: ## What Cognito tokens prove
+After sign-in, a Cognito user pool issues JSON Web Tokens (JWTs) signed with the pool's private key. The public keys are published at `https://cognito-idp.<region>.amazonaws.com/<userPoolId>/.well-known/jwks.json`.
+A backend verifies a token by checking:
+- **Signature**: using the key whose `kid` matches the token header, which proves Cognito issued it and it was not altered.
+- **Expiration**: the `exp` claim is in the future.
+- **Issuer and audience**: `iss` is your user pool, and the audience matches your app client (`aud` in ID tokens, `client_id` in access tokens), plus `token_use` is `id` or `access` as expected.
+Libraries such as `aws-jwt-verify` do these checks, and API Gateway authorizers can do them for you.
+W: JWT signature, expiration and audience: these checks prove the token was issued by your user pool for your app client and is still valid, which means a signed-in user made the request.
+X: A=Same IP as first sign-in: mobile and corporate users change IPs constantly, and several users can share one IP through NAT, so IP is neither reliable nor proof of identity.
+B=Known user agent: the user agent is a header any client can set to any value; it says nothing about authentication.
+C=Password in a custom header: sending the password on every request multiplies exposure and bypasses the token model Cognito provides; the backend should never handle raw passwords.
+T: Trust a Cognito-authenticated request only after verifying the JWT's signature and claims (expiry, issuer, audience/client).
+
+@ Q003330 explain
+G: ## Static security scanning of code
+Some security problems are visible in the source itself: hardcoded AWS keys or passwords, SQL injection, insecure cryptography, or overly permissive settings in infrastructure code. **Static application security testing (SAST)** tools read the code and flag these before deployment.
+On AWS:
+- **Amazon Q Developer** can run security scans from the IDE on the project, detecting hardcoded credentials and vulnerabilities, and suggests fixes.
+- **Amazon CodeGuru Security** offered similar scanning as a service and in pipelines, but AWS ended support for it on November 20, 2025; AWS recommends Amazon Q Developer code reviews and Amazon Inspector code security scanning instead.
+Run scans early (in the IDE and in CI) so issues are fixed before they reach a repository or production. Found secrets should be rotated and moved to Secrets Manager.
+W: CodeGuru Security or Q Developer scans: both are code security scanners that look for hardcoded secrets and security flaws during development, which is exactly the need; today Amazon Q Developer is the option to use, since CodeGuru Security is no longer available.
+X: A=AWS Budgets alerts: Budgets notify when spending or usage crosses a threshold; they never look at source code.
+C=CloudWatch dashboards: dashboards visualize runtime metrics and logs of a running app; they cannot find credentials written in code.
+D=Trusted Advisor cost checks: these review account resources for savings opportunities, not the contents of application code.
+T: Finding secrets and vulnerabilities in code is a code scanning (SAST) job, such as Amazon Q Developer security scans, not a cost or monitoring tool.
+
+@ Q003331 explain
+G: ## AWS SAM in a nutshell
+The **AWS Serverless Application Model (SAM)** is an extension of CloudFormation for serverless apps. A template with `Transform: AWS::Serverless-2016-10-31` can use short resource types:
+- `AWS::Serverless::Function` for a Lambda function, including its events such as an API path,
+- `AWS::Serverless::Api` or `AWS::Serverless::HttpApi` for API Gateway,
+- `AWS::Serverless::SimpleTable` for a simple DynamoDB table, and policy templates like `DynamoDBCrudPolicy`.
+A few lines expand into the full CloudFormation resources, roles and permissions at deploy time.
+## Local testing with the SAM CLI
+- `sam build` packages the functions.
+- `sam local invoke` runs a function once in a Docker container that mimics the Lambda runtime, with a test event.
+- `sam local start-api` serves the API locally so you can test with `curl`.
+- `sam deploy --guided` deploys the stack.
+W: AWS SAM with sam local: it provides concise serverless templates for Lambda, API Gateway and DynamoDB and runs functions and APIs locally for testing.
+X: B=Manual console setup: clicking through the console is not a template, cannot be version-controlled or repeated reliably, and offers no local testing.
+C=OpsWorks Chef cookbooks: OpsWorks configured servers with Chef or Puppet, not serverless resources, and AWS OpsWorks has reached end of life.
+D=EC2 user data scripts: user data runs commands when an EC2 instance boots; it does not define Lambda functions or APIs and there are no instances in this design.
+T: Serverless infrastructure as code with local testing = AWS SAM templates plus `sam local`.
+
+@ Q003332 explain
+G: ## The buildspec file
+AWS CodeBuild runs the commands listed in a YAML **buildspec**, by default `buildspec.yml` at the root of the source (or inline in the project, or at another path you configure). It is organized into phases:
+- `install`: set runtimes and install tools.
+- `pre_build`: for example run unit tests and log in to ECR with `aws ecr get-login-password | docker login ...`.
+- `build`: `docker build -t $REPO_URI:$CODEBUILD_RESOLVED_SOURCE_VERSION .`
+- `post_build`: `docker push` the image and write output files.
+It also has `env` (variables, Parameter Store and Secrets Manager references), `artifacts` and `reports` (for test results). Building Docker images needs privileged mode on the project, and the service role needs ECR push permissions.
+W: buildspec.yml: CodeBuild reads its phases and commands from the buildspec, so the test, build and push steps belong there.
+X: A=appspec.yml: this file is read by CodeDeploy to define deployment hooks and file mappings, not by CodeBuild to run builds.
+B=CloudFormation Outputs: Outputs export values such as ARNs or URLs from a stack; they cannot hold commands for a build to execute.
+C=Dockerfile EXPOSE: `EXPOSE` only documents which port the container listens on; it cannot run tests or push images to ECR.
+T: CodeBuild steps live in `buildspec.yml`; `appspec.yml` belongs to CodeDeploy.
+
+@ Q003333 explain
+G: ## Managed package repositories
+Builds usually pull third-party libraries from public registries such as npmjs.com and PyPI. **AWS CodeArtifact** gives a team a private, managed repository for these packages:
+- Supports npm, PyPI, Maven, NuGet, Swift, Ruby, Cargo and generic formats, working with the normal tools (`npm`, `pip`, `twine`, `mvn`).
+- An **upstream** or **external connection** to a public registry fetches a package on first request and keeps a copy, so later builds still work even if the public version disappears.
+- Private internal packages can be published to the same repository and shared across accounts, with IAM and resource policies controlling access.
+Example: `aws codeartifact login --tool npm --domain acme --repository shared` configures npm to install through CodeArtifact.
+W: AWS CodeArtifact: it hosts private npm and PyPI packages and caches public packages through upstream connections for builds.
+X: A=AWS CodeCommit: it hosts Git repositories of source code; it is not a package registry that `npm install` or `pip install` can resolve against.
+B=S3 Glacier: an archival storage class with slow retrieval; it has no package registry protocol and is unsuitable for build dependencies.
+D=Amazon ECR: it stores container images and OCI artifacts, not npm or Python packages served through their native package managers.
+T: Private language package repositories with upstream caching = CodeArtifact; ECR is for container images, CodeCommit for source code.
+
+@ Q003334 explain
+G: ## Tags, digests and immutability
+A container image in Amazon ECR can be referenced by a **tag** (a label like `latest` or `v1.4.2`) or by its **digest** (`sha256:...`, which identifies exact content). Tags are mutable by default, so pushing a new image with the same tag silently moves it.
+For reproducible deployments:
+- Tag each build with something unique, such as the Git commit ID (`myapp:3f9c2ab`).
+- Set the repository's **tag mutability** to `IMMUTABLE`; pushing an existing tag again then fails, so a tag always means one image.
+- Deploy the unique tag (or digest) in the task definition or manifest, so a rollback simply points back to the previous commit's image.
+W: Commit ID tag with tag immutability: each image has a unique tag that ECR will never let anyone overwrite, so a deployment always refers to exactly the image that was built and tested.
+X: A=Overwrite latest: the `latest` tag moves with every push, so two deployments of "latest" can run different code and rollbacks cannot reliably target a previous image.
+B=Rebuild on every server: each build can pull different base images or dependencies, so servers may run different code, and startup becomes slow.
+C=Images on laptops: there is no central, versioned, access-controlled registry, and nothing guarantees which build is on which server.
+T: Immutable deployments = unique tags (commit ID or digest) plus ECR tag immutability, never a moving `latest` tag.

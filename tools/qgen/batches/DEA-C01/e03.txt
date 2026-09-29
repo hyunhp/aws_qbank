@@ -1,0 +1,366 @@
+# DEA-C01 detailed explanations, e03 (explanation-only rewrites; letters are the published ones)
+
+@ Q000301 explain
+G: ## Push versus pull between pipeline stages
+A notification between two stages can be **pushed** to the receiver or **pulled** by it.
+- **Amazon SNS** pushes each message to every subscriber at the moment it is published. With no subscriber, the message is simply dropped; SNS does not store it for later.
+- **Amazon SQS** stores messages durably in a queue until a consumer calls `ReceiveMessage` and then `DeleteMessage`. The consumer decides when and how fast to poll, and a message that is not deleted reappears after the visibility timeout, so it is not lost if the consumer crashes.
+## Example
+Stage 1 finishes writing `s3://lake/curated/2026-09-29/` and sends `{"partition":"2026-09-29"}` to a queue. The downstream system polls the queue when it has capacity, processes the partition, and deletes the message only after success. Failed messages can move to a dead-letter queue after a set number of receives.
+W: Amazon SQS: a queue holds the message durably for one consuming system, which polls at its own pace and deletes the message only after processing, giving reliable, rate-controlled hand-off between stages.
+X: A=Amazon Pinpoint: Pinpoint is a customer-engagement service for sending marketing and transactional messages (email, SMS, push) to end users, not a durable work queue that a backend system polls.
+C=CloudWatch Events with no target: an event rule without a target matches events but delivers them nowhere, and events are not stored for later polling, so the downstream system never receives anything.
+D=SNS without a queue subscriber: SNS only pushes to subscribers at publish time and keeps no backlog, so with no subscriber the message is lost and there is nothing for the downstream system to poll.
+T: When one consumer must get every message and control its own pace, use a pull-based SQS queue; SNS push without a subscriber stores nothing.
+
+@ Q000302 explain
+G: ## Why string concatenation in a loop is slow
+Python strings are immutable. `result = result + s` inside a loop can create a brand-new string and copy everything built so far on each iteration, so the total work grows roughly with the square of the output size. For millions of items this dominates runtime.
+## Faster patterns
+- **Collect then join**: append pieces to a list and call `"".join(parts)` once. The final string is built in one pass.
+- **Vectorize**: with pandas or NumPy, operations such as `df["a"].str.cat(df["b"], sep=",")` or column arithmetic run in optimized C code over whole arrays instead of in the Python interpreter one element at a time.
+## Example
+Building a CSV line for 5 million rows with `line += ...` may take minutes; `",".join(values)` or a pandas `to_csv` call typically finishes in seconds because the per-item interpreter overhead and repeated copying disappear.
+W: Vectorized pandas/NumPy or a single join: both remove the repeated copying and per-element interpreter overhead of loop concatenation, changing the cost from roughly quadratic to linear and running most work in compiled code.
+X: A=Longer Lambda timeout: a longer timeout only lets the same slow code run longer before being stopped; the algorithm and the runtime stay exactly the same.
+B=More print statements: printing adds extra I/O on every iteration, which makes the loop slower, and gives no change to how the strings are built.
+D=Recursive function calls: recursion adds function-call overhead, keeps the same repeated copying, and in Python hits the default recursion limit (about 1,000 frames) long before a large list is processed.
+T: Fix the algorithm, not the limits: build strings with one `join` or vectorized operations instead of concatenating inside a Python loop.
+
+@ Q000303 explain
+G: ## What a Lambda cold start is
+When a request arrives and no initialized execution environment is free, Lambda must create one: download the code, start the runtime, and run your initialization code (imports, SDK clients, connections). That extra delay is the **cold start**. It shows up after idle periods and during sudden spikes, when many new environments are needed at once.
+## Provisioned concurrency
+**Provisioned concurrency** keeps a chosen number of environments already initialized and ready. Requests up to that number skip initialization and respond with consistent low latency.
+- It is set on a published version or alias, for example `prod` with 50 provisioned environments.
+- It can be scheduled or scaled with Application Auto Scaling ahead of known peaks.
+- You pay for the provisioned environments while they are configured.
+For supported runtimes, Lambda SnapStart is another way to shorten initialization, but provisioned concurrency is the setting that keeps environments warm.
+W: Provisioned concurrency: pre-initialized execution environments are ready before requests arrive, so the first invocations after idle periods or during spikes avoid initialization delay.
+X: A=X-Ray active tracing: tracing records where time is spent, including initialization, which helps diagnose cold starts but does not make them any shorter.
+B=Longer function timeout: the timeout is the maximum run time allowed per invocation; raising it does not reduce the time needed to create and initialize a new environment.
+C=Reserved concurrency of 1: reserved concurrency caps the function at one concurrent execution and does not pre-warm anything, so spikes would be throttled on top of still suffering cold starts.
+T: Cold starts are cured by keeping environments initialized with provisioned concurrency; timeouts, tracing and reserved concurrency do not pre-warm anything.
+
+@ Q000304 explain
+G: ## How Lambda allocates CPU
+Lambda has one performance dial: **memory**, from 128 MB to 10,240 MB. CPU power is allocated in proportion to memory.
+- At about 1,769 MB a function gets the equivalent of one full vCPU.
+- At the maximum of 10,240 MB it can use up to 6 vCPUs.
+## What this means for CPU-bound code
+A function that spends its time computing (parsing, compressing, hashing), rather than waiting on network calls, runs faster when it gets more CPU. Because billing is per GB-second, a function that finishes twice as fast with twice the memory can cost about the same.
+## Example
+A single-threaded transform at 512 MB takes 9 seconds. Raising memory toward about 1,769 MB gives it close to a full vCPU and can cut the duration sharply. Beyond one vCPU, a single-threaded function gains little, because it can use only one core unless the code is parallelized.
+W: Raise memory, which also raises vCPU: Lambda scales CPU share with configured memory, so a CPU-limited function gets more compute and completes sooner.
+X: B=Split code into multiple layers: layers only change how code and dependencies are packaged and shared; they add no CPU and do not change execution speed.
+C=Decrease memory: less memory also means a smaller CPU share, so a CPU-bound function would run even slower.
+D=Increase the timeout: a longer timeout only allows more run time before Lambda stops the function; it does not make the code run any faster.
+T: In Lambda, memory is the CPU knob: more memory gives a CPU-bound function more compute, while timeouts and layers change nothing about speed.
+
+@ Q000305 explain
+G: ## Choosing an engine for complex transformations
+SQL is ideal for set-based logic (filters, joins, aggregations). It becomes awkward when the job needs arbitrary Python functions, loops that refine features step by step, or libraries such as NumPy.
+**PySpark** is the Python API for Apache Spark. It splits data into partitions and processes them in parallel on many executors.
+- DataFrame joins and aggregations over terabytes are distributed across the cluster.
+- Custom Python logic can run as UDFs, including pandas UDFs that process batches of rows efficiently.
+- Iterative logic is written as normal Python code that builds Spark transformations.
+## Where to run it on AWS
+- **AWS Glue**: serverless Spark jobs; you choose worker type and count, with no cluster to manage.
+- **Amazon EMR** (on EC2, on EKS, or Serverless): more control over Spark versions, configuration and instance types.
+W: PySpark on Glue or EMR: it combines Python flexibility (UDFs, iterative code, libraries) with distributed execution, so 2 TB joins are spread across many workers instead of one machine.
+X: A=Athena SQL with nested subqueries: Athena is well suited to SQL, but iterative feature logic and custom Python functions are hard or impossible to express in nested SQL, which is exactly the stated problem.
+C=A single Lambda function: one invocation is limited to 10,240 MB of memory and 15 minutes of run time, far too small to join 2 TB of data.
+D=Redshift stored procedures only: stored procedures are written in PL/pgSQL, not Python, and would first require loading all the data into Redshift, so the custom Python logic still cannot be expressed.
+T: When logic outgrows SQL and data outgrows one machine, use distributed PySpark on Glue or EMR.
+
+@ Q000306 explain
+G: ## Treat pipeline code like application code
+Glue scripts are code, and the same problems appear when code is shared by email: no history, no review, and silent overwrites.
+- **Git** records every change with its author, and lets you compare or revert any version.
+- **Branches** let each engineer work in isolation without touching someone else's copy.
+- **Pull requests** add review before a change reaches the main branch, and merge conflicts are shown instead of silently lost.
+- **CI/CD** (for example CodePipeline with CodeBuild, or GitHub Actions) runs tests and deploys the reviewed script to S3 and the Glue job, so nobody uploads by hand.
+## Example flow
+An engineer branches `feature/dedupe`, edits `jobs/orders_etl.py`, opens a pull request, a teammate approves it, and the merge triggers a pipeline that runs unit tests and deploys the script to the staging Glue job.
+W: Git with branches, pull requests and CI deployment: it provides full history, isolated work, peer review before merge, and consistent automated deployment, which removes the overwrite problem.
+X: A=Weekly manual merge meeting: merging by hand once a week is slow and error-prone, still has no reliable history, and overwrites can happen between meetings.
+C=Console-only editing with versioning: editing directly in the Glue console gives no branch-based isolation or pull-request review, so two engineers can still change the same job and one change can replace the other.
+D=Shared S3 folder with versioning: S3 versioning keeps old object copies, but it has no branching, diff-based review or merge; the last upload still wins and changes are not reviewed.
+T: Version control with pull-request review and CI/CD solves collaboration problems; storage-level versioning only keeps copies.
+
+@ Q000307 explain
+G: ## Separate logic from I/O
+A Glue job usually does three things: read data (from the Data Catalog or S3), transform it, and write it. Only the middle part is business logic, and it is the part worth unit testing.
+- Move each transformation into a plain function that takes a DataFrame and returns a DataFrame, such as `def clean_orders(df): ...`.
+- Keep reading and writing in the job's entry script.
+- In tests, create a local `SparkSession`, build a small DataFrame from a few hand-written rows, call the function, and assert on the result with `pytest`.
+## Example
+`test_clean_orders` builds three rows, one with a null `order_id`, calls `clean_orders`, and asserts that two rows remain. It runs in seconds on a laptop or in a CI build, with no AWS resources and no production data. AWS also publishes Glue Docker images for running Glue libraries locally when the code needs Glue-specific APIs.
+W: Extract logic into functions tested with pytest: pure transformation functions can be tested locally with small in-memory data, quickly and repeatably, without running a Glue job or touching production.
+X: B=Inspect S3 output after deployment: manual checking happens only after code is deployed, is not automated or repeatable, and cannot isolate which function caused a problem.
+C=Run the full job against production for every change: this provisions Glue resources on every test, is slow and costly, and risks touching production data, which the requirement explicitly avoids.
+D=Disable job bookmarks: bookmarks only track which input was already processed between runs; turning them off does not create unit tests or remove the need to run the job.
+T: Make ETL testable by isolating pure transformation functions and testing them locally with pytest and small DataFrames.
+
+@ Q000308 explain
+G: ## Where Glue job logs go
+AWS Glue sends driver and executor logs to Amazon CloudWatch Logs, in log groups such as `/aws-glue/jobs/output` and `/aws-glue/jobs/error`, with one log stream per job run (and more for continuous logging).
+## CloudWatch Logs Insights
+Logs Insights is a query language over one or more log groups for a chosen time range. It can filter, parse fields out of text, and aggregate across all streams and runs at once.
+## Example query
+- `fields @timestamp, @message`
+- `| filter @message like /Exception/`
+- `| parse @message /(?<errorType>[A-Za-z.]+Exception)/`
+- `| stats count(*) by errorType | sort count(*) desc`
+This returns a ranked count of error types across many runs in seconds, for example showing that most failures are `S3Exception` throttling errors.
+W: CloudWatch Logs Insights: it queries the Glue log groups across all runs and streams, extracts the error type with `parse`, and counts occurrences with `stats`, which is exactly the analysis needed.
+X: B=S3 server access logs: these record requests made to an S3 bucket (who requested which object), not the application errors written by the Glue driver and executors.
+C=Glue console job run list: it shows each run's status, duration and a short error message, but cannot search thousands of log lines or group and count errors across runs.
+D=CloudTrail event history: CloudTrail records AWS API calls such as `StartJobRun`, not the log output produced inside the Spark job, so it cannot show the job's error messages.
+T: To search and aggregate application log lines across many runs, use CloudWatch Logs Insights; CloudTrail and S3 access logs record API and bucket requests, not job output.
+
+@ Q000309 explain
+G: ## Infrastructure as code in a programming language
+**AWS CloudFormation** deploys resources from JSON or YAML templates. The **AWS Cloud Development Kit (CDK)** lets you describe the same resources in Python, TypeScript, Java, C# or Go, then **synthesizes** a CloudFormation template (`cdk synth`) and deploys it (`cdk deploy`).
+- **Constructs** are reusable classes. A team can write a `DataPipeline` construct that creates a bucket, a Glue job and its IAM role with safe defaults, and reuse it for every dataset.
+- Because it is normal code, you can use loops, conditions and packages.
+- The `assertions` module lets you write unit tests that check the synthesized template, for example that the bucket has encryption enabled.
+## Example
+`DataPipeline(self, "Orders", source="orders")` could create three resources in one line, and a pytest test could assert that the Glue job's role has no `*` permissions.
+W: AWS CDK: it defines infrastructure in Python with reusable constructs and unit tests, and deploys through CloudFormation, which matches every requirement.
+X: A=AWS Config rules: Config records resource configuration and evaluates compliance after resources exist; it does not define or deploy infrastructure.
+B=Systems Manager Parameter Store: it stores configuration values and secrets for applications to read, not definitions of buckets, jobs or roles.
+C=AWS Service Catalog: it lets administrators publish approved products (usually backed by CloudFormation templates) for others to launch, but it is not a Python framework for writing and unit testing infrastructure code.
+T: Writing infrastructure in Python with reusable components and tests that deploys via CloudFormation is AWS CDK.
+
+@ Q000310 explain
+G: ## What AWS SAM adds to CloudFormation
+The **AWS Serverless Application Model (SAM)** is a CloudFormation extension (`Transform: AWS::Serverless-2016-10-31`) with short resource types for serverless apps, plus a CLI.
+- **Concise definitions**: `AWS::Serverless::Function` with an `Events` section of type `Api` creates the Lambda function, the API Gateway route and the permissions in a few lines. `AWS::Serverless::SimpleTable` creates a basic DynamoDB table.
+- **Local testing**: `sam local invoke` and `sam local start-api` run functions and the API in Docker on your machine.
+- **Gradual deployments**: `AutoPublishAlias: live` plus `DeploymentPreference: Type: Canary10Percent5Minutes` makes SAM set up AWS CodeDeploy to shift traffic to the new version in steps, with optional alarms and automatic rollback.
+W: AWS SAM: it provides shorthand serverless resource types, local testing with the SAM CLI, and built-in gradual Lambda traffic shifting through CodeDeploy.
+X: A=Elastic Beanstalk: Beanstalk deploys web applications onto managed EC2 environments; it does not model API Gateway plus Lambda plus DynamoDB or shift Lambda alias traffic.
+C=AWS OpsWorks: OpsWorks was a Chef and Puppet configuration management service for servers and has reached end of life; it never defined serverless APIs.
+D=AWS Config: Config records and evaluates resource configuration for compliance; it cannot define, test or deploy an application.
+T: For concise serverless definitions with local testing and gradual Lambda deployments, use AWS SAM.
+
+@ Q000311 explain
+G: ## Storage options for Lambda
+- **`/tmp` ephemeral storage** is configurable from 512 MB up to 10,240 MB. It belongs to a single execution environment: other concurrent environments cannot see it, and it disappears when the environment is recycled.
+- **Amazon EFS** can be mounted into a function through its file system configuration, using an EFS access point and a local path such as `/mnt/refdata`. The function must be connected to a VPC that can reach the EFS mount targets.
+## Why EFS fits shared reference data
+EFS is a network file system that many clients use at once. Every concurrent invocation sees the same files, writes are persistent, and the size grows automatically well beyond what `/tmp` can hold.
+## Example
+A preprocessing job keeps a multi-GB lookup dataset at `/mnt/refdata/geo/`. Hundreds of concurrent Lambda invocations read it with normal file I/O, and a nightly update writes a new version that all of them see.
+W: An EFS file system mounted by Lambda: it gives persistent, shared, read-write POSIX storage across all concurrent invocations and is not limited by the `/tmp` size.
+X: A=/tmp at its maximum: even at 10,240 MB, `/tmp` is private to one execution environment and not persistent, so it cannot be shared across concurrent invocations.
+B=Instance store on the host: Lambda runs on AWS-managed infrastructure; functions have no access to or control over the underlying host's disks.
+C=S3 Glacier Deep Archive: it is an archival storage class whose retrievals take hours, and it cannot be mounted as a file system for read-write access.
+T: When Lambda needs large, shared, persistent file storage across invocations, mount Amazon EFS; `/tmp` is small and private to each environment.
+
+@ Q000312 explain
+G: ## CI/CD for Glue scripts
+A typical AWS-native pipeline has three parts:
+- **Source**: a CodePipeline source stage watches the `main` branch of the repository (for example through a connection to GitHub or another Git provider). A merged pull request starts the pipeline automatically.
+- **Build and test**: a **CodeBuild** project runs a `buildspec.yml` that installs dependencies and runs unit tests such as `pytest tests/`. A failing test stops the pipeline.
+- **Deploy**: another CodeBuild step (or a CloudFormation/CDK deploy action) copies the script to the staging S3 location and updates the staging Glue job definition.
+## Example
+Merge to `main` leads to CodePipeline starting, then CodeBuild running tests, then `aws s3 cp jobs/orders_etl.py s3://etl-staging/scripts/` and a stack update for the staging job. No one uploads scripts from the console.
+W: CodePipeline with CodeBuild tests and deploys: CodePipeline reacts to the merge, CodeBuild runs the tests, and a deploy stage pushes the script to staging automatically.
+X: A=Manual uploads to S3: this is exactly the manual step the team wants to remove, with no automated tests and a risk of uploading the wrong version.
+C=Amazon Macie on pull requests: Macie discovers sensitive data in S3 buckets; it does not scan pull requests, run tests or deploy code.
+D=AWS Config rules on commits: Config rules evaluate AWS resource configurations for compliance; they are not triggered by Git commits and cannot build, test or deploy scripts.
+T: Automated test-and-deploy on merge is a CodePipeline plus CodeBuild pipeline; Macie and Config are governance tools, not CI/CD.
+
+@ Q000313 explain
+G: ## How Spark joins data
+Spark splits a dataset into **partitions** spread across executors. To join `orders` with `customers` on `customer_id`, all rows with the same `customer_id` from both sides must be on the same executor.
+**Shuffle** is the step that makes this happen: each executor writes its rows grouped by a hash of the key, and the other executors fetch the groups they are responsible for over the network. Joins, `groupBy`, `distinct` and repartitioning trigger shuffles ("wide" transformations).
+## Why it matters
+Shuffles are often the most expensive part of a job: data is serialized, written to disk, and sent over the network. Skewed keys can make one task much larger than the others.
+- A **broadcast join** avoids the shuffle when one side is small, by sending a full copy of the small table to every executor.
+W: Shuffle: it is the redistribution of data across executors by key so that matching records meet on the same partition, and it is network- and disk-intensive.
+X: A=Checkpointing: checkpointing saves a DataFrame or streaming state to reliable storage to truncate lineage or recover after failure; it does not move rows by key.
+B=Garbage collection: this is JVM memory management that frees unused objects inside each executor; it involves no data exchange between executors.
+C=Broadcast variable: a broadcast sends one read-only copy of small data to every executor, which is the technique used to avoid shuffling, not the redistribution itself.
+T: Moving rows across the cluster so matching keys meet is a shuffle; a broadcast is the way to avoid one when a side is small.
+
+@ Q000314 explain
+G: ## Membership checks and lookup cost
+A deduplication step asks one question per record: "have I seen this ID before?" The cost of that check depends on the data structure.
+- **Hash set**: the ID is hashed to a bucket, so a lookup takes constant time on average (O(1)), no matter whether there are thousands or millions of IDs.
+- **Balanced tree or binary search on a sorted array**: O(log n).
+- **Linear scan of a list or array**: O(n), meaning every lookup gets slower as more IDs are stored.
+## Example
+With 10 million stored IDs, a linear scan may compare against millions of entries per record, while a hash set checks about one bucket. In practice, a stream processor might keep a hash set per time window in memory, or use a keyed store such as DynamoDB with the ID as the partition key for the same hash-based lookup. A Bloom filter is a related hash-based option when memory is tight and rare false positives are acceptable.
+W: Hash set: hashing gives average constant-time membership checks, so lookup speed stays fast even with millions of prior IDs.
+X: A=Unbalanced binary tree, depth-first: an unbalanced tree can degrade into a long chain (for example when IDs arrive in order), and a depth-first traversal visits nodes one by one, giving linear-time lookups.
+B=Sorted array with linear scan: scanning from the start is O(n) per lookup, and keeping the array sorted as new IDs arrive also requires shifting elements.
+D=Singly linked list: a list can only be walked from the head, so each check compares against up to every stored ID, which is O(n).
+T: For fast "seen before?" checks, use hash-based lookups with average O(1) cost; lists, scans and unbalanced trees degrade to O(n).
+
+@ Q000315 explain
+G: ## At-least-once delivery
+Amazon S3 event notifications are delivered at least once. Rarely, the same event arrives twice, so the Lambda function can run twice for one object. If each run appends a row, duplicates appear.
+## Idempotency
+An operation is **idempotent** if running it many times has the same effect as running it once. For events, this means recording which items were already processed and skipping repeats.
+- Build an idempotency key from the event, such as bucket plus object key plus `versionId` (or the event's `sequencer`).
+- Before writing, do a conditional write to a tracking table, for example a DynamoDB `PutItem` with `attribute_not_exists(pk)`. If the condition fails, the object was already processed and the function exits.
+- Alternatively, make the target write itself idempotent, such as an upsert or `MERGE` keyed on the object ID instead of an append.
+Powertools for AWS Lambda includes an idempotency utility that implements this pattern with DynamoDB.
+W: Idempotency keyed on the object's ID: tracking processed object IDs (or upserting by that key) turns duplicate deliveries into no-ops, so each object produces exactly one row.
+X: A=More reserved concurrency: reserved concurrency only sets how many copies of the function can run at once; duplicate events would still be processed and appended.
+B=Smaller notification payload: payload size has nothing to do with how many times an event is delivered, so duplicates still arrive and still append rows.
+D=Statelessness only: a stateless function has no memory of previous invocations, so by itself it cannot tell that an event was already processed.
+T: With at-least-once events, make processing idempotent with a key per object; concurrency and payload settings cannot remove duplicates.
+
+@ Q000316 explain
+G: ## Scripting on Windows EC2
+**PowerShell** is included with Windows and is the native shell for automating Windows tasks. **AWS Tools for PowerShell** adds cmdlets for AWS services, and AWS Windows AMIs typically include them.
+- `Write-S3Object -BucketName my-bucket -Folder C:\export -KeyPrefix nightly/ -Recurse` uploads a folder.
+- `Read-S3Object -BucketName my-bucket -KeyPrefix inbound/ -Folder C:\inbound` downloads objects.
+- Credentials come from the instance profile (IAM role), so no keys are stored in the script.
+## Scheduling
+The script can run every night with Windows Task Scheduler, or through AWS Systems Manager (Run Command or State Manager) using the `AWS-RunPowerShellScript` document.
+W: PowerShell with AWS Tools for PowerShell: it is native to Windows and provides S3 cmdlets for uploading and downloading files, using the instance role for credentials.
+X: A=SQL scripts: SQL runs inside a database engine to query and change tables; it cannot move files between local folders and S3.
+B=Bash run by the Windows command shell: the Windows command shell (`cmd.exe`) does not run Bash scripts; Bash needs an extra layer such as WSL, so it is not the native choice.
+C=JSON documents executed by the OS: JSON is a data format, not a programming language, and Windows cannot execute it as a script.
+T: On Windows, native automation with AWS is PowerShell plus AWS Tools for PowerShell.
+
+@ Q000317 explain
+G: ## OLTP versus OLAP stores
+- **OLTP databases** (RDS for MySQL, DynamoDB) are built for many small reads and writes of individual rows.
+- **Data warehouses** (OLAP) are built for scanning, joining and aggregating huge tables.
+## How Amazon Redshift handles analytics
+- **Columnar storage**: a query that sums `revenue` reads only that column, with heavy compression, instead of whole rows.
+- **Massively parallel processing (MPP)**: data is spread across nodes and slices, and each part of a join or aggregation runs in parallel.
+- **Concurrency**: workload management (WLM) queues and **concurrency scaling** add temporary capacity when many users query at once, keeping performance consistent. Redshift Serverless scales compute automatically.
+## Example
+`SELECT region, SUM(amount) FROM sales JOIN stores USING (store_id) GROUP BY region` over 3 billion rows runs across all nodes, while 200 analysts run dashboards at the same time.
+W: Amazon Redshift: its columnar MPP design is built for complex joins and aggregations over billions of rows, and concurrency scaling keeps performance consistent for many users.
+X: A=Amazon DynamoDB: DynamoDB is a key-value and document store optimized for lookups by key; it has no SQL joins or large aggregations and would need full table scans.
+B=Amazon RDS for MySQL: MySQL is a row-based OLTP engine on a single primary; billions-row joins and aggregations for 200 concurrent users would be slow and inconsistent.
+C=Amazon ElastiCache: ElastiCache is an in-memory cache for fast key lookups; it is not a durable SQL store and cannot run analytical joins.
+T: Large SQL analytics with many concurrent users belongs in a columnar MPP data warehouse such as Redshift, not in OLTP databases or caches.
+
+@ Q000318 explain
+G: ## In-memory speed with durability
+**Amazon MemoryDB** is a Redis OSS-compatible (and Valkey-compatible) in-memory database that is also **durable**.
+- Reads are served from memory, with microsecond latency.
+- Every write is committed to a distributed Multi-AZ transaction log before it is acknowledged, giving single-digit millisecond writes.
+- Because the log is durable, data survives node restarts and failures, so MemoryDB can be the primary database, not just a cache.
+## How it compares
+- **ElastiCache** is designed mainly as a cache; Memcached in particular has no persistence or replication.
+- **DynamoDB with DAX** can give microsecond reads from the DAX cache, but uses the DynamoDB API rather than Redis commands.
+## Example
+A game stores sessions with `HSET session:9f2 player 71 level 12` and reads them back in microseconds, and the data remains after a node failover.
+W: Amazon MemoryDB: it combines Redis API compatibility, microsecond reads, single-digit millisecond durable writes and Multi-AZ persistence across restarts.
+X: A=DynamoDB with DAX: DAX can serve cached reads in microseconds, but applications use the DynamoDB API, not the Redis API, so the Redis compatibility requirement is not met.
+B=ElastiCache for Memcached: Memcached is a purely in-memory cache with no persistence or replication, so data is lost on restart, and it speaks the Memcached protocol, not Redis.
+D=Aurora Serverless v2: Aurora is a disk-backed relational database with millisecond-level latency and SQL access, not microsecond reads or the Redis API.
+T: Durable, Redis-compatible in-memory storage is MemoryDB; Memcached is not durable and DAX is not Redis.
+
+@ Q000319 explain
+G: ## API compatibility when migrating streaming
+Kafka producers and consumers use Kafka client libraries and the Kafka wire protocol: they connect to brokers, write to topics and partitions, and track progress with consumer group offsets.
+**Amazon MSK** runs real Apache Kafka brokers, managed by AWS (provisioning, patching, broker replacement, storage). Existing clients only need new bootstrap broker addresses and security settings; the code stays the same. **MSK Serverless** removes capacity planning as well.
+## Why the other streaming services differ
+- **Kinesis Data Streams** has its own API (`PutRecord`, `GetRecords`, shards, KCL).
+- **Amazon Data Firehose** (formerly Kinesis Data Firehose) is a delivery service that loads data into destinations such as S3 or Redshift.
+- **SQS** is a message queue with its own API and no topics or partitions.
+## Example
+A producer configured with `bootstrap.servers=b-1.mycluster...:9098` publishes to `orders` exactly as before, and consumer groups keep committing offsets.
+W: Amazon MSK: it runs open-source Apache Kafka, so existing native Kafka clients, APIs and tooling work without code changes.
+X: A=Amazon SQS: SQS uses its own queue API (`SendMessage`, `ReceiveMessage`) with no topics, partitions or consumer offsets, so all Kafka clients would need rewriting.
+B=Kinesis Data Streams: it is a managed streaming service with a different API and concepts (shards, sequence numbers), so Kafka client libraries cannot talk to it directly.
+C=Kinesis Data Firehose: Firehose is a delivery pipeline into destinations such as S3, not a Kafka-compatible broker that native consumers can read from.
+T: Keeping native Kafka clients unchanged requires real Kafka brokers, which is Amazon MSK; Kinesis and SQS use their own APIs.
+
+@ Q000320 explain
+G: ## Vector search with pgvector
+The `pgvector` extension, available on Aurora PostgreSQL and RDS for PostgreSQL, adds a `vector` column type and distance operators such as `<->` (L2) and `<=>` (cosine). Without an index, a nearest-neighbor query compares the query vector with every row.
+## Approximate nearest neighbor (ANN) indexes
+- **HNSW** (Hierarchical Navigable Small World) builds a multi-layer graph linking each vector to close neighbors. A query walks the graph from coarse to fine layers, giving very fast queries with high recall. Building it takes longer and it uses more memory.
+- **IVFFlat** clusters vectors into lists and searches only the nearest lists. It builds faster and uses less memory, but usually has lower query speed at the same recall.
+## Example
+`CREATE INDEX ON items USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);` then `ORDER BY embedding <=> $1 LIMIT 10` uses the index.
+W: HNSW index: its graph structure gives the fastest approximate nearest-neighbor queries in pgvector, at the cost of longer build time and more memory, exactly the tradeoff the team accepts.
+X: A=Hash index: a PostgreSQL hash index supports only equality matches on a value; it cannot find vectors that are close to each other by distance.
+C=GIN index: GIN is an inverted index for values containing elements, such as arrays, `jsonb` or full-text search; it does not support vector distance ordering.
+D=B-tree index: a B-tree orders scalar values for equality and range queries; it cannot order rows by similarity in high-dimensional vector space.
+T: For fastest pgvector similarity search when build time and memory are acceptable costs, choose HNSW; hash, GIN and B-tree indexes do not handle vector distance.
+
+@ Q000321 explain
+G: ## Two families of ANN indexes
+Approximate nearest neighbor (ANN) indexes trade a little accuracy (recall) for much faster search than comparing against every vector.
+- **IVF (inverted file)**: a **training** step runs clustering (such as k-means) on the data to create centroids. Each vector is assigned to its nearest centroid's list. A query checks only the closest few lists (the `probes` setting). It uses relatively little extra memory, but the index needs representative data to train on and may need rebuilding if the data distribution changes a lot.
+- **HNSW (Hierarchical Navigable Small World)**: vectors are inserted into a multi-layer proximity graph; no training step is needed and new vectors can be added at any time. It usually gives higher recall at a given query speed, but stores many neighbor links per vector, so it uses more memory and takes longer to build.
+## Example
+In pgvector, an `ivfflat` index is created after loading data and is tuned with `lists` and `probes`, while an `hnsw` index can be created on an empty table and is tuned with `m`, `ef_construction` and `ef_search`.
+W: IVF needs a training step; HNSW uses more memory: IVF must cluster data before indexing, while HNSW skips training but stores a memory-heavy graph, which is the core tradeoff.
+X: B=IVF supports only exact search: IVF is an approximate method; it deliberately searches only some clusters, which can miss true neighbors in exchange for speed.
+C=HNSW builds faster with less memory but lower recall: it is generally the reverse; HNSW typically builds slower and uses more memory, in exchange for high recall and fast queries.
+D=Identical characteristics: the two structures work very differently (clusters versus a graph), so build time, memory use and query behavior differ, which is why the choice matters.
+T: IVF is lighter on memory but needs training on data; HNSW needs no training and gives strong recall and speed at the cost of memory and build time.
+
+@ Q000322 explain
+G: ## AWS Transfer Family
+**AWS Transfer Family** provides fully managed SFTP, FTPS, FTP and AS2 endpoints that store files directly in Amazon S3 or Amazon EFS. AWS runs, scales and patches the servers.
+- Partners connect with standard SFTP clients and authenticate with their existing **SSH public keys** stored on their Transfer Family user (or with a custom identity provider).
+- Each user gets an IAM role and a **logical home directory**, for example `/` mapped to `s3://partner-inbox/acme/`. With restricted logical directories, the partner cannot browse or even see other partners' folders.
+- Uploaded files land as S3 objects, so S3 event notifications or EventBridge can start the next pipeline step.
+## Example
+User `acme` connects to `s-1234.server.transfer.us-east-1.amazonaws.com`, runs `put orders.csv`, and the file appears at `s3://partner-inbox/acme/orders.csv`.
+W: Transfer Family SFTP with scoped home folders: a managed SFTP endpoint backed by S3, SSH key authentication, and per-user logical home directories give each partner only its own folder with no servers to run.
+X: A=DataSync agents at each partner: DataSync moves data between storage systems using agents the partners would have to deploy and run; it is not an SFTP endpoint that partners log in to with their keys.
+C=Presigned URLs emailed daily: presigned URLs are HTTPS links for single objects that expire; they are not SFTP, do not use the partners' SSH keys, and emailing links daily is manual and fragile.
+D=EC2 SFTP server syncing to S3: this works technically but means running, patching and scaling servers yourself, which violates the no-servers requirement.
+T: Managed SFTP into S3 with per-partner folder isolation is AWS Transfer Family with logical home directories.
+
+@ Q000323 explain
+G: ## Querying across Redshift and operational databases
+**Redshift federated query** lets a Redshift SQL query read live data from Amazon RDS or Aurora (PostgreSQL and MySQL) without loading it first.
+- You create an external schema that points to the source database, for example `CREATE EXTERNAL SCHEMA ops FROM POSTGRES DATABASE 'app' URI '<aurora-endpoint>' IAM_ROLE '<role-arn>' SECRET_ARN '<secret-arn>'`, with credentials held in AWS Secrets Manager.
+- Queries then reference `ops.orders` like any table. Redshift pushes filters down to the source where it can and joins the result with local tables.
+## Example
+`SELECT c.segment, COUNT(*) FROM ops.orders o JOIN dim_customer c ON o.customer_id = c.id WHERE o.created_at > current_date - 1 GROUP BY 1;` combines today's live orders from Aurora with a customer dimension stored in Redshift.
+## Related features
+- **Redshift Spectrum** reads files in Amazon S3.
+- **Zero-ETL integrations** replicate Aurora data into Redshift continuously; federated query reads it in place.
+W: Redshift federated query: it exposes the Aurora PostgreSQL database as an external schema, so one Redshift query can join local tables with live operational data without copying it.
+X: A=Redshift Spectrum: Spectrum queries data files in S3 through external tables; it cannot connect to a live Aurora database.
+C=Redshift materialized views: a materialized view stores precomputed results of a query; it does not by itself connect to Aurora, and its stored results would not be live.
+D=Amazon Athena: Athena is a separate query service; it can reach other sources with connectors, but it is not a Redshift SQL query and would not join directly with the Redshift cluster's local tables as required.
+T: To join Redshift tables with live RDS or Aurora data in one Redshift query, use federated query; Spectrum is for files in S3.
+
+@ Q000324 explain
+G: ## Materialized views in Redshift
+A **materialized view** stores the result of a query, such as a heavy `GROUP BY` over a fact table, as a physical table. Queries against it read the small stored result instead of recomputing from billions of rows.
+- `REFRESH MATERIALIZED VIEW` updates it. Where the query allows, Redshift refreshes **incrementally**, processing only the changed rows.
+- With `AUTO REFRESH YES`, Redshift refreshes the view in the background after base table changes.
+- Automatic query rewriting can also use an eligible materialized view for matching queries.
+## Why it fits this case
+The dashboard runs every minute, but the data changes only a few times per hour. Nearly every run repeats the same work, so computing once per change and serving the stored result many times is ideal.
+## Example
+`CREATE MATERIALIZED VIEW daily_sales AUTO REFRESH YES AS SELECT store_id, sale_date, SUM(amount) FROM sales GROUP BY 1, 2;` and the dashboard then queries `daily_sales`.
+W: A materialized view with auto refresh: it precomputes the heavy aggregation once per data change, and the per-minute dashboard reads the small stored result.
+X: A=UNLOAD to S3 each minute: UNLOAD exports query results to files in S3; doing it every minute adds work and does not make the dashboard's Redshift query faster.
+B=Disable result caching: turning off the result cache forces Redshift to recompute the full aggregation every minute, which increases the load instead of reducing it.
+D=A bigger cluster: more nodes may shorten each run, but the same heavy computation is still repeated every minute, at a higher cost.
+T: For a repeated heavy aggregation on slowly changing data, precompute it with an auto-refreshed materialized view instead of scaling up or disabling caching.
+
+@ Q000325 explain
+G: ## Redshift Spectrum
+**Redshift Spectrum** lets Redshift query files in Amazon S3 without loading them into the cluster.
+- You create an external schema linked to the AWS Glue Data Catalog, for example `CREATE EXTERNAL SCHEMA hist FROM DATA CATALOG DATABASE 'history' IAM_ROLE '<role-arn>'`, and define (or crawl) external tables over the Parquet files.
+- A dedicated Spectrum layer scans S3 in parallel. With Parquet, it reads only the needed columns, and partition filters skip whole prefixes.
+- External tables can be joined with local Redshift tables in the same query.
+## Example
+`SELECT d.region, SUM(h.amount) FROM hist.sales_2019 h JOIN dim_store d ON h.store_id = d.id GROUP BY 1;` joins years of Parquet history in S3 with a local dimension table, while only recent data is stored in the cluster.
+W: Redshift Spectrum: it queries Parquet files in S3 through external tables directly from Redshift SQL and joins them with local tables, with no loading into the cluster.
+X: A=Redshift federated query: federated query connects to live RDS and Aurora PostgreSQL or MySQL databases, not to Parquet files in S3.
+C=AWS Glue crawler: a crawler discovers file schemas and creates Data Catalog tables; it can prepare metadata for Spectrum but cannot run queries itself.
+D=Athena federated query: this runs in Athena, using connectors to reach other data sources; it is not Redshift SQL and cannot join directly with the cluster's local tables.
+T: S3 files from Redshift SQL means Spectrum; federated query is for live operational databases.

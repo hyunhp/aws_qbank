@@ -1,0 +1,346 @@
+# ANS-C01 detailed explanations, batch e10 (explanation-only rewrites; letters are the published ones)
+
+@ Q003817 explain
+G: ## Which direction is the query going?
+Route 53 Resolver is the DNS server every VPC gets at the VPC base address plus two (for example `10.0.0.2`). It answers for private hosted zones associated with the VPC, but it is only reachable from inside AWS. Hybrid DNS adds **Resolver endpoints**, which are network interfaces in your subnets:
+- An **inbound endpoint** gets IP addresses in the VPC (for example `10.0.1.10` and `10.0.2.10`, one per AZ). On-premises DNS servers forward queries to those IPs over Direct Connect or VPN, and the Resolver answers them, including private hosted zone records.
+- An **outbound endpoint** is the reverse: it lets the Resolver forward queries for chosen domains from the VPC to DNS servers on premises, using forwarding rules.
+## Example
+On-premises servers need `db.corp.aws.example` from a private hosted zone. The on-premises DNS server gets a conditional forwarder: `corp.aws.example` goes to the inbound endpoint IPs. The private hosted zone must be associated with the VPC that holds the inbound endpoint, and security groups on the endpoint must allow DNS (TCP and UDP port 53) from the on-premises resolvers.
+W: Inbound endpoint: it gives on-premises resolvers an IP address inside the VPC to send queries to, so the Route 53 Resolver can answer them from the private hosted zones associated with that VPC.
+X: B=Internet gateway: an internet gateway routes traffic between the VPC and the internet. It does not expose the VPC Resolver, which answers private hosted zones only for queries that arrive from inside the VPC or through an inbound endpoint.
+C=Outbound endpoint: an outbound endpoint forwards queries that start in the VPC toward on-premises DNS servers. It is the opposite direction and cannot accept queries from on premises.
+D=Public hosted zone with the same name: a public zone would publish the internal records to the whole internet, and it is a separate zone from the private one, so it does not make the private records resolvable.
+T: On premises to AWS private names needs an inbound endpoint; AWS to on-premises names needs an outbound endpoint and forwarding rules.
+
+@ Q003818 explain
+G: ## Resolver rules and endpoints are separate resources
+To resolve an on-premises domain from a VPC, the Route 53 Resolver needs two things:
+- An **outbound endpoint**: network interfaces in a VPC (at least two AZs recommended) that send forwarded queries toward on-premises DNS servers over Direct Connect or VPN.
+- A **forwarding rule**: for example `corp.example.com` forward to `192.168.10.10` and `192.168.20.10` through that outbound endpoint. A rule applies to a VPC only once it is associated with that VPC.
+## Centralizing with AWS RAM
+The rule can be shared with other accounts (or a whole organization) through AWS Resource Access Manager. Each account then associates the shared rule with its own VPCs in the same Region. Queries from those VPCs are sent out through the endpoint in the central VPC.
+- One pair of endpoints and one rule serve all 30 VPCs.
+- Only the shared services VPC needs a network path to the on-premises DNS servers.
+- Adding a new VPC is just one rule association.
+W: Shared outbound endpoints and RAM-shared rules: the endpoints live once in a shared services VPC, and the rule shared through RAM is associated with every VPC, which meets the single-set-of-endpoints requirement with the least management.
+X: A=Public zones copying on-premises records: this publishes internal names on the internet, and every copied record drifts from the on-premises source whenever it changes.
+B=EC2 DNS servers in every VPC: 30 self-managed DNS fleets must be patched and scaled, and forwarding internal queries over the internet exposes them; it is the opposite of one central set of endpoints.
+C=Outbound endpoints in all 30 VPCs: this works but creates 30 sets of endpoints, each billed per ENI-hour, and 30 separate rules to maintain, which violates the single-set requirement.
+T: Put one outbound endpoint in a shared services VPC and share the forwarding rule with RAM; do not deploy endpoints per VPC.
+
+@ Q003819 explain
+G: ## Private hosted zones are attached to VPCs
+A private hosted zone answers queries only from the VPCs associated with it. When the zone and the VPC are in the same account, you just associate them. Across accounts, both owners must act, and this is done with the CLI, SDK or API rather than the console:
+- In **Account A** (zone owner): `aws route53 create-vpc-association-authorization --hosted-zone-id Z123 --vpc VPCRegion=us-east-1,VPCId=vpc-0b11`
+- In **Account B** (VPC owner): `aws route53 associate-vpc-with-hosted-zone --hosted-zone-id Z123 --vpc VPCRegion=us-east-1,VPCId=vpc-0b11`
+- Optionally, Account A then deletes the authorization; the existing association stays in place.
+After this, instances in Account B's VPC resolve the zone's records through their own VPC Resolver. The VPC needs DNS resolution and DNS hostnames enabled.
+W: Authorization then association: the zone owner authorizes the specific VPC, and the VPC owner then associates it; together these are the required two cross-account steps.
+X: A=Rely on VPC peering: peering routes IP packets between VPCs but does not share private hosted zones. The Account B VPC's Resolver still has no association with the zone and cannot answer for it.
+B=Make the zone public: a public zone exposes the internal names to everyone on the internet, and you cannot convert a private zone to public; you would create a new zone.
+C=Copy records into a new zone: a second zone must be updated by hand every time a record changes, so the copies drift and there are now two sources of truth.
+T: Cross-account private hosted zones use an authorization from the zone owner plus an association by the VPC owner, not peering or copies.
+
+@ Q003820 explain
+G: ## What DNSSEC protects against
+In DNS spoofing or cache poisoning, an attacker gets a resolver to accept a forged answer, for example sending `www.example.com` to the attacker's IP. **DNSSEC** adds digital signatures to DNS records so validating resolvers can check that an answer really came from the zone owner and was not altered.
+## How it works in Route 53
+- You enable DNSSEC signing on the public hosted zone. Route 53 signs records with a zone-signing key it manages.
+- You create a key-signing key (KSK) backed by an asymmetric customer managed key in AWS KMS (created in `us-east-1`).
+- You add a DS record for the KSK to the parent zone (at the registrar), which builds the chain of trust from the root.
+Resolvers that validate DNSSEC then reject responses whose signatures do not match.
+W: DNSSEC signing: signed records let validating resolvers verify the authenticity and integrity of every answer from the public zone, which is exactly protection against spoofed responses.
+X: B=DNS Firewall: DNS Firewall filters the queries that resources in your VPCs send through the Route 53 Resolver, blocking or allowing domains. It does not sign or authenticate the answers the internet receives from your public zone.
+C=Weighted routing: weighted records split traffic between endpoints by ratio. They change which answer is returned, not whether a resolver can verify it is genuine.
+D=Private hosted zones only: private zones are resolvable only inside associated VPCs, so the public names would stop working for internet users; it removes the service instead of protecting it.
+T: To prove public DNS answers are authentic, sign the zone with DNSSEC; DNS Firewall controls outbound queries from VPCs instead.
+
+@ Q003821 explain
+G: ## Picking an Elastic Load Balancer by layer
+- **Application Load Balancer (ALB)**: layer 7, HTTP and HTTPS listeners (including gRPC). It terminates the connection and opens a new one to the target, so the target sees the ALB's IP and gets the client IP in the `X-Forwarded-For` header.
+- **Network Load Balancer (NLB)**: layer 4, TCP, UDP and TLS listeners, any port and any protocol on top of them. It can pass the client's source IP to the target (client IP preservation, on by default for instance targets), and supports proxy protocol v2 when preservation is not possible.
+- **Gateway Load Balancer (GWLB)**: sends traffic to a fleet of inspection appliances using GENEVE; it is not a front end for application clients.
+- **Classic Load Balancer**: the previous-generation option.
+## Example
+A game server speaks its own binary protocol over TCP port 7777 and bans abusive players by IP. An NLB TCP listener on 7777 forwards the stream unchanged, and the server sees each player's real address.
+W: Network Load Balancer: it balances any TCP protocol at layer 4 without needing to understand it, and it preserves the client source IP to the targets.
+X: A=Classic Load Balancer: it is a previous-generation load balancer; in TCP mode it opens its own connection to the target, so the target sees the load balancer's IP unless proxy protocol is added, and AWS recommends current-generation load balancers.
+B=Application Load Balancer: an ALB has only HTTP and HTTPS listeners (gRPC runs over HTTPS), so it cannot carry a custom binary TCP protocol, and it replaces the source IP with its own.
+C=Gateway Load Balancer: it forwards packets to virtual appliances such as firewalls for inspection, not to application servers that answer clients.
+T: Custom TCP protocol plus client source IP at the target points to NLB; ALB only understands HTTP and proxies the connection.
+
+@ Q003822 explain
+G: ## Inserting appliances without breaking traffic
+A firewall that inspects traffic "transparently" must see the original packets, with the real source and destination IPs, and send them back on their way. **Gateway Load Balancer (GWLB)** is built for this:
+- It listens on all ports and protocols (an IP listener) and wraps each packet in **GENEVE** (UDP port 6081) toward an appliance, so the original packet is untouched.
+- The appliances inspect, then return the packet to the GWLB, which forwards it to its destination.
+- Traffic reaches the GWLB through **Gateway Load Balancer endpoints** that you use as route table targets, for example `0.0.0.0/0` goes to `vpce-0abc` in an app subnet.
+- Flows are kept on the same appliance (flow stickiness) and health checks remove failed appliances, so you scale by adding instances to the target group.
+W: Gateway Load Balancer with GENEVE: it keeps packets intact, balances them across the appliance fleet and scales horizontally, which is exactly transparent inline inspection.
+X: B=ALB with path rules: an ALB terminates HTTP connections and routes by URL; it cannot pass arbitrary packets through a firewall with the original IPs intact.
+C=Classic Load Balancer with stickiness: a Classic Load Balancer proxies client connections to back ends and has no way to insert appliances into routed traffic paths.
+D=NLB with TLS termination: terminating TLS makes the NLB an endpoint for new connections; it does not act as a route table target and does not hand the original packets to appliances and back.
+T: Scaling inline firewalls transparently needs GWLB with GENEVE and GWLB endpoints; ALB and NLB are front ends for applications.
+
+@ Q003823 explain
+G: ## Content-based routing is layer 7
+To route by host name or path, a load balancer must decrypt HTTPS and read the HTTP request. An **Application Load Balancer** does this with listener rules:
+- A rule condition can match the `Host` header, such as `api.example.com`, or a path such as `/images/*`, plus headers, methods, query strings and source IPs.
+- Each rule forwards to a target group, so one HTTPS listener can serve many services.
+## Example
+On one listener on port 443 with a certificate from AWS Certificate Manager:
+- `Host: api.example.com` goes to the API service target group.
+- `Path: /static/*` goes to the static content target group.
+- The default action goes to the web front end.
+W: Application Load Balancer: it terminates HTTPS and evaluates host-header and path conditions in listener rules to send each request to the right target group.
+X: B=Network Load Balancer: an NLB works at layer 4 and forwards connections by port and protocol; it never reads HTTP headers or paths, so it cannot choose a service per URL.
+C=AWS Global Accelerator: it gives static anycast IPs and routes to Regional endpoints by health, location and weights at layer 4. It does not look at HTTP requests; you would put an ALB behind it for path rules.
+D=Gateway Load Balancer: GWLB sends packets to inspection appliances and does not make HTTP routing decisions.
+T: Host- and path-based routing requires a layer 7 load balancer, which on AWS is the ALB.
+
+@ Q003824 explain
+G: ## Getting the client IP through an NLB
+An NLB can normally pass the client's IP straight to the target (client IP preservation). Sometimes that is not possible, for example when the NLB is behind an AWS PrivateLink endpoint service, or when targets are registered by IP and preservation is turned off to avoid routing issues. The target then sees an NLB private IP as the source.
+## Proxy protocol v2
+When enabled on the target group, the NLB adds a small binary header at the start of each TCP connection, before any application data. It holds the original source IP and port, destination and, for PrivateLink, the endpoint ID.
+- It works with TLS passthrough (TCP listener on 443) because it sits outside the encrypted stream.
+- The target software must be configured to expect it, for example `proxy_protocol` on an nginx `listen` directive, or connections will fail to parse.
+W: Proxy protocol v2: the NLB prepends the original connection details, including the client IP, to each connection so targets can read it even without client IP preservation.
+X: A=X-Forwarded-For headers: an NLB works at layer 4 and does not modify HTTP requests, and with TLS passthrough it could not insert headers into the encrypted stream anyway. That header comes from an ALB.
+B=Sticky sessions: stickiness keeps a client on the same target based on source IP, but it passes no information about the client to the target.
+C=Cross-zone load balancing: it only lets each NLB node spread connections across targets in all enabled AZs; it does not change what source address the target sees.
+T: When an NLB cannot preserve the client IP, enable proxy protocol v2 and configure targets to read it; X-Forwarded-For is an ALB feature.
+
+@ Q003825 explain
+G: ## What VPC Flow Logs record
+VPC Flow Logs capture metadata about IP traffic on network interfaces, at the VPC, subnet or interface level. Each record describes a flow over an aggregation interval, for example:
+- source and destination IP and port, protocol, packets and bytes
+- `action`: `ACCEPT` or `REJECT`, which is the result of security group and network ACL evaluation
+- optional fields such as `tcp-flags`, `pkt-srcaddr` and `flow-direction`
+They do not contain packet payloads. Records go to CloudWatch Logs, Amazon S3 or Amazon Data Firehose.
+## Troubleshooting example
+An application cannot reach a database on port 5432. Filtering flow logs for the database interface and `dstport = 5432` shows `REJECT`, so the traffic is being blocked by a security group or network ACL, not by the database.
+W: VPC Flow Logs: they record traffic metadata including the accept or reject decision for every flow, which is what is needed to troubleshoot security group rules.
+X: A=CloudTrail data events: CloudTrail records API activity such as S3 object reads or Lambda invocations; it has no record of packets allowed or blocked by security groups.
+B=Route 53 query logs: these log DNS queries and responses, not IP traffic or whether a connection was accepted.
+C=VPC Traffic Mirroring: it copies full packets to a monitoring appliance for deep inspection. It is heavier, needs an analysis tool, and does not report accept or reject decisions.
+T: For accepted and rejected traffic metadata use Flow Logs; for full packet contents use Traffic Mirroring.
+
+@ Q003826 explain
+G: ## Copying packets for deep inspection
+Intrusion detection systems (IDS) need the full packet, including payload, to match attack signatures. **VPC Traffic Mirroring** copies traffic from the network interfaces of EC2 instances:
+- **Mirror source**: the interface of the instance to watch (supported instance types, mainly Nitro-based).
+- **Mirror target**: another interface, a Network Load Balancer or a Gateway Load Balancer endpoint in front of the IDS fleet.
+- **Mirror filter**: rules for which traffic to copy, such as only TCP port 443 inbound.
+- **Mirror session**: ties them together. Copies are wrapped in VXLAN (UDP port 4789) so the appliance can decapsulate them.
+The original traffic is not affected, because only copies go to the target.
+W: VPC Traffic Mirroring: it sends full copies of the packets from the chosen instances' interfaces to the IDS appliance, including payloads.
+X: B=Reachability Analyzer: it analyzes configuration (route tables, security groups, ACLs) to explain whether a path is possible. It never looks at real packets.
+C=VPC Flow Logs: flow logs only hold metadata such as addresses, ports, bytes and accept or reject; they have no payloads for an IDS to inspect.
+D=CloudWatch Internet Monitor: it measures internet performance and availability between users and your application; it does not copy instance traffic.
+T: Payload-level inspection needs Traffic Mirroring; Flow Logs and Reachability Analyzer only give metadata or configuration analysis.
+
+@ Q003827 explain
+G: ## Seeing the internet side of your application
+Many user complaints come from problems between the user and AWS: an ISP outage in one city, or high latency in one network. **Amazon CloudWatch Internet Monitor** uses the connectivity data AWS already collects across its global network to show this:
+- You create a monitor and add resources: VPCs, CloudFront distributions, Network Load Balancers or WorkSpaces directories.
+- It builds health metrics per location and ISP (city plus network) for the traffic that reaches those resources.
+- It raises health events when performance or availability drops, says whether the cause is likely AWS or the internet, and can suggest better Regions or delivery options.
+Results appear in the console and in CloudWatch Logs and metrics, which you can alarm on.
+W: CloudWatch Internet Monitor: it shows how internet issues by city and provider affect the performance and availability of CloudFront and VPC-hosted applications for real users.
+X: B=IAM Access Analyzer: it finds resources shared outside the account and unused or overly broad permissions; it has no network performance data.
+C=Trusted Advisor: it checks accounts against best practices for cost, security, fault tolerance and limits; it does not monitor internet paths to users.
+D=AWS Config advanced queries: these query the current configuration of resources with SQL-like syntax, not live traffic health.
+T: Internet Monitor answers "is the internet hurting my users"; Config, Trusted Advisor and Access Analyzer look at configuration and permissions.
+
+@ Q003828 explain
+G: ## Capacity and resilience are different goals
+- A **dedicated Direct Connect connection** is a physical port of 1, 10, 100 or 400 Gbps at a Direct Connect location.
+- A **LAG** (link aggregation group) bundles several connections of the same speed at the same location into one logical link, adding bandwidth, but all members end on the same AWS device.
+- **Resilience** comes from more than one connection on different devices, ideally at different locations, so the loss of one router, port or site leaves a working path.
+## Example
+Two locations, each with a LAG of 2 x 10 Gbps (or with a 100 Gbps connection), gives more than 20 Gbps in total and still leaves a full path if one device or site fails. The Direct Connect Resiliency Toolkit models these designs (for example high and maximum resiliency). Size each path for the full load if 20 Gbps must survive a failure.
+W: Multiple connections at different locations: diverse locations remove the single device and site as a point of failure, and LAGs add the dedicated bandwidth needed for 20 Gbps.
+X: A=Two VPN tunnels on one internet link: a standard VPN tunnel carries at most about 1.25 Gbps, the internet link is not dedicated capacity, and the single internet connection is itself a point of failure.
+B=One 100 Gbps connection at one location: it has plenty of bandwidth, but a single port on a single device at one site fails with any device, port or location problem.
+D=One 50 Mbps hosted connection: it is hundreds of times smaller than the 20 Gbps required, and a single connection still has no redundancy.
+T: LAGs add bandwidth at one location; resilience needs separate connections on separate devices and locations.
+
+@ Q003829 explain
+G: ## Direct Connect virtual interfaces
+A virtual interface (VIF) is a VLAN with a BGP session on a Direct Connect connection. The type decides what you can reach:
+- **Public VIF**: AWS public endpoints (for example Amazon S3 public IPs) in all Regions.
+- **Private VIF**: a virtual private gateway on one VPC, or a Direct Connect gateway that fans out to VGWs.
+- **Transit VIF**: a Direct Connect gateway associated with one or more **transit gateways**.
+## Multi-Region example
+The on-premises router has one transit VIF to a Direct Connect gateway. That DX gateway is associated with transit gateways in `us-east-1`, `eu-west-1` and `ap-northeast-1`. Each transit gateway has its VPCs attached, and the allowed prefixes on each association control which VPC CIDRs are advertised back to on premises. One BGP session reaches all three Regions.
+W: Transit VIF to a DX gateway: a transit VIF is the only VIF type that works with transit gateways, and a DX gateway is a global resource that can be associated with transit gateways in many Regions.
+X: A=Hosted private VIF to S3: a private VIF reaches private IP ranges through a VGW or DX gateway; it does not target an S3 endpoint and is not how transit gateways are connected.
+B=Public VIF: a public VIF carries traffic to AWS public service IPs; it does not reach private VPC addresses through transit gateways.
+C=Private VIF to one VPC's gateway: it ends on a single virtual private gateway, so it reaches one VPC and cannot connect to transit gateways in three Regions.
+T: Direct Connect to transit gateways always means a transit VIF to a Direct Connect gateway associated with those transit gateways.
+
+@ Q003830 explain
+G: ## Outbound versus inbound path control in BGP
+Each side of a BGP session chooses its own outgoing path from the routes it learned.
+- **Your outbound** traffic (on premises to AWS) is decided by your routers. **Local preference** is set on routes you learn and is compared first in normal BGP path selection: the highest wins.
+- **Traffic coming back to you** (AWS to on premises) is decided by AWS's routers based on what you advertise: prefix length, AWS local preference BGP communities, AS_PATH length and MED.
+## Example
+AWS advertises `10.50.0.0/16` over connections A and B. On the on-premises router, set local preference 200 on routes learned from A and keep 100 on B. All outbound traffic uses A; if A fails, its routes disappear and B takes over automatically.
+W: Higher local preference on routes from A: local preference is the attribute your own routers use to choose an exit, so preferring A's routes makes on-premises outbound traffic use A with B as backup.
+X: A=Shorter AS_PATH toward AWS over B: AS_PATH on routes you advertise influences AWS's choice for return traffic, and a shorter path over B would even pull that traffic onto the backup.
+B=Shorter prefix over B: prefix length in your advertisements again affects only AWS's path to you; it has no effect on which link your routers pick for outbound traffic.
+D=Higher MED on A: MED is a hint to the neighbor about inbound traffic, and a higher MED makes A less preferred for AWS's return traffic; it does not steer your outbound traffic.
+T: Control your outbound path with local preference on received routes; control AWS's return path with what you advertise (prefix length, communities, AS_PATH).
+
+@ Q003831 explain
+G: ## Steering AWS's return traffic
+AWS chooses how to send traffic to your network from the routes you advertise over each Direct Connect virtual interface. For the same prefix, in order:
+- **Longest prefix** wins (a `/24` beats a `/16`).
+- **Local preference BGP communities** you attach, `7224:7300` (high) down to `7224:7100` (low).
+- **Shortest AS_PATH** wins.
+## AS_PATH prepending example
+Advertise `192.168.0.0/16` on the primary with AS_PATH `65001`, and on the backup with `65001 65001 65001`. With equal prefix length and no communities, AWS sees the primary path as shorter and uses it. If the primary fails, only the backup route remains and traffic moves there.
+W: AS_PATH prepending on the backup: making the backup advertisement look longer causes AWS to choose the primary for return traffic while keeping the backup ready for failover.
+X: A=Shut down BGP on the primary: removing the primary's routes forces traffic onto the backup, the opposite of the goal, and leaves no failover during those hours.
+B=Advertise only over VPN: then AWS has no route over either Direct Connect connection for that prefix, so return traffic would use the VPN instead of the primary.
+C=Local preference on on-premises routers: that attribute only affects the path your routers choose for outbound traffic; AWS never sees it and it does not change the return path.
+T: Influence AWS's return traffic through your advertisements, such as AS_PATH prepending or local preference communities, not with local preference on your own routers.
+
+@ Q003832 explain
+G: ## Why BGP alone detects failures slowly
+BGP notices a dead neighbor when the **hold timer** expires with no keepalive received. On Direct Connect the default hold time is 90 seconds, so a silent failure (for example a device between the routers dropping traffic while the physical port stays up) could leave traffic lost for over a minute.
+## Bidirectional Forwarding Detection
+BFD is a lightweight protocol that exchanges very frequent hello packets between the two routers. On Direct Connect:
+- Asynchronous BFD is enabled on the AWS side of each virtual interface; you configure it on your router.
+- The AWS defaults are a 300 ms interval and a multiplier of 3, so a failure is detected in about 900 ms.
+- BFD then tears down the BGP session at once, and traffic moves to the backup connection.
+W: BFD: it detects forwarding failures in under a second and signals BGP to drop the session immediately, which is what enables failover within about a second.
+X: B=Longer hold timers: a longer hold time makes BGP wait even longer before declaring the neighbor down, so failover gets slower.
+C=Jumbo frames: jumbo frames raise the MTU (up to 9001 bytes on private VIFs) for throughput efficiency; they have nothing to do with detecting link failure.
+D=Static routes: Direct Connect virtual interfaces require BGP, and static routes have no liveness check at all, so failures would not be detected automatically.
+T: Sub-second Direct Connect failover comes from BFD, not from tuning hold timers or MTU.
+
+@ Q003833 explain
+G: ## Direct Connect is private, not encrypted
+Traffic on Direct Connect uses a dedicated path, but it is not encrypted by default. For compliance that requires encryption in transit, there are two main options:
+- **MACsec (IEEE 802.1AE)**: layer 2 encryption between your router and the AWS device, at line rate. It is available on selected dedicated connections (10, 100 and 400 Gbps at supported locations) and uses a key you configure (CKN/CAK) on both ends.
+- **Site-to-Site VPN over Direct Connect**: IPsec tunnels at layer 3. They can run over a public VIF to the VPN endpoints, or use private IP VPN over a transit VIF so the tunnels use private addresses. A standard tunnel carries up to about 1.25 Gbps.
+Applications can also encrypt themselves with TLS end to end.
+W: C=VPN over Direct Connect: IPsec tunnels carried over the Direct Connect path encrypt every packet at the IP layer while still using the dedicated link.
+E=MACsec: MACsec encrypts frames on the physical link itself on supported dedicated connections, giving high-throughput layer 2 encryption.
+X: A=BGP communities: communities are tags that influence route selection and scope; they do not change or encrypt the traffic.
+B=Public VIF alone: a public VIF only provides reachability to public AWS endpoints; without IPsec or TLS on top, the data still crosses it in clear text.
+D=Jumbo frames: raising the MTU improves efficiency for large packets but provides no confidentiality.
+T: Encrypt Direct Connect with MACsec at layer 2 or an IPsec VPN over it at layer 3; routing and MTU settings add no encryption.
+
+@ Q003834 explain
+G: ## Hub and spoke with segmentation
+A **transit gateway** is a Regional router that VPCs, VPNs and Direct Connect gateways attach to. It is transitive: any attachment can reach any other if the route tables allow it. It can be shared with other accounts through AWS RAM and supports thousands of attachments.
+## Segmentation with route tables
+Each attachment is associated with exactly one transit gateway route table, and can propagate its routes into one or more tables.
+- `prod` table: prod VPCs associated; prod VPCs and shared services propagate into it.
+- `dev` table: dev VPCs associated; dev VPCs and shared services propagate into it.
+- `shared` table: shared services VPC associated; both prod and dev propagate into it.
+Prod and dev can both reach shared services, but never each other, because neither table has a route to the other environment.
+W: Transit gateway with per-environment route tables: it gives transitive routing for 200 VPCs through one hub, and separate route tables enforce segmentation between environments.
+X: B=Full mesh of peering: 200 VPCs need about 19,900 peering connections, which far exceeds the per-VPC peering quota, and peering is not transitive, so it cannot give hub routing.
+C=One VPC with 200 subnets: every subnet in a VPC can reach every other through the `local` route, so environments are not segmented by routing, and one VPC becomes a huge shared failure and permissions domain.
+D=VPN between every pair: this needs thousands of tunnels, each standard tunnel capped around 1.25 Gbps, with costly and fragile operations.
+T: At hundreds of VPCs, use a transit gateway and separate its route tables per environment; peering and pairwise VPNs do not scale or transit.
+
+@ Q003835 explain
+G: ## Options for connecting VPCs
+- **VPC peering**: a direct connection between two VPCs, in the same or different Regions and accounts. There is no hourly charge; you pay only for data transfer (data within the same Availability Zone is free). There is no bandwidth bottleneck beyond instance limits and no extra hop. It is not transitive, and CIDRs must not overlap.
+- **Transit gateway**: a hub with transitive routing, but each attachment is billed per hour and each GB processed is billed.
+- **Site-to-Site VPN**: IPsec over the internet, about 1.25 Gbps per standard tunnel, and hourly charges.
+- **Direct Connect**: connects on-premises networks to AWS, not VPC to VPC.
+## Example
+An app VPC `10.1.0.0/16` and a data VPC `10.2.0.0/16` exchange large volumes. One peering connection plus a route in each VPC's route table gives the lowest latency and cost.
+W: VPC peering: it links exactly two VPCs directly with high bandwidth and low latency and has no hourly or attachment fee, which fits when transitive routing is not needed.
+X: A=Direct Connect: it links an on-premises network to AWS through a physical port with its own port-hour charges; it is not a way to connect two VPCs.
+B=Transit gateway: it would work, but it charges per attachment-hour and per GB processed, which the requirement explicitly rules out; its transitive routing is not needed here.
+C=Site-to-Site VPN: standard VPN tunnels are limited to about 1.25 Gbps each, add encryption overhead and hourly charges, so they are neither the highest bandwidth nor free of hourly fees.
+T: For just two VPCs with no transitive needs, peering is the cheapest, lowest-latency choice; transit gateways add per-attachment and per-GB charges.
+
+@ Q003836 explain
+G: ## Why stateful firewalls need symmetric flows
+A stateful firewall tracks each connection. If the request passes through the appliance in AZ a but the response passes through the appliance in AZ b, the second firewall has no record of the connection and drops the reply.
+## How a transit gateway picks the AZ
+By default, a transit gateway keeps traffic in the AZ it came from when possible. Source and destination VPCs in different AZs mean the request enters the inspection VPC in one AZ and the reply in another, so flows become asymmetric.
+**Appliance mode** on the inspection VPC attachment makes the transit gateway choose one network interface in the inspection VPC per flow, using a hash of the flow, and use it for both directions for the life of the flow.
+Enable it with `aws ec2 modify-transit-gateway-vpc-attachment --options ApplianceModeSupport=enable`.
+W: Appliance mode on the inspection attachment: it pins both directions of each flow to the same AZ and appliance, so the stateful firewall sees request and response and no longer drops return traffic.
+X: A=Disable route propagation everywhere: this removes the dynamic routes that send traffic to the inspection VPC and other VPCs, breaking connectivity instead of fixing symmetry.
+B=More subnets in one AZ: extra subnets in one AZ do not change how the transit gateway selects an AZ for each direction, and they concentrate risk in one AZ.
+C=DNS support on the transit gateway: this lets public DNS names resolve to private IPs across attached VPCs; it has no influence on the path packets take.
+T: Stateful inspection through a transit gateway across AZs requires appliance mode on the inspection VPC attachment.
+
+@ Q003837 explain
+G: ## Transit gateway peering across Regions
+Transit gateways are Regional. To connect two Regions, you create a **peering attachment** between them (same or different accounts); traffic crosses the AWS global network encrypted.
+Unlike VPC or VPN attachments, a peering attachment does not propagate routes. You add **static routes** in each transit gateway route table that point remote CIDRs to the peering attachment.
+## Example
+- In the `us-east-1` transit gateway route table: `10.20.0.0/16` goes to the peering attachment `tgw-attach-0peer`.
+- In the `eu-west-1` transit gateway route table: `10.10.0.0/16` goes to the peering attachment.
+Both IPv4 and IPv6 routes can be used. If dynamic routing between Regions is required, AWS Cloud WAN can share routes automatically across its Regions.
+W: Static routes across the peering attachment: routes are not propagated over a transit gateway peering, so each side must have static routes to the remote CIDRs pointing to the peering attachment.
+X: A=Dynamic BGP propagation: transit gateway peering does not run BGP or propagate routes; without static routes, neither side knows the remote CIDRs.
+B=IPv6 only: peering attachments carry both IPv4 and IPv6 traffic; there is no IPv6-only restriction.
+D=Requires a Direct Connect gateway: peering is built directly between the two transit gateways over the AWS backbone; a Direct Connect gateway is only for Direct Connect connectivity.
+T: Transit gateway inter-Region peering always needs static routes on both sides; use Cloud WAN if you need dynamic routing between Regions.
+
+@ Q003838 explain
+G: ## Transit Gateway Connect
+SD-WAN appliances often run in a VPC and need to exchange many routes with AWS dynamically. A **Connect attachment** is built on top of an existing transport attachment (a VPC attachment or Direct Connect) and adds:
+- **GRE tunnels** between the transit gateway and the appliance, using private IP addresses over the transport attachment.
+- **BGP** inside each tunnel, so the appliance and transit gateway exchange routes dynamically.
+- Each Connect peer (GRE tunnel) supports up to 5 Gbps, and one attachment can have several peers, more than the roughly 1.25 Gbps of a standard VPN tunnel. There is no IPsec overhead.
+## Example
+The SD-WAN VPC is attached to the transit gateway. A Connect attachment on top of it has two Connect peers with inside addresses from `169.254.100.0/29`. The appliances advertise branch prefixes over BGP, and the transit gateway propagates them into its route tables.
+W: Transit Gateway Connect with GRE and BGP: it is designed for SD-WAN appliances, giving dynamic routing over GRE with more throughput than VPN tunnels.
+X: B=Static VPN: static routing has no dynamic route exchange, and each standard VPN tunnel is limited to about 1.25 Gbps, so it misses both requirements.
+C=Private VIF to the SD-WAN VPC: a private VIF is a Direct Connect interface from on premises to a virtual private gateway; it does not attach a VPC's appliances to a transit gateway.
+D=VPC peering with static routes: peering does not connect to a transit gateway and cannot run BGP, so the SD-WAN routes could not be exchanged dynamically.
+T: SD-WAN appliances that need BGP and more than VPN throughput to a transit gateway use a Connect attachment.
+
+@ Q003839 explain
+G: ## What AWS Cloud WAN adds
+Building a global network with transit gateways means one transit gateway per Region, peering between them, static routes and many route tables. **AWS Cloud WAN** manages this from one place:
+- A **core network policy** (a JSON document) defines the Regions (core network edges), the **segments** such as `prod`, `dev` and `shared`, and rules for which attachments join which segment, for example by tag.
+- Attachments include VPCs, Site-to-Site VPNs, Connect (SD-WAN), transit gateway route tables and Direct Connect gateways, so both VPCs and on-premises sites join.
+- Routes are shared dynamically between Regions within a segment, and policies control sharing between segments.
+## Example
+A VPC tagged `env=prod` in `eu-west-1` is automatically placed in the `prod` segment and can reach prod VPCs in `us-east-1` and prod branch sites, but not dev.
+W: AWS Cloud WAN: it builds and operates a global network from a central policy, with segments that apply across Regions and on-premises sites.
+X: B=VPC peering mesh: peering links only VPCs, is not transitive, grows as n squared connections and has no concept of segments or on-premises sites.
+C=Amazon Route 53: Route 53 is a DNS and health checking service; it does not route IP traffic between networks.
+D=AWS VPN CloudHub: CloudHub lets several VPN sites talk through one virtual private gateway in one VPC; it has no multi-Region management or policy-based segmentation.
+T: For global, policy-driven segmentation across Regions and sites, choose Cloud WAN rather than hand-built peering or VPN hubs.
+
+@ Q003840 explain
+G: ## Service networking instead of network connectivity
+Peering, transit gateways and VPNs connect IP networks: you manage CIDRs, route tables and security groups, and then still need to secure each service. **Amazon VPC Lattice** works at the application layer:
+- A **service** represents an application (HTTP, HTTPS, gRPC or TLS passthrough) with listeners and target groups (instances, IPs, Lambda functions, ECS, Kubernetes pods).
+- A **service network** groups services and is associated with VPCs; it can be shared across accounts with AWS RAM.
+- **Auth policies** (IAM-style) on the service network and each service decide who can call what; when a policy requires authenticated callers, requests are signed with SigV4.
+Clients in an associated VPC reach a service by DNS name. Lattice handles connectivity, even with overlapping CIDRs, with no route tables to manage.
+W: VPC Lattice: it connects services across VPCs and accounts at the application layer, with built-in IAM auth policies and no route management.
+X: A=VPC peering mesh: peering needs route table entries for every pair and non-overlapping CIDRs, and it gives network access only; authentication would still be up to each service.
+B=NAT gateways only: a NAT gateway lets private subnets start outbound connections to the internet or other networks; it does not provide service discovery or authorization.
+D=Site-to-Site VPN: VPN creates encrypted IP tunnels that still need routing and firewall rules, with no per-service authorization.
+T: For service-to-service traffic with auth and no routing to manage, use VPC Lattice; peering and VPN connect networks, not services.
+
+@ Q003841 explain
+G: ## Planning for a Direct Connect failure
+A single Direct Connect connection is a single point of failure: the port, the device, the location or the carrier circuit can go down. Common backups:
+- **A second Direct Connect connection at another location**: keeps dedicated bandwidth and predictable latency during a failure. This is the basis of the high resiliency models.
+- **A Site-to-Site VPN as backup**: IPsec over the internet to the same virtual private gateway, transit gateway or Cloud WAN. It is cheaper but a standard tunnel carries only about 1.25 Gbps.
+With BGP on both paths, AWS prefers Direct Connect routes over VPN routes for the same prefix, so the VPN is used only when the Direct Connect routes disappear.
+W: D=Second connection at another location: an independent connection on a different device and site keeps private dedicated connectivity when the first fails.
+E=Site-to-Site VPN backup: a VPN over the internet gives a separate path that BGP falls back to automatically when the Direct Connect routes are withdrawn.
+X: A=Larger VPC CIDR: it only adds address space inside the VPC; it creates no additional path between on premises and AWS.
+B=Second internet gateway: a VPC can have only one internet gateway attached, and an internet gateway serves internet traffic, not private hybrid connectivity.
+C=More NAT gateways: NAT gateways let private subnets start outbound connections; they do not carry on-premises traffic into the VPC or replace a Direct Connect link.
+T: Back up Direct Connect with another Direct Connect connection at a different location or a Site-to-Site VPN; VPC-internal components add no hybrid path.

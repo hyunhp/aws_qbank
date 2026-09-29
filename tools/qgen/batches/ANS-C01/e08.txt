@@ -1,0 +1,364 @@
+# ANS-C01 detailed explanations, e08 (explanation-only rewrites; letters are the published ones)
+
+@ Q001744 explain
+G: ## What VPC Flow Logs record
+VPC Flow Logs capture IP traffic metadata (addresses, ports, protocol, bytes, ACCEPT or REJECT) for network interfaces in a VPC, a subnet or a single interface. They are not a full packet capture, and some traffic is deliberately left out.
+## Traffic that flow logs never show
+- Traffic to and from the Amazon DNS server (the `.2` address of the VPC, such as `10.0.0.2`, or `169.254.169.253`).
+- Instance metadata traffic to `169.254.169.254` and Amazon Time Sync traffic.
+- DHCP traffic and traffic to the reserved router address of the subnet.
+If an instance uses its own DNS server instead, that traffic is ordinary IP traffic and is logged.
+## Where DNS visibility comes from
+**Route 53 Resolver query logging** records each query made through the Resolver: the name asked, the record type, the response code and the source instance, delivered to CloudWatch Logs, S3 or Firehose.
+W: Amazon DNS traffic is excluded: flow logs by design skip queries to the Amazon-provided resolver, so no filter or format change will make them appear. Resolver query logging is the service that captures these DNS queries.
+X: B=Aggregation interval: the interval (1 or 10 minutes) only controls how long packets are grouped into one record. Short flows are still recorded; nothing about DNS depends on it.
+C=UDP not captured: flow logs record TCP, UDP, ICMP and other protocols. DNS is missing because of the destination (the Amazon resolver), not the protocol.
+D=dns-query field: the custom format has no such field. Flow log fields describe packets and flows (addresses, ports, flags, `pkt-*` addresses), never DNS query names.
+T: DNS to the Amazon-provided resolver never shows up in flow logs; use Route 53 Resolver query logging to see which names instances look up.
+
+@ Q001745 explain
+G: ## Default versus custom flow log formats
+The default flow log format records `srcaddr` and `dstaddr`, which describe addresses as seen at the logged network interface. For an intermediate interface such as a NAT gateway, that view hides who really started the flow.
+## The pkt-* fields
+A **custom format** lets you pick extra fields, including:
+- `pkt-srcaddr`: the source address in the original packet header.
+- `pkt-dstaddr`: the destination address in the original packet header.
+Example: instance `10.0.1.5` connects to `203.0.113.5` through a NAT gateway. In the NAT gateway's log, `pkt-srcaddr` shows `10.0.1.5` and `pkt-dstaddr` shows `203.0.113.5`, so the originating instance is identifiable.
+## Changing the format
+A flow log's format cannot be edited after creation. Create a new flow log for the NAT gateway interface with the custom format (then delete the old one if no longer needed).
+W: Custom format with pkt-srcaddr and pkt-dstaddr: these fields show the original packet addresses passing through the NAT gateway interface, linking each outbound connection back to the private instance that started it.
+X: A=Per-instance ENI logs: instance interface logs do not "ignore NAT"; they simply record what that one interface sees. Using them means enabling and correlating logs on every instance interface, while the NAT gateway's own log can show the original addresses directly.
+C=1-minute interval: the aggregation interval only changes how often records are written. It adds no address fields, so the NAT gateway view stays the same.
+D=CloudWatch Logs destination: the destination (S3, CloudWatch Logs or Firehose) changes where records go, not which fields they contain.
+T: Traffic through a NAT gateway or other middlebox hides the real endpoints in srcaddr and dstaddr; add pkt-srcaddr and pkt-dstaddr in a custom format.
+
+@ Q001746 explain
+G: ## Flow logs in S3 as a data lake
+Flow logs delivered to S3 can be written in plain text or **Apache Parquet**, a columnar format that compresses well and lets query engines read only the needed columns. Hive-compatible partition prefixes (by date and hour) can be enabled so queries scan only the relevant time range.
+## Querying with Athena
+Amazon Athena is serverless SQL over data in S3: you define a table over the flow log prefix and pay per data scanned. No servers or pipelines are needed.
+Example logic for a port scan:
+- Filter `action = 'REJECT'`.
+- Group by `srcaddr`, `dstaddr` and a time bucket (for example 5 minutes).
+- Keep groups where `COUNT(DISTINCT dstport)` exceeds a threshold, such as 100.
+The query can be saved and run on a schedule, and Parquet plus partitions keep it fast and cheap.
+W: Athena SQL on REJECT records: Athena queries Parquet flow logs natively, and grouping REJECTs by source, destination and time window while counting distinct destination ports finds scan patterns at scale with no infrastructure to run.
+X: A=GuardDuty disables delivery: GuardDuty has no role in turning off flow log delivery, and Athena reads Parquet very well; Parquet is one of the formats it is optimized for.
+B=Manual file search: downloading and grepping files does not scale to large volumes, and counting per file cannot relate records across files or time windows to find distinct ports per source.
+D=WAF logging on the VPC: AWS WAF protects HTTP(S) resources such as CloudFront, Application Load Balancers and API Gateway. It cannot attach to a VPC and never sees the rejected TCP/UDP packets of a port scan.
+T: Flow logs in S3 (ideally Parquet with partitions) plus Athena SQL give serverless, at-scale detection of patterns such as port scans.
+
+@ Q001747 explain
+G: ## CloudTrail event types
+- **Management events** are control-plane operations that create, change or delete resources or their settings, such as `CreateVpc`, `AuthorizeSecurityGroupIngress` or `CreateRouteTable`.
+- **Data events** are high-volume resource operations, such as S3 `GetObject` or Lambda `Invoke`. They are off by default and cost extra.
+## Event history versus trails
+- **Event history** is on in every account with no setup. It shows the last **90 days** of management events per Region, viewable and searchable in the console or with `LookupEvents`.
+- A **trail** delivers events to S3 (and optionally CloudWatch Logs) for as long as you keep them. A new trail logs management events by default.
+Example: an auditor asking who opened a security group two months ago can find it in event history; one asking about last year needs a trail or a CloudTrail Lake event data store.
+W: Both are management events with 90 days of event history: both calls change resource configuration, so a default trail records them, and without any trail event history still keeps them searchable for 90 days.
+X: A=Data events required: data events cover object- and item-level operations such as S3 reads and writes. Creating a VPC or changing a security group is a control-plane change, which is a management event.
+B=Only CreateVpc logged: `AuthorizeSecurityGroupIngress` also changes configuration and is a management event. No EC2 security group API needs data events.
+D=Only in VPC Flow Logs: flow logs record network packets, not API calls. Every EC2 and VPC API call is recorded by CloudTrail.
+T: Configuration-changing API calls are management events, logged by default and visible in 90-day event history even without a trail.
+
+@ Q001748 explain
+G: ## Where CloudTrail records an event
+CloudTrail records each API call in the Region where the call was made. A peering connection is accepted by calling `AcceptVpcPeeringConnection` in the accepter VPC's Region, so here the event lives in ap-southeast-2.
+## Single-Region versus multi-Region trails
+- A **single-Region trail** logs only events from its own Region.
+- A **multi-Region trail** logs events from all Regions, including new ones enabled later, to one bucket.
+## Organization trails
+An organization trail is created in the management account (or a delegated administrator account) and applies to every member account automatically. Its Region scope still matters: an organization trail limited to us-east-1 collects only us-east-1 events from each member.
+Example: a member account creates a route in eu-west-1; a single-Region us-east-1 organization trail never sees it.
+W: Single-Region trail: the trail only covers us-east-1, so the ap-southeast-2 acceptance is never collected. Making it a multi-Region organization trail captures events from every Region in every member account.
+X: B=Only IAM events: organization trails capture the same management events as any trail, including all EC2 and VPC networking calls.
+C=Member needs own trail: organization trails apply to member accounts automatically and do not skip networking calls; a member trail would not fix the Region scope of the central trail.
+D=Requester's Region only: the acceptance is an API call in the accepter's Region (ap-southeast-2), and CloudTrail records it there, not in the requester's Region.
+T: CloudTrail records events where the API call happens; only a multi-Region (organization) trail captures every Region centrally.
+
+@ Q001749 explain
+G: ## Event-driven remediation
+CloudTrail records every management API call, and those records are delivered to Amazon EventBridge as events with detail type `AWS API Call via CloudTrail`, typically within a short time of the call.
+## How the pattern works
+- An EventBridge rule matches `source: aws.ec2`, the detail type above and `detail.eventName: AuthorizeSecurityGroupIngress`, in each Region to protect.
+- The rule invokes a Lambda function with the event, which contains the group ID and the requested permissions.
+- The function checks for port `3389` open to `0.0.0.0/0` (and `::/0`) and calls `RevokeSecurityGroupIngress` for just that rule, optionally notifying the team with SNS.
+This reacts to the change itself, not to a scan or to traffic, so the exposure window is short.
+W: EventBridge rule on AuthorizeSecurityGroupIngress with a Lambda that revokes: the API call itself triggers the automation, so an open RDP rule is removed within seconds to minutes instead of waiting for a scan or an attack.
+X: A=Wait for a GuardDuty finding: GuardDuty reports suspicious activity such as brute-force attempts after they happen. It does not fire when a rule is created, so the port stays open until an attack is detected.
+B=24-hour periodic Config rule: a periodic evaluation can leave RDP exposed for up to a day. The requirement is near real-time reaction to the API call.
+C=Flow Logs after a connection: this reacts only after RDP traffic has already arrived, and flow logs are delivered in batches, so it is both late and indirect.
+T: To close a misconfiguration within seconds, react to the API call event (EventBridge plus Lambda), not to periodic scans or observed traffic.
+
+@ Q001750 explain
+G: ## AWS Config rules and remediation
+AWS Config records resource configurations and evaluates them with rules. The managed rule **restricted-ssh** marks a security group NON_COMPLIANT when it allows inbound TCP `22` from `0.0.0.0/0` (or `::/0`), and it re-evaluates whenever a security group changes.
+## Scaling to an organization
+- A **conformance pack** bundles rules and remediation actions in one template.
+- An **organization conformance pack** deploys it to every member account from the management or delegated administrator account.
+## Automatic remediation
+A remediation action runs a Systems Manager Automation document against the non-compliant resource. For example, `AWS-DisablePublicAccessForSecurityGroup` removes rules that open SSH or RDP to everyone. With automatic remediation enabled, it runs without a person.
+W: restricted-ssh in a conformance pack with SSM remediation: Config continuously evaluates every security group, the conformance pack spreads the rule across the organization, and the attached Automation document removes the offending rule automatically.
+X: A=Inspector reachability reviewed weekly: Inspector network reachability findings show which ports are reachable, but a weekly manual review is neither continuous compliance nor automatic removal.
+C=Trusted Advisor cost checks: cost optimization checks look at spend such as idle resources. They do not evaluate security group rules and cannot remediate anything.
+D=CloudTrail Insights: Insights flags unusual API call rates or error rates. It does not judge whether a rule is compliant and takes no corrective action.
+T: Continuous configuration compliance with automatic fixes across accounts is AWS Config: a rule in an organization conformance pack plus an SSM remediation action.
+
+@ Q001751 explain
+G: ## Managed versus custom Config rules
+- **Managed rules** are prebuilt by AWS, such as `restricted-ssh` or `vpc-flow-logs-enabled`. You only set parameters.
+- **Custom Lambda rules** run your own Lambda function. Config passes the resource's configuration item, and the function can call any AWS API, then reports COMPLIANT or NON_COMPLIANT with `PutEvaluations`.
+- **Custom policy rules** use AWS CloudFormation Guard syntax. They check fields of a single configuration item and cannot call other APIs.
+## Why this check needs Lambda
+Checking whether a VPC's traffic is routed through a firewall means combining several resources: the VPC, its route tables (`DescribeRouteTables`) and the Network Firewall endpoints (`ListFirewalls`, `DescribeFirewall`). Only a Lambda-backed rule can make those lookups and correlate them.
+Example: for each VPC, find the firewall associated with it and confirm that the subnet route tables send `0.0.0.0/0` to a firewall endpoint (`vpce-...`).
+W: Custom Lambda-backed Config rule: the function can query EC2 route tables and Network Firewall firewalls, correlate them per VPC and report compliance, which no managed rule does.
+X: A=Not possible with Config: custom rules exist exactly for checks AWS does not provide, so this can be automated rather than done by hand.
+C=Conformance packs express any logic: a conformance pack is a container that deploys rules and remediations. It does not add a way to write cross-resource API lookups; the logic still has to live in a rule.
+D=Purpose-built managed rule: the managed Network Firewall rules check firewall and policy settings, not whether each VPC's route tables send traffic through a firewall, and the question states no such rule exists.
+T: When no managed rule fits, especially for checks spanning several resources, write a custom Lambda-backed Config rule.
+
+@ Q001752 explain
+G: ## Evaluation and remediation are separate
+An AWS Config rule only evaluates: it marks resources COMPLIANT or NON_COMPLIANT. Fixing them is a separate **remediation configuration** attached to the rule.
+## Setting up remediation
+- Choose a Systems Manager Automation document, either AWS-owned or your own, that corrects the resource (for example, one that deletes an overly permissive network ACL entry).
+- Map parameters, such as passing the resource ID from the evaluation, and give an IAM role the Automation can assume.
+- Choose **manual** remediation (someone clicks Remediate) or **automatic** remediation with retry settings.
+This works for both managed and custom rules.
+Example: a custom rule flags entry `100 allow 0.0.0.0/0 all`; the remediation runs `DeleteNetworkAclEntry` for that rule number.
+W: No remediation action attached: without a remediation configuration with auto-remediation enabled, Config just reports NON_COMPLIANT. Attaching an SSM Automation document and turning on automatic remediation makes the fix happen.
+X: B=Convert to a managed rule: custom rules support remediation actions the same way managed rules do.
+C=Requires Security Hub: Config invokes SSM Automation directly. Security Hub aggregates findings and is not needed for Config remediation.
+D=Config is read-only: Config rules can have remediation actions, both manual and automatic, that change resources through SSM Automation.
+T: A Config rule only detects; remediation happens only when an SSM Automation remediation action is attached and set to automatic.
+
+@ Q001753 explain
+G: ## Two different questions
+- **Is it configured correctly?** AWS Config records resource settings (VPCs, subnets, route tables, security groups, NACLs) and evaluates them against rules, continuously and with history.
+- **Is something behaving badly?** Amazon GuardDuty analyzes activity: VPC flow logs, DNS query logs and CloudTrail events, and compares them with threat intelligence and anomaly models.
+## Example
+A rule "every VPC must have flow logs enabled" is a configuration question for Config. An instance connecting to an IP known for malware hosting is a behavior question, and GuardDuty raises a finding for it.
+## Where Security Hub fits
+AWS Security Hub collects findings from Config, GuardDuty, Inspector and others and runs its own checks built on Config. It aggregates; it does not replace GuardDuty's threat detection.
+W: Config for requirement 1, GuardDuty for requirement 2: Config continuously evaluates VPC configuration against rules, and GuardDuty detects communication with known malicious IPs from network and DNS activity.
+X: A=Security Hub alone: Security Hub's controls depend on Config, and threat findings come from GuardDuty. On its own it neither records configuration nor analyzes traffic.
+B=GuardDuty for 1, Config for 2: swapped. GuardDuty does not evaluate configuration against internal rules, and Config does not see network traffic.
+C=Config for both: Config sees resource settings, not packets or DNS queries, so no custom rule can detect traffic to malicious IPs.
+T: Configuration compliance is AWS Config; threat detection from activity is GuardDuty.
+
+@ Q001754 explain
+G: ## Reading GuardDuty finding names
+A finding type follows `ThreatPurpose:ResourceType/ThreatFamily`, sometimes with a suffix such as `.Custom` or `!DNS`:
+- **UnauthorizedAccess**: the purpose, activity that may indicate unauthorized access.
+- **EC2**: the affected resource is an EC2 instance.
+- **MaliciousIPCaller**: the instance is communicating with an IP address on a threat list. The current documentation lists the EC2 form as `UnauthorizedAccess:EC2/MaliciousIPCaller.Custom`, meaning the address is on a custom threat list you uploaded; matches against AWS's built-in threat intelligence appear under other types, such as `Backdoor:EC2/C&CActivity.B`.
+Either way, the instance itself is talking to a known-bad address, which may mean it is compromised.
+## A sound first response
+- **Contain**: move the instance to an isolation security group with no rules or tightly restricted ones, or restrict it with a NACL.
+- **Preserve evidence**: snapshot EBS volumes and keep logs before terminating anything.
+- **Investigate**: use Amazon Detective or flow logs and CloudTrail to learn what it contacted and how it got there.
+W: Talking to a threat-listed IP, isolate and investigate: the finding means the instance communicated with a listed malicious address, so contain it, preserve evidence and investigate before deciding on cleanup.
+X: A=IAM user from Tor: sign-ins or API calls from Tor exit nodes produce IAM-related findings such as `UnauthorizedAccess:IAMUser/TorIPCaller`, not an EC2 finding.
+B=WAF blocked a request: WAF blocks are recorded in WAF logs and metrics; GuardDuty does not report WAF actions as this finding.
+C=Security group changed: an unauthorized configuration change is visible in CloudTrail and Config. This finding type describes the instance's network communication, not a change to its security group.
+T: Read the finding type (purpose, resource, family): MaliciousIPCaller on EC2 means the instance talked to a known-bad IP; contain, preserve evidence, investigate.
+
+@ Q001755 explain
+G: ## How GuardDuty detects C2 beaconing
+Amazon GuardDuty is a managed threat detection service. Once enabled, it reads its foundational data sources directly, with nothing to install on hosts:
+- **VPC flow log data**: which IPs and ports instances talk to.
+- **DNS query logs**: names looked up through the Amazon-provided resolver.
+- **CloudTrail management events**: API activity.
+It compares this activity with AWS-maintained threat intelligence (from AWS and partner sources) and with machine learning models. No feed setup is needed; custom threat lists are optional extras.
+## Example
+An instance resolves a domain known for command-and-control every 60 seconds. GuardDuty can raise findings such as `Backdoor:EC2/C&CActivity.B!DNS`.
+W: GuardDuty: it is agentless, uses built-in threat intelligence and analyzes network, DNS and CloudTrail activity, so it detects C2 communication without agents or feed management.
+X: B=Needs a paid third-party feed: GuardDuty includes its threat intelligence in the service. Manual flow log review would also be slow and miss DNS-based C2.
+C=Network Firewall rules only: Network Firewall does offer AWS managed threat signature rule groups, including command-and-control categories, but it is inline inspection that needs firewall endpoints in each VPC, routing changes and a firewall policy. That is infrastructure to build and run, not zero-setup detection.
+D=Inspector reachability analysis: Amazon Inspector finds software vulnerabilities and which ports are reachable from outside. It does not watch outbound traffic for beaconing.
+T: Agentless, built-in threat intelligence detection of malicious communication is GuardDuty; Network Firewall and Inspector serve other purposes.
+
+@ Q001756 explain
+G: ## GuardDuty's foundational data sources
+When GuardDuty is enabled, it analyzes three data sources that it collects through its own independent streams:
+- **VPC flow log data** for EC2 network activity.
+- **DNS logs** for queries made through the Amazon-provided resolver.
+- **CloudTrail management events**.
+You do not need to create VPC Flow Logs, a CloudTrail trail or Resolver query logging for GuardDuty to work, and enabling GuardDuty does not create or change those resources in your account. Your own flow logs (to S3 or CloudWatch Logs) and GuardDuty's copy are separate; GuardDuty's analysis does not affect your log delivery or cost.
+## Example
+A new account has no flow logs at all. After GuardDuty is enabled, it can still raise `Recon:EC2/PortProbeUnprotectedPort` for an instance being probed.
+W: GuardDuty reads the data independently: it pulls flow log, DNS and CloudTrail data directly from AWS, so network findings work even when the team has never enabled VPC Flow Logs.
+X: A=Requires flow logs to S3: GuardDuty does not poll customer buckets for flow logs; it has its own feed.
+C=Only CloudTrail: GuardDuty analyzes VPC flow log and DNS data as well as CloudTrail, which is how it produces network findings.
+D=Resolver query logging required: GuardDuty reads DNS activity from the Amazon resolver on its own; Route 53 Resolver query logging is for your own analysis and is not a prerequisite.
+T: GuardDuty consumes its own independent copy of flow log, DNS and CloudTrail data; you do not need to enable those logs for it.
+
+@ Q001757 explain
+G: ## Where GuardDuty's DNS data comes from
+GuardDuty's DNS analysis uses the query logs of the **Amazon-provided DNS resolver** (Route 53 Resolver at the VPC `.2` address). It sees names queried there, which lets it detect DNS-based threats such as `Trojan:EC2/DNSDataExfiltration` (data hidden in long query names) or lookups of known bad domains.
+## What changes if an instance bypasses it
+If the instance sends queries straight to an external resolver, for example `8.8.8.8` or a self-hosted server, those queries never reach the Amazon resolver:
+- GuardDuty has no DNS log entries for them, so DNS-based findings cannot be produced.
+- Flow log data still shows UDP/TCP `53` connections to the external IP, but not the names queried.
+Organizations often block outbound port 53 except to the VPC resolver, or use Route 53 Resolver DNS Firewall, to keep DNS observable.
+W: Bypassing the Amazon resolver hides DNS queries: GuardDuty's DNS log data source only covers queries that go through the Amazon-provided resolver, so DNS exfiltration from this instance would go undetected by its DNS-based findings.
+X: A=Only flow logs affected: the opposite. Flow log data still records the connections to the external resolver; what is lost is GuardDuty's DNS query visibility.
+C=Inspects DNS packets at the ENI: GuardDuty does not capture packets on interfaces. It relies on the Amazon resolver's logs for query names.
+D=Redirects DNS traffic: GuardDuty is a detection service that is not in the traffic path, so it cannot redirect or alter an instance's DNS traffic.
+T: GuardDuty's DNS detections only cover queries sent to the Amazon-provided resolver; using a third-party resolver creates a blind spot.
+
+@ Q001758 explain
+G: ## Two tunnels per VPN connection
+Every AWS Site-to-Site VPN connection has **two tunnels**, each ending on a different AWS endpoint (outside IP) for redundancy. AWS performs routine maintenance that can take one tunnel down for a short time, one tunnel at a time.
+## Making failover automatic
+- Configure **both** tunnels on the customer gateway device.
+- With **BGP (dynamic routing)**, each tunnel advertises routes; when one tunnel drops, its BGP session ends and traffic moves to the other within the BGP timers. AS-path prepending or local preference can make one tunnel preferred (active/passive).
+- With static routing, the device needs tunnel monitoring (for example DPD or SLA probes) to move routes itself.
+Example: tunnel 1 is preferred by BGP; during maintenance on tunnel 1, traffic shifts to tunnel 2 with no manual steps.
+W: Configure both tunnels, BGP preferred: with both tunnels up, AWS maintenance on one tunnel leaves the other ready, and BGP moves traffic over automatically.
+X: B=Manual backup tunnel: waiting for an operator to bring up tunnel 2 means an outage every time tunnel 1 goes down, which is exactly what happened.
+C=Second tunnel for IPv6 only: the second tunnel is for redundancy. A VPN connection's tunnels carry one address family (IPv4 or IPv6) set for the connection, so a tunnel cannot be dedicated to IPv6 this way.
+D=Ask AWS to skip maintenance: AWS does not exempt individual tunnels from maintenance; the design expects customers to use both tunnels.
+T: Always configure both VPN tunnels, ideally with BGP, so AWS maintenance on one tunnel causes automatic failover rather than an outage.
+
+@ Q001759 explain
+G: ## What the tunnel options control
+Each Site-to-Site VPN tunnel has **tunnel options** that set what the AWS endpoint will accept during IKE negotiation:
+- Phase 1 and Phase 2 **encryption algorithms**, such as `AES256` or `AES256-GCM-16`.
+- Phase 1 and Phase 2 **integrity algorithms**, such as `SHA2-256` or `SHA2-512`.
+- Phase 1 and Phase 2 **Diffie-Hellman group numbers**, such as `14` to `24`.
+- **IKE versions** (`ikev1`, `ikev2`).
+By default AWS allows a broad set, including AES-128, SHA-1, DH group 2 and IKEv1, for compatibility with older devices.
+## Enforcing a standard
+Restrict each option on both tunnels with `ModifyVpnTunnelOptions`, in the console, or at creation. The AWS side then refuses any proposal outside the list, even if a customer device offers it.
+W: Tunnel options with only approved values: limiting encryption, integrity, DH groups and IKE version on the AWS side guarantees nothing weaker can ever be negotiated.
+X: B=Customer gateway only: AWS tunnel options can be customized, and restricting only the customer device leaves the AWS side willing to accept weaker proposals from any misconfigured device.
+C=Config rule blocking tunnels: tunnel options are part of the VPN API (`ModifyVpnTunnelOptions`). A Config rule could only report; it does not stop a tunnel from negotiating weak settings.
+D=Defaults already strong: the defaults include AES-128, SHA-1, DH group 2 and IKEv1 for backward compatibility, so they do not meet this standard.
+T: To enforce cryptographic standards on AWS VPN, restrict the tunnel options on the AWS side; defaults allow weaker proposals.
+
+@ Q001760 explain
+G: ## Dead Peer Detection (DPD)
+DPD checks whether the IPsec peer is still alive. Each side sends R-U-THERE messages when it has not heard from the peer, and declares the peer dead after a timeout, then takes the **DPD timeout action**: clear the SAs, restart IKE, or do nothing.
+## AWS DPD settings
+On AWS tunnels, the DPD timeout defaults to 30 seconds and the timeout action can be `clear`, `none` or `restart`, set per tunnel in the tunnel options.
+## Why mismatches cause flapping
+If one side uses much more aggressive timers or retry counts than the other, it may declare the peer dead after brief delays or lost DPD messages, tear the tunnel down and renegotiate. The tunnel comes back, and the cycle repeats every few minutes even though Phase 1 and Phase 2 negotiate successfully each time.
+W: Mismatched DPD timers: an overly aggressive DPD interval on the customer gateway leads to false "peer dead" decisions and repeated teardowns. Aligning DPD timeout, retries and actions on both sides stops the flapping.
+X: B=Throughput limit cycling: exceeding a tunnel's bandwidth leads to packet drops, not AWS deliberately taking the tunnel down and up.
+C=Five-minute maximum session: there is no such limit. SAs are rekeyed when their lifetimes end (by default 1 hour for Phase 2 and 8 hours for Phase 1) without taking the tunnel down.
+D=Customer gateway IP changed: if the public IP changed, the tunnel would not re-establish at all with the configured customer gateway; it would not keep coming back up.
+T: A tunnel that repeatedly drops and re-establishes while IKE/IPsec negotiation succeeds points to DPD timer or action mismatches.
+
+@ Q001761 explain
+G: ## Two ways to encrypt Direct Connect traffic
+- **IPsec VPN over Direct Connect**: a Site-to-Site VPN runs over a public VIF (to public VPN endpoints) or a transit VIF (Private IP VPN to a transit gateway). A standard tunnel supports up to about **1.25 Gbps**, so using a 10 Gbps link needs several tunnels with ECMP, and a single flow still stays on one tunnel. IPsec also adds encryption overhead per packet.
+- **MACsec (IEEE 802.1AE)**: Layer 2 encryption between the customer router and the AWS Direct Connect device, done in hardware at close to line rate on supported **dedicated** connections (10, 100 and 400 Gbps at supported locations). It needs MACsec-capable router ports.
+## Example
+A 10 Gbps dedicated connection with MACsec can carry about 10 Gbps of encrypted traffic. With standard IPsec tunnels, reaching the same needs around eight tunnels and ECMP, and no single flow exceeds one tunnel's limit.
+W: VPN caps per tunnel, MACsec runs near line rate: each IPsec tunnel has a fixed bandwidth limit (about 1.25 Gbps for a standard tunnel), while MACsec encrypts in hardware at Layer 2 with close to full connection bandwidth.
+X: B=VPN outperforms MACsec: the layers are reversed. MACsec is Layer 2 and IPsec is Layer 3, and MACsec is the faster option on high-speed links.
+C=Identical performance: per-tunnel limits and encapsulation overhead make IPsec throughput and latency different from MACsec's, so cost is not the only factor.
+D=No MACsec on Direct Connect: MACsec is supported on dedicated Direct Connect connections at eligible speeds and locations.
+T: Encrypting a high-speed dedicated Direct Connect link at line rate calls for MACsec; IPsec over DX is limited per tunnel.
+
+@ Q001762 explain
+G: ## Dedicated versus hosted connections
+- A **dedicated connection** is a physical port on an AWS Direct Connect device assigned to your account (1, 10, 100 or 400 Gbps).
+- A **hosted connection** is provisioned by a Direct Connect Partner on the partner's own port and shared infrastructure, then handed to your account at a set speed.
+## MACsec requirements
+MACsec encrypts the link between your router and the AWS device, so it requires your own dedicated port that is MACsec-capable. It is offered on dedicated connections at 10, 100 and 400 Gbps at supported locations, not on hosted connections of any speed.
+Example: a 10 Gbps hosted connection shows no MACsec option; ordering a 10 Gbps dedicated connection with MACsec capability at a supported location does.
+W: No MACsec on hosted connections: the fix is to order a MACsec-capable dedicated connection from AWS at an eligible speed and location.
+X: A=Partner support case unlocks it: no support case or partner action enables MACsec on a hosted connection; the partner's shared port is not your MACsec link.
+C=Enable on the AWS side first: there is no account-level switch that later propagates MACsec to hosted connections; hosted connections do not support it.
+D=Only 100 Gbps connections: 10 Gbps dedicated connections support MACsec as well, and hosted connections do not at any speed.
+T: MACsec on Direct Connect requires a MACsec-capable dedicated connection at 10, 100 or 400 Gbps; hosted connections cannot use it.
+
+@ Q001763 explain
+G: ## MACsec key hierarchy
+MACsec on Direct Connect uses a pre-shared key pair that you create and associate with the connection:
+- **CKN** (Connectivity Association Key Name): identifies the key.
+- **CAK** (Connectivity Association Key): the secret itself.
+The same CKN/CAK pair is configured on your router. AWS stores it in AWS Secrets Manager in your account through a service-linked role.
+## MACsec Key Agreement (MKA)
+With the CAK, both devices run **MKA**, which derives the **Secure Association Key (SAK)** that actually encrypts frames. MKA rotates SAKs automatically during operation, with no manual steps.
+To change the long-term key, associate a new CKN/CAK pair with the connection and configure it on the router.
+W: CKN/CAK pre-shared pair with MKA: the pre-shared pair authenticates the two devices, and MKA derives and periodically rotates the data encryption keys.
+X: A=AWS manages all keys: the customer supplies the CKN/CAK and configures them on its router; without them, MKA cannot run.
+B=Re-enter keys at each rotation: MKA rotates SAKs automatically; only a deliberate change of the CKN/CAK pair needs an update.
+D=TLS certificates like ACM: MACsec is Layer 2 and uses MKA with pre-shared CAKs, not TLS or ACM certificates.
+T: MACsec on Direct Connect is keyed by a pre-shared CKN/CAK pair; MKA handles deriving and rotating the actual encryption keys.
+
+@ Q001764 explain
+G: ## Mutual TLS needs a private PKI
+In **mTLS**, both sides present X.509 certificates: the server proves its identity, and each client service proves its own. Every service must trust the CA that issued the others' certificates.
+## AWS Private CA
+AWS Private CA (formerly ACM Private CA) lets you run your own CA hierarchy, for example an offline-style root CA and subordinate issuing CAs, entirely under your control:
+- Certificates can name any internal identity, such as `orders.internal.corp` or a service ID.
+- Nothing is published to the public: the root is trusted only where you install it.
+- Certificates can be issued through ACM (with automatic renewal) or directly with `IssueCertificate`, and revocation uses CRLs or OCSP.
+## Example
+A root CA signs an issuing CA; each microservice receives a client certificate from it, and every service trusts only that root.
+W: AWS Private CA: it provides a managed, organization-only CA hierarchy that issues client and server certificates for internal mTLS without any public CA.
+X: A=Public ACM for private names: public ACM certificates require proving control of a public domain, and are issued by a public CA, which the requirement excludes.
+B=Cognito client certificates: Cognito user pools issue tokens for user and app authentication, not X.509 client certificates for service-to-service TLS.
+C=Secrets Manager's built-in CA: Secrets Manager stores and rotates secrets; it has no certificate authority.
+T: Internal mTLS with a CA trusted only inside the organization calls for AWS Private CA; public ACM certificates depend on a public CA and public domains.
+
+@ Q001765 explain
+G: ## ACM validation methods
+Before issuing a public certificate, ACM checks that you control the domain. For a certificate used on an Application Load Balancer, the choices are:
+- **DNS validation**: ACM gives you a CNAME record (for example `_x1.example.com` pointing to `_y2.acm-validations.aws`). You add it once to the zone.
+- **Email validation**: ACM emails domain contacts, and someone must click an approval link.
+## Managed renewal
+ACM starts renewing well before expiry. With DNS validation, it checks that the CNAME is still present and the certificate is still in use, then renews and deploys to the load balancer without anyone acting. With email validation, renewal typically depends on someone approving emails again, which can be missed.
+W: DNS validation: as long as the validation CNAME stays in DNS and the certificate is in use, ACM renews automatically, indefinitely.
+X: A=Either method renews identically: email validation relies on human approval of renewal emails, so it is not the same as hands-off DNS renewal.
+C=HTTP validation required for ALB: certificates for an ALB are validated with DNS or email; there is no rule that ALB certificates renew only with an HTTP token.
+D=Email renews without action: email validation is the method that normally needs someone to approve, the opposite of the claim.
+T: For hands-off, indefinite ACM renewal, choose DNS validation and leave the CNAME in place.
+
+@ Q001766 explain
+G: ## Why DNS-validated certificates still need the CNAME
+DNS validation is not a one-time step. At renewal time, ACM checks the same validation CNAME again to confirm you still control the domain. If the record is gone, ACM cannot validate, sends notifications (AWS Health and EventBridge events), and the certificate eventually expires.
+## Fixing it
+- **Before expiry**: add the CNAME back (ACM shows the same name and value in the certificate details), and managed renewal can proceed.
+- **After expiry**: ACM does not renew an expired certificate. Request a new certificate (in us-east-1 for CloudFront), validate it with the CNAME, and attach it to the distribution.
+## Preventing a repeat
+Mark `_...acm-validations.aws` CNAMEs as required in DNS cleanup, and alert on ACM renewal events.
+W: Renewal needs the validation CNAME: deleting it blocked managed renewal. Recreate the record so renewal works, or reissue a new certificate and attach it if the old one has already expired.
+X: A=No ongoing validation, CloudFront cache: ACM revalidates the domain at every renewal, and the certificate itself shows Expired in ACM, so this is not a CloudFront caching problem.
+B=Only affects HTTP-validated certificates: the CNAME is exactly what DNS-validated certificates depend on; it is the removed record that broke this certificate.
+D=Falls back to email: ACM does not switch a DNS-validated certificate to email validation automatically.
+T: DNS-validated ACM certificates need the validation CNAME to stay in DNS for every renewal; deleting it leads to expiry.
+
+@ Q001767 explain
+G: ## Public certificates
+A public certificate from ACM is issued by a public CA that browsers already trust. The CA must verify you control the domain, with DNS or email validation, so the domain must be a real, public domain such as `www.example.com`. Public ACM certificates are free for use with integrated services such as load balancers and CloudFront.
+## Private certificates
+AWS Private CA issues certificates from your own CA hierarchy. They can name any identity: private DNS names such as `api.corp.internal`, IP addresses or service IDs. Only systems that install your root certificate trust them, which is fine for internal clients but not for the public internet.
+## Example
+A shopping site uses a public ACM certificate for `shop.example.com`; its internal inventory service at `inventory.svc.internal` uses a certificate from Private CA trusted by internal clients.
+W: Public ACM for the website, Private CA internally: public visitors need a publicly trusted certificate for a validated domain, while private hostnames can only get certificates from a private CA.
+X: A=Private CA for both: public ACM certificates are not deprecated, and browsers on the internet do not trust a private CA, so the website would show certificate errors.
+B=Public ACM for both: public certificates require domain validation; a public CA cannot issue for non-public hostnames such as internal-only names.
+C=Private CA issues only IP certificates: Private CA issues certificates for DNS names, IP addresses and other identities, not only IP addresses.
+T: Public, internet-facing names use public ACM certificates; private, internal-only names use certificates from AWS Private CA.
+
+@ Q001768 explain
+G: ## "Never over the public internet" is a path requirement
+TLS protects the contents of traffic but not the path. A rule that traffic must never cross the public internet rules out any public endpoint, even with strong encryption.
+## AWS PrivateLink for SaaS
+- The provider places its service behind a Network Load Balancer (or Gateway Load Balancer) and publishes an **endpoint service**.
+- The customer creates an **interface VPC endpoint** in its own VPC. It appears as network interfaces with private IPs from the customer's subnets.
+- Applications call the endpoint's private DNS name or IP, and traffic flows over the AWS network to the provider, without an internet gateway, NAT or public IPs.
+Many SaaS providers offer PrivateLink for exactly this, including cross-Region access for supported services.
+W: PrivateLink to the provider's endpoint service: the connection runs from a private endpoint in the customer VPC over the AWS network to the provider, so PHI never touches the public internet.
+X: A=TLS 1.3 over the internet: encryption does not change the path, and the policy forbids internet traversal even with TLS.
+B=Internet gateway with restricted security groups: security groups limit who can connect, but the traffic still leaves through an internet gateway onto the public internet.
+C=Global Accelerator anycast IPs: accelerator IPs are public; clients reach the nearest edge location over the internet before entering the AWS network.
+E=Provider's public API endpoint: a public endpoint is reached over the internet, which the policy prohibits.
+T: When traffic must never cross the public internet, use PrivateLink to the provider; TLS, security groups and public anycast IPs do not change the path.

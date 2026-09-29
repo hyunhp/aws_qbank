@@ -1,0 +1,358 @@
+# DEA-C01 detailed explanations, batch e02 (explanation-only rewrites; letters are the published ones)
+
+@ Q000276 explain
+G: ## How Athena charges for a query
+Athena bills by the bytes it reads from S3. Two things decide how many bytes that is:
+- **File format.** CSV is row-based: to get 5 columns, Athena must read every row in full, including the other 75 columns. Parquet (and ORC) is **columnar**: each column is stored separately, so Athena reads only the column chunks the query names. Parquet also keeps min/max statistics per row group, so some blocks can be skipped entirely.
+- **Partitioning.** If data is laid out as `s3://lake/sales/dt=2026-09-01/`, a query with `WHERE dt = '2026-09-01'` touches only that prefix (partition pruning) instead of the whole table.
+## A quick example
+Selecting 5 of 80 columns from Parquet reads roughly 5/80 of the column data. Filtering one day out of a year of daily partitions reads about 1/365 of that. Compression such as Snappy shrinks what remains, and the savings multiply.
+W: Partitioned, compressed Parquet: columnar storage removes the 75 unused columns from the scan, date partitions remove the days the filter excludes, and compression reduces the bytes left. Each effect lowers bytes scanned, which is exactly what Athena bills for.
+X: B=JSON Lines: JSON is still row-based and repeats every field name in every record, so files usually get larger and Athena still reads whole records. It helps with nested data, not with scan cost.
+C=Raise the scan limit: a workgroup data usage limit is a guardrail that cancels or alerts on large queries. Raising it allows more scanning and more spending; it does not make any query read less data.
+D=Gzip the CSV: compression cuts the bytes stored and read, so it helps a little, but Athena must still decompress and read every column of every row in every file. Without columnar format and partitions, most of the waste remains.
+T: Athena cost follows bytes scanned: columnar Parquet skips unused columns and partitions skip unused dates, which is far more than compressing row-based CSV can achieve.
+
+@ Q000277 explain
+G: ## Serving data to other applications through an API
+When many internal applications need the same curated data, you usually put a managed API in front of it instead of giving each app direct access to storage or a query engine.
+- **Amazon API Gateway** provides the HTTPS endpoint. It can require **IAM authorization**, so each caller signs requests (SigV4) with its own role, and access is controlled with IAM and resource policies.
+- **Usage plans and API keys** let you give each application its own throttling rate, burst and quota, so one noisy app cannot starve the others.
+- A **Lambda backend** runs the logic: it reads a precomputed aggregate from S3, or runs an Athena query, and returns JSON.
+## Example
+The billing app calls `GET /customers/{id}/aggregates` signed with its IAM role; API Gateway checks the signature and its usage plan limit of, say, 50 requests per second, then invokes Lambda, which fetches the aggregate and returns it.
+W: API Gateway with Lambda: API Gateway provides IAM authentication and per-client throttling through usage plans out of the box, and Lambda queries or reads the curated S3 data without any servers to run.
+X: A=EC2 with a shared password: one password shared by all apps cannot identify which app is calling, so per-app throttling and auditing are impossible, and you must patch, scale and secure the server yourself.
+B=Direct Athena access: each app would need broad Athena, Glue Data Catalog and S3 permissions, would write its own SQL, and there is no per-app request throttling or single REST contract; it is a query engine, not an API layer.
+D=Public S3 URLs: public objects have no authentication at all, which exposes customer data to anyone with the URL, and S3 offers no per-application throttling.
+T: For a secured, throttled internal REST endpoint, use API Gateway (IAM auth plus usage plans) in front of a Lambda backend, not direct storage or query-engine access.
+
+@ Q000278 explain
+G: ## Describing a workload with the "Vs" of data
+Data engineers often characterize a workload with a few properties:
+- **Volume**: how much data there is.
+- **Velocity**: how fast it arrives, and how much that rate changes.
+- **Variety**: how many different shapes it takes: structured rows, semi-structured JSON, unstructured images or text.
+## Why they matter for architecture
+High **variety** favors storing data in its native format in a data lake such as Amazon S3 and applying a schema when it is read (**schema-on-read**), for example with a Glue Data Catalog table over JSON, rather than forcing everything into one fixed relational schema up front.
+Highly **variable velocity** favors services that scale automatically, such as Kinesis Data Streams in on-demand mode, Lambda, or serverless query engines, rather than capacity sized for the average day.
+W: High variety and variable velocity: three different data structures point to flexible, schema-on-read storage, and unpredictable spikes during campaigns point to elastic, automatically scaling ingestion and processing.
+X: A=Low variety, predictable batches: the workload mixes relational rows, JSON and images and arrives in unpredictable spikes, so both parts of this description contradict the scenario.
+B=Single type, fixed schema: that describes a classic relational workload where schema-on-write fits well; here images and evolving JSON logs cannot share one fixed schema.
+D=Low volume, constant velocity: the stem stresses rates that spike unpredictably, which is the opposite of constant velocity, and small steady data would not push the design toward elastic services.
+T: Many data shapes (variety) plus unpredictable arrival rates (velocity) are what drive a schema-on-read data lake with automatically scaling processing.
+
+@ Q000279 explain
+G: ## Using a foundation model inside a pipeline
+Traditional parsing with rules or regular expressions struggles with free text such as product reviews. A **foundation model** (a large pretrained model) can read a review and return structured output, for example:
+- input: "The X200 blender is loud but crushes ice perfectly"
+- output: `{"product": "X200 blender", "sentiment": "mixed"}`
+## Amazon Bedrock
+**Amazon Bedrock** is a fully managed service that offers foundation models from several providers through one API. You call `InvokeModel` or `Converse` with a prompt; AWS runs and scales the model, so there are no GPUs, endpoints or model servers to manage.
+In a pipeline, a Glue job, Lambda function or Step Functions state can read each review from S3, call Bedrock with an extraction prompt, and write the structured result back. For large offline jobs, Bedrock batch inference can process files from S3.
+W: Amazon Bedrock: it gives managed API access to foundation models that can extract entities and sentiment from unstructured text, and it can be called from the transformation step without hosting any model infrastructure.
+X: B=Kinesis Data Analytics: now called Amazon Managed Service for Apache Flink, it runs stream-processing applications such as windowed aggregations; it does not provide foundation models for understanding text.
+C=Glue Schema Registry: it stores and validates schemas (Avro, JSON Schema, Protobuf) for streaming producers and consumers; it cannot read free text or extract entities from it.
+D=Redshift Spectrum: it lets Redshift run SQL over files in S3; SQL can filter and aggregate text columns but cannot interpret meaning such as product names or sentiment.
+T: To pull structure out of unstructured text with a foundation model and no model hosting, call Amazon Bedrock from the pipeline; streaming, schema and SQL services do not interpret language.
+
+@ Q000280 explain
+G: ## DynamicFrame versus DataFrame
+A Spark **DataFrame** needs one schema for the whole dataset. If a field is a number in some JSON records and a string in others, Spark must pick one type up front, and mismatched values may become null or cause errors.
+An AWS Glue **DynamicFrame** is made of self-describing records: each record carries its own structure, and no single schema is required at read time.
+- When a field has conflicting types, Glue records it as a **choice type**, for example `price: choice<int,string>`.
+- You then decide how to resolve it with `resolveChoice` (cast, split into columns, or make a struct), and rename or retype fields with `ApplyMapping`.
+- When the data is clean, `toDF()` converts it to a regular Spark DataFrame for strict-schema processing.
+## Typical pattern
+`glueContext.create_dynamic_frame.from_catalog(...)` reads the messy JSON, `resolveChoice` fixes conflicts, then `toDF()` hands a clean DataFrame to the rest of the script.
+W: DynamicFrame: it reads semi-structured data without a fixed schema, keeps conflicting field types as choice types instead of failing, and can later be converted to a strict DataFrame with `toDF()`.
+X: A=NumPy array: NumPy holds in-memory numeric arrays on one machine; it is not a distributed Spark structure and has no notion of nested JSON records or schema evolution.
+B=Spark DataFrame only: a DataFrame applies one inferred or declared schema to all records, so inconsistent types are coerced, nulled or rejected instead of being preserved for later resolution.
+D=Pandas DataFrame: pandas runs on a single node and loads data into memory, which does not scale for a Glue Spark job, and it offers no Glue schema-conflict handling.
+T: Read evolving JSON as a DynamicFrame, resolve choice types, then convert to a DataFrame; a plain DataFrame forces one schema too early.
+
+@ Q000281 explain
+G: ## Partitioning data in S3 for Athena
+A partitioned table stores data under prefixes named after column values, commonly in Hive style:
+`s3://sales/year=2026/month=09/country=KR/part-0001.parquet`
+Each partition value becomes a column Athena can filter on. When a query says `WHERE year = '2026' AND month = '09' AND country = 'KR'`, Athena reads only that prefix and skips everything else (**partition pruning**), which lowers both run time and bytes scanned.
+## Choosing partition keys
+- Use columns that appear in most `WHERE` clauses.
+- Keep the number of values reasonable: too many tiny partitions create many small files and slow down planning.
+- For many partitions, **partition projection** lets Athena compute partition locations from the key pattern instead of looking them up in the catalog.
+W: Partition by year, month and country: these match exactly how analysts filter, so Athena prunes whole prefixes and reads only the relevant slice of data.
+X: A=Partition by file size: file size is not a column anyone filters on, so no query predicate can ever prune those partitions.
+C=Random UUID partitions: a random value never appears in analyst filters, so every query must scan every partition, and the huge number of partitions adds planning overhead.
+D=Single unpartitioned prefix: with no partitions, every query scans the full dataset regardless of the date or country filter.
+T: Partition on the columns queries actually filter by (here year, month and country) so Athena can skip everything outside the requested slice.
+
+@ Q000282 explain
+G: ## Two ways to run Spark on Amazon EMR
+- **EMR Serverless**: you create an application (for example Spark), submit jobs, and EMR provisions and scales workers for each job automatically. You choose the release, worker size (vCPU, memory, disk), CPU architecture and optional pre-initialized capacity, but you never pick EC2 instance types or manage nodes. You pay for the resources the job actually uses.
+- **EMR on EC2**: you launch a cluster of EC2 instances. You choose instance types and families, instance fleets, Spot or On-Demand, custom AMIs, bootstrap actions and cluster configuration. In return you own sizing, scaling policies and shutting clusters down.
+## Picking between them
+Sporadic, unpredictable jobs fit Serverless well because nothing sits idle between runs. Needs such as a specific instance family or a custom AMI with special drivers push toward EMR on EC2, where the underlying hardware is under your control.
+W: Serverless trades control for simplicity: EMR Serverless removes cluster provisioning and scaling, while EMR on EC2 keeps full control of instance types and custom AMIs for the occasional specialized job.
+X: A=Identical control: EMR Serverless hides the EC2 layer, so you cannot pick instance types or use custom AMIs there; the level of control is deliberately different.
+B=Serverless needs manual clusters: this reverses the two. Serverless has no clusters to provision, whereas EMR on EC2 is where you create and size clusters yourself, with optional managed scaling.
+C=EMR on EC2 runs only Hive: EMR on EC2 runs Spark, Hive, Presto/Trino, Flink, HBase and more; Spark is one of its most common workloads.
+T: EMR Serverless removes cluster management but hides the hardware; choose EMR on EC2 when you need specific instance types or custom AMIs.
+
+@ Q000283 explain
+G: ## How a Glue job reaches a database in a VPC
+An RDS instance lives in private subnets of a VPC. A Glue **JDBC connection** tells Glue which subnet and security groups to use; when the job starts, Glue creates elastic network interfaces in that subnet, and all traffic to the database leaves from those interfaces.
+For the connection to work:
+- The subnet must have a route to the database subnet (same VPC, or peering or a transit gateway for another VPC).
+- The Glue security group needs a **self-referencing inbound rule** allowing all TCP from itself, which Glue components require.
+- The RDS security group must allow inbound on port `3306` from the Glue security group.
+- To reach S3 for scripts and output, the subnet needs an S3 gateway endpoint or a NAT gateway.
+## Reading the symptom
+A **timeout** means packets never got an answer, which is a network path problem. Bad credentials would give an "access denied" error instead.
+W: Missing route or security group rule: a connection timeout while the database is healthy and credentials are right means Glue's network interfaces cannot reach RDS, typically because of a missing route or a security group rule for port 3306.
+X: A=Newer JDBC driver: a driver incompatibility produces protocol or authentication errors once connected, not a timeout, and current MySQL drivers work with supported MySQL versions.
+B=Multi-AZ enabled: Multi-AZ adds a standby in another Availability Zone and keeps the same endpoint; it does not block connections.
+D=Catalog name mismatch: the Data Catalog database name and the connection name are independent labels, and a naming mismatch would not cause a network timeout to RDS.
+T: A JDBC timeout from Glue means a network path problem (subnet routes or security groups), not credentials or database settings.
+
+@ Q000284 explain
+G: ## Paying only when you query
+**Amazon Athena** is a serverless SQL engine: there is nothing to provision, and data stays in S3. With the default pricing you pay for the data each query scans (per TB), so a month with no queries costs nothing beyond S3 storage.
+Because the data is already **Parquet**, Athena reads only the needed columns, and partitions can reduce the scan further, so each ad hoc query over 5 TB may read only a small fraction of it.
+## Contrast with always-on options
+- A provisioned database or cluster charges every hour it runs, whether or not anyone queries.
+- Loading 5 TB into a database also means building and maintaining an ingestion job and paying for duplicate storage.
+W: Athena pay-per-scan: it queries the Parquet files in place with no infrastructure, and charges only for data scanned when a query runs, which suits a handful of monthly ad hoc queries.
+X: B=RDS for PostgreSQL: you would pay for an instance and several TB of storage all month, plus build a load process, for a few queries; row-based PostgreSQL is also not built for large analytical scans.
+C=Permanent EMR with Presto: a long-running cluster bills for its EC2 instances every hour even when idle, and someone must manage and patch it.
+D=Provisioned Redshift all month: a provisioned cluster bills per node-hour regardless of use, which is expensive for a few queries per month and requires cluster management.
+T: For rare ad hoc SQL over data already in S3, Athena's pay-per-query model beats any always-on database or cluster.
+
+@ Q000285 explain
+G: ## The small files problem
+Spark splits input into tasks, and with many tiny files each file tends to become its own task. With millions of files of a few KB:
+- Listing S3 prefixes takes a long time before any data is read.
+- The driver schedules millions of tasks, and each task spends more time starting up than reading data.
+- Adding workers does not help much, because the bottleneck is per-file overhead, not compute.
+## Two fixes
+- **Compaction**: rewrite the data periodically into larger files, commonly in the range of about 128 MB to 1 GB, often as Parquet.
+- **Grouping on read**: Glue can combine many small files into one task with the connection options `groupFiles` set to `inPartition` and a target `groupSize`, for example `{"groupFiles": "inPartition", "groupSize": "134217728"}` for about 128 MB groups.
+W: Compact or group small files: both reduce the number of files or tasks Spark must handle, which removes the listing and scheduling overhead that dominates this job.
+X: B=Convert to JSON: changing the format leaves the same millions of tiny files, and JSON is larger and slower to parse than most formats, so the overhead remains.
+C=Disable job bookmarks: bookmarks track which data was already processed; turning them off makes the job reprocess everything, which adds work instead of reducing per-file overhead.
+D=More DPUs only: more workers cannot fix a job bound by listing and per-file task overhead; you pay more for capacity that mostly waits on scheduling.
+T: With millions of tiny files, reduce the file count (compaction or `groupFiles`) instead of adding more compute.
+
+@ Q000286 explain
+G: ## Why database connections are awkward in Lambda
+A classic JDBC or ODBC client opens a TCP connection, keeps it alive and waits for results. In Lambda, execution environments come and go, so connections are hard to reuse, drivers add package size, and long queries keep the function running and billing while it waits.
+## The Redshift Data API
+The **Amazon Redshift Data API** is an HTTPS API for running SQL:
+- `ExecuteStatement` (or `BatchExecuteStatement`) submits SQL and returns a statement ID immediately.
+- `DescribeStatement` reports whether it is still running, finished or failed.
+- `GetStatementResult` pages through the results.
+Authentication uses IAM with temporary credentials or a Secrets Manager secret, it works with provisioned clusters and Redshift Serverless, and completion events can be sent to EventBridge.
+W: Redshift Data API: it runs SQL over HTTPS with IAM or Secrets Manager credentials and returns a statement ID for asynchronous polling, so Lambda needs no drivers, persistent connections or pooling.
+X: A=Redshift Spectrum: Spectrum lets a Redshift cluster query external tables in S3; you still have to connect to Redshift to use it, so it does nothing for how Lambda submits queries.
+B=JDBC pool in Lambda: this is exactly the persistent connection management the requirement rules out, and pools behave poorly because each Lambda environment keeps its own connections and may be frozen or discarded.
+C=Amazon RDS Proxy: RDS Proxy pools connections for RDS and Aurora databases; it does not support Amazon Redshift.
+T: For connectionless, asynchronous SQL from Lambda to Redshift, use the Redshift Data API instead of drivers or connection pools.
+
+@ Q000287 explain
+G: ## The "Vs" of data again
+- **Volume**: how much data.
+- **Velocity**: how fast it arrives.
+- **Variety**: how many different structures it takes.
+- **Veracity**: how trustworthy and accurate it is.
+## Why variety forces different tools
+Each structure has a natural home and processing style:
+- Structured order rows fit relational tables or a warehouse such as Redshift and are queried with SQL.
+- Semi-structured JSON clickstream events suit S3 with schema-on-read (Glue crawlers, Athena) or stream processing.
+- Unstructured images are stored as S3 objects and processed with image-aware tools such as Amazon Rekognition, not SQL.
+No single store handles all three well, so the pipeline mixes tools.
+W: Variety of data structures: relational rows, semi-structured JSON and binary images each need a different storage format and processing engine, which is what drives the multi-tool design.
+X: A=Velocity of order writes: the write rate of one database affects how that database is sized, not why images and JSON events need different tools than relational rows.
+B=Veracity of clickstream: data quality matters for validation and cleansing, but it does not explain why images, JSON and tables need different storage and processing.
+D=Volume of RDS alone: the size of one relational database says nothing about the other two data types and would at most call for a bigger database, not different tools.
+T: When a pipeline mixes tables, JSON and images, variety is the characteristic that drives different storage and processing tools.
+
+@ Q000288 explain
+G: ## Orchestrating AWS API calls without servers
+**AWS Step Functions** runs a state machine defined in Amazon States Language. Each state does one thing, and the service keeps track of where the workflow is.
+- **Service integrations** call AWS APIs directly: optimized integrations for common services, plus AWS SDK integrations for most AWS APIs, with no Lambda code needed.
+- The **`.sync` pattern** waits for a job to finish, for example `arn:aws:states:::glue:startJobRun.sync` starts a Glue job and continues only when it completes.
+- **Retry** with `IntervalSeconds`, `MaxAttempts` and `BackoffRate` handles transient failures; a **Choice** state branches on results.
+## Example
+Call API 1, then 2 and 3; a Choice state checks a status field; the Glue task waits with `.sync`; any step failing retries with backoff before a Catch routes to an alert.
+W: Step Functions with service integrations: it sequences API calls, retries with backoff, branches with Choice states and waits for Glue with `.sync`, all as a fully managed, serverless service.
+X: A=Cron on EC2 with the CLI: this needs a server to patch and keep running, and you must hand-code retries, branching and job polling in scripts.
+B=Single sleeping Lambda: Lambda stops after at most 15 minutes, so waiting for a Glue job can exceed it, and you pay for idle time while the function sleeps.
+D=Largest MWAA environment: Airflow could orchestrate this, but MWAA runs an always-on environment that bills hourly, and the largest size adds cost with no benefit for a five-step flow.
+T: For serverless sequencing, retries, branching and waiting on AWS jobs, use Step Functions service integrations rather than scripts, sleeping functions or an Airflow environment.
+
+@ Q000289 explain
+G: ## Event routing with Amazon EventBridge
+**Amazon EventBridge** is a serverless event bus. Applications publish custom events with `PutEvents`, typically to a custom event bus. Each event is JSON with fields such as `source`, `detail-type` and `detail`.
+**Rules** match events by pattern, for example `{"source": ["com.shop.orders"], "detail-type": ["OrderBatchReady"]}`, and send matching events to targets.
+- A rule can have several targets (up to five), and several rules can match the same event, so one event can fan out to many consumers independently.
+- Targets include Step Functions state machines, Lambda functions, SQS queues, SNS topics, Kinesis streams and API destinations.
+- An **archive** can keep events for replay, which helps auditing.
+## Example
+One rule starts a state machine; a second rule on the same pattern sends the event to an SQS queue for an audit consumer and to a Lambda function for parallel processing.
+W: Amazon EventBridge: rules match the specific custom event and route it to Step Functions and other independent targets at the same time, with no code to fan it out.
+X: B=SNS used exclusively: SNS fans out messages, but it cannot start a Step Functions execution directly as a subscriber and has no content-based rules over event fields; you would need extra glue code.
+C=Systems Manager Automation: Automation runs operational runbooks against resources, such as patching or restarting instances; it is not an event bus that routes application events.
+D=AWS Config rules: Config evaluates resource configuration for compliance; it reacts to configuration changes, not to custom application events.
+T: For custom application events that must start a state machine and fan out to other targets, EventBridge rules are the routing layer.
+
+@ Q000290 explain
+G: ## Why Lambda-calling-Lambda breaks down
+A Lambda function can run for at most **15 minutes** (900 seconds). An "orchestrator" function that calls other functions synchronously and waits for them:
+- is stopped at 15 minutes, even if the workflow is half done, and loses its in-memory progress;
+- pays for the whole time it spends waiting on other functions;
+- has to hand-code retries, error handling and state tracking.
+## What Step Functions changes
+A **Standard** workflow can run for up to a year. The state machine stores the progress between steps, so no function has to stay alive to remember where the workflow is. Each step is a separate Lambda invocation with its own 15-minute limit, and retries and error handling are declared per state.
+W: 15-minute Lambda timeout: a workflow that sometimes runs over 20 minutes cannot be held inside one orchestrating function, while Step Functions keeps state externally and runs for much longer.
+X: B=Step Functions cannot invoke Lambda: invoking Lambda is one of the most common Step Functions tasks, through an optimized service integration.
+C=No way to pass data: Lambda functions pass data through invocation payloads and return values, or through S3 and DynamoDB, so data passing is possible, just clumsy to manage.
+D=Lambda cannot call Lambda: a function can invoke another with the Lambda `Invoke` API; it works, it just makes a fragile, time-limited orchestrator.
+T: One Lambda orchestrating a long workflow hits the 15-minute cap; Step Functions holds the state so each step stays short.
+
+@ Q000291 explain
+G: ## Standard versus Express workflows
+Step Functions offers two workflow types:
+- **Standard**: runs up to one year, **exactly-once** execution of each step, execution history kept by the service for 90 days, billed per state transition. Suited to long-running, auditable processes.
+- **Express**: runs up to **five minutes**, designed for very high event rates, billed by number of requests and duration and memory. Asynchronous Express workflows run at least once and synchronous ones at most once. History goes to CloudWatch Logs if you enable logging.
+## Why cost differs
+Millions of short executions with several states each would create many millions of state transitions on Standard. Express charges for short durations instead, which is usually much cheaper at high volume.
+W: Express Workflows: they are built for high-volume, short executions and billed by requests and duration, and they drop the exactly-once guarantee and 90-day history that this workload does not need.
+X: B=Activity tasks with EC2 workers: activities let your own workers poll for work; that adds servers to manage and cost, and it is a task pattern, not a cheaper workflow type.
+C=Standard Workflows: per-transition billing across millions of executions is expensive, and its exactly-once semantics and long history are features the scenario says it does not need.
+D=Zero-second Wait state: a Wait state only pauses execution; it adds a transition rather than reducing cost, and it does not change the workflow type.
+T: High-volume, short, cost-sensitive executions without exactly-once needs belong in Express; Standard is for long-running, auditable workflows.
+
+@ Q000292 explain
+G: ## Error handling in Step Functions
+Each Task state can declare how it reacts to errors:
+- **Retry** lists rules matched by error name, with `IntervalSeconds` (first wait), `MaxAttempts` (how many retries) and `BackoffRate` (multiplier for each next wait). For example `IntervalSeconds: 2`, `BackoffRate: 2`, `MaxAttempts: 3` waits 2, 4 and 8 seconds. `MaxDelaySeconds` and `JitterStrategy` can cap and spread waits.
+- **Catch** runs after retries are exhausted (or for errors with no retry): it routes the execution to another state, such as one that logs the failure and notifies a team, and can put the error details into the state's output with `ResultPath`.
+## Example
+The Lambda task retries `Lambda.ServiceException` and custom transient errors three times with backoff, then `Catch` on `States.ALL` goes to a `HandleFailure` state.
+W: Retry with backoff plus Catch: Retry handles transient errors with a limited number of increasingly spaced attempts, and Catch sends the execution to a fallback state only once those attempts fail.
+X: A=Parallel state without error handling: a Parallel state runs branches at the same time; without Retry or Catch, one failed branch fails the whole state, so it adds no retries or fallback.
+C=More Lambda memory: more memory gives more CPU, which may speed code up, but it does nothing about errors caused by a downstream service.
+D=Map over an empty array: a Map state iterates over items; with an empty array it does nothing at all and provides no retry or fallback behavior.
+T: Declare Retry with a backoff rate for transient errors and Catch for the fallback path; the two together give bounded retries followed by graceful failure.
+
+@ Q000293 explain
+G: ## Fan-out with Amazon SNS
+**Amazon SNS** is a publish/subscribe service. A publisher sends one message to a **topic**, and SNS delivers a copy to every subscriber of that topic independently.
+Subscription types include email, SMS, HTTPS endpoints, SQS queues, Lambda functions and Amazon Data Firehose.
+- Each subscription gets its own delivery and retry behavior, so a slow or failed email delivery does not stop the Lambda invocation.
+- A **subscription filter policy** can restrict which messages a given subscriber receives.
+## Example
+A pipeline failure alarm publishes to `pipeline-failures`. The on-call email subscription sends the alert to engineers, and the Lambda subscription runs remediation, both from the same single message.
+W: SNS topic with email and Lambda subscriptions: one published message is copied to each subscriber, so engineers get email and the remediation function runs, independently of each other.
+X: B=One SQS queue for both: a queue delivers each message to one consumer that then deletes it, so engineers and Lambda would compete for messages, and SQS cannot send email.
+C=Kinesis read by an email client: email clients cannot consume Kinesis streams, and you would need custom consumers just to turn records into alerts.
+D=CloudWatch dashboard: a dashboard shows metrics to someone who opens it; it does not push notifications or invoke functions.
+T: For one message that must reach several independent receivers such as email and Lambda, publish once to an SNS topic and subscribe each receiver.
+
+@ Q000294 explain
+G: ## Buffering work with Amazon SQS
+When a producer is faster than a consumer, you need a **buffer** that stores work until the consumer is ready. **Amazon SQS** does this:
+- The producer sends messages to the queue, which holds them durably (up to 14 days retention).
+- A Lambda **event source mapping** polls the queue and invokes the function with batches, scaling up as concurrency allows. Messages that are not deleted after processing become visible again and are retried.
+- A **dead-letter queue** (set through the redrive policy's `maxReceiveCount`) receives messages that keep failing, so they can be inspected instead of retried forever.
+## Example
+The producer writes 10,000 tasks per minute; the function processes 3,000 per minute; the backlog waits safely in SQS and drains when traffic drops. A malformed task moves to the DLQ after five failed receives.
+W: SQS queue with a DLQ: the queue absorbs bursts and keeps every task until Lambda has capacity, and the DLQ keeps tasks that repeatedly fail, so nothing is lost.
+X: A=15-minute timeout: the timeout limits how long one invocation runs; tasks are lost because invocations are throttled before they start, which a longer timeout does not change.
+B=Synchronous tight retry loop: throttled synchronous calls return an error to the producer, and hammering Lambda in a loop adds load and still loses tasks if the producer gives up or crashes.
+C=More memory: memory makes each invocation faster, but throttling depends on concurrency limits, and without a buffer, bursts above capacity are still dropped.
+T: When producers outpace a consumer, put a durable queue between them (with a DLQ for poison messages) instead of tuning the function.
+
+@ Q000295 explain
+G: ## Glue Workflows and triggers
+An **AWS Glue Workflow** chains crawlers and jobs together using **triggers**. Trigger types:
+- **Scheduled**: fires on a cron schedule.
+- **On-demand**: fires when started manually or through the API.
+- **Conditional**: fires when watched jobs or crawlers reach a given state, such as `SUCCEEDED` for a job or a successful crawl.
+- **EventBridge event** (for starting workflows): fires from matching events.
+A conditional trigger has a **predicate** with a list of conditions and a logical operator: `AND` (all must be met) or `ANY` (one is enough).
+## Example
+Trigger `after-both-crawlers` has conditions `crawler-orders SUCCEEDED` and `crawler-customers SUCCEEDED` with `Logical: AND`, and its action starts `job-join-orders`.
+W: Conditional trigger with AND: it watches both crawlers and starts the downstream job only when both have completed successfully, which is exactly the multi-predicate dependency required.
+X: A=Every-5-minutes schedule: a schedule fires on time, not on state, so the job could start before the crawlers finish, or run repeatedly for no reason.
+C=On-demand manual trigger: it needs a person or script to start the job and does not check the crawlers' results at all.
+D=Job bookmarks: bookmarks track which input data a job has already processed; they do not control when a job starts or what it depends on.
+T: In Glue Workflows, dependencies on the success of several crawlers or jobs are expressed with a conditional trigger using the AND operator.
+
+@ Q000296 explain
+G: ## Where failed events go with EventBridge
+When an EventBridge rule sends an event to a target, EventBridge retries delivery with a **retry policy** (by default up to 24 hours and up to 185 attempts, both configurable). Without a dead-letter queue, events that still cannot be delivered are dropped.
+- A **dead-letter queue (DLQ)** is an SQS queue attached to the **rule target**. Undeliverable events land there with attributes describing the error, so you can inspect and redrive them later.
+## A Lambda detail worth knowing
+EventBridge invokes Lambda asynchronously. Failures EventBridge sees, such as throttling or missing permissions, go to the target DLQ. Errors thrown by the function code itself are retried by Lambda's own asynchronous invocation settings; to keep those events too, also configure an **on-failure destination** or DLQ on the Lambda function.
+W: DLQ on the rule target: it stores events that exhaust the configured retries in an SQS queue instead of discarding them, so they can be inspected and reprocessed.
+X: A=S3 Versioning on output: versioning keeps older versions of objects already written; it records nothing about events that never finished processing.
+B=Disable retries: turning retries off makes more events fail on the first transient error, and without a DLQ they are still discarded.
+D=15-minute Lambda timeout: a longer timeout may avoid some timeouts, but any event that still fails is lost with no record.
+T: Attach an SQS dead-letter queue to the EventBridge target (and an on-failure destination on the function for code errors) so failed events are kept instead of dropped.
+
+@ Q000297 explain
+G: ## How Amazon MWAA runs Airflow
+**Amazon Managed Workflows for Apache Airflow (MWAA)** runs the Airflow scheduler, web server, workers and metadata database for you.
+- **Workers scale automatically**: you set a minimum and maximum worker count, and MWAA adds workers as queued and running tasks grow, then removes them when the load drops.
+- **High availability**: an environment is created in two private subnets in **different Availability Zones**, and MWAA runs its components across them, so the environment tolerates a single AZ failure.
+- Environment classes (for example `mw1.small` to larger sizes) set the capacity of schedulers and workers.
+## Example
+With `MinWorkers: 1` and `MaxWorkers: 10`, a quiet night runs on one worker, and a morning backfill with dozens of tasks scales toward ten without anyone launching instances.
+W: Autoscaling workers across AZs: MWAA scales workers between the configured minimum and maximum based on task load, and deploys the environment across two Availability Zones for availability.
+X: B=Fixed worker count: MWAA supports a minimum and maximum worker setting and scales between them automatically; a fixed count happens only if you set both to the same value.
+C=Manually launched EC2 workers: MWAA workers are managed by the service; you never launch EC2 instances to add Airflow capacity.
+D=No AZ redundancy: MWAA requires subnets in two Availability Zones precisely so the environment can span them.
+T: MWAA scales Airflow workers automatically between a min and max and spans two Availability Zones, with no instances to manage.
+
+@ Q000298 explain
+G: ## Map state modes in Step Functions
+A **Map** state runs the same steps for every item in a list.
+- **Inline** mode runs iterations inside the parent execution, with limited parallelism and a single shared execution history, which suits small lists.
+- **Distributed** mode starts **child workflow executions** for items, can read item lists or objects directly from S3, and scales to very large numbers of items with high concurrency.
+Useful Distributed Map settings:
+- `MaxConcurrency` caps how many children run at once, protecting downstream systems.
+- `ToleratedFailurePercentage` (or `ToleratedFailureCount`) lets the run succeed if only a small share of items fail.
+- `ItemBatcher` groups items so each child processes several.
+## Example
+Point an `ItemReader` at the S3 prefix with 3,000 files, set `MaxConcurrency: 100` and `ToleratedFailurePercentage: 1`.
+W: Distributed Map with limits: it processes each file as an independent child execution in parallel, with `MaxConcurrency` for the concurrency cap and `ToleratedFailurePercentage` for the 1% failure tolerance.
+X: A=Wait state between files: a Wait state only pauses; it would make processing sequential and slow, with no parallelism or failure tolerance.
+B=Choice state loop: looping with a Choice state processes one file per iteration in sequence and quickly accumulates a huge execution history, with no failure-percentage setting.
+C=Parallel with 3,000 branches: Parallel branches are fixed in the definition, so the list cannot change per run, a 3,000-branch definition would be enormous, and Parallel has no failure-percentage tolerance.
+T: For thousands of independent items with a concurrency cap and failure tolerance, use Distributed Map; Parallel is for a few fixed branches.
+
+@ Q000299 explain
+G: ## Two orchestrators, two cost models
+- **AWS Step Functions** is serverless. You define a state machine in Amazon States Language (JSON or the visual Workflow Studio). Standard workflows are billed per state transition, so when nothing runs, nothing is billed, and there are no servers to patch.
+- **Amazon MWAA** runs a managed Apache Airflow environment. Workflows are Python DAGs. The environment bills per hour for as long as it exists (plus workers above the minimum and metadata storage), whether or not a DAG runs.
+## Applying it here
+A 10-step pipeline running twice a day makes only a few dozen state transitions a day, a tiny Step Functions cost. An MWAA environment would be idle almost all day while still billing hourly. MWAA makes more sense when a team already has Airflow DAGs or needs Airflow's operators and ecosystem.
+W: Step Functions: it is serverless, costs nothing between runs and needs no environment to operate, so a small, infrequent pipeline without existing DAGs costs and weighs the least there.
+X: B=MWAA has no minimum cost: an MWAA environment bills hourly for as long as it exists, which is exactly the idle cost the team wants to avoid.
+C=Step Functions needs Python DAGs: Python DAGs are how Airflow workflows are written; Step Functions uses Amazon States Language definitions, so the reason given is wrong even though the service is right.
+D=MWAA is cheaper for small flows: an always-on environment is the more expensive choice for a workflow that runs twice a day, especially with no existing DAGs to reuse.
+T: For small, infrequent workflows without Airflow history, serverless Step Functions avoids MWAA's always-on environment cost and upkeep.
+
+@ Q000300 explain
+G: ## Where Step Functions records what happened
+Every execution keeps an **event history**: a timeline of events such as `TaskStateEntered`, `TaskScheduled`, `TaskFailed` and `ExecutionFailed`, each with timestamps and details.
+In the console, the execution details page shows:
+- a **graph view** where the failed state is highlighted;
+- per-state **input and output**, so you can see exactly what data reached the failing state;
+- the **error name and cause**, for example `States.TaskFailed` with the message returned by Lambda.
+For Standard workflows this history is kept for 90 days and is also available through the `GetExecutionHistory` API. Express workflows record it in CloudWatch Logs when logging is enabled. After fixing the issue, a failed Standard execution can be **redriven** from the failed state.
+W: Execution event history and graph view: it shows which state failed, the input and output of every state, and the exact error and cause in one place, so diagnosis takes seconds.
+X: A=AWS Config timeline: Config records configuration changes to the state machine resource, not what happened inside individual executions.
+B=CloudTrail StartExecution events: CloudTrail logs API calls, such as who started the execution, but not the internal state-by-state data flow or task errors.
+C=Cost Explorer: Cost Explorer shows spending by service and tag; it contains no execution details or error information.
+T: To debug a failed Step Functions run, open the execution's event history and graph view; Config, CloudTrail and Cost Explorer record changes, API calls and spend, not execution internals.

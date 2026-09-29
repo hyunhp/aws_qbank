@@ -1,0 +1,340 @@
+# ANS-C01 detailed explanations, batch e07 (explanation-only rewrites; letters are the published ones)
+
+@ Q001719 explain
+G: ## Why the NAT gateway bill grows
+A NAT gateway charges per hour and **per GB processed**. Every byte an instance in a private subnet sends to Amazon S3 or DynamoDB through it is billed as NAT data processing, even though both services are inside AWS.
+## Gateway endpoints
+S3 and DynamoDB are the two services that support **gateway VPC endpoints**. A gateway endpoint is not a network interface: it adds a route to the subnet route table whose destination is the service's managed prefix list (for example `pl-xxxxxxxx` for S3 in that Region) and whose target is the endpoint (`vpce-...`).
+- Traffic to S3 or DynamoDB now matches that more specific prefix-list route instead of `0.0.0.0/0 -> nat-...`, so it never touches the NAT gateway.
+- Gateway endpoints have no hourly or per-GB charge.
+- Traffic stays on the AWS network, and endpoint policies can limit which buckets or tables are reachable.
+W: Gateway endpoints for S3 and DynamoDB: they route that traffic around the NAT gateway through a route-table entry, so the NAT data processing charge for it disappears and the endpoints themselves are free, while the traffic stays private.
+X: A=NAT instance: a NAT instance avoids the per-GB fee but adds EC2 cost, becomes a throughput bottleneck and a single point of failure you must patch and manage, and S3/DynamoDB traffic still goes through an address translator instead of a private path.
+B=More Elastic IPs: extra Elastic IPs raise the number of concurrent connections a NAT gateway can make to one destination; they do nothing to the per-GB processing charge, which is billed on every byte either way.
+D=Interface endpoints: S3 and DynamoDB do offer interface endpoints (PrivateLink), but they bill per endpoint per AZ per hour plus per GB. Gateway endpoints for the same two services cost nothing, so they are the more effective way to remove this charge.
+T: For S3 and DynamoDB from inside a VPC, the free gateway endpoint beats both the NAT gateway and a paid interface endpoint whenever the traffic starts in that VPC.
+
+@ Q001721 explain
+G: ## MTU and what changes on the VPN path
+The MTU is the largest packet a link carries. Inside a VPC many instance types use jumbo frames with an MTU of `9001` bytes, but traffic that leaves the VPC through an internet gateway or a Site-to-Site VPN is limited to smaller packets.
+A Site-to-Site VPN wraps each packet in IPsec: new IP header, ESP header, padding and authentication data. That overhead means the tunnel supports a maximum MTU of about `1446` bytes and a TCP MSS of about `1406` bytes.
+## Where the stalls come from
+- TCP handshakes and small messages fit and work.
+- Large segments sized for a big MTU are too big for the tunnel. If the "fragmentation needed" ICMP messages that Path MTU Discovery relies on are lost or filtered, the sender keeps retransmitting packets that are dropped: stalls and retransmissions.
+- The fix is **MSS clamping** on the customer gateway (for example clamping to `1379`, as AWS's sample configurations do) and/or lowering the MTU on the instances or interfaces that talk over the VPN.
+W: IPsec overhead lowers the path MTU: packets sized for the jumbo-frame interface exceed what the tunnel can carry, and without MSS clamping (or working PMTUD) the oversized segments are dropped, producing exactly the stall-and-retransmit pattern seen only for larger payloads.
+X: A=VPN bandwidth cap: each VPN tunnel does have a throughput limit, but hitting it slows transfers down; it does not make only large payloads stall while small ones succeed, and the problem started right after the MTU change.
+B=Jumbo frames end to end: Site-to-Site VPN does not support jumbo frames at all. Raising the on-premises router MTU to 9001 cannot help because the IPsec tunnel itself caps packet size below 1500 bytes.
+C=Jumbo frames only within one subnet: jumbo frames work between instances anywhere in the same VPC (and the stem says in-VPC throughput improved). The failure is on the path that leaves the VPC through the VPN, not inside it.
+T: Jumbo frames stop at the VPC edge; over IPsec the effective MTU is about 1446 bytes, so clamp the MSS or lower the MTU rather than expecting large packets to pass.
+
+@ Q001722 explain
+G: ## How inter-AZ data transfer is billed
+Traffic between two resources in the same Region but different Availability Zones is charged per GB **in each direction** (approximately $0.01 per GB each way in most Regions). Traffic between resources in the same AZ over private IPs is free.
+A three-tier app spread across three AZs with a load balancer and a single database endpoint sends roughly two-thirds of its app-to-database calls to another AZ. A chatty tier multiplies that into a large line item.
+## Keeping traffic local without losing AZs
+- Place a **read replica** or **cache node** in every AZ, such as ElastiCache replicas or RDS/Aurora readers.
+- Make the app tier **AZ-aware**: each instance reads the AZ it runs in (from instance metadata) and sends reads to the replica or cache node in that same AZ, falling back to another AZ only if the local one is unhealthy.
+- Writes still go to the primary, but reads, which usually dominate chatty traffic, stay in-AZ.
+W: AZ-aware routing to same-AZ replicas or cache nodes: most calls stay inside one AZ, where data transfer is free, while every AZ still has capacity and the deployment keeps its multi-AZ availability.
+X: A=VPC Flow Logs: flow logs only record metadata about traffic for analysis; they do not compress or change the traffic itself, and they add their own logging cost.
+C=Single AZ: moving all tiers into one AZ does remove the charge, but it breaks the stated requirement to keep the number of AZs for availability and turns an AZ outage into a full outage.
+D=Transit Gateway: a transit gateway is not a VPC replacement and its traffic is not free. It adds per-attachment and per-GB processing fees, and cross-AZ transfer is still billed.
+T: Cut inter-AZ costs by keeping calls within an AZ (local replicas or caches plus AZ-aware clients), not by collapsing into one AZ.
+
+@ Q001723 explain
+G: ## Dedicated versus hosted Direct Connect
+- A **dedicated connection** is a physical port on an AWS Direct Connect device, ordered from AWS in fixed speeds such as `1`, `10`, `100` or `400` Gbps. You (or your provider) arrange the cross-connect in the Direct Connect location and pay port-hours for the full port speed.
+- A **hosted connection** is provisioned by an AWS Direct Connect Partner on the partner's own interconnect. The partner offers set capacities from 50 Mbps up to 25 Gbps, including `2` Gbps, and handles the physical port, cross-connect and usually the local loop to your site.
+A hosted connection supports one virtual interface, and its capacity is fixed by the partner, but for a mid-size company that wants a specific bandwidth without running physical infrastructure it is the simplest fit.
+## Example
+A company needing 2 Gbps orders a 2 Gbps hosted connection from a partner and accepts it in the console. It pays AWS the hosted port-hour rate for 2 Gbps plus the partner's fees, with no cross-connect to manage.
+W: About 2 Gbps partner hosted connection: it matches the needed bandwidth exactly, the partner owns the port, cross-connect and local loop, and the company pays only for 2 Gbps instead of a larger dedicated port it would not fill.
+X: A=Dedicated 10 Gbps: a 10 Gbps port bills port-hours for 10 Gbps whether or not it is used, and it still needs a physical cross-connect. It is not "always cheaper" for someone who needs 2 Gbps.
+C=Hosted VIF: a hosted virtual interface is a VIF created on someone else's existing connection. It provides no physical cross-connect; the hosted connection (or dedicated connection) is what carries the physical capacity.
+D=Two 1 Gbps dedicated in a LAG: this reaches 2 Gbps but doubles the ports and cross-connects to manage, which is the opposite of the goal of minimizing physical complexity.
+T: Need a sub-10 Gbps speed like 2 Gbps without owning cross-connects → a partner hosted connection; dedicated ports come only in large fixed sizes you manage physically.
+
+@ Q001724 explain
+G: ## Global Accelerator in one picture
+AWS Global Accelerator gives an application two static **anycast** IPv4 addresses (four for dual-stack) announced from AWS edge locations worldwide. A client connects to the nearest edge, and traffic then rides the AWS backbone to the closest healthy endpoint group.
+- It supports **TCP and UDP** listeners, so game protocols work.
+- Health checks move traffic away from an unhealthy Region automatically, typically within seconds, without DNS caching delays.
+- The IP addresses stay the same for the life of the accelerator (or you can bring your own), so they can be allowlisted in firewalls once.
+## Why not CloudFront
+Amazon CloudFront is a content delivery network for HTTP and HTTPS (including WebSocket and gRPC). By default its edge IP addresses are a large, changing set (a static IP list is an optional add-on feature), and it does not carry arbitrary UDP application traffic at all.
+W: Global Accelerator: static anycast IPs that never change, native TCP and UDP support, and health-based routing to the nearest healthy Region match every requirement; CloudFront cannot carry the UDP game traffic.
+X: A=Neither supports UDP: Global Accelerator does support UDP listeners, so no custom load-balancing layer is needed.
+B=Only because it is cheaper: CloudFront does not carry arbitrary UDP traffic and does not give a small fixed set of IPs, so the choice is about capability, not price.
+D=CloudFront for any protocol: CloudFront handles HTTP-based traffic only, so a UDP game protocol cannot use it, and by default its edge addresses are numerous and change over time.
+T: Non-HTTP (UDP) traffic plus fixed allowlistable IPs plus fast Regional failover → Global Accelerator, not CloudFront.
+
+@ Q001725 explain
+G: ## Path MTU Discovery (PMTUD)
+When a packet is bigger than the next link's MTU and has the "Don't Fragment" bit set, a router drops it and returns an ICMP message ("fragmentation needed", ICMP type 3 code 4; for IPv6, "packet too big"). The sender then lowers its packet size. Most TCP stacks set Don't Fragment on their segments so that PMTUD works.
+## The black hole
+A Site-to-Site VPN adds IPsec overhead, so the tunnel carries smaller packets than a normal 1500-byte Ethernet link.
+- The TLS handshake uses small packets, so it completes.
+- The server then sends full-size data segments. They are too large for the tunnel and get dropped, and the ICMP message telling the server to shrink them is blocked by the on-premises firewall.
+- The server keeps retransmitting the same oversized segments; the download hangs forever.
+## Fixes
+- Allow the needed ICMP types (type 3 code 4) through the firewall so PMTUD works.
+- Or clamp the TCP MSS on the VPN device (for example `1379`) so segments always fit inside the tunnel.
+W: PMTUD black hole: small exchanges fit, large segments exceed the tunnel MTU and are dropped, and the blocked ICMP means the sender is never told to shrink them. Allowing that ICMP or clamping the MSS fixes it.
+X: A=DNS issue: name resolution happens before the connection; a handshake that completes proves DNS worked, and a large download does not trigger a new lookup mid-stream.
+B=IKE phase 2 lifetime: rekeys happen in the background with overlapping security associations; they would cause brief interruptions for all traffic, not a reliable hang that affects only large transfers right after the handshake.
+D=Concurrent connection limit: a connection-count limit would stop new connections from opening; here the connection opens and the handshake succeeds, then data stalls.
+T: "Handshake works, big transfers hang, ICMP blocked" is the signature of a PMTUD black hole; permit ICMP fragmentation-needed or clamp the MSS.
+
+@ Q001726 explain
+G: ## Sharing Direct Connect across many accounts
+A Direct Connect **connection** is a physical port owned by one account, but what it can reach is decided by the virtual interfaces and gateways behind it.
+- A **Direct Connect gateway** is a global object. It can be associated with virtual private gateways or transit gateways that belong to other accounts, after those owners accept the association proposal.
+- A **transit VIF** on the connection attaches to a DX gateway that is associated with a **transit gateway**. The transit gateway can be shared across the organization with AWS RAM, and each account attaches its VPCs to it.
+## Example
+A network account owns two DX connections in different locations for resilience, each with a transit VIF to one DX gateway, associated with a central transit gateway. Thirty accounts attach their VPCs to that transit gateway, and transit gateway route tables control which VPCs see on-premises routes.
+W: A few DX connections shared through a DX gateway and transit gateway: port-hour costs drop to a handful of connections, cross-connect management is centralized, and every business unit's VPCs still get private connectivity to on-premises.
+X: B=One connection per account: connections are owned by one account, but DX gateways and shared transit gateways let one connection serve VPCs in many accounts, so a per-account connection is unnecessary and keeps the high port costs.
+C=Share EC2 instances with RAM: RAM does not share EC2 instances, and sharing compute would not give other accounts' VPCs a network path to on-premises.
+D=Per-account VPNs: Site-to-Site VPNs run over the internet with lower, variable throughput and many tunnels to manage. They replace dedicated private connectivity instead of consolidating it.
+T: Consolidate Direct Connect with a few resilient connections plus a DX gateway and a RAM-shared transit gateway, not one connection or VPN per account.
+
+@ Q001727 explain
+G: ## Two knobs in Global Accelerator
+A standard accelerator has listeners, and each listener has one **endpoint group per Region**. Inside a group are the endpoints (ALBs, NLBs, EC2 instances, Elastic IPs).
+- The **traffic dial** is set per endpoint group, from 0 to 100 percent. It controls how much of the traffic that Global Accelerator would send to that Region is actually accepted there; the rest is sent to other endpoint groups.
+- **Endpoint weights** (0 to 255) work only inside one endpoint group, splitting that Region's share among its endpoints.
+## Example
+Setting the new Region's dial to `10` means 10 percent of the traffic routed toward that Region is served by it, and the remaining 90 percent goes to the original Region. Raising the dial step by step (10, 25, 50, 100) is the usual pattern for Regional blue/green and gradual rollouts. The resulting share of total traffic also depends on how many users are closest to each Region.
+W: Traffic dial on the new endpoint group: it is the Region-level control built for partial Regional traffic shifts, applied at endpoint-group scope, and it can be raised gradually until full cutover.
+X: A=Endpoint weights of 10: weights are relative only among endpoints in the same group; if every endpoint in the new group has weight 10, they still share 100 percent of that group's traffic. Weights cannot limit a whole Region.
+B=Health check interval: the interval only controls how often endpoints are probed (10 or 30 seconds); it has no effect on how traffic is split.
+D=Source IP affinity: client affinity keeps a given client on the same endpoint; it has no sampling percentage and does not shift a share of traffic to a Region.
+T: Share of traffic for a Region → traffic dial on its endpoint group; share among endpoints inside one Region → weights.
+
+@ Q001728 explain
+G: ## Enhanced networking and ENA
+Current-generation (Nitro) EC2 instances reach their rated bandwidth through **enhanced networking** with the **Elastic Network Adapter (ENA)**. The guest operating system needs a working ENA driver, and the AMI needs ENA support enabled.
+- Many Nitro instance types will not even launch from an AMI without ENA support, and an old or misconfigured driver misses performance fixes and features, so throughput can stay well below the rating while CPU sits idle.
+- Check it with commands such as `ethtool -i eth0` (driver should be `ena`) and `modinfo ena` on Linux, and the instance or AMI `enaSupport` attribute.
+## Other limits to know
+"Up to 25 Gbps" is a burst figure. A single flow (one 5-tuple) is also limited: about 5 Gbps between instances outside a cluster placement group and about 10 Gbps inside one. So after the driver, check that the test uses several parallel flows (for example `iperf3 -P 8`).
+W: ENA driver installed and current: enhanced networking is the prerequisite for high bandwidth on current-generation instances, and a missing or outdated ENA driver is the first host-level cause to rule out when throughput is capped with low CPU.
+X: A=DHCP option set DNS servers: DNS settings affect name resolution only; once two instances are talking by IP, DHCP options have no effect on throughput.
+B=NAT gateway in the path: traffic between two instances in the same VPC is routed locally and never goes through a NAT gateway.
+D=Security group bandwidth rule: security groups only allow or deny traffic by protocol, port and source or destination; they have no bandwidth setting.
+T: Low throughput with idle CPU on a modern instance → check ENA enhanced networking first, then per-flow limits, not DNS, NAT or security groups.
+
+@ Q001729 explain
+G: ## Two ways to send data from AWS to your data center
+- **Internet data transfer out** is billed per GB at tiered rates. Rates drop at higher volume tiers but never reach zero.
+- **Direct Connect data transfer out** is billed per GB at a separate, lower rate that depends on the AWS Region and the Direct Connect location. On top of that you pay a fixed **port-hour** fee for the connection (plus any partner or colocation costs).
+Data transfer **into** AWS is free in both cases.
+## Break-even thinking
+At small volumes the port-hour fee dominates, and the internet can be cheaper. At hundreds of TB per month, the per-GB difference multiplied by the volume is usually much larger than the fixed port cost.
+Example: if the DX rate is a few cents per GB lower than the internet tier rate, 500 TB (about 500,000 GB) saves thousands to tens of thousands of dollars a month, compared with an approximate port fee of a few hundred dollars (1 Gbps) to under two thousand dollars (10 Gbps) a month.
+W: Lower per-GB DX egress offsets port-hour fees: at 500 TB or more per month the per-GB savings over internet egress typically exceed the fixed port cost, which is the classic reason high-volume egress moves to Direct Connect.
+X: A=Internet egress free above 500 TB: internet data transfer out has lower rates in higher tiers but is never free, so Direct Connect's advantage remains.
+C=Same per-GB cost: Direct Connect data transfer out has its own lower rate card; if it cost the same, there would be no cost case for DX.
+D=DX transfer free: Direct Connect still charges per GB for data leaving AWS, in addition to port-hours; only inbound data is free.
+T: Direct Connect trades a fixed port fee for a lower per-GB egress rate; at high volume the per-GB savings win.
+
+@ Q001730 explain
+G: ## Stateless versus stateful engines in Network Firewall
+AWS Network Firewall processes each packet first with the **stateless engine**, which looks at one packet at a time. Each stateless rule has an action:
+- `aws:pass`: allow the packet and **skip stateful inspection** entirely.
+- `aws:drop`: drop it.
+- `aws:forward_to_sfe`: hand it to the **stateful engine**, which tracks connections and knows that a reply belongs to an allowed flow.
+The stateless default action decides what happens to packets that match no stateless rule.
+## What goes wrong here
+Outbound SYNs to port 443 match the stateless `aws:pass` rule and leave without the stateful engine seeing the flow. The replies come back from source port 443 to an ephemeral destination port, so they do not match the port-443 rule and fall to the default `aws:forward_to_sfe`. The stateful engine sees mid-stream packets of a connection whose start it never saw; they are out of state for it, and the stateful engine drops them.
+W: aws:pass skips state tracking: the stateful engine never records the outbound connection, so its return packets are dropped. Forward the traffic to the stateful engine and allow it with a stateful pass rule, which also allows the replies automatically.
+X: A=Stateless groups cannot match ports: stateless rules match on source and destination addresses, ports, protocols and TCP flags, so a TCP 443 rule is perfectly valid.
+C=Missing route to the internet gateway: if the firewall subnet had no route to the internet gateway, the outbound requests would not reach the internet either; the stem says outbound connections initiate successfully.
+D=NAT gateway required: Network Firewall inspects routed traffic and does not need a NAT gateway to allow TLS; a NAT gateway is only needed when private addresses must be translated, which is not the failure described.
+T: Use stateless pass only when you also handle return traffic statelessly; for normal outbound flows, forward to the stateful engine so replies are tracked.
+
+@ Q001731 explain
+G: ## Two rule-evaluation modes for stateful rule groups
+- **Default action order**: all stateful rules across all groups are evaluated by action type, `pass` first, then `drop`, then `reject`, then `alert`. The order in which you attached groups does not decide anything, and traffic that matches no rule is allowed.
+- **Strict order**: each rule group gets an explicit **priority** in the policy, and rules inside a group are evaluated in their listed order. The first matching rule with a terminating action wins.
+With strict order you also choose a **stateful default action** for unmatched traffic, such as "drop all" or "drop established", with optional alert logging.
+## Example
+Priority 100 is the deny-malicious-CIDRs group, priority 200 the allowed-FQDN group, and the default action is drop all. Anything not explicitly allowed by the FQDN list and not already denied is dropped, in a sequence auditors can read directly from the policy.
+W: Strict order with explicit group priorities and a strict default drop: this makes evaluation deterministic by priority and guarantees that unmatched traffic is dropped, which is exactly what the auditors require.
+X: A=One stateless rule group: stateless rules cannot inspect domain names and do not track connections, so the FQDN allow list and stateful behavior would be lost.
+C=Alert-only Suricata rules: alert only logs matches and does not block anything; it neither enforces an order nor drops unmatched traffic.
+D=Default action order with implicit pass: this is the opposite of the requirement, since evaluation follows action type rather than a chosen sequence and unmatched traffic passes.
+T: Predictable sequence plus deny-by-default → strict rule order with priorities and a strict default action, not action-order evaluation.
+
+@ Q001732 explain
+G: ## Three kinds of stateful rules in Network Firewall
+- **Standard (5-tuple) rules**: match protocol, source and destination IP and port, and direction, with actions such as pass, drop or alert. They do not look inside the payload.
+- **Domain list rules**: allow or deny by domain name, using the TLS SNI or the HTTP Host header.
+- **Suricata-compatible rule strings**: the full Suricata IPS syntax, including payload keywords such as `content`, `pcre`, `flow` and protocol keywords.
+## Example
+A rule like `drop tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"C2 beacon"; flow:to_server,established; content:"|de ad be ef|"; sid:1000001; rev:1;)` drops any outbound TCP flow whose payload contains that byte sequence. For encrypted traffic the payload is only visible if TLS inspection is configured.
+W: Suricata-compatible IPS rule strings: only this format can match specific byte patterns inside the TCP payload with keywords like `content`, adding deep packet inspection alongside the existing IP and port filters.
+X: A=Domain list rules: they match only the domain name in SNI or the Host header; they cannot see a byte pattern in the payload, and malware that uses IPs or new domains would slip through.
+C=5-tuple rules do DPI automatically: standard stateful rules match header fields only; they do not inspect payload content unless you write Suricata rules.
+D=Stateless port rules: stateless rules look at single packets' headers and cannot inspect payloads; blocking a port "historically associated" with malware also blocks legitimate traffic and misses malware on other ports.
+T: Payload byte patterns need Suricata `content` rules; 5-tuple and domain lists only see headers and names.
+
+@ Q001733 explain
+G: ## Rule group capacity in Network Firewall
+When you create a rule group you set its **capacity**: the maximum processing units the group may use. Network Firewall reserves that capacity against the firewall policy's limits, so it is fixed for the life of the rule group.
+- **Capacity cannot be changed after creation.** You can edit the rules inside the group freely as long as they fit.
+- For stateful Suricata groups, each rule consumes capacity (roughly one unit per rule), so more rules than the capacity allows will not fit.
+## Growing a rule group
+- Create a new rule group with a larger capacity, leaving headroom for growth.
+- Copy the existing rules into it, plus the new ones.
+- Update the firewall policy to reference the new group in place of the old one, then delete the old group.
+Estimating capacity generously at creation avoids repeating this later.
+W: Create a larger new group, migrate the rules and update the policy: because a rule group's capacity is immutable, replacing the group is the only way to hold more rules.
+X: A=Same-name second group: a rule group name must be unique for its type within an account and Region, and Network Firewall never merges groups; each group is evaluated independently.
+B=Account quota increase: quotas cover things like total capacity per policy and number of groups, but raising them does not change the capacity of an existing rule group.
+D=Edit the capacity: the capacity value is set at creation and cannot be modified; only the rules inside can be updated.
+T: Rule group capacity is fixed at creation; outgrow it by replacing the group, not by editing it.
+
+@ Q001734 explain
+G: ## How a rate-based rule counts
+An AWS WAF rate-based rule counts requests per **aggregation key** over a time window (for example 5 minutes) and acts on keys that exceed the limit.
+- Aggregate key **IP** uses the IP address of the connection that reached WAF.
+- Aggregate key **Forwarded IP** reads the client address from a header such as `X-Forwarded-For` set by a proxy in front.
+- Custom keys can combine headers, cookies, query arguments and more.
+## Why this deployment fails
+Every request reaches WAF from the security appliance's single IP. With key IP, all users share one counter: peak traffic exceeds 2,000 and everyone is blocked, while a real attacker spreading requests over thousands of IPs is never counted separately.
+## The fix
+Configure the rule's forwarded IP settings with the header the appliance sets (for rate-based rules WAF uses the first, original-client address in it) and a fallback for missing or invalid headers. Only trust that header when the appliance reliably writes it, because clients can forge it otherwise.
+W: Aggregate on a trusted forwarded-IP header: each real client gets its own counter again, so normal users stay under the limit and individual abusive sources are rate-limited.
+X: A=Move to Shield Advanced: Shield Advanced adds DDoS detection, response and cost protection, but request rate limiting is still done by WAF rules, which would keep the same wrong key.
+B=Raise the limit: this stops blocking legitimate users but, as the option itself says, still counts everyone as one IP and leaves the attack unmitigated.
+D=One global counter: a constant key makes all traffic share one counter, the same failure as today; the first spike blocks everyone and no individual attacker is identified.
+T: Behind a proxy, a rate rule keyed on the connection IP sees one client; key it on a trusted forwarded-IP header to count real clients.
+
+@ Q001735 explain
+G: ## AWS Firewall Manager
+Firewall Manager centrally applies security policies across accounts in an AWS Organizations organization. It needs a designated Firewall Manager administrator account, and AWS Config enabled in the member accounts.
+A **WAF policy** defines a web ACL with **first** rule groups (evaluated before anything else) and **last** rule groups, plus a scope, such as all ALBs in chosen accounts or OUs, optionally filtered by tags.
+- With auto remediation on, Firewall Manager creates the managed web ACL in every in-scope account and associates it with every existing and newly created ALB.
+- Account owners can add their own rule groups between the first and last groups, but they cannot remove or override the ones set by the policy, and Firewall Manager reapplies the policy if it drifts.
+- New accounts that join the in-scope OUs are covered automatically.
+W: Firewall Manager WAF policy across the organization: it attaches the standard web ACL to every current and future ALB in all 40 accounts, keeps baseline rule groups non-removable, and needs no per-account work.
+X: B=Per-account web ACL plus SCP: someone must create and maintain 40 web ACLs and associate each new ALB by hand; an SCP can deny disassociation but cannot attach the web ACL to new ALBs.
+C=Share via RAM manually: a web ACL can be associated only with resources in its own account, so sharing one web ACL for other accounts' ALBs is not how WAF works, and manual association by each team is exactly the effort and gap to avoid.
+D=Config rule with SSM remediation: this can work but is custom automation to build and run in every account, reacts only after drift, and still lets owners change the web ACL between checks; Firewall Manager provides this natively.
+T: Org-wide, enforced WAF on every ALB with least effort → AWS Firewall Manager, not per-account ACLs, SCPs or custom Config remediation.
+
+@ Q001736 explain
+G: ## What each service does
+- **AWS WAF** is a Layer 7 web application firewall for CloudFront, ALB, API Gateway, AppSync and some other resources. It evaluates HTTP(S) requests against rules: managed SQL injection and cross-site scripting rule groups, IP sets, rate-based rules, bot control and more.
+- **AWS Shield Standard** is free and automatic, protecting all AWS customers against common Layer 3/4 DDoS attacks.
+- **AWS Shield Advanced** is a paid subscription on top: enhanced detection and mitigation for protected resources (including application-layer DDoS with automatic mitigation through WAF), attack visibility and metrics, access to the Shield Response Team, and cost protection for scaling during an attack. It also includes standard AWS WAF usage (web ACLs, rules and requests, but not paid add-ons such as Bot Control) for the resources it protects at no extra charge.
+## For an API under both attacks
+SQL injection is a malicious request payload: WAF rules block it. A volumetric DDoS is about traffic volume: Shield absorbs network-layer floods, and Shield Advanced adds tailored detection, response support and cost protection.
+W: WAF filters Layer 7 requests; Shield Advanced adds DDoS defense and support: the two are complementary, and the API needs WAF for SQL injection and Shield Advanced for the DDoS side.
+X: B=Shield Advanced replaces WAF: Shield Advanced does not inspect payloads for SQL injection on its own; its Layer 7 mitigations are themselves WAF rules in a web ACL.
+C=Both Layer 3/4 only: WAF works at Layer 7 on HTTP requests, and Shield Advanced also handles application-layer DDoS through WAF.
+D=WAF requires Shield Advanced: WAF is sold and used independently; Shield Advanced only includes standard WAF usage for its protected resources.
+T: WAF decides which requests are allowed (Layer 7 content); Shield Advanced focuses on DDoS resilience, response and cost protection.
+
+@ Q001737 explain
+G: ## Automatic application-layer DDoS mitigation
+Shield Advanced can detect HTTP floods against protected resources by learning a traffic baseline. With **automatic application layer DDoS mitigation** enabled, it responds by itself:
+- It creates rules in a Shield-managed rule group inside the resource's **AWS WAF web ACL**, targeting the attack signature.
+- You choose whether those rules **count** or **block**.
+- When the attack ends, Shield removes the rules again.
+This is supported for Amazon CloudFront distributions and Application Load Balancers.
+## Prerequisites
+- The resource is protected by Shield Advanced.
+- A web ACL is associated with the resource, because the mitigation is implemented as WAF rules. Shield cannot add rules if no web ACL exists.
+- Enable automatic mitigation for that protection. Adding a rate-based rule and Route 53 health checks for health-based detection is also recommended.
+W: Associate a WAF web ACL and enable automatic mitigation: Shield Advanced implements Layer 7 mitigations as WAF rules, so it needs a web ACL on the ALB, and then it adds and removes those rules automatically during attacks.
+X: A=CloudFront required: automatic application-layer mitigation is supported directly on ALBs as well as on CloudFront distributions; CloudFront in front is a good practice but not a requirement.
+C=Fixed target group without Auto Scaling: scaling behavior does not enable or disable Shield's mitigation, and removing Auto Scaling would only make the app less able to absorb load.
+D=Disable WAF: this removes the very mechanism Shield uses to apply Layer 7 mitigations, so automatic mitigation could not work.
+T: Shield Advanced's automatic Layer 7 mitigation works through a WAF web ACL on the protected CloudFront or ALB resource; no web ACL, no automatic rules.
+
+@ Q001738 explain
+G: ## The Shield Response Team (SRT)
+The SRT is a group of AWS DDoS specialists available to **Shield Advanced** subscribers. During an attack they can analyze traffic and write or adjust custom mitigations, such as WAF rules, on the customer's behalf.
+## What is required
+- An active Shield Advanced subscription, with the affected resource added as a protected resource.
+- An AWS Support plan at the Business level or higher (Business, Enterprise On-Ramp or Enterprise), so that DDoS support cases can be opened to reach the SRT. AWS has been introducing renamed support plans, so confirm the qualifying plans in the current Shield documentation.
+- For the SRT to make changes in the account, the customer grants it access through an IAM role (and optionally to specific S3 buckets holding logs).
+Proactive engagement, where the SRT contacts you when a protected resource's health checks fail during an attack, also needs Route 53 health checks associated with the protections.
+W: Business, Enterprise On-Ramp or Enterprise Support: Shield Advanced customers engage the SRT by opening a support case, which requires one of these support plans.
+X: A=Only with Network Firewall: SRT engagement depends on Shield Advanced and the support plan, not on whether Network Firewall protects the resource.
+B=Trust & Safety case first: the Trust & Safety team handles abuse reports about AWS resources; it is not a gateway to the SRT, which is reached through AWS Support.
+D=Basic Support: Basic Support cannot open technical cases, so it cannot be used to engage the SRT even with Shield Advanced.
+T: SRT access = Shield Advanced + a Business-level or higher support plan (+ an IAM role if the SRT should act in the account).
+
+@ Q001739 explain
+G: ## Subscribing versus protecting
+Subscribing to AWS Shield Advanced is done once per account (or across an organization with Firewall Manager). It does **not** protect anything by itself: you must add each resource as a **protected resource**.
+Supported resource types include CloudFront distributions, Route 53 hosted zones, Global Accelerator accelerators, Application and Classic Load Balancers, and **Elastic IP addresses** (which covers EC2 instances and Network Load Balancers behind them).
+## What adding a protection turns on
+- Enhanced, resource-specific detection with CloudWatch metrics such as `DDoSDetected` and attack details in the console.
+- Tailored network-layer mitigations, including for UDP reflection attacks, SRT support and cost protection for that resource.
+An Elastic IP that was never added still gets the automatic Shield Standard defenses, but no Shield Advanced metrics or events.
+W: Elastic IP never added as a protected resource: the subscription alone does not cover resources, so Shield Advanced has no protection for that EIP and shows no enhanced metrics for it.
+X: A=Elastic IPs not eligible: Elastic IP addresses are a supported Shield Advanced resource type, commonly used to protect EC2 and NLB workloads.
+B=No UDP inspection: Shield Advanced detects and mitigates UDP floods and reflection attacks, which are among the most common network-layer DDoS attacks.
+C=Automatic protection of everything: a subscription enables the service for the account, but each resource must be added (directly or through a Firewall Manager Shield policy) before it is protected.
+T: Shield Advanced protects only resources you add; subscribe, then add each EIP, ALB, CloudFront distribution and so on.
+
+@ Q001740 explain
+G: ## Stateless network ACLs
+Security groups are stateful: if a request is allowed out, its reply is allowed back in automatically. **Network ACLs are stateless**: each packet is checked against the rules in its direction on its own.
+## Ports on the return trip
+An HTTPS request from an instance goes from a random **ephemeral** source port (for example `49152`) to destination port `443`. The reply comes back from source port 443 to destination port 49152.
+- The outbound NACL rule "TCP 443 to 0.0.0.0/0" allows the request.
+- The inbound NACL rule "TCP 443 from 0.0.0.0/0" matches only packets whose **destination** is 443, so it does not match the reply, which is then denied by the default rule.
+## Fix
+Add an inbound rule allowing TCP `1024-65535` from `0.0.0.0/0` (or the specific API range). Many OSes use a narrower ephemeral range, but NAT gateways and ELBs use 1024-65535, so that range is the safe choice.
+W: NACLs are stateless; allow inbound ephemeral ports for the replies: the responses arrive on ephemeral destination ports, which no inbound rule allows, so they are dropped even though the security group permits them.
+X: A=Only outbound rules: NACLs have both inbound and outbound rules and apply them to every subnet, public or private.
+B=Security groups are stateless: security groups are stateful and allow return traffic automatically, as the stem itself states.
+C=Reverse evaluation order: NACL rules are evaluated from the lowest rule number upward; and even in any order, no rule here matches the reply.
+T: With NACLs, allow the return path explicitly: outbound 443 needs inbound ephemeral ports, because the reply's destination is the client's ephemeral port.
+
+@ Q001741 explain
+G: ## Referencing a security group instead of IPs
+A security group rule can use another **security group ID** as its source, for example "allow TCP 8080 from `sg-web`". The rule then matches traffic from any network interface that has `sg-web` attached, whatever its IP address.
+- When the web tier scales out, new instances launch with `sg-web` and are allowed immediately.
+- When instances are replaced and IPs change, no rule needs editing.
+- It works across all AZs and subnets in the VPC (and, with some limits, in peered VPCs or through a transit gateway with security group referencing).
+## Example
+- `sg-web`: inbound 443 from the load balancer's security group.
+- `sg-app`: inbound 8080 from `sg-web` only. Nothing else in the VPC can reach the app tier, even from the same subnet.
+W: App SG inbound allowing the web tier's security group: it follows the web tier automatically as it scales across AZs and allows only those instances, with no IP maintenance.
+X: A=SG ID in a NACL: network ACL rules accept only CIDR blocks, not security group IDs.
+C=One /32 per instance: with constantly changing IPs, the list is always out of date, quickly hits the rules-per-group quota, and needs constant automation.
+D=Whole VPC CIDR: this lets every resource in the VPC reach the app tier, breaking the "only from the web tier" requirement.
+T: Tier-to-tier access with dynamic IPs → security group referencing, not CIDRs or NACLs.
+
+@ Q001742 explain
+G: ## How NACL rules are evaluated
+A network ACL has numbered rules for each direction. For every packet, AWS checks the rules **from the lowest number upward** and applies the **first rule that matches**; later rules are not considered. If nothing matches, the final `*` rule denies the packet.
+## Why a new low-numbered deny can hit good traffic
+The new deny rule 50 is checked before the allow rule 100. If its CIDR is broader than intended or overlaps the legitimate range, legitimate packets match rule 50 first and are denied; rule 100 is never reached for them.
+Example: the intent was to block `203.0.113.0/26`, but the rule was entered as `203.0.0.0/16`, which also contains the partner range `203.0.200.0/24` allowed by rule 100.
+Fix: correct the deny CIDR to the exact malicious range, and leave gaps in numbering (10, 20, 30) so specific rules can be placed carefully.
+W: Lowest number first, and rule 50 matched the legitimate range too: first-match evaluation means the lower-numbered deny wins for any overlapping address, so the allow at rule 100 no longer applies to that traffic.
+X: B=Rule 50 is outbound only: each NACL rule belongs to one direction; if rule 50 were outbound it could not block the inbound traffic from the legitimate range, yet that traffic is now being blocked.
+C=Deny inverts the default: adding a deny rule changes nothing about other rules or the default `*` deny; each rule stands on its own.
+D=Most restrictive match wins: NACLs do not combine matching rules; they stop at the first match by rule number. "All rules evaluated" describes security groups, which only have allow rules.
+T: NACLs are first-match by rule number; a low-numbered deny whose CIDR overlaps an allowed range blocks that range.
+
+@ Q001743 explain
+G: ## Managed prefix lists
+A **customer-managed prefix list** is a named set of CIDR blocks (`pl-...`) that you maintain in one place. Security group rules and route tables can reference it instead of listing CIDRs one by one.
+- Update the list (add or remove an office range), and every security group rule that references it uses the new entries automatically.
+- A list has a **maximum entries** value you set, which can be increased later, and it can be shared with other accounts through AWS RAM.
+## Quota detail to know
+A security group rule that references a prefix list counts against the security group rule quota as the list's **maximum entries**, not as one rule. For 200+ ranges the inbound rules-per-group quota usually still has to be raised (it is adjustable, within the overall limit on rules per network interface). The big gain is management: one list and one rule reference instead of hundreds of rules duplicated across groups.
+W: Customer-managed prefix list referenced in one rule: all office CIDRs live in one centrally updated list, every associated security group picks up changes immediately, and each group needs only a single rule referencing it.
+X: B=Unlimited rule quota: security group rule quotas are adjustable but never unlimited, and one rule per CIDR across many groups is exactly the maintenance burden to avoid.
+C=NACL instead: NACLs have their own small rule limit per ACL (20 by default, adjustable up to 40 per direction), apply to whole subnets and are stateless, so they are a worse fit.
+D=200 security groups: an ENI can have only a handful of security groups (5 by default, 16 maximum), so 200 groups per instance is impossible.
+T: Many CIDRs managed centrally for security groups → a customer-managed prefix list referenced in the rules (remembering it counts as its max entries toward the quota).

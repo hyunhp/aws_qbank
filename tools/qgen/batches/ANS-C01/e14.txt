@@ -1,0 +1,180 @@
+# ANS-C01 detailed explanations, batch e14 (explanation-only rewrites; letters are the published ones)
+
+@ Q003918 explain
+G: ## Controlling S3 access from the bucket side
+An S3 bucket is not inside your VPC, so network controls in the VPC only shape what your own subnets can send. To say "this bucket may only be used through one endpoint", the rule has to live on the bucket itself: the **bucket policy**.
+## The aws:SourceVpce condition key
+When a request reaches S3 through a VPC endpoint (gateway or interface), S3 knows the endpoint ID and exposes it as `aws:SourceVpce`. A bucket policy can deny every request that did not arrive through the approved endpoint:
+- Effect `Deny`, Principal `*`, Action `s3:*`, Resource the bucket and `bucket/*`
+- Condition `StringNotEquals` `aws:SourceVpce` = `vpce-0abc1234`
+Requests from the internet, from other VPCs or from other endpoints are then refused, whoever signs them. Be careful: the same deny also blocks console and administrator access that does not come through the endpoint, so plan an exception or a break-glass path.
+W: Bucket policy with aws:SourceVpce: the policy is evaluated by S3 on every request, and the condition matches the endpoint ID the request came through, so anything not arriving via that specific endpoint is denied regardless of network location or credentials.
+X: A=NACL blocking S3 IPs: a network ACL only filters traffic entering or leaving that subnet. It cannot stop anyone outside the subnet, from the internet or another account, from calling the bucket, and S3 public IP ranges are large and change over time.
+B=Security group on the bucket: security groups attach to network interfaces in a VPC. An S3 bucket has no network interface you control, so there is nothing to attach a security group to.
+C=Route 53 private zone: DNS only decides which address a name resolves to inside the VPC. Clients elsewhere still resolve the public S3 name and nothing is enforced on the bucket.
+T: To restrict who can reach a bucket, put the rule on the bucket (bucket policy with `aws:SourceVpce`); network controls in one VPC cannot stop access from everywhere else.
+
+@ Q003919 explain
+G: ## Two directions of S3 control
+- A **bucket policy** protects your bucket: it decides who may use it.
+- A **VPC endpoint policy** protects your VPC: it decides which S3 actions and buckets any caller inside the VPC may reach through the endpoint.
+Data exfiltration means someone inside the VPC copies data to a bucket they own in another account. A bucket policy on your buckets cannot stop that, because the destination bucket is not yours.
+## How the endpoint policy helps
+An S3 gateway or interface endpoint accepts a resource policy. Instead of the default "allow everything", you allow only your buckets, for example Resource `arn:aws:s3:::corp-data-*` and `arn:aws:s3:::corp-data-*/*`, or use the condition key `aws:ResourceOrgID` to allow any bucket owned by your AWS Organization. Requests to any other bucket through the endpoint are denied. Remember to also allow AWS-owned buckets your instances need, such as OS package repositories, and to block other paths to S3 (for example a NAT gateway to the internet).
+W: VPC endpoint policy limited to company buckets: the endpoint evaluates every S3 request that passes through it, so uploads to buckets outside the allowed list or outside the organization are refused before they reach S3.
+X: A=Public IPs on instances: public addresses give instances a direct path to the internet and to any S3 bucket, which widens the exfiltration route instead of closing it.
+B=Second internet gateway: a VPC can have only one internet gateway attached, and an internet gateway adds internet access; it has no ability to filter which S3 buckets are reachable.
+D=Larger VPC CIDR: the size of the address range only changes how many IPs are available. It has no effect on which S3 buckets requests are allowed to reach.
+T: Bucket policies protect your buckets from outsiders; endpoint policies stop insiders from sending data to buckets you do not own.
+
+@ Q003920 explain
+G: ## Where VPC Flow Logs can go
+VPC Flow Logs capture metadata about IP traffic (source, destination, ports, action, bytes) for a VPC, subnet or network interface. They can be delivered to CloudWatch Logs, to Amazon S3 or to Amazon Data Firehose. Delivery to an S3 bucket in a different account is supported through the bucket policy.
+## Making logs tamper-resistant
+- A central **log archive account** keeps logs away from the workload accounts, so an administrator of the workload cannot delete them.
+- **S3 Object Lock** stores objects in a write-once-read-many (WORM) model. In **compliance mode** with a one-year retention period, no user, not even the root user, can delete a locked log object version or shorten its retention until the period ends.
+- An S3 Lifecycle rule can then move older logs to cheaper storage classes or expire them after the retention period.
+Example: every account in the organization sends flow logs to `s3://org-flowlogs-archive`, which has Object Lock enabled with a default retention of 365 days.
+W: S3 in a log archive account with Object Lock: separate account ownership prevents workload admins from touching the logs, and Object Lock retention makes each log object impossible to modify or delete for the full year.
+X: A=CloudWatch Logs with seven-day retention: logs would be deleted after seven days, far short of the one-year requirement, and a log group alone is not a WORM store.
+C=EBS volume on a logging instance: flow logs cannot be delivered to EBS directly, and a volume can be edited, deleted or lost with its instance, so it is neither durable nor tamper-resistant.
+D=CloudTrail instead of Flow Logs: CloudTrail records API calls made to AWS services, not the IP traffic flowing in the VPC, so traffic evidence would be missing entirely.
+T: Compliance retention of network logs = central S3 bucket in a separate account plus Object Lock; CloudTrail is API activity, not traffic.
+
+@ Q003921 explain
+G: ## What Amazon VPC Lattice does
+VPC Lattice is an application networking service. You register services (backed by instances, containers, Lambda functions or load balancers) and group them into a **service network**. VPCs associated with the service network can call those services even if they are in other VPCs or accounts, without peering or transit gateways, and overlapping CIDRs do not matter.
+## Identity-based authorization
+Lattice supports **auth policies**, which are IAM-style resource policies on the service network and on each service. With the auth type `AWS_IAM`, callers sign requests with SigV4 and Lattice checks the caller's IAM principal against the policy before forwarding the request.
+- Example: allow `vpc-lattice-svcs:Invoke` on the `orders` service only for the role `arn:aws:iam::111122223333:role/checkout-svc`.
+- Conditions can also use request details such as the HTTP method or path.
+This is authorization by "who is calling", not "which IP is calling".
+W: VPC Lattice with IAM auth policies: it connects HTTP services across VPCs and evaluates each request against auth policies using the caller's IAM identity, which is exactly service-to-service authorization.
+X: B=Security groups with CIDR rules: security groups allow or deny by IP range, port and protocol. Any process on an allowed host would be admitted, so they cannot tell which service identity is calling.
+C=Stateless NACL rules: network ACLs filter packets by IP and port at the subnet boundary. They have no knowledge of IAM principals or HTTP requests.
+D=Public ALBs without authentication: exposing services publicly with no authentication allows anyone on the internet to call them, the opposite of identity-based authorization.
+T: IP-based controls answer "where from"; VPC Lattice auth policies answer "which IAM identity", which is what service-to-service authorization needs.
+
+@ Q003922 explain
+G: ## Why DNS is an exfiltration channel
+DNS queries usually leave a network even when other outbound traffic is blocked. Malware can encode stolen data in subdomain labels, for example `c2VjcmV0.data.attacker.example`, so the attacker's name server receives the data as it answers queries. It can also use DNS to find command-and-control servers.
+## AWS controls for VPC DNS
+- **Route 53 Resolver DNS Firewall** filters queries that VPC resources send to the Route 53 Resolver. Rule groups contain domain lists (your own or AWS managed lists of known malicious domains) with actions `BLOCK`, `ALLOW` or `ALERT`. Blocked queries can get `NXDOMAIN`, `NODATA` or an override answer.
+- **Amazon GuardDuty** analyzes DNS logs from the Route 53 Resolver as a foundational data source, without you enabling Resolver query logging (this covers instances that use the Amazon-provided DNS resolver, not custom DNS servers), and raises findings such as DNS-based data exfiltration or queries to known malicious domains.
+One prevents known bad lookups; the other detects suspicious behavior you did not predict.
+W: B=DNS Firewall with block lists: it stops queries to listed malicious or unwanted domains at the Resolver, so data cannot be sent to or instructions received from those domains.
+E=GuardDuty DNS monitoring: it continuously analyzes Resolver DNS activity and flags exfiltration patterns and malicious domains, giving detection for threats not yet on a block list.
+X: A=Disabling DNS support: turning off DNS resolution breaks every workload that resolves names, including AWS service endpoints, instead of filtering bad queries.
+C=Public hosted zones for all domains: a public hosted zone is only used when its domain is delegated to it by the registrar, so it cannot take over queries for domains you do not own, and it filters nothing.
+D=Longer TTLs: TTLs only control how long answers are cached. Exfiltration uses unique names that are never cached, so every query still goes out.
+T: Protect VPC DNS by blocking known bad domains with Resolver DNS Firewall and detecting suspicious DNS behavior with GuardDuty.
+
+@ Q003923 explain
+G: ## Proving isolation instead of hoping for it
+Checking route tables by hand only shows one hop. A real path to the internet can come through an internet gateway, a NAT gateway, a transit gateway to an egress VPC, peering or a firewall, so correctness depends on the whole chain.
+## Network Access Analyzer
+Network Access Analyzer, part of Amazon VPC, lets you define a **Network Access Scope**: a description of paths that should not exist, such as "from these subnets to an internet gateway". It then analyzes the actual network configuration (route tables, security groups, NACLs, gateways, load balancers) and reports every path that matches as a finding.
+- Scopes are reusable, so the same "no internet access" rule can be deployed and analyzed in every account, for example with automation across the organization.
+- Findings show the full path, hop by hop, so engineers can see which component opens it.
+- Because it analyzes configuration, it sends no traffic.
+W: Network Access Analyzer scopes: they express the requirement once as an unwanted-path rule and evaluate it against the real configuration of each account, giving repeatable evidence of any path from restricted subnets to the internet.
+X: B=Cost Explorer data transfer reports: cost data only shows how much traffic was billed. It says nothing about which routes exist and misses paths that simply have not been used yet.
+C=CloudFront access logs: these record requests to a CloudFront distribution, not the routing of VPC subnets, so they cannot show whether a restricted subnet can reach the internet.
+D=Quarterly manual route table checks: manual review across many accounts is slow, error-prone and only looks at routes, not complete paths through gateways and firewalls, and it leaves gaps between reviews.
+T: To verify that a network path must not exist, define it as a Network Access Analyzer scope and review the findings rather than inspecting route tables by hand.
+
+@ Q003924 explain
+G: ## Blocking by country at the edge
+Country-level blocking relies on a geolocation database that maps a client IP address to a country. AWS offers this in two edge services:
+- **CloudFront geographic restrictions**: a distribution-wide allow list or block list of countries. Blocked viewers receive HTTP `403 Forbidden`. It is simple, but applies to the whole distribution.
+- **AWS WAF geo match statement**: a rule condition matching one or more country codes. It can be combined with other conditions (for example block country `XX` except for the path `/status`, or rate-limit instead of block) and runs on CloudFront at the edge as well as on ALB, API Gateway and other supported resources.
+Example: a web ACL on the CloudFront distribution with a geo match rule for two country codes and action `Block`.
+W: C=CloudFront geo restrictions: the distribution checks the viewer's country at the edge location and rejects requests from blocked countries with a 403 before they reach the origin.
+E=WAF geo match rules: a web ACL rule matches the request's country of origin and blocks it, with the flexibility to combine the country check with other request conditions.
+X: A=Route 53 simple routing: simple routing returns the same records to every resolver. It does not block any user, and even geolocation routing only chooses answers rather than enforcing access.
+B=Security groups with country filters: security groups filter by IP ranges, ports and protocols. They have no country-based rules and do not sit at the edge.
+D=NACLs with country rules: network ACLs have a small rule limit, filter only by CIDR and port, and have no notion of countries, so geo blocking is not possible there.
+T: Country blocking at the edge = CloudFront geo restrictions for a simple whole-distribution rule, or WAF geo match when you need finer conditions; VPC filters know only IPs.
+
+@ Q003925 explain
+G: ## Encryption provided by the Nitro System
+Many current EC2 instance types are built on the AWS Nitro System. When two instances of **supported types** communicate, the Nitro hardware automatically encrypts the traffic between them in transit, with no configuration and no change to the operating system or application.
+- It applies to traffic between supported instances within the same VPC or across peered VPCs, as long as the traffic does not pass through a virtual network device or service such as a load balancer or transit gateway; the EC2 documentation lists the exact conditions.
+- Encryption is offloaded to the Nitro hardware, so it uses no instance CPU and AWS states there is no performance impact.
+- If either side is an unsupported instance type, the traffic is not covered, so check the list of supported instance types in the EC2 documentation.
+## When you still need TLS
+If you need end-to-end protection you control, or traffic crosses unsupported instances, a load balancer, a transit gateway or the internet, applications still add TLS or use IPsec.
+W: Supported Nitro instances encrypt automatically: traffic between supported Nitro-based instance types is encrypted by the underlying hardware, which satisfies the requirement without any application change.
+X: A=Only with public IP addresses: a public IP only makes an instance reachable from the internet. It does not add encryption, and Nitro encryption works on private addresses inside the VPC.
+B=Always clear text, no options: this ignores the automatic Nitro in-transit encryption between supported instance types, as well as application-level TLS and IPsec options.
+C=Routing through a NAT gateway: a NAT gateway translates addresses for outbound connections; it does not encrypt traffic, and instance-to-instance traffic in a VPC does not pass through it.
+T: For transparent instance-to-instance encryption without code changes, use supported Nitro instance types; NAT and public IPs never encrypt.
+
+@ Q003926 explain
+G: ## WebSocket and load balancers
+A WebSocket connection starts as an HTTP request with an `Upgrade: websocket` header and then stays open as a long-lived, two-way connection over the same TCP session. The load balancer must understand the HTTP upgrade and keep the connection open.
+## Which load balancer does what
+- **Application Load Balancer (ALB)**: layer 7. Natively supports WebSocket on HTTP and HTTPS listeners and routes by host header, path, HTTP headers, methods, query strings or source IP. Example: `/chat/*` to a WebSocket target group, `/api/*` to REST services.
+- **Network Load Balancer**: layer 4. Can pass WebSocket traffic as TCP, but cannot inspect HTTP, so no path or host routing.
+- **Gateway Load Balancer**: sends packets to third-party appliances such as firewalls using GENEVE.
+- **Classic Load Balancer**: previous-generation, without listener rules for host or path routing.
+W: Application Load Balancer: it handles the WebSocket upgrade natively and offers HTTP listener rules for routing, meeting both requirements in one managed load balancer.
+X: A=Gateway Load Balancer: it transparently inserts virtual appliances into the traffic path at layer 3. It does not terminate HTTP or provide HTTP routing rules for applications.
+C=VPC endpoint service: an endpoint service exposes a service to other VPCs through PrivateLink, fronted by a Network or Gateway Load Balancer. It is a connectivity feature, not an HTTP routing load balancer.
+D=Classic Load Balancer: this legacy load balancer has no content-based routing rules, so it cannot route by path or host, and AWS recommends current-generation load balancers instead.
+T: Need WebSockets plus HTTP routing rules → ALB; layer 4 or legacy load balancers cannot route on HTTP content.
+
+@ Q003927 explain
+G: ## How Route 53 chooses among Regions
+When the same application runs in several Regions, Route 53 routing policies decide which record to return to each DNS query.
+- **Latency-based routing**: you create one record per Region, each tagged with its Region. Route 53 uses latency measurements it collects over time between users' networks and AWS Regions, and answers with the record for the Region that offers the lowest latency for that query.
+- **Geolocation routing** answers based on where the user is (continent, country, state), regardless of which Region is actually fastest.
+- **Weighted routing** splits traffic by percentages, for example 90/10 for a canary.
+- **Simple routing** returns one record set for everyone.
+Example: users in Singapore could be sent to `ap-southeast-1` and users in Frankfurt to `eu-central-1`; if network conditions change, latency routing follows the measurements, not a fixed map. Latency records can be combined with health checks so an unhealthy Region is skipped.
+W: Latency-based routing: it answers each query with the Region that has the lowest measured network latency for the user, which is precisely the requirement.
+X: A=Simple routing: it returns the same record set to every user and has no way to compare Regions, so users are not steered to the fastest one.
+B=Geolocation routing: it maps users to Regions by their location. Nearest by geography is not always lowest latency, and the mapping does not follow real network conditions.
+C=Weighted routing: it distributes traffic by fixed proportions you set, so a user may be sent to a distant Region regardless of latency.
+T: "Lowest latency" means latency-based routing; geolocation is about where the user is, not how fast the path is.
+
+@ Q003928 explain
+G: ## What instances learn from DHCP
+When an EC2 instance boots, it gets network settings through DHCP. The VPC's **DHCP options set** controls what is handed out:
+- `domain-name`: the suffix appended to short host names, for example `corp.example.com`, so `db01` resolves as `db01.corp.example.com`
+- `domain-name-servers`: the DNS servers instances use, either `AmazonProvidedDNS` (the Route 53 Resolver) or up to four custom IP addresses, such as on-premises or Active Directory DNS servers
+- `ntp-servers` and NetBIOS settings
+## How it is applied
+A DHCP options set is associated with a VPC; each VPC has one at a time. You cannot edit an existing set, so you create a new one and associate it. Running instances pick up the new values when they renew their DHCP lease or reboot. If you replace `AmazonProvidedDNS` with custom servers, those servers must be able to resolve AWS names, often by forwarding to the Route 53 Resolver.
+W: DHCP options set: it is the VPC feature that delivers the domain name suffix and DNS server addresses to every instance automatically.
+X: B=Endpoint policy: an endpoint policy controls which actions and resources can be accessed through a VPC endpoint. It has no role in instance DNS configuration.
+C=Route table: route tables decide where packets go based on destination CIDR. They do not tell instances which DNS servers or domain suffix to use.
+D=Prefix list: a prefix list is a named set of CIDR blocks referenced in routes and security group rules. It does not configure DNS settings.
+T: Instance DNS servers and domain suffix come from the VPC's DHCP options set; routing and access-control objects do not touch them.
+
+@ Q003975 explain
+G: ## Two kinds of audit evidence
+Auditors usually ask two questions about a firewall: **who changed it and when**, and **what did it look like before and after**.
+- **AWS CloudTrail** records API calls to AWS services. For AWS Network Firewall, calls such as `CreateRuleGroup`, `UpdateRuleGroup` and `DeleteRuleGroup` are logged with the caller identity, time, source IP and request parameters. Sending a trail to a central S3 bucket keeps this history long term.
+- **AWS Config** records resource configuration over time. Network Firewall rule groups (`AWS::NetworkFirewall::RuleGroup`) and firewall policies are supported resource types, so Config keeps a configuration history showing each version of the rule group, and Config rules can evaluate them for compliance.
+Example: an auditor sees in CloudTrail that a role called `UpdateRuleGroup` at 14:02, and in Config the exact rule that was added at that time.
+W: C=CloudTrail events for Network Firewall: every change made through the API, console or CLI appears as an event naming the principal, time and parameters, answering who changed what.
+E=AWS Config history for rule groups: Config snapshots the rule group configuration each time it changes, giving a timeline of versions that shows exactly what the rules were at any point.
+X: A=CloudFront access logs: these record viewer requests to a CloudFront distribution. They contain nothing about changes made to firewall rule groups.
+B=Route 53 query logs: these record DNS queries resolved in a VPC or for a hosted zone, not management actions on Network Firewall.
+D=VPC Flow Logs for firewall endpoints: flow logs describe traffic passing through network interfaces. They show packets, not who modified the rules or what the rules contained.
+T: Traffic logs show what flowed; CloudTrail shows who changed a resource and AWS Config shows how its configuration evolved.
+
+@ Q003976 explain
+G: ## Private REST APIs in API Gateway
+An Amazon API Gateway REST API can use the **private** endpoint type. A private API has no internet-facing endpoint: it can be invoked only through an **interface VPC endpoint** for the `execute-api` service, which places network interfaces with private IPs in the consumer VPC.
+## Two layers of control
+- The **interface endpoint** gives a VPC a network path to API Gateway. Only VPCs with such an endpoint can reach private APIs at all.
+- The API's **resource policy** decides which endpoints may call this API. A typical policy denies `execute-api:Invoke` unless `aws:SourceVpce` equals an approved endpoint ID (or `aws:SourceVpc` equals an approved VPC). A private API needs a resource policy that allows access, otherwise calls are denied.
+Example: VPCs A and B each have an `execute-api` endpoint; the resource policy allows only `vpce-0aaa` and `vpce-0bbb`, so a third VPC with its own endpoint is still refused.
+W: B=Private API with resource policy: the private endpoint type removes internet exposure, and the resource policy limits invocation to the listed VPC endpoints or VPCs, enforcing which consumers are allowed.
+E=Interface endpoints for execute-api: they provide the private network path from each allowed VPC to API Gateway, which is the only way a private API can be reached.
+X: A=Internet gateway in each VPC: an internet gateway gives public internet access. Private APIs are not reachable over the internet, so it adds exposure without providing the needed path.
+C=Public REST API with IP allow list: the API would still have an internet-facing endpoint, and requests from a VPC reach it over the internet from NAT or public IP addresses, so private VPC CIDRs never appear as the source and the allow list cannot express "only these VPCs".
+D=Public DNS record: DNS only maps a name to an address. It enforces no access control and cannot make a private API reachable from outside the allowed VPC endpoints.
+T: Private API access is two parts: an `execute-api` interface endpoint for the network path, and a resource policy that allows only the approved endpoints or VPCs.

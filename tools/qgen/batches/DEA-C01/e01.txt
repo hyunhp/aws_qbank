@@ -1,0 +1,360 @@
+# DEA-C01 detailed explanations e01 (explanation-only rewrites; letters are the published ones)
+
+@ Q000251 explain
+G: ## Why the Kafka API matters
+Apache Kafka is an open-source streaming platform. Producers write records to **topics**, topics are split into **partitions**, and consumer groups read partitions using the Kafka client library and protocol.
+If existing applications are written against the Kafka client API (for example a Java consumer using `KafkaConsumer` with `group.id` and offsets), they only need a broker that speaks the same protocol.
+## What Amazon MSK provides
+Amazon Managed Streaming for Apache Kafka (MSK) runs real Apache Kafka brokers for you: AWS provisions them, replaces failed nodes, patches software and stores data across Availability Zones. MSK Serverless removes even broker sizing.
+- Existing consumers keep their code; usually only the `bootstrap.servers` list and the authentication settings (IAM, SASL/SCRAM or TLS) change.
+- High-throughput clickstream data fits Kafka's partitioned, append-only log model.
+W: Amazon MSK: it is real Apache Kafka as a managed service, so existing Kafka consumers run with configuration changes only while AWS operates the brokers.
+X: A=Amazon SQS: SQS is a message queue with its own API (SendMessage, ReceiveMessage, DeleteMessage); it has no partitions, offsets or consumer groups, so every Kafka consumer would have to be rewritten.
+B=AWS DMS: DMS migrates and replicates databases; it can write to Kafka as a target, but it is not a streaming broker that producers and consumers connect to.
+D=Amazon Kinesis Data Streams: Kinesis is a managed stream, but it uses its own API and KCL, not the Kafka protocol, so Kafka consumers would need to be rewritten.
+T: When the requirement is "reuse Kafka clients", pick MSK; Kinesis is also a managed stream, but it speaks a different API.
+
+@ Q000252 explain
+G: ## DynamoDB Streams
+DynamoDB Streams is a change log for one table. Every insert, update and delete becomes a stream record, kept for 24 hours.
+- The **stream view type** decides what each record contains: `KEYS_ONLY`, `NEW_IMAGE`, `OLD_IMAGE` or `NEW_AND_OLD_IMAGES`.
+- Records for the same partition key appear in the order the changes happened, and each change appears exactly once in the stream.
+## Lambda event source mapping
+Lambda can read a stream through an **event source mapping**. Lambda polls the stream shards, batches records and invokes the function, usually within seconds of the write.
+Example: an order `order-42` changes status from `PAID` to `SHIPPED`. With `NEW_AND_OLD_IMAGES`, the function receives both the old item (status `PAID`) and the new item (status `SHIPPED`), in the same order as the writes for that key.
+W: DynamoDB Streams with Lambda: the stream captures every change in order per partition key, `NEW_AND_OLD_IMAGES` supplies before and after images, and the event source mapping invokes the function within seconds.
+X: A=Scanning every minute: a scan reads the whole table, costs read capacity each time, misses deletes and intermediate updates, and never shows the previous version of an item.
+B=CloudWatch alarm on write capacity: the metric shows how much was written, not which items changed or what their values were, so there is nothing to process.
+C=Hourly S3 export: an export is a point-in-time copy, so latency is up to an hour and the changes between exports, their order and old images are lost.
+T: For per-item change processing on DynamoDB, use Streams (choose the view type for the images you need); scans, metrics and exports only show snapshots.
+
+@ Q000253 explain
+G: ## Full load and change data capture (CDC)
+AWS Database Migration Service (DMS) moves data between databases and targets such as Amazon S3. A replication **task** can run in three modes:
+- **Full load**: copy the existing rows once.
+- **CDC only**: replicate only changes.
+- **Full load and CDC**: copy existing data, then keep applying changes.
+## How CDC works for Oracle
+DMS reads the database's transaction logs (for Oracle, redo and archived logs via LogMiner or Binary Reader), turns committed inserts, updates and deletes into change records, and writes them to the target continuously.
+For an S3 target, DMS writes CSV or Parquet files; change files can carry an operation column such as `I`, `U` or `D`, so downstream jobs know what changed. Latency is typically seconds to minutes, and no custom code is needed.
+Example: the full load writes every table once to `s3://lake/oracle/`, then new change files keep arriving until the cutover date.
+W: DMS full load plus CDC: it copies the data once and then streams ongoing changes from the Oracle logs to S3 with low latency, entirely through managed configuration.
+X: A=Hourly full extract with Glue: rereading all data every hour is slow and costly, gives up to an hour of latency, and requires writing and maintaining ETL code.
+B=Nightly Data Pump exports: exports happen once a day, so latency is hours, and each export is a full dump rather than a stream of changes.
+C=Weekly Snowball Edge: Snowball is for offline bulk transfer when the network is too slow; shipping a device weekly gives days of latency, not minutes.
+T: "Keep changes flowing after the initial copy, no code" means a DMS task with full load plus CDC; batch exports and devices only give periodic snapshots.
+
+@ Q000254 explain
+G: ## What Amazon AppFlow does
+Amazon AppFlow is a no-code, fully managed service that moves data between SaaS applications (such as Salesforce, ServiceNow, Zendesk) and AWS services such as Amazon S3 and Amazon Redshift.
+A **flow** defines a source object, a destination, and how it runs:
+- **Run mode**: on demand, on a schedule (for example every hour) or on an event from the SaaS app.
+- **Incremental transfer**: for scheduled flows, only records created or changed since the last run are pulled, based on a timestamp field such as `LastModifiedDate`.
+- **Mapping, filters and validations**: choose and rename fields, filter records (for example `StageName` not equal to `Closed Lost`), mask values.
+Example: an hourly flow copies changed `Opportunity` records to `s3://marketing/salesforce/` in Parquet, with no servers or scripts.
+W: AppFlow with incremental transfer: it connects to Salesforce natively, runs hourly, pulls only changed records, and applies field mapping and filters without code or servers.
+X: A=DataSync with a Salesforce location: DataSync copies files and objects between storage systems (NFS, SMB, HDFS, object storage); it does not read records from SaaS application APIs like Salesforce.
+C=EC2 cron script: this works technically, but it means writing code against the Salesforce SDK and running and patching a server, both of which the requirement rules out.
+D=Glue job calling the REST API: a custom Glue script means writing and maintaining code for API paging, authentication and change tracking, which the team wants to avoid.
+T: SaaS-to-AWS data movement without code is AppFlow; DataSync moves files between storage systems, and scripts or Glue jobs require code.
+
+@ Q000255 explain
+G: ## Event-driven starts from S3
+Amazon S3 can send an event every time an object is created. When **EventBridge notifications** are enabled on the bucket, each `Object Created` event goes to the default event bus within seconds.
+An **EventBridge rule** matches events using an event pattern and can filter on the key:
+- `bucket.name` equal to `raw`
+- `object.key` with a prefix of `orders/` and a suffix of `.csv`
+The rule can target a Glue workflow (whose event trigger starts the job), a Step Functions state machine, or a Lambda function that calls `StartJobRun` with the object key.
+## One start per object
+Each object creation produces one event, so each file starts exactly one run; no polling means the same object is not picked up twice by overlapping schedules. Jobs should still be idempotent in case an event is ever delivered more than once.
+W: S3 events to EventBridge with a filter: each new object emits one event within seconds, the pattern keeps only `orders/` keys ending in `.csv`, and the rule starts the job once per file.
+X: A=CloudWatch alarm on object count: S3 storage metrics such as `NumberOfObjects` are reported once a day, so the job would start many hours late and could not tell which file arrived.
+B=Glue trigger every five minutes: a schedule adds up to five minutes of delay, starts runs even when no file arrived, and needs extra logic to avoid processing a file twice.
+D=Crawler every minute: crawlers update the Data Catalog, they do not detect individual files or check extensions, and running one per minute is costly while still adding delay.
+T: "Start within seconds, per file, only matching keys" is an S3 event through an EventBridge rule; schedules, crawlers and metrics are polling that adds delay and duplicates.
+
+@ Q000256 explain
+G: ## Why a sleep loop is expensive
+Lambda bills for the time the function runs, measured in milliseconds, multiplied by the memory configured. A function that sleeps between polls is billed for the whole sleep, and a single Lambda invocation can run at most 15 minutes, so a loop cannot run forever anyway.
+## Amazon EventBridge Scheduler
+EventBridge Scheduler is a serverless scheduler that invokes a target on a schedule:
+- **Rate expressions** such as `rate(15 minutes)`.
+- **Cron expressions** such as `cron(0/15 * * * ? *)` with a time zone.
+- **One-time** schedules at a set date and time.
+It can call more than 200 AWS services, including Lambda, with a retry policy and an optional dead-letter queue. The function then does one poll, stores the result and exits, so you pay only for a few seconds every 15 minutes.
+W: EventBridge Scheduler: a `rate(15 minutes)` schedule invokes the function only when work is due, so each run is short and nothing is billed while waiting.
+X: A=15-minute timeout with a sleep loop: the function would still be billed for all the sleeping time, and 15 minutes is the hard maximum, so the loop would be killed anyway.
+C=RDS stored procedure: a database is not a scheduler for external API calls; it adds an always-on database cost, and calling HTTP APIs from inside RDS is limited and awkward.
+D=S3 Transfer Acceleration: it speeds up long-distance uploads to S3 through edge locations; it has nothing to do with running code on a schedule.
+T: Schedule short invocations with EventBridge Scheduler instead of keeping a Lambda function awake to wait.
+
+@ Q000257 explain
+G: ## Apache Airflow and DAGs
+Apache Airflow is an open-source workflow orchestrator. Workflows are **DAGs** (directed acyclic graphs) written in Python; each task uses an **operator**, such as `PythonOperator` or `BashOperator`, and a scheduler runs tasks in dependency order.
+## Amazon MWAA
+Amazon Managed Workflows for Apache Airflow (MWAA) runs Airflow for you:
+- You upload DAG files to an S3 bucket (for example `s3://airflow-env/dags/`) plus `requirements.txt` and plugins.
+- AWS runs the scheduler, web server, workers and metadata database, scales workers with load, and applies patches within the Airflow version you choose.
+- Access to the Airflow UI goes through IAM.
+Because it is the same Airflow, existing DAGs usually move with little or no change, apart from connections, variables and package versions.
+W: Amazon MWAA: it runs standard Apache Airflow, so the 40 existing DAGs are reused as is while AWS handles scaling, patching and the infrastructure.
+X: A=Self-managed Airflow on EC2: the DAGs would run unchanged, but the team would still patch, scale and monitor the servers and the database, which the requirement wants to avoid.
+B=Step Functions with ASL: Step Functions uses Amazon States Language (JSON), so every DAG would need to be rewritten, which contradicts "without rewriting".
+D=Glue workflows: Glue workflows chain Glue jobs, crawlers and triggers; they cannot run Airflow DAGs, so every pipeline would be rebuilt.
+T: Existing Airflow DAGs plus managed operations means MWAA; Step Functions and Glue workflows are alternatives that require a rewrite.
+
+@ Q000258 explain
+G: ## What IteratorAge means
+For a Kinesis event source, Lambda reports `IteratorAge`: the age of the last record in each batch when it was read. A rising value means records are arriving faster than the consumer processes them, so the backlog grows.
+## How Lambda reads a Kinesis stream
+By default Lambda processes **one batch at a time per shard**, in order. Throughput per shard therefore depends on how many records each invocation handles and how many invocations run at once.
+- **Batch size** (up to 10,000 records) plus a batching window: more records per invocation means less per-invocation overhead.
+- **Parallelization factor** (1 to 10): up to 10 concurrent batches per shard, while records with the same partition key are still processed in order.
+Example: with 4 shards and factor 1, only 4 invocations run at a time; with factor 5, up to 20 can run.
+W: Larger batches and higher parallelization factor: when each invocation is already fast, the bottleneck is how many records each call and each shard handle, and these two settings raise both.
+X: A=Fewer shards: shards are the unit of parallelism; removing them reduces the number of concurrent batches and makes the lag worse.
+B=Less memory: Lambda CPU scales with memory, so reducing it can only slow each invocation; it does not add parallelism.
+C=Standard throughput only: standard (shared) consumers are the default; switching to it does nothing, and the fix for read contention would be enhanced fan-out, not the reverse.
+T: When a Kinesis-triggered Lambda is fast but IteratorAge keeps rising, raise batch size and parallelization factor (or add shards), not memory reductions.
+
+@ Q000259 explain
+G: ## Shard limits in provisioned mode
+In provisioned mode, each Kinesis shard accepts up to **1 MB per second or 1,000 records per second** of writes. When producers exceed that for a shard, `PutRecord` or `PutRecords` return `ProvisionedThroughputExceededException`.
+- Traffic spikes push total writes over the shard capacity.
+- A skewed **partition key** can overload one "hot" shard even when the total is fine.
+## Two standard fixes
+- **More capacity**: split shards or use `UpdateShardCount`, or switch to **on-demand mode**, where Kinesis scales capacity automatically based on observed traffic.
+- **Handle throttling in the producer**: retry failed records with exponential backoff (for example 100 ms, 200 ms, 400 ms, plus jitter). With `PutRecords`, retry only the records marked as failed. The Kinesis Producer Library (KPL) and AWS SDKs include retry logic.
+W: A=More shards or on-demand mode: raises the write capacity of the stream so spikes fit within the per-shard limits, or lets Kinesis scale it automatically.
+C=Exponential backoff and retry: brief throttling during spikes becomes a short delay instead of lost records, and backing off avoids hammering the throttled shard.
+X: B=Shorter retention: retention controls how long data is kept for reading; it has no effect on how fast producers can write to a shard.
+D=Disable encryption: server-side encryption does not reduce the write limit of a shard; turning it off lowers security without solving throttling.
+E=Omit the partition key: the partition key is required on every record because it decides the shard; the API rejects records without it.
+T: Write throttling in Kinesis is fixed by adding capacity (more shards or on-demand) and retrying with backoff, not by changing retention or encryption.
+
+@ Q000260 explain
+G: ## Shared versus dedicated read throughput
+Each Kinesis shard supports **2 MB per second of reads** in total. With standard (shared-throughput) consumers, all applications reading the same shard split that 2 MB/s and are limited to 5 `GetRecords` calls per second per shard, so each added consumer slows the others.
+## Enhanced fan-out
+With **enhanced fan-out**, a consumer registers with `RegisterStreamConsumer` and receives its own **2 MB per second per shard** pipe.
+- Records are pushed over HTTP/2 using `SubscribeToShard`, typically with about 70 ms propagation delay.
+- Each registered consumer is independent of the others; a stream supports up to 20 registered consumers by default.
+- It is billed per consumer-shard-hour and per GB retrieved.
+Example: analytics, alerting and archive each read 2 MB/s from every shard at the same time, instead of sharing 2 MB/s between the three.
+W: Enhanced fan-out: each registered consumer gets a dedicated 2 MB/s per shard, so several applications read at full speed without competing.
+X: A=On-demand mode: it scales write and read capacity of the stream automatically, but consumers using shared throughput still share each shard's 2 MB/s.
+B=Server-side encryption: KMS encryption protects data at rest; it does not change how read throughput is shared between consumers.
+D=Firehose delivery: Firehose is one more consumer that delivers to destinations such as S3; it does not give other applications dedicated read throughput.
+T: Many consumers at full speed on the same stream means enhanced fan-out; scaling mode and encryption do not change the shared-read limit.
+
+@ Q000261 explain
+G: ## Fan-in and fan-out
+These two terms describe how many producers and consumers share one channel.
+- **Fan-in**: many sources write to one destination. Hundreds of IoT gateways all putting records into one Kinesis stream is fan-in; the stream becomes the single ordered buffer.
+- **Fan-out**: one source is read by many consumers, each getting its own copy. Analytics, alerting and archive all reading the same stream independently is fan-out.
+## Why a stream fits both
+A Kinesis stream keeps records for the retention period, and each consumer tracks its own position (a checkpoint or sequence number). Consumers do not remove records for each other, unlike a queue. With enhanced fan-out, each consumer also gets its own read throughput.
+Example: gateway `gw-17` writes a reading once; the alerting app reads it within a second, the analytics app reads it in its own batch, and Firehose archives it to S3.
+W: Fan-in then fan-out: many gateways converge on one stream, and several consumers independently read the same records from it.
+X: A=Nightly batch to S3: the scenario describes continuous streaming read by several consumers at full speed, not a once-a-day batch job.
+B=Point-to-point queues: separate queues for every gateway-consumer pair would be hundreds of channels and does not match one shared stream.
+D=Reversed terms: gateways writing into one stream is fan-in, not fan-out, and consumers reading the same data independently is fan-out, not fan-in.
+T: Many writers into one stream is fan-in; many independent readers of that stream is fan-out.
+
+@ Q000262 explain
+G: ## Kinesis retention tiers
+A Kinesis data stream keeps records for **24 hours by default**. You can raise retention with `IncreaseStreamRetentionPeriod`, up to **365 days**, on an existing stream without re-creating it.
+- **Default (24 hours)**: included in the base price.
+- **Extended retention (up to 7 days)**: an additional charge per shard-hour (or per GB in on-demand mode).
+- **Long-term retention (beyond 7 days)**: an additional charge per GB-month stored, plus a charge per GB when reading data older than 7 days.
+## Why keep 30 days
+Consumers can restart from an earlier position (for example `AT_TIMESTAMP`) and reprocess everything after a bug fix, without asking the source systems to send data again. The price is paying to store that data in the stream.
+Example: at 30 days, a stream holding 1 TB per day keeps about 30 TB billed as long-term storage.
+W: Extra charges for longer retention: anything above 24 hours is billed on top of the base price, so the replay window is paid for with storage charges (per shard-hour up to 7 days, per GB-month beyond that).
+X: A=Deletion after 7 days anyway: Kinesis keeps data for the configured period, up to 365 days; there is no hidden 7-day cap that deletes data early.
+B=No cost, needs re-sharding: retention changes are billed and do not require changing the shard count.
+C=Stream must be re-created: retention is changed in place with `IncreaseStreamRetentionPeriod` or `DecreaseStreamRetentionPeriod` on a running stream.
+T: Longer Kinesis retention enables replay without re-ingesting, and the tradeoff is additional retention charges, not re-creation or re-sharding.
+
+@ Q000263 explain
+G: ## Stateless versus stateful
+- **Stateless** processing handles each record on its own, such as filtering or reformatting. Nothing needs to be remembered between records.
+- **Stateful** processing depends on earlier records: counts, windows, joins, deduplication. A 5-minute rolling average per device needs the recent readings for each device kept in memory.
+## How Apache Flink keeps state safe
+Amazon Managed Service for Apache Flink runs Flink applications. Flink stores keyed state (for example per `device_id`) and takes periodic **checkpoints** to durable storage; **snapshots** can be taken manually or on updates.
+If the application restarts or scales, Flink restores state from the last checkpoint and replays the stream from the matching position, so the window continues with no lost or double-counted readings.
+Example: device `d-9` has 4 minutes of readings in its window when the job restarts; after recovery the window still holds them and the next average is correct.
+W: Stateful processing with checkpoints in Flink: a rolling window per device is state, and Flink checkpoints let the job resume with the window intact after a restart.
+X: A=Nightly Glue batch: a nightly job cannot produce a rolling 5-minute average in real time; results would arrive hours later.
+B=Firehose Lambda transform: the transform processes each buffered batch independently and keeps no state across batches, so it cannot hold a window per device.
+C=Lambda per record: each invocation is independent with no durable memory, so the window would be lost between calls unless you build your own external state store.
+T: Windows and aggregates over time are stateful; use a stream processor with checkpointed state such as Flink, not stateless per-record functions.
+
+@ Q000264 explain
+G: ## How DMS reaches an on-premises database
+An AWS DMS replication instance runs inside a VPC subnet and has an elastic network interface with a **private IP address** from that subnet. When the source database is on premises and reached over a Site-to-Site VPN (or Direct Connect), traffic is routed through the VPC's virtual private gateway or transit gateway without NAT, so the on-premises side sees that private address as the source.
+## What to allowlist
+- The firewall allows the replication instance's private IP (or, more robustly, the small subnet CIDR the instance lives in, such as `10.20.8.0/28`) on the SQL Server port, `1433` by default.
+- The VPC route table sends the on-premises range (for example `192.168.0.0/16`) to the VPN, and the security group allows outbound traffic to it.
+- The replication instance does not need to be publicly accessible.
+Keep in mind that the address can change if the instance is replaced or fails over, which is why allowlisting the subnet range is common.
+W: Stable private IP that the firewall allows: over the VPN the instance connects from its private VPC address, so allowlisting that address (or its subnet) gives the firewall a consistent source to trust.
+X: A=Rotate the IP daily: a changing address is the opposite of the requirement; the firewall rule would break every day.
+B=S3 Transfer Acceleration: it speeds up uploads to S3 buckets through edge locations; it is not a DMS setting and has nothing to do with source IP addresses.
+D=Disable the security group: security groups cannot be removed from an instance, and weakening them does not change the source address; it only reduces security.
+T: Over a VPN, on-premises firewalls see the DMS instance's private VPC address, so allowlist that address or its subnet.
+
+@ Q000265 explain
+G: ## Redshift streaming ingestion
+Amazon Redshift can read directly from **Amazon Kinesis Data Streams** and **Amazon MSK** without staging in S3.
+First you create an external schema that points at the stream source using an IAM role, for example `CREATE EXTERNAL SCHEMA kds FROM KINESIS IAM_ROLE '...'`.
+Then you define a **materialized view** over the stream, for example selecting `approximate_arrival_timestamp` and parsing the JSON payload stored in the `kinesis_data` column.
+- Each refresh pulls new records from the stream into the view; with `AUTO REFRESH YES`, Redshift refreshes it automatically.
+- Latency from stream to query is typically seconds, and large volumes are supported.
+- Analysts query the view with normal SQL and can join it with warehouse tables.
+Example: a dashboard queries `clickstream_mv` for the last 5 minutes of page views.
+W: Streaming ingestion into a materialized view: Redshift reads the Kinesis stream directly and refreshes the view within seconds, so SQL queries see live events without S3 or ETL.
+X: A=Federated query to RDS: federated query reads live data from RDS or Aurora PostgreSQL and MySQL databases, not from Kinesis streams.
+B=Serverless snapshot restore: restoring a snapshot recovers earlier data into a namespace; it does not ingest new streaming events.
+D=Redshift Spectrum: Spectrum queries files stored in S3, so it requires landing the data in S3 first, which the requirement rules out.
+T: Kinesis or MSK straight into Redshift means streaming ingestion with a materialized view; Spectrum needs S3 and federated query needs a database.
+
+@ Q000266 explain
+G: ## Crawlers and ETL jobs have different jobs
+- A **Glue crawler** scans data in S3 (or JDBC sources), infers the schema and partitions, and creates or updates tables in the **Glue Data Catalog**. Its schema change policy can add new columns when they appear. Athena uses the Data Catalog to find tables, so crawled tables become queryable.
+- A **Glue ETL job** is Spark (or Python shell) code that reads data, transforms it and writes it out, for example writing Parquet partitioned by `dt`.
+## A typical daily pipeline
+First the crawler runs on `s3://raw/sales/` and updates the `raw_sales` table with any new columns.
+Then a nightly ETL job reads `raw_sales` and writes Parquet to `s3://curated/sales/`, where another crawler run or the job itself (using catalog updates) keeps the curated table current.
+A Glue workflow or trigger can chain the crawler and job.
+W: Crawler catalogs, ETL job converts: the crawler discovers schemas and new columns so Athena can see the tables, and the ETL job rewrites the data as Parquet.
+X: A=Crawler does both: crawlers only read data and write metadata to the catalog; they never rewrite files into another format.
+B=Roles reversed: an ETL job can update the catalog, but it is the crawler that infers schemas automatically, and a crawler cannot convert files.
+C=DataBrew catalogs, crawler converts: DataBrew is a visual data preparation tool, not the schema discovery tool, and crawlers still cannot convert data.
+T: Crawlers write metadata (schemas to the Data Catalog); ETL jobs write data (such as Parquet); neither does the other's job.
+
+@ Q000267 explain
+G: ## Transient clusters
+Amazon EMR runs open-source frameworks such as Apache Spark on managed clusters. A **transient cluster** is created for a job, runs its steps and terminates automatically when the steps finish, so nothing is billed between nightly runs. **EMR Serverless** goes further: you submit a Spark job and pay only for the vCPU, memory and storage it uses, with no cluster to size.
+Both keep full Spark control: custom JARs, `spark-submit` parameters, and Spark configuration such as `spark.sql.shuffle.partitions`.
+## Spot Instances
+Spot Instances use spare EC2 capacity at a large discount compared with On-Demand. They can be reclaimed with a two-minute warning, so a common pattern is On-Demand for the primary node and part of the core capacity, and Spot for task nodes through instance fleets with several instance types.
+Example: a 40 TB nightly job runs for 2 hours on a transient cluster, with most task capacity on Spot, and the cluster disappears when it finishes.
+W: Transient EMR or EMR Serverless with Spot: the job keeps custom JARs and Spark tuning, compute exists only while the job runs, and Spot capacity lowers the cost further.
+X: A=Permanent cluster sized for peak: you pay for peak capacity 24 hours a day even though the job runs once a night, which is the most expensive choice.
+B=Load into Redshift: loading 40 TB into a warehouse for each run adds load time and storage cost and cannot run the custom Spark JARs.
+C=Lambda per file: Lambda has a 15-minute limit, limited memory and no Spark engine, so custom Spark code and tuning cannot run there, and joins or shuffles across 40 TB do not fit this model.
+T: Periodic heavy Spark jobs belong on transient EMR clusters or EMR Serverless (with Spot for savings), not on always-on clusters.
+
+@ Q000268 explain
+G: ## Rate limits and HTTP 429
+An API with a rate limit returns **HTTP 429 Too Many Requests** when a client sends more calls than allowed in a time window. Many APIs also include a `Retry-After` header saying how many seconds to wait. Retrying immediately just sends more requests into the same exhausted window, so every retry fails too.
+## Exponential backoff with jitter
+- **Exponential backoff**: wait longer after each failure, for example 1 s, 2 s, 4 s, 8 s, up to a maximum and a retry limit.
+- **Jitter**: add a random amount to each wait, so many concurrent callers do not all retry at the same moment.
+- **Retry-After**: when the server sends it, wait at least that long.
+Example: the first call gets 429 with `Retry-After: 5`; the function waits 5 seconds plus a little jitter, retries, and on further 429s doubles the wait until a limit is reached, then fails so a later run can continue.
+W: Backoff with jitter and Retry-After: spacing out retries lets the rate-limit window reset, and following the server's hint avoids calls that are guaranteed to fail.
+X: A=More reserved concurrency: more parallel callers send even more requests into the limit, producing more 429 errors, not fewer.
+C=Switch trigger to S3 events: what starts the function does not change how fast it calls the API once running, so the 429s continue.
+D=Disable retries: stopping the loop avoids some errors, but temporary 429s then lose data; the right fix is to retry later, not never.
+T: Answer HTTP 429 by slowing down (exponential backoff, jitter, Retry-After), never by retrying faster or giving up.
+
+@ Q000269 explain
+G: ## What a job bookmark is
+AWS Glue **job bookmarks** store state about what a job already processed, so the next run can continue from there.
+- For S3 sources, Glue tracks which files were processed, using object timestamps and paths, and on the next run reads only files that are new since the last successful run.
+- For JDBC sources, Glue can use key columns (for example an increasing `id`) to read only new rows.
+- The job runs with `--job-bookmark-option job-bookmark-enable`, each source needs a `transformation_ctx`, and the script calls `job.init()` and `job.commit()` so the state is saved.
+Example: on Monday the job reads 200 files under `s3://lake/raw/`; on Tuesday 30 new files arrive, and the job reads only those 30. A bookmark can be reset or paused to reprocess data.
+W: Job bookmarks: Glue remembers which files were processed, so each nightly run reads only newly arrived files.
+X: B=DynamicFrame partitioning: partitioning decides how data is organized or filtered by keys such as date; it does not track which files a previous run already processed.
+C=Data Catalog versioning: table versions record schema changes over time; they do not track which files a job processed.
+D=G.2X workers: the worker type sets memory and compute per worker; it makes a run faster, not incremental.
+T: Incremental processing in Glue means job bookmarks; worker types and partitioning change performance or layout, not what gets reread.
+
+@ Q000270 explain
+G: ## Kubernetes operators and CRDs
+Kubernetes can be extended with **custom resource definitions (CRDs)**, new object types such as `SparkApplication`, and **operators**, controllers that watch those objects and act on them. The open-source Spark operator, for example, lets you submit a `SparkApplication` YAML file and handles driver and executor pods, retries and cleanup.
+## Amazon EKS
+Amazon Elastic Kubernetes Service (EKS) is managed Kubernetes: AWS runs the control plane, and you run standard Kubernetes tooling (`kubectl`, Helm, operators, CRDs) on EC2 or Fargate nodes. EMR on EKS can also run Spark jobs on an EKS cluster.
+Amazon ECS is also a container orchestrator, but it has its own task and service model, not the Kubernetes API, so Kubernetes operators and CRDs cannot run there.
+Example: the team installs the Spark operator with Helm on EKS and submits nightly jobs as `SparkApplication` resources.
+W: Amazon EKS: it provides the Kubernetes API, so existing operators and CRDs for Spark job management work unchanged.
+X: B=EMR Serverless: it runs Spark jobs without a cluster to manage, but there is no Kubernetes API, so operators and CRDs cannot be installed.
+C=Lambda container images: Lambda runs one function invocation for up to 15 minutes, with no Kubernetes API, and does not suit distributed Spark jobs.
+D=ECS with Fargate: ECS is simpler but uses its own orchestration API, not Kubernetes, so Kubernetes operators and CRDs cannot be used.
+T: "Kubernetes operators and CRDs" is the signal for EKS; ECS and EMR Serverless run containers or Spark without the Kubernetes API.
+
+@ Q000271 explain
+G: ## How Glue reaches private databases
+By default, Glue jobs run in an AWS-managed network. To reach a database that has no public address, you attach a **Glue connection** of type JDBC to the job. The connection specifies:
+- The JDBC URL, for example `jdbc:sqlserver://10.50.1.20:1433;databaseName=sales`.
+- Credentials, ideally from AWS Secrets Manager.
+- A **VPC, subnet and security group**. Glue then creates elastic network interfaces with private IPs in that subnet.
+## Path to on premises
+From the subnet, the VPC route table sends the on-premises range to a virtual private gateway or transit gateway associated with Direct Connect. Traffic stays on private connections, and the on-premises firewall allows the subnet range. The security group needs a self-referencing rule allowing all TCP (a Glue requirement) and outbound access to the database port.
+If the job also needs S3, add an S3 gateway endpoint to the VPC, since the subnet may have no internet route.
+W: JDBC connection in your VPC subnet: Glue places its network interfaces in your subnet, so traffic follows your private routes over Direct Connect without any internet exposure.
+X: A=Internet-facing crawler: crawlers also need a connection in the VPC to reach private databases; there is no internet-facing Glue endpoint that reaches on-premises SQL Server privately.
+B=No connection with public DNS: without a connection the job runs outside your VPC and can reach only public addresses, which would require exposing SQL Server to the internet.
+D=Public SQL Server endpoint: publishing the database on the internet contradicts the "no internet exposure" requirement.
+T: To reach private or on-premises databases, give Glue a JDBC connection in your VPC subnet; the routing over Direct Connect then comes from your VPC.
+
+@ Q000272 explain
+G: ## Identity federation to Redshift
+Instead of a shared database password, users can sign in with their corporate identity provider (IdP), such as Microsoft Entra ID, Okta or AD FS.
+- The Redshift **JDBC or ODBC driver** supports federated sign-in plugins, for example a browser-based SAML or OAuth plugin.
+- The IdP authenticates the user; the driver exchanges that for temporary credentials (through IAM, Redshift's native IdP integration or IAM Identity Center).
+- Redshift maps the user and group claims to database users and roles, so permissions follow corporate group membership.
+## Why it is better
+No password is stored in the BI tool, credentials expire automatically, and removing a user from the IdP removes their access. Every query is attributed to the individual analyst.
+Example: an analyst opens a BI tool, a browser window asks for the company login with MFA, and queries run under the analyst's own mapped identity with the permissions of an `analysts` role.
+W: Driver with IdP federation: the analyst signs in with corporate credentials, the driver obtains temporary credentials, and no shared password is needed.
+X: B=Share the admin password: every analyst gets full admin rights, nobody's queries can be told apart, and rotating the password breaks everyone.
+C=Email CSV exports: this gives up live queries entirely and sends data outside controlled systems, a security and data governance problem.
+D=Data API with root user: the root user should never be used for daily work, and a desktop BI tool connects through JDBC or ODBC, not by making root-signed Data API calls.
+T: Corporate identity to Redshift means JDBC or ODBC federation through your IdP for temporary credentials, never shared or root credentials.
+
+@ Q000273 explain
+G: ## Glue connections and DynamicFrames
+A Glue Spark job can read from many sources in the same script. Each source becomes a **DynamicFrame** (Glue's schema-flexible version of a Spark DataFrame):
+- Redshift: `create_dynamic_frame.from_options(connection_type="redshift", ...)` or a Data Catalog table, using a Glue connection for network access and a temporary S3 directory for unloading.
+- S3 Parquet: `create_dynamic_frame.from_catalog(database="lake", table_name="customers")` or `from_options` with `connection_type="s3"` and `format="parquet"`.
+The job then joins them with `Join.apply` or by converting to Spark DataFrames, and writes the result wherever needed.
+Example: orders from Redshift joined with customer profiles from S3 on `customer_id`, written back to S3 as Parquet, all in one run.
+W: Multiple connections and DynamicFrames in one job: each source is read into its own DynamicFrame, and the join happens inside the same Spark job.
+X: B=S3 Batch Operations: it runs operations on existing S3 objects (copy, tag, invoke Lambda); it cannot read tables from Redshift.
+C=Two Lambda functions merged client-side: this moves the join out of Spark into custom code with memory and runtime limits, and it is not a single Glue transformation step.
+D=Redshift Spectrum instead of Glue: Spectrum lets Redshift query S3 data, but the requirement is a Glue ETL job; bypassing Glue does not meet it.
+T: One Glue job can read many sources (each a DynamicFrame via its connection) and join them in one step.
+
+@ Q000274 explain
+G: ## Glue Flex execution
+AWS Glue offers two execution classes for Spark jobs:
+- **Standard**: capacity is reserved for the job, so it starts quickly and runs predictably.
+- **Flex**: the job runs on spare compute capacity at a lower price per DPU-hour (roughly a third less). Start times can be delayed, and a run can take longer if capacity is reclaimed.
+You choose it with the job's execution class (`ExecutionClass` set to `FLEX` on the job or in `StartJobRun`). Flex is supported for Glue Spark jobs on Glue 3.0 and later.
+## When to use it
+Flex fits non-urgent work: nightly batches, tests, one-off backfills. Jobs with strict start times or SLAs should stay on standard.
+Example: a nightly job that must finish by 6 a.m. but can start any time after midnight runs on Flex and costs less.
+W: Flex execution: it runs the same job on spare capacity at a lower price, which suits a nightly job that can tolerate variable start times.
+X: A=G.2X workers only: G.2X gives more memory per worker at a higher cost per worker; it does not discount anything.
+C=Job bookmarks: bookmarks avoid reprocessing old data, which can reduce work, but they are not an execution option with a lower price.
+D=More DPUs: more DPUs can make a job finish faster, but total cost typically stays the same or goes up; it does not lower the rate.
+T: Non-urgent Glue Spark jobs cost less on Flex execution; worker types and DPU counts change capacity, not the price per DPU.
+
+@ Q000275 explain
+G: ## Right-size the compute to the event
+The workload is tiny and infrequent: a few KB, a few times per hour. Compute that runs all the time, or that takes minutes to start, costs far more than the work itself.
+## S3 events to Lambda
+An S3 bucket can invoke a Lambda function directly on `s3:ObjectCreated:*` for a prefix or suffix such as `.json`. The event includes the bucket and key, so the function reads the object, normalizes it and writes the result.
+- It starts within seconds, even with an occasional cold start.
+- Billing is per request and per millisecond of run time, so there is effectively no cost when idle.
+- Scaling is automatic if many files arrive at once.
+Example: `raw/2026/09/event-81.json` lands, and the function flattens nested fields and writes `clean/event-81.json` in a few hundred milliseconds.
+W: Lambda triggered by the S3 event: it runs for milliseconds per small file, starts within seconds, and costs nothing between files.
+X: B=EC2 polling: an instance running all the time costs money even when idle, and polling adds delay and extra list requests.
+C=Continuously running EMR: a cluster built for big data jobs is far too large and expensive for a few KB per hour.
+D=Glue Spark job per file: Spark jobs take far longer than a few seconds to start and have a minimum billing duration, so they are slow and costly for tiny files.
+T: For small, infrequent files needing fast processing, use S3 events with Lambda; clusters and servers cost money while idle.

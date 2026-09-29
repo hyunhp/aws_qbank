@@ -1,0 +1,360 @@
+# ANS-C01 detailed explanations, batch e13 (explanation-only rewrites; letters are the published ones)
+
+@ Q003893 explain
+G: ## Route 53 Resolver endpoints in hybrid DNS
+Hybrid DNS uses two kinds of Route 53 Resolver endpoints:
+- An **inbound endpoint** gives on-premises DNS servers IP addresses inside the VPC to which they can forward queries for private hosted zones.
+- An **outbound endpoint** plus forwarding rules lets VPC resources resolve on-premises names, for example forwarding `corp.example.com` to on-premises DNS servers.
+Each endpoint is made of elastic network interfaces, one per IP address you choose, and each IP lives in a specific subnet and therefore in one Availability Zone. AWS requires at least two IP addresses per endpoint and recommends placing them in different AZs.
+## Why AZ spread matters
+If every endpoint IP sits in one AZ, an AZ impairment takes all hybrid resolution down at once. With IPs in, say, `us-east-1a` and `us-east-1b`, on-premises forwarders list both addresses and simply fail over to the surviving one.
+W: Endpoint IPs in at least two AZs: each IP is an ENI in its own subnet, so spreading them across AZs removes the single-AZ failure point, and DNS clients or forwarders retry the other address automatically.
+X: B=Single IP in one AZ: this is the exact single point of failure the question wants to remove; it also falls below the two-IP minimum Resolver requires for an endpoint.
+C=One on-premises DNS server: a single on-premises forwarder with no secondary makes the on-premises side of the path fragile, so availability gets worse, not better.
+D=Public internet DNS only: public resolvers cannot answer for private hosted zones or internal on-premises names, so hybrid resolution simply stops working.
+T: Resolver endpoints are ENIs in specific subnets; spread their IPs across at least two AZs (and use redundant on-premises forwarders) for highly available hybrid DNS.
+
+@ Q003894 explain
+G: ## What the CloudFront cache key is
+CloudFront stores each object under a **cache key**. By default the key is the domain and URL path, and a **cache policy** decides which query strings, headers and cookies are added to it.
+Every extra value in the key creates a separate cached copy. Tracking parameters such as `utm_source` or `gclid` are different for almost every visitor, so these two requests become two cache misses even though the page is identical:
+- `/product/42?utm_source=mail&id=7`
+- `/product/42?utm_source=ads&id=7`
+## Fixing it with a cache policy
+Create a cache policy whose query-string setting is an allow list containing only the parameters that change the response (here `id`). Requests that differ only in tracking parameters now share one cache entry. If the origin still needs other values for logging, an **origin request policy** can forward them without putting them into the cache key.
+W: Exclude unneeded query strings from the cache key: removing the tracking parameters collapses many variants into one cached object, which raises the hit ratio directly.
+X: A=TTL of zero: a zero default TTL makes CloudFront revalidate or refetch from the origin almost every time, which lowers the hit ratio further.
+B=Include everything in the key: adding all headers, cookies and query strings multiplies the number of unique keys, which is the root cause of the low hit ratio.
+C=Disable compression: compression settings do not create per-visitor variants; turning it off only makes responses larger and slower without fixing the varying query strings.
+T: Keep only the values that change the response in the cache key; varying tracking parameters in the key fragment the cache.
+
+@ Q003895 explain
+G: ## How DNS failover timing adds up
+With Route 53 failover routing, a primary and a secondary record share a name, and a health check decides which one is returned. Total failover time is roughly:
+- **Detection time**: health check request interval (standard 30 seconds, fast 10 seconds) multiplied by the failure threshold (number of consecutive failed checks).
+- **Cache time**: resolvers and clients keep the old answer until the record's TTL expires.
+## Example
+A 30-second interval with threshold 3 detects failure in about 90 seconds. If the record TTL is 86,400 seconds (one day), some clients keep going to the dead endpoint for up to a day. Using a 10-second interval, a sensible threshold and a TTL of 60 seconds brings failover down to a couple of minutes. Very low values raise query costs and risk flapping, so tune rather than minimize blindly.
+W: B=Tuned health checks: failover routing only switches when a health check fails, and the interval and failure threshold set how quickly that happens.
+E=Lower TTL: a short TTL on the failover records makes resolvers and clients discard the old answer sooner, so they pick up the secondary record quickly.
+X: A=Remove health checks: without health checks Route 53 never marks the primary unhealthy, so automatic failover stops entirely.
+C=One-day TTL: a long TTL lets clients cache the failed endpoint for up to a day, which is the opposite of what is needed.
+D=Simple routing, one record: simple routing has no health-check-based failover, so there is nothing to fail over to.
+T: DNS failover speed is detection time (health check interval x threshold) plus cache time (TTL); tune the checks and lower the TTL.
+
+@ Q003896 explain
+G: ## VPC Reachability Analyzer
+Reachability Analyzer is a configuration analysis tool. You pick a source and a destination (for example a load balancer's network interface and an EC2 instance), plus an optional port and protocol, and it builds a model of the path from your configuration:
+- route tables, security groups and network ACLs
+- load balancers, NAT gateways, transit gateways, peering connections and more
+It sends no packets. The result is either **reachable**, with every hop listed, or **not reachable**, with the blocking component named, such as a security group that lacks an inbound rule for port `8080` from the ALB's security group.
+## Why it fits here
+The team wants proof that the new rule permits ALB-to-target traffic without generating test traffic. Reachability Analyzer answers exactly that question from configuration alone, and it can be rerun after every change.
+W: Reachability Analyzer: it evaluates security groups, NACLs and routes along the configured path and reports whether the ALB can reach the targets, without sending any traffic.
+X: B=Amazon Inspector: Inspector finds software vulnerabilities and network exposure findings for workloads; it does not verify a specific source-to-destination path on demand.
+C=AWS Artifact: Artifact is a portal for downloading AWS compliance reports and agreements; it has nothing to do with network paths.
+D=CloudWatch Synthetics: canaries actively send scripted requests to endpoints, which is test traffic, and they test from the canary's location rather than the ALB-to-target path.
+T: To prove a path works from configuration alone, use Reachability Analyzer; synthetic canaries and scanners do different jobs.
+
+@ Q003897 explain
+G: ## The full path from a private subnet to the internet
+For IPv4 internet access from a private subnet, every link below must work:
+- The private subnet's route table sends `0.0.0.0/0` to a NAT gateway.
+- The NAT gateway sits in a **public** subnet whose route table sends `0.0.0.0/0` to an internet gateway attached to the VPC.
+- Network ACLs on both subnets allow the outbound request and the **return traffic**.
+## Why NACLs catch people out
+NACLs are stateless. A request to `203.0.113.10:443` leaves from a source port such as `49152`, so the reply comes back to that high port. If the private subnet's inbound NACL (or the public subnet's NACL) only allows `443`, replies to ephemeral ports `1024-65535` are dropped and connections time out even though the routes are correct.
+W: C=NAT gateway without an IGW route: if the NAT gateway's subnet has no `0.0.0.0/0` route to an internet gateway, translated traffic has nowhere to go, so the correct private route leads to a dead end.
+E=NACLs block ephemeral return ports: stateless NACLs must explicitly allow reply traffic on high ports; if they do not, responses are dropped and connections never complete.
+X: A=DNS hostnames enabled: this setting only controls whether instances receive DNS hostnames; it never blocks routing to the internet.
+B=Too much memory: instance memory size has no effect on network routing or reachability.
+D=Amazon Linux AMI: the operating system image does not stop NAT-based internet access; Amazon Linux works normally behind a NAT gateway.
+T: A NAT route is only half the path; the NAT gateway needs a public subnet with an IGW route, and stateless NACLs must allow ephemeral return traffic.
+
+@ Q003898 explain
+G: ## Why a NAT gateway runs out of ports
+A NAT gateway rewrites the source of each connection to its own IP address and a source port. For one **unique destination** (same destination IP, port and protocol), each NAT IP address supports about 55,000 simultaneous connections. When a fleet opens many connections to the same endpoint, for example one API at `198.51.100.20:443`, that pool fills up and the NAT gateway reports `ErrorPortAllocation`, visible as a CloudWatch metric.
+## Ways to add capacity
+- Associate **secondary IP addresses** with the NAT gateway; each extra address adds another pool of about 55,000 connections to that destination.
+- Split subnets across **several NAT gateways**, each with its own addresses.
+- Reduce connection churn, for example with connection reuse or pooling in the application.
+W: Secondary IPs or more NAT gateways: port exhaustion is a per-address limit toward one destination, so more source addresses give proportionally more simultaneous connections.
+X: A=Private subnet without a route: moving the NAT gateway away from the internet gateway route breaks internet access for everything and does not add ports.
+B=Only one subnet through the NAT: concentrating traffic does not add capacity, and cutting other subnets off just breaks their internet access instead of fixing port allocation.
+D=Disable DNS support: turning off VPC DNS breaks name resolution for the workloads; it does not reduce the number of connections to the destination.
+T: `ErrorPortAllocation` means too many connections from one NAT address to one destination; add NAT addresses or gateways rather than changing routes or DNS.
+
+@ Q003899 explain
+G: ## Monitoring Direct Connect
+Direct Connect publishes metrics to Amazon CloudWatch for each connection and virtual interface, including:
+- `ConnectionState`: 1 when the physical connection is up, 0 when it is down.
+- Connection traffic and error metrics such as bit rate, packet rate, CRC errors and optical light levels.
+- Virtual interface metrics such as bit rate and packet rate, and BGP session status for the virtual interface.
+A CloudWatch alarm on `ConnectionState` with a threshold below 1 can notify an Amazon SNS topic, for example paging the on-call network engineer within minutes. AWS Health also reports Direct Connect events such as scheduled maintenance, and these can be routed through Amazon EventBridge to the same notifications.
+## Why automation matters
+BGP sessions and links fail at any hour. A monitoring approach must detect the change on its own and alert people immediately, rather than wait for someone to look.
+W: CloudWatch alarms on Direct Connect metrics: the service publishes connection and interface health as metrics, so alarms detect state changes automatically and notify through SNS.
+X: A=Route 53 query logging: query logs record DNS lookups; they say nothing about the physical link or BGP session state.
+C=Weekly manual console check: an outage could go unnoticed for up to a week, which is not alerting at all.
+D=S3 event notifications on backups: these fire when objects are written to a bucket, not when a connection or BGP session changes state.
+T: Alert on Direct Connect health with CloudWatch metrics and alarms (plus AWS Health events for maintenance), not with unrelated logs or manual checks.
+
+@ Q003900 explain
+G: ## Egress filtering by domain name
+Security groups and network ACLs match IP addresses, ports and protocols only. Many SaaS and update endpoints change IPs often, so an allow list of approved **domains** needs a service that understands names.
+AWS Network Firewall is a managed, stateful firewall deployed in firewall subnets. Its **domain list** stateful rule group inspects:
+- the TLS **SNI** in HTTPS connections
+- the HTTP `Host` header in plain HTTP
+You can allow a list such as `.amazonaws.com` and `updates.example.com` and drop everything else. Routes send outbound traffic from workload subnets through the firewall endpoint, often in a central inspection VPC behind a transit gateway.
+W: Network Firewall with domain lists: it provides stateful inspection and matches outbound connections by domain name, which is exactly an approved-domain allow list.
+X: A=Internet gateway with restrictive routes: route tables send traffic by destination CIDR; they cannot see domain names or inspect sessions.
+B=NACL deny rules: NACLs are stateless and match only CIDRs and ports, so they cannot identify domains at all.
+C=Security groups by domain name: security group rules reference CIDRs, prefix lists or other security groups, not domain names.
+T: Domain-based, stateful egress filtering is a Network Firewall job; SGs, NACLs and routes only understand IPs and ports.
+
+@ Q003901 explain
+G: ## Centralized IPS between VPCs
+AWS Network Firewall supports **Suricata-compatible** stateful rules, so it can act as an intrusion prevention system that drops traffic matching attack signatures. A common design for traffic between VPCs:
+- Each workload VPC attaches to a **transit gateway**.
+- Transit gateway route tables send inter-VPC traffic to an **inspection VPC** that has firewall endpoints in each AZ.
+- After inspection the traffic returns to the transit gateway and on to the destination VPC.
+## Why appliance mode
+Without appliance mode, the transit gateway may pick a different AZ for the return direction, so the reply reaches a firewall endpoint that never saw the request. A stateful firewall drops that asymmetric flow. Enabling **appliance mode** on the inspection VPC attachment keeps both directions of a flow in the same AZ.
+W: Network Firewall inspection VPC with TGW and appliance mode: it runs Suricata-compatible IPS rules centrally for all inter-VPC traffic, and appliance mode keeps flows symmetric so stateful inspection works.
+X: B=Single EC2 proxy in one AZ: one instance is a single point of failure and a throughput bottleneck, and a proxy is not a Suricata-based IPS.
+C=Stateless allow-all NACLs: allowing all traffic inspects nothing, and NACLs cannot evaluate IPS signatures in any case.
+D=Broad security group rules: security groups filter by address, port and group; broad allows widen exposure and provide no intrusion detection or prevention.
+T: Suricata-compatible IPS between VPCs means Network Firewall in an inspection VPC behind a transit gateway, with appliance mode for symmetric flows.
+
+@ Q003902 explain
+G: ## AWS WAF for layer 7 protection
+AWS WAF inspects HTTP(S) requests at CloudFront, Application Load Balancer, API Gateway and other supported resources. A **web ACL** holds rules that allow, block, count or challenge requests:
+- **AWS Managed Rules** such as the SQL database rule group detect SQL injection patterns in query strings, bodies and headers, for example `' OR 1=1 --`.
+- **Rate-based rules** count requests per source IP (or other key) over a time window and block IPs that exceed a limit, such as 1,000 requests in 5 minutes.
+Both kinds of rule live in the same web ACL, so one configuration covers injection and per-IP throttling.
+W: WAF with managed and rate-based rules: managed rule groups block SQL injection by inspecting request content, and rate-based rules limit each IP, which covers both requirements.
+X: B=NACLs with port restrictions: NACLs see only IPs and ports, so they cannot read request content to find SQL injection or count requests per IP.
+C=Shield Standard: it protects automatically against common network and transport layer DDoS attacks, not application-layer SQL injection or per-IP rate limits.
+D=VPC Flow Logs with alerts: flow logs record connection metadata after the fact; they do not see HTTP payloads and cannot block anything.
+T: Application-layer attacks and per-IP throttling are handled by AWS WAF managed rules plus rate-based rules.
+
+@ Q003903 explain
+G: ## Shield Standard versus Shield Advanced
+- **Shield Standard** is automatic and free for all customers. It mitigates common network and transport layer DDoS attacks such as SYN floods.
+- **Shield Advanced** is a paid subscription for protected resources such as CloudFront distributions, Route 53 hosted zones, Global Accelerator accelerators, load balancers and Elastic IPs. It adds detailed attack detection and metrics, application-layer mitigation with AWS WAF, and:
+- **Cost protection**: service credits for scaling charges caused by a DDoS attack.
+- **Shield Response Team (SRT)** access for help during attacks (requires a Business Support or higher plan).
+## Example
+An online store fronted by CloudFront and an ALB subscribes to Shield Advanced. During a large attack, Auto Scaling launches extra instances; the extra charges can be credited, and the SRT can help write WAF rules.
+W: Shield Advanced: it is the only option that combines enhanced DDoS mitigation with cost protection and access to the Shield Response Team.
+X: A=WAF alone: WAF filters web requests but offers no DDoS cost protection or response team, and it does not cover network-layer floods on its own.
+B=Security groups only: security groups allow or deny by port and source; they do not absorb volumetric attacks or provide any DDoS services.
+C=GuardDuty only: GuardDuty detects threats from logs and reports findings; it does not mitigate DDoS attacks.
+T: Cost protection and SRT access are Shield Advanced features; WAF, security groups and GuardDuty do not provide them.
+
+@ Q003904 explain
+G: ## Referencing security groups across a peering connection
+A security group rule can use another security group as its source instead of a CIDR, for example allow TCP `5432` from `sg-0abc1234`. The rule then follows whichever instances carry that group, even as their IPs change.
+For **VPC peering in the same Region**, rules can reference security groups in the peer VPC, including one in another account (written as `account-id/sg-id`). The peering connection must be active and routes must exist in both route tables.
+## Example
+VPC A (app servers in `sg-app`) is peered with VPC B (database). The database security group in VPC B allows port `5432` from `sg-app`. New app instances with `sg-app` are allowed automatically.
+For peering across Regions, security group references are not available; rules use CIDR blocks of the peer instead.
+W: Same-Region peer security group references: security groups can use a group from a peered VPC in the same Region as a rule source, as long as the peering is active.
+X: A=Peered VPCs cannot exchange traffic: peering exists precisely so that the two VPCs can exchange traffic once routes and rules allow it.
+B=Only across Regions: this reverses the rule; cross-Region peering does not support security group references, while same-Region peering does.
+D=CIDR blocks only: security group rules can reference other security groups and prefix lists as sources, not just CIDR ranges.
+T: Security group references work over same-Region peering; across Regions you must use CIDRs.
+
+@ Q003905 explain
+G: ## Stateful versus stateless filtering in a VPC
+- **Security groups** attach to network interfaces and are **stateful**: if an inbound connection is allowed, the reply is automatically allowed out, and vice versa.
+- **Network ACLs** attach to **subnets** and are **stateless**: each packet is checked on its own against numbered rules, so inbound and outbound directions each need explicit rules, including for return traffic.
+## Example
+A web subnet NACL allows inbound TCP `443` from `0.0.0.0/0`. Because the NACL is stateless, it also needs an outbound rule allowing TCP `1024-65535` so replies reach clients on their ephemeral ports. A security group allowing inbound `443` needs no such outbound rule.
+W: B=NACL inbound rules: they are evaluated at the subnet boundary for traffic entering the subnet, without tracking connection state.
+E=NACL outbound rules: they are evaluated at the subnet boundary for traffic leaving the subnet, again with no memory of earlier packets.
+X: A=Security group outbound rules: security groups apply at the network interface and are stateful, so replies to allowed connections pass automatically.
+C=Security group inbound rules: they are also stateful and interface-level, not stateless subnet-level controls.
+D=WAF web ACL rules: WAF evaluates HTTP requests at resources such as CloudFront or an ALB, not packets at a subnet boundary.
+T: NACLs are stateless and subnet-level in both directions; security groups are stateful and attached to interfaces.
+
+@ Q003906 explain
+G: ## Two audit sources for network changes
+- **AWS CloudTrail** records API calls: who called what, when and from where. Changing a security group produces an event such as `AuthorizeSecurityGroupIngress` with the IAM identity, source IP and request parameters. Creating a route produces `CreateRoute`.
+- **AWS Config** records the configuration of resources over time as configuration items. For a route table or security group you can see the state before and after each change, and the timeline links related CloudTrail events so auditors can connect a change to the identity that made it.
+## Example
+An auditor asks why port 22 was open last Tuesday. Config history shows the security group rule appeared at 14:02 and was removed at 16:30; the matching CloudTrail events show which IAM role made both changes.
+W: C=CloudTrail: it logs every network configuration API call with the caller identity, time and parameters, which is the who-did-what evidence.
+E=Config history: it keeps the before-and-after configuration of route tables and security groups over time and ties changes to related CloudTrail events.
+X: A=VPC Flow Logs only: flow logs record IP traffic metadata, not configuration changes or who made them.
+B=CloudFront access logs: these record viewer requests to a distribution, not VPC configuration edits.
+D=S3 Storage Lens: it reports storage usage and activity metrics for S3 buckets and has no view of network configuration.
+T: CloudTrail answers who changed what via API calls; Config answers what the configuration looked like over time. Flow logs only show traffic.
+
+@ Q003907 explain
+G: ## Continuous compliance with AWS Config
+AWS Config evaluates resources against **Config rules** whenever they change. The managed rule `restricted-ssh` flags any security group that allows inbound TCP `22` from `0.0.0.0/0` (or `::/0`) as noncompliant.
+A rule can have a **remediation action** that runs an AWS Systems Manager Automation document, either manually or automatically. For example, `AWS-DisablePublicAccessForSecurityGroup` removes rules that open SSH and RDP to the world.
+## Example flow
+- A developer adds `0.0.0.0/0` on port 22 to a security group.
+- Config records the change and evaluates `restricted-ssh`; the group is marked noncompliant.
+- Automatic remediation runs the Automation document, which deletes the offending rule, and the group returns to compliant.
+Using an organization-level rule or conformance pack applies this in every account.
+W: Config rule with SSM Automation remediation: Config detects the violation continuously on each change and the attached Automation document fixes it without human action.
+X: A=Monthly manual report: it is neither continuous nor automatic; an open SSH rule could stay exposed for weeks.
+B=CloudFront geo restriction: geo restriction limits which countries can reach a CloudFront distribution; SSH to instances does not pass through CloudFront.
+C=Flow logs without analysis: storing logs with no evaluation detects nothing, and flow logs do not show security group rules or fix them.
+T: Continuous detection plus automatic fixing of misconfigurations means a Config rule with an SSM Automation remediation.
+
+@ Q003908 explain
+G: ## AWS Firewall Manager
+Firewall Manager is a central policy service for AWS Organizations. From a delegated administrator account you create policies that are applied automatically to existing and new accounts and resources in scope:
+- **AWS WAF** policies: attach web ACLs with required rule groups to ALBs, CloudFront distributions and API Gateway stages.
+- **Shield Advanced** policies: enable protections on resources.
+- **Security group** policies: apply common groups, audit rules and flag overly permissive ones.
+- Also Network Firewall, Route 53 Resolver DNS Firewall and third-party firewall policies.
+## Example
+A policy says every internet-facing ALB tagged `env=prod` must have the company baseline web ACL. When a team in a new account creates such an ALB, Firewall Manager attaches the web ACL automatically.
+Prerequisites are AWS Organizations and AWS Config enabled in member accounts.
+W: Firewall Manager: it is designed to define WAF, Shield Advanced and security group policies once and enforce them across all accounts in the organization.
+X: B=Security Hub: it aggregates findings and runs security standard checks, but it does not deploy WAF rules or Shield protections.
+C=AWS Config only: Config evaluates and records configurations; it cannot centrally author and push WAF or Shield Advanced protections.
+D=Amazon Detective: Detective helps investigate security findings using graph analysis; it manages no firewall rules.
+T: Central, multi-account management of WAF, Shield Advanced and security group policies is Firewall Manager; Security Hub and Config report rather than enforce these.
+
+@ Q003909 explain
+G: ## Network Firewall logging
+AWS Network Firewall can produce several log types from its stateful engine:
+- **Alert logs**: traffic that matched a rule with an alert or drop action.
+- **Flow logs**: standard network flow records for traffic through the stateful engine.
+- **TLS logs** for TLS inspection events.
+Each log type is sent to one destination you choose in the firewall's logging configuration:
+- **Amazon S3** for low-cost storage and querying with Athena.
+- **CloudWatch Logs** for search, metric filters and alarms.
+- **Amazon Data Firehose** for streaming to other targets such as OpenSearch or a third-party SIEM.
+## Example
+Alert logs go to CloudWatch Logs with a metric filter and alarm on drops, while flow logs go to a central S3 bucket in a log archive account.
+W: S3, CloudWatch Logs or Data Firehose: these are the three supported destinations for Network Firewall logs, covering storage, search and streaming to central tools.
+X: A=Local disk on the endpoint: firewall endpoints are managed by AWS; customers have no disk on them, and logs are delivered to AWS destinations.
+C=Only email notifications: Network Firewall does not email logs; notifications can be built from logs with alarms, but they are not a log destination.
+D=Only DynamoDB tables: DynamoDB is not a supported log destination for Network Firewall.
+T: Network Firewall logs go to S3, CloudWatch Logs or Data Firehose, one destination per log type.
+
+@ Q003910 explain
+G: ## Amazon GuardDuty
+GuardDuty is a managed threat detection service. When you enable it, it analyzes foundational data sources through independent streams, without you having to turn on or store the logs yourself:
+- **VPC Flow Logs** data for connections to and from your instances.
+- **DNS query logs** for queries through the Route 53 Resolver.
+- **CloudTrail** management events.
+It compares activity with threat intelligence (known malicious IPs and domains) and machine learning baselines, then produces findings.
+## Example findings
+- An instance talks to a known command-and-control server, producing a backdoor or trojan finding.
+- An instance queries a domain associated with cryptocurrency mining, producing a crypto-mining finding.
+Findings go to the console, Security Hub and EventBridge for automated response.
+W: GuardDuty: it analyzes VPC flow and DNS log data against threat intelligence and reports communication with known malicious IPs and domains.
+X: B=Amazon Inspector: Inspector scans EC2, container images and Lambda for software vulnerabilities and network exposure; it does not analyze live traffic for threats.
+C=Firewall Manager: it deploys firewall policies across accounts; it does not perform threat detection on logs.
+D=Shield Standard: it mitigates common DDoS attacks automatically, but it does not detect instances talking to malicious IPs.
+T: Threat detection from flow and DNS activity is GuardDuty; Inspector finds vulnerabilities and Shield handles DDoS.
+
+@ Q003911 explain
+G: ## Encryption on both legs of an ALB
+An Application Load Balancer terminates client connections, so there are two separate connections:
+- **Client to ALB**: encrypted when the listener is HTTPS with a certificate, usually from ACM.
+- **ALB to target**: encrypted only when the target group protocol is HTTPS; the target must then serve TLS with its own certificate.
+With an HTTPS listener and an HTTP target group, traffic is decrypted at the ALB and sent in plain text inside the VPC. For end-to-end encryption, both legs must use TLS. The ALB does not validate the target's certificate, so targets can use self-signed or private CA certificates.
+## Example
+Listener `HTTPS:443` with an ACM certificate for `app.example.com`, forwarding to a target group `HTTPS:8443`, where each instance runs a web server with a certificate from AWS Private CA.
+W: HTTPS listener and HTTPS target group: TLS on the listener protects the client leg, and HTTPS to targets with certificates re-encrypts the ALB-to-target leg.
+X: A=TCP listener on an ALB: ALB listeners support only HTTP and HTTPS; a TCP listener belongs to a Network Load Balancer, and no certificates means no encryption.
+B=HTTP listener and HTTP target group: both legs are plain text, so nothing is encrypted.
+D=HTTPS listener with HTTP target group: the client leg is encrypted, but the ALB decrypts and forwards plain text to targets, so it is not end to end.
+T: End-to-end encryption through an ALB requires TLS on both the listener and the target group.
+
+@ Q003912 explain
+G: ## TLS termination on a Network Load Balancer
+A Network Load Balancer supports several listener protocols:
+- **TCP**: passes bytes straight through; any TLS is handled by the targets.
+- **TLS**: the NLB terminates TLS with a certificate from **AWS Certificate Manager**, then sends decrypted traffic to the targets (typically a TCP target group).
+Using ACM centralizes certificate management: public ACM certificates renew automatically, and one certificate or a set of SNI certificates is attached to the listener instead of being copied to each backend server. A security policy on the listener controls the allowed TLS versions and ciphers.
+## Example
+Listener `TLS:443` with an ACM certificate for `api.example.com`, forwarding to target group `TCP:8080`. Backend servers never hold private keys.
+W: NLB TLS listener with ACM: the NLB terminates client TLS using an ACM certificate managed in one place and forwards decrypted traffic to the backend.
+X: A=TCP listener, certificates on clients: a TCP listener does not terminate TLS, so the backend would receive encrypted traffic, and client certificates do not centralize server certificate management.
+C=ALB with HTTP only: HTTP listeners offer no TLS for clients, and switching to an ALB does not satisfy the NLB requirement.
+D=Global Accelerator without certificates: Global Accelerator does not terminate TLS, so it cannot decrypt traffic for the backend.
+T: For TLS offload on an NLB, use a TLS listener with an ACM certificate; a TCP listener passes encrypted traffic through.
+
+@ Q003913 explain
+G: ## Public versus private certificates
+- **Public ACM certificates** are trusted by browsers but can only be issued for publicly resolvable domain names that you validate. They do not suit internal names such as `orders.internal.corp`.
+- **AWS Private Certificate Authority** creates a managed private CA hierarchy (root and subordinate CAs) whose keys are protected in HSMs. Your organization distributes the root certificate to its clients so they trust it.
+## Automated issuance and renewal
+You can request private certificates through ACM backed by your Private CA; ACM then renews them automatically before expiry and can deploy them to integrated services such as load balancers. Private CA can also issue certificates directly through its API for workloads like Kubernetes pods or IoT devices.
+## Example
+A company creates a subordinate CA in Private CA and uses ACM to issue `*.internal.corp` certificates for internal ALBs, with no manual renewals.
+W: AWS Private CA: it provides a managed private CA that issues internal certificates, and with ACM integration those certificates are issued and renewed automatically.
+X: A=Self-signed certificates: each host trusts nothing by default, and issuance, distribution and renewal must all be done by hand.
+B=DNSSEC keys: DNSSEC signing keys protect DNS responses; they are not TLS certificates for services.
+C=Public ACM certificates only: public certificates require public domain validation and are not intended for private internal names.
+T: Internal services with automated certificate lifecycle need AWS Private CA (often through ACM); public ACM certificates are for public names.
+
+@ Q003914 explain
+G: ## Is a Direct Connect link encrypted?
+No, not by default. Direct Connect is a private physical connection, but traffic on it travels unencrypted unless you add encryption:
+- **MACsec** (IEEE 802.1AE) encrypts at layer 2 between your router and the AWS Direct Connect device. It is available on supported dedicated connections (for example 10 Gbps and higher) and needs MACsec-capable routers and a configured key.
+- **Site-to-Site VPN** builds IPsec tunnels at layer 3. It can run over the internet, or over Direct Connect using a public VIF or a transit VIF with private IP VPN, giving both dedicated bandwidth and encryption.
+## Example
+A bank uses a 100 Gbps dedicated connection with MACsec for bulk data, and an IPsec VPN over the internet as an encrypted backup path.
+W: D=MACsec: it encrypts frames on the physical Direct Connect link between the customer router and AWS.
+E=Site-to-Site VPN: IPsec tunnels encrypt traffic end to end between the customer gateway and AWS, whether they run over the internet or over Direct Connect.
+X: A=Jumbo frames: jumbo frames only raise the MTU for efficiency; they add no encryption.
+B=VPC peering with on-premises: VPC peering connects two VPCs only; it cannot connect an on-premises network, and it is not an encryption feature.
+C=Private VIF alone: a private virtual interface provides private routing, but traffic on it is not encrypted without MACsec or a VPN.
+T: Direct Connect is private but not encrypted; add MACsec at layer 2 or an IPsec Site-to-Site VPN at layer 3.
+
+@ Q003915 explain
+G: ## Zero-trust access with AWS Verified Access
+AWS Verified Access provides access to internal applications without a VPN. Users connect to an application URL, and every request is evaluated against policies before it reaches the application:
+- **Identity** from a trust provider such as IAM Identity Center or an OIDC identity provider (for example group membership).
+- **Device posture** from a device management trust provider (for example whether the laptop is managed and compliant).
+Policies are written in the Cedar policy language, for example allow only users in group `finance` on compliant devices. Access is logged per request.
+## How it differs from a VPN
+A VPN gives the device a network path into the VPC after one login. Verified Access grants access per application and per request, which follows zero-trust principles.
+W: Verified Access: it gives VPN-less access to internal applications and checks both user identity and device posture on each request.
+X: B=Client VPN only: Client VPN is by definition a VPN, and it grants network-level access rather than per-application policy checks with device posture.
+C=Direct Connect: Direct Connect is a dedicated site-to-AWS link for networks, not user access for remote employees.
+D=CloudFront: CloudFront is a content delivery network; it does not evaluate user identity and device posture for internal applications.
+T: VPN-less, per-request access with identity and device checks is AWS Verified Access; Client VPN still gives network-level VPN access.
+
+@ Q003916 explain
+G: ## AWS Client VPN
+AWS Client VPN is a managed remote-access VPN for individual users. Key points:
+- It is **OpenVPN-based**, so users connect with the AWS-provided client or another OpenVPN-compatible client.
+- The **Client VPN endpoint** is associated with subnets in the VPC and assigns client addresses from a client CIDR such as `10.100.0.0/22`.
+- Authentication can use **Active Directory** (through AWS Directory Service), mutual certificate authentication, or SAML-based federation.
+- Authorization rules and security groups control which networks users can reach.
+## Example
+A remote engineer opens the client, signs in with AD credentials, receives a client IP and reaches a database in a private subnet allowed by the authorization rules.
+W: Client VPN: it is the managed OpenVPN-based remote-access service that supports Active Directory authentication for individual users.
+X: A=Transit Gateway: it connects VPCs and on-premises networks as a hub; it does not authenticate remote users.
+C=Internet Gateway: it provides internet routing for a VPC; it offers no VPN or user authentication.
+D=Site-to-Site VPN: it connects networks through IPsec tunnels between a customer gateway and AWS, not individual users with an OpenVPN client.
+T: Remote users with an OpenVPN client and AD sign-in use Client VPN; Site-to-Site VPN is for connecting whole networks.
+
+@ Q003917 explain
+G: ## Preventive guardrails with SCPs
+A **service control policy** (SCP) in AWS Organizations sets the maximum permissions for accounts in an OU. Even an administrator in a member account cannot perform an action that an SCP denies. SCPs do not apply to the management account.
+## Example policy idea
+Attach an SCP to the workload OUs, but not to the networking OU, that denies:
+- `ec2:CreateInternetGateway`
+- `ec2:AttachInternetGateway`
+- often also `ec2:CreateEgressOnlyInternetGateway`
+Alternatively, attach it higher up and add a condition that excludes approved account IDs with `aws:PrincipalAccount`. Workload accounts then reach the internet only through centralized egress in the networking accounts.
+## Preventive versus detective
+An SCP stops the action at the API call, so the gateway never exists. Scripts and scans find problems after they already exist.
+W: SCP denying IGW creation and attachment: SCPs are enforced for every principal in the affected accounts, so the gateway cannot be created or attached outside the approved accounts.
+X: A=Weekly delete script: it is detective, not preventive; a gateway could exist and carry traffic for up to a week before it is removed.
+B=Security group rule: security groups filter traffic to and from interfaces; they cannot target an internet gateway or stop one being created.
+D=Route 53 policy: restricting public DNS records does not control whether internet gateways can be created or attached, so gateways could still appear.
+T: To prevent a resource from being created across accounts, deny the API actions with an SCP; scripts and traffic rules act too late or in the wrong place.

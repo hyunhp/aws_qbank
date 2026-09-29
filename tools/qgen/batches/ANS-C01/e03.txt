@@ -83,11 +83,11 @@ A packet crossing a transit gateway is routed by the TGW route table associated 
 - It reports each hop and the route used.
 - It flags where the path breaks, such as "no route" or a blackhole route in a specific route table.
 - It can check the return path as well.
-Example: analyzing `10.1.0.0` to `10.2.5.10` shows that the route table for the VPN attachment has `10.2.0.0/16` as a blackhole.
+Example: analyzing `10.1.0.25` to `10.2.5.10` shows that the route table for the VPN attachment has `10.2.0.0/16` as a blackhole.
 W: Route Analyzer: it analyzes transit gateway route tables along the whole path and points to the exact missing or blackhole route, which is what the engineer is asking for.
 X: A=Trusted Advisor: Trusted Advisor checks best practices such as security group openness and service limits. It does not trace routes through transit gateway route tables.
 B=Logs Insights on flow logs: flow logs show traffic that was observed. They can show that packets stopped, but not which route table entry is missing or blackholed.
-C=Reachability Analyzer only: Reachability Analyzer traces paths between specific AWS resources, but it is scoped to resource-to-resource analysis in one Region. The question is about the routing across TGW route tables, which Route Analyzer is built to analyze, including routes toward on-premises prefixes and peered transit gateways.
+C=Reachability Analyzer only: Reachability Analyzer tests a path between a specific source and destination resource in your VPCs. It is not the tool built around transit gateway route tables; Route Analyzer walks the TGW route tables of a global network, including peered transit gateways and VPN or Direct Connect attachments, and names the table with the missing or blackhole route.
 T: For "which TGW route table is missing or blackholing my route", use Network Manager Route Analyzer; flow logs show symptoms, not the broken route.
 
 @ Q001623 explain
@@ -109,12 +109,12 @@ T: Watch the attachment's own `BytesIn`/`BytesOut` (converted to bits per second
 G: ## Cross-account delivery of flow logs
 A flow log can publish to an S3 bucket in **another account**. Delivery is done by the log delivery service (`delivery.logs.amazonaws.com`), so the bucket owner grants that service permission in the bucket policy.
 ## Allowing a whole organization
-Instead of listing 100 account IDs, the bucket policy can use a condition key such as `aws:SourceOrgID` to allow deliveries on behalf of any account in the organization. Each member account then creates a flow log whose destination is the central bucket ARN, for example `arn:aws:s3:::central-flow-logs`.
+Instead of setting up permissions account by account, the bucket owner writes one bucket policy that lets the log delivery service write objects for the organization's accounts, using conditions such as `aws:SourceAccount` (or, where supported, an organization-wide key such as `aws:SourceOrgID`). Each member account then creates a flow log whose destination is the central bucket ARN, for example `arn:aws:s3:::central-flow-logs`.
 - Account teams do not need their own trust relationships.
 - Creating the flow logs can be automated with CloudFormation StackSets or similar tooling.
 - Objects are stored under prefixes that include the source account ID and Region, so logs stay separable.
 W: Central S3 bucket with an organization-wide policy: flow logs support direct cross-account S3 delivery, and one bucket policy scoped to the organization avoids per-account permission work.
-X: A=Cannot deliver cross-account: this is false. Flow logs can be published to an S3 bucket owned by another account, and to CloudWatch Logs or Firehose in another account with the right roles.
+X: A=Cannot deliver cross-account: this is false. Flow logs can be published to an S3 bucket owned by another account, and to a Firehose stream in another account by using a cross-account delivery role.
 C=Weekly manual copy: manual CLI copies are slow, error-prone and leave logs up to a week stale, which is poor for security analysis and does not scale to 100 accounts.
 D=Per-account trust and emailing ARNs: this is the per-account manual setup the company wants to avoid, and emailing ARNs has no role in how delivery works.
 T: Point every account's flow logs at one S3 bucket whose policy trusts the organization, instead of building per-account trusts or copying logs.
@@ -142,7 +142,7 @@ A **Direct Connect gateway** is a global object: it is not tied to a Region. A c
 One transit VIF has one BGP session. Associate the Direct Connect gateway with a transit gateway in each of the five Regions, and on-premises routes reach all of them through that single session. Transit gateways in another account can be associated through an association proposal.
 Example: on-premises advertises `192.168.0.0/16` once; the transit gateways in `us-east-1`, `eu-west-1` and three other Regions each learn it, and the allowed prefixes of each association are advertised back.
 W: Direct Connect gateway with a transit VIF: one BGP session over one VIF reaches transit gateways in all five Regions, including across accounts, instead of a VIF per VPC.
-X: B=Five private VIFs, one BGP session: every VIF has its own BGP session by design, so five VIFs cannot share one session, and private VIFs still reach one virtual private gateway at a time.
+X: B=Five private VIFs, one BGP session: every VIF has its own BGP session by design, so five VIFs cannot share one session, and private VIFs connect to virtual private gateways, not to transit gateways.
 C=Hosted VIF per Region: a hosted VIF is a VIF created on one account's connection for another account. It does not extend a connection to extra Regions.
 D=SiteLink to each VPC: SiteLink sends traffic between Direct Connect locations. It does not connect VPCs or reduce the number of BGP sessions to AWS.
 T: Many Regions over one BGP session means a transit VIF to a Direct Connect gateway associated with each Region's transit gateway.
@@ -215,7 +215,7 @@ G: ## Transit Gateway Connect
 - A Connect peer supports up to 5 Gbps, and one Connect attachment can have several peers, with ECMP across them.
 ## Compared with a standard VPN
 A standard Site-to-Site VPN tunnel is IPsec with a bandwidth of about 1.25 Gbps, and encryption adds overhead. GRE has no encryption, so SD-WAN appliances that already encrypt their own overlays avoid double encryption.
-Example: an SD-WAN appliance in a transit VPC forms two Connect peers with inside addresses from `169.254.100.0/29` and exchanges routes over BGP.
+Example: an SD-WAN appliance in a transit VPC forms two Connect peers, each with its own /29 inside CIDR from `169.254.0.0/16` (such as `169.254.100.0/29` and `169.254.100.8/29`), and exchanges routes over BGP.
 W: Transit Gateway Connect: it is the TGW feature that uses GRE tunnels with BGP for SD-WAN appliances and offers more bandwidth per tunnel than a standard VPN tunnel.
 X: A=Transit VIF: a transit VIF is a Direct Connect virtual interface to a Direct Connect gateway. It is a BGP session over a physical connection, not a GRE tunnel from an appliance.
 C=Standard VPN with two tunnels: a standard VPN uses IPsec, not GRE, and each tunnel keeps the lower standard tunnel bandwidth. The second tunnel is mainly for redundancy.
@@ -259,8 +259,8 @@ The **MTU** is the largest packet a path can carry without fragmentation.
 - A transit gateway carries up to 8500 bytes for VPC, Direct Connect, Connect and peering attachments, but only 1500 bytes for VPN attachments.
 - Inside the IPsec tunnel the usable size is smaller still, because encryption headers take space (the VPN tunnel MTU is 1446 bytes).
 ## What happens on failover
-When traffic moves from Direct Connect to the VPN, hosts keep sending large packets. Packets bigger than the tunnel MTU are dropped or must be fragmented, and throughput collapses. The fix is to clamp TCP MSS on the routers, rely on path MTU discovery, or set an MTU that works on both paths.
-Example: a 9001-byte replication packet that fit on Direct Connect cannot fit in a tunnel that carries about 1400 bytes of payload.
+When traffic moves from Direct Connect to the VPN, hosts keep sending large packets. Packets bigger than the tunnel MTU are dropped or must be fragmented, and throughput collapses. A transit gateway does not send ICMP "fragmentation needed" messages, so path MTU discovery cannot be relied on. The fix is to clamp TCP MSS on the routers or set a host MTU that works on both paths.
+Example: an 8500-byte replication packet that fit on Direct Connect cannot fit in a tunnel that carries about 1400 bytes of payload.
 W: VPN does not support jumbo frames: the VPN path has a much smaller MTU, so the jumbo packets the replication workload sends fail or fragment after failover.
 X: A=Manual VPN re-establishment: VPN tunnels with BGP stay up and take routes automatically. The stem says traffic did fail over and throughput dropped, so traffic was flowing.
 B=BGP cannot fail over between DX and VPN: BGP failover between Direct Connect and VPN is a standard, supported design, and the stem shows the failover happened.
@@ -328,17 +328,17 @@ T: Enforce "never" at the routing layer: separate TGW route tables with only sha
 
 @ Q001639 explain
 G: ## Every hop needs a route
-Traffic from VPC A to VPC B through a transit gateway uses three route lookups, plus filtering:
+Traffic from VPC A to VPC B through a transit gateway needs a route at every hop in both directions, plus filtering:
 - **VPC A subnet route table**: VPC B's CIDR must point to the transit gateway, for example `10.2.0.0/16 -> tgw-0abc`.
 - **TGW route table** associated with VPC A's attachment: a route to VPC B's attachment (the propagated route in the question).
-- **VPC B subnet route table**: a return route to VPC A's CIDR through the transit gateway.
+- **VPC B subnet route table** and the **TGW route table associated with VPC B's attachment**: return routes to VPC A's CIDR.
 - **Security groups and network ACLs** on both sides must allow the traffic.
 ## Common mistake
 Seeing the route in the TGW route table and assuming the job is done. The transit gateway never receives the packet if VPC A's own subnet route table still has no route toward it.
 W: VPC A route to the TGW: the subnet route table in VPC A must send VPC B's CIDR to the transit gateway, otherwise traffic never reaches the transit gateway in the first place.
 X: A=Static routes only: propagated routes are normal, working routes in a TGW route table. There is no rule that only static routes are usable.
 B=Multicast support: multicast is for one-to-many traffic. Unicast traffic between VPCs does not need it.
-D=Same Availability Zone: VPCs attached to one transit gateway do not need to share an Availability Zone; each attachment only needs a subnet in every AZ where its resources send traffic.
+D=Same Availability Zone: VPCs attached to one transit gateway do not need to share an Availability Zone; each attachment only needs a subnet in every AZ where it has resources that use the transit gateway.
 T: A transit gateway route is only one hop; also check the VPC subnet route tables on both sides, and security groups and NACLs.
 
 @ Q001640 explain

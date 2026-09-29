@@ -1,0 +1,353 @@
+# MLA-C01 detailed explanations, e12 (explanation-only rewrites; letters are the published ones)
+
+@ Q003646 explain
+G: ## What reproducible deployment means
+A deployment is reproducible when you can rebuild exactly the same running model later: the same model weights, the same code and the same libraries. If any of these can silently change, two deployments of "the same model" may behave differently and you cannot explain or roll back a problem.
+## Two things to lock down
+- **The environment**: refer to container images by digest (for example `my-repo@sha256:...`) instead of a moving tag like `latest`, and pin library versions in `requirements.txt`. A digest always points to the same image bytes.
+- **The artifact**: register each trained model as a version in a SageMaker Model Registry model package group. Each version points to a fixed `model.tar.gz`, its image, metrics and approval status, and lineage tracking records which data, code and training job produced it.
+Example: version 7 of `fraud-model` was trained from a specific dataset snapshot by a specific training job; redeploying version 7 next month gives the same behavior.
+W: B=Pinned digests and versions: the image and libraries cannot drift between builds, so the same environment runs every time.
+E=Registered versions with lineage: each deployment refers to an immutable model version whose data, code and training job are recorded, so it can be traced and redeployed.
+X: A=Overwrite artifacts in one S3 location: each new model replaces the old file, so you lose earlier versions and cannot tell which artifact a given endpoint was built from.
+C=Retrain on production endpoints: training in the serving environment changes the model outside any controlled, recorded process, so no one can reproduce what is running.
+D=Install latest libraries at startup: every container start may pull different package versions, so the same image can behave differently from one day to the next.
+T: Reproducibility comes from fixed inputs (pinned image digests and library versions plus registered, lineage-tracked model versions), not from overwriting or pulling "latest".
+
+@ Q003647 explain
+G: ## Approval gates for model deployment
+An approval gate stops a pipeline until a named person or team explicitly approves the next step. For ML this usually combines two pieces:
+- **SageMaker Model Registry**: every model version has a `ModelApprovalStatus` such as `PendingManualApproval`, `Approved` or `Rejected`. Only an approved version should reach production.
+- **A deployment pipeline** (for example AWS CodePipeline) with a **manual approval action** before the production stage. The pipeline pauses, notifies reviewers (for example through Amazon SNS), and continues only when someone with the right IAM permissions approves.
+## How it fits together
+A new version is registered as pending. The risk team reviews metrics and bias reports, sets the version to approved, and an EventBridge rule on that status change starts the deployment. The production stage still waits at the manual approval action, so nothing reaches customers without a recorded decision.
+W: A=Manual approval tied to Model Registry status: the pipeline cannot deploy to production until the risk team approves, and the decision is recorded with the model version.
+X: B=Email after deployment: the model is already serving customers when the risk team hears about it, so the review cannot prevent a bad deployment.
+C=Data scientists deploy when confident: this relies on personal judgment and skips the independent risk review the company requires.
+D=Any team can change the endpoint: unrestricted changes bypass every control and make it impossible to guarantee that only approved models serve traffic.
+T: Enforce review before production with a pipeline approval gate linked to Model Registry status; notifications after the fact are not a control.
+
+@ Q003648 explain
+G: ## Serving models on Amazon EKS
+Amazon EKS is AWS's managed Kubernetes service. Teams that already run their applications on Kubernetes can serve ML models the same way: package a model server (for example NVIDIA Triton, TorchServe or vLLM) in a container, deploy it as a Kubernetes Deployment, and expose it through a Service or ingress.
+- **GPU nodes**: add a managed node group with GPU instances (such as `g5` or `p4d`), or let Karpenter provision them, and install the NVIDIA device plugin so pods can request `nvidia.com/gpu`.
+- **Scaling**: the Horizontal Pod Autoscaler scales model pods, and the cluster adds or removes nodes as needed.
+- **Consistency**: the platform team keeps one set of tools for deployment, logging, security and cost controls.
+Example: a recommendation model runs as three Triton pods on a GPU node group, while CPU-only preprocessing services run on a separate node group in the same cluster.
+W: C=EKS with GPU node groups: it runs containerized model servers on the Kubernetes platform the team already standardizes on, with GPU capacity only where needed.
+X: A=Amazon SQS: SQS stores and delivers messages between components; it has no compute, so it cannot load a model or produce predictions.
+B=Lightsail without containers: Lightsail offers simple virtual servers and is not a Kubernetes platform, so it ignores the company's EKS standard.
+D=AWS Glue jobs: Glue runs batch ETL jobs that start, process data and stop; it does not keep a low-latency service running to answer real-time requests.
+T: If the platform standard is Kubernetes, serve models as containers on EKS (adding GPU node groups when required) rather than on queues, ETL jobs or non-Kubernetes hosts.
+
+@ Q003649 explain
+G: ## Step caching in SageMaker Pipelines
+A SageMaker pipeline is a graph of steps such as processing, training and evaluation. Rerunning the whole graph after a small change repeats work that has not changed.
+With **step caching**, you attach a `CacheConfig` to a step, for example `CacheConfig(enable_caching=True, expire_after="P30D")`. When the pipeline runs, SageMaker looks for an earlier successful run of the same step with the same arguments (inputs, parameters, image, instance settings) within the expiry window.
+- **Cache hit**: the step is skipped and its previous outputs are reused.
+- **Cache miss**: the step runs normally, for example because the input data location or a hyperparameter changed.
+Example: you change only the evaluation threshold. The expensive data preparation and training steps hit the cache, and only evaluation runs again.
+W: C=Step caching: it reuses earlier outputs when a step's arguments have not changed, saving both time and compute.
+X: A=S3 lifecycle rules: they move or expire objects between storage classes over time; they do not decide whether a pipeline step needs to run.
+B=Endpoint auto scaling: it changes the number of inference instances behind an endpoint based on load and has no effect on pipeline execution.
+D=CloudWatch alarm actions: they react when a metric crosses a threshold; they cannot detect unchanged inputs or skip pipeline steps.
+T: To skip unchanged work in SageMaker Pipelines, enable step caching; storage, scaling and alarm features do not affect which steps run.
+
+@ Q003650 explain
+G: ## AWS Step Functions as an orchestrator
+AWS Step Functions runs workflows (state machines) written in Amazon States Language. Each state calls a service or makes a decision, and Workflow Studio lets you design the flow visually.
+- **Service integrations**: call AWS Lambda, start an AWS Glue job, or create a SageMaker training job, transform job or endpoint. With the `.sync` pattern, the workflow waits until the job finishes.
+- **Error handling**: `Retry` blocks retry failed states with backoff, and `Catch` blocks route failures to cleanup or notification steps.
+- **Visibility**: each execution shows which state succeeded or failed, with inputs and outputs.
+Example: Lambda validates new files, a Glue job builds features, SageMaker trains a model, a Choice state checks the accuracy, and a Catch sends an SNS alert if training fails.
+W: B=AWS Step Functions: it coordinates Lambda, Glue and SageMaker in one visual workflow with built-in retries and error handling.
+X: A=Amazon Inspector: it scans EC2 instances, container images and Lambda functions for software vulnerabilities; it does not run workflows.
+C=Amazon Route 53: it provides DNS, domain registration and routing policies for network traffic, not orchestration of processing steps.
+D=Amazon Kinesis: it ingests and processes streaming data records; it does not coordinate a sequence of jobs across services with error handling.
+T: For a visual, fault-tolerant workflow across several AWS services, use Step Functions; the other services secure, route or stream but do not orchestrate.
+
+@ Q003651 explain
+G: ## Data quality monitoring with Model Monitor
+A model learns patterns from its training data. If live inputs start to look different (for example, customers become younger or a feature suddenly contains many nulls), predictions can quietly get worse. This is **data drift**.
+SageMaker Model Monitor detects it in three steps:
+- **Baseline**: a baselining job analyzes the training dataset and writes `statistics.json` (distributions per feature) and `constraints.json` (expected types, completeness, ranges).
+- **Capture**: data capture on the endpoint saves real requests and responses to S3.
+- **Schedule**: a monitoring schedule (for example hourly) compares captured data with the baseline and writes a violations report; it can also publish CloudWatch metrics for alarms.
+Example: the baseline says `income` is never missing, but live data shows 20% missing values, so the job reports a completeness violation.
+W: A=Model Monitor data quality with a baseline: it repeatedly compares live input distributions with statistics from the training data and reports drift automatically.
+X: B=Debugger rules on the training job: Debugger inspects tensors and system metrics during training (for example vanishing gradients or overfitting); it never sees the endpoint's live traffic.
+C=Ground Truth labeling: Ground Truth creates labels through human or automated labeling workflows; it does not compare feature distributions with a baseline.
+D=Neo compilation: Neo optimizes a trained model for specific hardware to improve inference performance; it has nothing to do with detecting changes in input data.
+T: Input drift after deployment is detected by Model Monitor data quality monitoring against a training baseline, not by training-time or model-optimization tools.
+
+@ Q003652 explain
+G: ## Model quality monitoring with delayed labels
+Input drift tells you the data changed; it does not tell you whether predictions are still correct. To measure accuracy you need the true outcome (ground truth), which often arrives later, for example whether a loan defaulted weeks after the decision.
+SageMaker Model Monitor **model quality monitoring** handles this:
+- Data capture stores each prediction with an `inferenceId` (or event id).
+- When labels become known, you upload them to S3 with the same id.
+- A scheduled job merges predictions with labels and computes metrics such as accuracy, precision, recall, F1 or RMSE, compares them with a baseline, and can publish CloudWatch metrics.
+Example: on day 1 the model predicts churn for customer 123; on day 5 you upload that customer 123 did not churn. The next run counts that prediction as a false positive.
+W: D=Model quality monitoring with delayed ground truth: it joins captured predictions to labels uploaded later, so accuracy and related metrics can be tracked over time.
+X: A=Data quality on inputs only: it detects shifts in input features but, without labels, cannot say whether predictions were right, so it cannot measure accuracy.
+B=Hourly retraining without evaluation: this spends compute on new models without ever measuring whether the current or the new model is accurate.
+C=Comparing predictions with earlier predictions: a model can be consistently wrong, so consistency between its own outputs says nothing about correctness.
+T: Accuracy needs ground truth; with delayed labels, use model quality monitoring that merges later labels with captured predictions.
+
+@ Q003653 explain
+G: ## Data capture: the input to Model Monitor
+Model Monitor jobs do not look at the endpoint directly; they analyze files in S3. **Data capture** writes those files.
+You enable it with `DataCaptureConfig` when you create the endpoint configuration:
+- `EnableCapture`: turns capture on.
+- `InitialSamplingPercentage`: how much traffic to record, for example 20%.
+- `DestinationS3Uri`: where the JSON Lines capture files are written.
+- `CaptureOptions`: capture the request (`Input`), the response (`Output`), or both.
+Example: an endpoint captures 50% of requests and responses to `s3://ml-monitoring/fraud/`. An hourly monitoring schedule reads that hour's files and compares them with the baseline. Without capture, the monitoring job has nothing to analyze.
+W: A=Data capture on the endpoint configuration: it records requests and responses to S3, which is the data every Model Monitor job reads.
+X: B=Managed spot training: it lowers training cost by using spare capacity; it applies to training jobs and does not record inference traffic.
+C=Multi-model hosting: it lets one endpoint serve many models from S3 to save cost; it does not store requests or responses for analysis.
+D=Network isolation on the training job: it blocks outbound network access for a training container; it is a training security setting, not a way to record endpoint traffic.
+T: Model Monitor analyzes captured traffic in S3, so data capture on the endpoint must be enabled first; cost and security settings do not provide that data.
+
+@ Q003654 explain
+G: ## Bias drift monitoring
+A model can be fair when deployed and become biased later because the population it serves changes. For example, approval rates for one age group may slowly fall below those of others.
+SageMaker Clarify defines bias metrics, and Model Monitor runs them on a schedule:
+- A **baseline** is computed with Clarify, specifying the sensitive attribute (facet) such as age group, and the positive outcome such as "approved".
+- Captured endpoint traffic (plus ground truth where a metric needs labels) is analyzed periodically.
+- Metrics such as the difference in positive proportions in predicted labels (DPPL) are compared with allowed ranges, and violations are reported and published to CloudWatch.
+Example: DPPL for applicants under 25 moves from 0.02 to 0.15, beyond the configured threshold, so the job flags bias drift for investigation.
+W: C=Bias drift monitoring with Clarify and Model Monitor: it recalculates bias metrics for sensitive groups on live data and alerts when they move beyond the baseline.
+X: A=Data capture only: capture records traffic, but without a scheduled analysis job no bias metric is ever calculated, so nothing is detected.
+B=CPU utilization alarms: CPU load shows how busy the instance is, not whether predictions treat groups differently.
+D=CloudTrail logging of InvokeEndpoint: CloudTrail records who called an API and when; it does not analyze prediction outcomes by group.
+T: Fairness changes over time are detected by Clarify bias drift monitoring on live data, not by capture alone, infrastructure metrics or API logs.
+
+@ Q003655 explain
+G: ## Feature attribution drift
+Feature attribution explains how much each feature contributes to predictions. SageMaker Clarify computes this with SHAP values.
+**Feature attribution drift monitoring** (a Model Monitor job type using Clarify) works like this:
+- A baseline records the feature importance ranking on training data, for example `income` > `debt_ratio` > `age`.
+- On a schedule, attributions are computed on captured live traffic.
+- The rankings are compared (Clarify uses an NDCG score), and a large drop is reported as a violation and can be published as a CloudWatch metric.
+Example: after a marketing change, `age` becomes the most important feature. The data may still pass data quality checks, but the model is now relying on different signals, which is worth investigating.
+W: D=Feature attribution drift monitoring: it compares live feature importance with the baseline ranking and reports when the drivers of predictions change.
+X: A=S3 object versioning: it keeps earlier versions of objects to protect against overwrites and deletes; it does not calculate which features drive predictions.
+B=Endpoint health checks: they confirm that instances respond; a healthy endpoint can still rely on completely different features than before.
+C=IAM Access Analyzer: it finds resources shared outside the account and helps validate policies; it has no view of model behavior.
+T: When the question is "which features drive predictions now?", use feature attribution drift monitoring; storage, health and permission tools cannot see it.
+
+@ Q003656 explain
+G: ## Event-driven retraining
+The goal is to retrain when drift actually happens, without waiting for a person. The pieces connect like this:
+- **Model Monitor** runs on a schedule and, when metric publishing is enabled, sends drift metrics to CloudWatch (for example a per-feature baseline drift value).
+- A **CloudWatch alarm** watches that metric and changes to `ALARM` when it crosses the threshold.
+- An **Amazon EventBridge rule** matches the alarm state change and targets a **SageMaker pipeline**, starting an execution (optionally with parameters).
+- The pipeline retrains, evaluates and registers a new model version, which can then pass the usual approval gate.
+Example: the drift metric for `transaction_amount` exceeds 0.3 two runs in a row, the alarm fires, and a retraining pipeline starts within minutes.
+W: B=CloudWatch alarm to EventBridge to pipeline: it turns a measured drift signal into an automatic retraining run, only when the threshold is crossed.
+X: A=Delete the endpoint on any violation: this causes an outage for every client and does nothing to produce a better model.
+C=Fixed daily retraining: it spends compute even when there is no drift and can still react late when drift starts right after a run; it is not triggered by the threshold.
+D=Quarterly manual review: drift could harm predictions for months before someone reads the reports, and the process is not automatic.
+T: Connect Model Monitor metrics to a CloudWatch alarm and an EventBridge rule that starts a SageMaker pipeline, so retraining follows drift instead of the calendar.
+
+@ Q003657 explain
+G: ## Endpoint health metrics in CloudWatch
+SageMaker real-time endpoints publish invocation metrics to CloudWatch in the `AWS/SageMaker` namespace, per endpoint and variant:
+- `Invocations`: number of requests.
+- `Invocation4XXErrors`: requests rejected because of client problems, such as a malformed payload.
+- `Invocation5XXErrors`: failures on the model or server side, such as container errors.
+- `ModelLatency`: time the model container takes to respond (in microseconds).
+- `OverheadLatency`: time SageMaker adds around the model call, such as routing and authentication.
+Instance metrics such as `CPUUtilization`, `MemoryUtilization` and `GPUUtilization` appear in the `/aws/sagemaker/Endpoints` namespace.
+Example: an alarm when `Invocation5XXErrors` exceeds 1% of invocations, or when p99 `ModelLatency` exceeds the SLA, catches problems before users complain.
+W: B=Invocation 4XX and 5XX errors: they show failed requests from the client side and the model side, the most direct sign that the endpoint is unhealthy.
+E=ModelLatency and OverheadLatency: they show how long requests take inside the model and in SageMaker, so latency problems can be detected and located.
+X: A=Training data size in S3: this describes stored data used to build the model and does not change when the serving endpoint slows down or fails.
+C=Number of Studio notebooks: this reflects development activity and has no relation to how the endpoint handles requests.
+D=Number of Ground Truth labels: this measures a labeling job's progress and says nothing about inference errors or latency.
+T: Operational health of an endpoint means errors and latency (`Invocation4XXErrors`, `Invocation5XXErrors`, `ModelLatency`, `OverheadLatency`), not counts of data or dev resources.
+
+@ Q003658 explain
+G: ## Drift is a signal, not the damage itself
+A drift report says the live data differs from the baseline. It does not say whether the model's decisions got worse. Some drift is harmless (for example a feature the model barely uses), and some is severe.
+To judge impact, look at outcomes:
+- **Model quality metrics** from ground truth, such as accuracy, precision, recall or RMSE, calculated with Model Monitor model quality monitoring or offline evaluation.
+- **Business KPIs** influenced by the model, such as conversion rate, fraud losses or approval rates.
+- **Segment checks**: see whether the drifting feature affects a particular customer group.
+Example: `device_type` drifts because a new mobile app launched, but precision and fraud losses are unchanged, so no urgent retraining is needed. If recall had dropped from 0.85 to 0.70, retraining would be justified.
+W: D=Quality metrics and business KPIs: they measure whether predictions and the outcomes they drive actually got worse, which is what decides if the drift matters.
+X: A=Model artifact size: the file size is fixed at training time and does not change with drift or reveal prediction quality.
+B=Container image build date: an old image may need patching, but its age says nothing about whether drifted data hurts predictions.
+C=Endpoint count and naming: these are inventory and naming details that have no connection to the accuracy of any model.
+T: After a drift alert, check ground-truth quality metrics and business KPIs to decide whether it matters; metadata about artifacts or endpoints cannot tell you.
+
+@ Q003659 explain
+G: ## Right-sizing inference endpoints
+A real-time endpoint bills for every instance-hour whether it is busy or idle. At 5% GPU utilization the company pays for about twenty times the capacity it uses.
+**Right-sizing** means choosing the smallest (or cheapest) instance that still meets latency and throughput targets:
+- **Utilization data**: CloudWatch shows `CPUUtilization`, `GPUUtilization` and `GPUMemoryUtilization` for the endpoint's instances.
+- **SageMaker Inference Recommender**: runs load tests of your model on several instance types and reports latency, throughput and cost per inference, so you can compare options with evidence.
+- Other options include a smaller GPU, a CPU or AWS Inferentia instance, or (for models that run well on CPU) serverless inference for spiky low traffic.
+Example: a model on a large multi-GPU instance meets its latency SLA on a single-GPU `ml.g5.xlarge`, which costs a fraction per hour.
+W: A=Right-size with Inference Recommender or utilization data: it replaces an oversized instance with one that meets requirements at lower cost, removing the idle capacity being paid for.
+X: B=More data capture: capturing more requests adds S3 storage and processing cost and does not change the instance being billed.
+C=Hourly Model Monitor: monitoring jobs run on their own instances, so they add cost without reducing the oversized endpoint.
+D=Second GPU instance: adding capacity to an endpoint that is already 95% idle roughly doubles the bill instead of reducing it.
+T: Low utilization means the instance is too big; right-size it using utilization data or Inference Recommender instead of adding capacity or monitoring.
+
+@ Q003660 explain
+G: ## SageMaker Savings Plans
+A Savings Plan is a commitment to spend a fixed amount per hour (for example $10/hour) for 1 or 3 years. In return, usage up to that amount is billed at a discounted rate.
+**SageMaker Savings Plans** apply to eligible SageMaker ML instance usage, including training, real-time and batch inference, processing and notebooks, regardless of instance family, size or Region. The discount follows the workload if the team moves from one instance type to another.
+- Good fit: steady, predictable usage over years.
+- Usage above the commitment is billed at on-demand rates.
+- They are separate from Compute Savings Plans, which cover EC2, Fargate and Lambda but not SageMaker instances.
+Example: a company always runs about $15/hour of SageMaker usage, so it commits $12/hour for 3 years and keeps flexibility for peaks.
+W: C=SageMaker Savings Plans: they give a discount on SageMaker instance usage in exchange for a long-term hourly spend commitment, which suits years of steady workloads.
+X: A=On-demand with alarms: alarms can warn about spending but the price per hour stays at the full on-demand rate.
+B=EC2 Reserved Instances: EC2 reservations discount EC2 instances you run yourself; SageMaker ML instances are billed separately and do not use them.
+D=Dedicated Hosts: SageMaker runs jobs and endpoints on instances it manages, and it does not offer Dedicated Hosts as a purchasing option to lower cost.
+T: Steady SageMaker usage is discounted with SageMaker Savings Plans; EC2 Reserved Instances and Dedicated Hosts do not apply to SageMaker ML instances.
+
+@ Q003661 explain
+G: ## Two big sources of ML waste
+**Paying full price for interruptible training.** Managed spot training runs jobs on spare EC2 capacity at a large discount (up to about 90% off on-demand). Spot capacity can be reclaimed, so:
+- Set `use_spot_instances=True` and a `max_wait` time at least as long as `max_run`.
+- Save checkpoints to `checkpoint_s3_uri`; after an interruption, SageMaker copies the saved checkpoints back to the new instance so the training script can resume from the latest one instead of starting over.
+**Paying for idle resources.** Notebook instances, Studio apps and test endpoints bill per hour even when nobody uses them.
+- Use idle shutdown settings or lifecycle configurations to stop notebooks and apps after a period of inactivity.
+- Delete or scale down development endpoints when experiments finish.
+Example: a nightly 6-hour training job moves to spot with hourly checkpoints, and Studio apps shut down after 1 hour idle, cutting two large cost lines.
+W: D=Managed spot training with checkpoints: it uses discounted spare capacity, and checkpoints let interrupted jobs resume so little work is lost.
+E=Stop idle notebooks and endpoints: it removes hourly charges for resources that are running but doing nothing.
+X: A=Keep experiment endpoints running: each endpoint bills for every instance-hour even with no traffic, so this increases cost.
+B=Largest GPU for small experiments: small jobs cannot use the extra capacity, so you pay a higher hourly rate with little or no speed gain.
+C=Disable checkpointing: checkpoint storage is cheap, and without it every spot interruption restarts training from the beginning, wasting far more compute.
+T: Cut training cost with spot plus checkpoints, and cut idle cost by automatically stopping unused notebooks and endpoints; removing checkpoints backfires with spot.
+
+@ Q003662 explain
+G: ## AWS Inferentia for inference
+AWS Inferentia is a chip designed by AWS specifically for deep learning inference. **Inf2** instances use Inferentia2 and are aimed at high throughput and low cost per inference, including for large models such as transformers.
+- Models are compiled with the **AWS Neuron SDK**, which supports frameworks such as PyTorch and TensorFlow.
+- They are available as EC2 instances and as SageMaker hosting instances (`ml.inf2.*`).
+- Many workloads get a better price-performance ratio than comparable GPU instances; benchmark your own model to confirm.
+Example: a text classification model served on a GPU instance is compiled with Neuron and moved to `ml.inf2.xlarge`, lowering cost per million predictions at similar latency.
+W: B=Inferentia-based Inf2 instances: purpose-built inference accelerators deliver high throughput at a lower cost than typical GPU instances for supported models.
+X: A=Memory optimized X2: these provide very large RAM for in-memory databases and analytics but have no ML accelerator, so deep learning inference throughput would be poor.
+C=Burstable T3: they run at a baseline CPU level and spend credits to burst; sustained high-throughput inference drains credits and gets throttled or charged extra.
+D=Storage optimized I4i: they offer fast local NVMe storage for I/O-heavy databases, which does not speed up neural network computation.
+T: For cheaper high-throughput deep learning inference, choose accelerators built for it (Inferentia/Inf2), not instances optimized for memory, bursts or storage.
+
+@ Q003663 explain
+G: ## Cost allocation tags
+A tag is a key-value label on an AWS resource, such as `Project=churn` or `Team=risk`. Most SageMaker resources support tags, including training jobs, processing jobs, endpoints, notebook instances, models and Studio domains.
+To use tags for costs:
+- Apply a consistent tag, for example `Project`, to every SageMaker resource (automate it in pipelines or with templates).
+- Activate the tag key as a **cost allocation tag** in the Billing and Cost Management console.
+- In **Cost Explorer** or Cost and Usage Reports, group or filter charges by that tag.
+Billing data carries a tag only for usage after the tag is on the resource, and a newly activated tag can take up to 24 hours to appear, so tag resources from the start. Tag policies in AWS Organizations can help enforce consistent keys.
+Example: Cost Explorer shows that `Project=recommendations` spent most of last month on one endpoint, while `Project=churn` spent mainly on training.
+W: C=Tags plus cost allocation in Cost Explorer: tagged resources carry the project name into billing data, so costs can be grouped and compared by project.
+X: A=Single S3 prefix for models: a prefix only organizes object storage; it does not label training or hosting compute, which are the main ML costs.
+B=Delete and recreate monthly: this disrupts work and still gives no breakdown by project, because nothing identifies which resource belonged to whom.
+D=One shared role name: an IAM role controls permissions and is not a billing dimension; sharing one role actually makes projects harder to tell apart.
+T: To see ML costs by project, tag SageMaker resources and activate those tags for cost allocation in Cost Explorer.
+
+@ Q003664 explain
+G: ## Auto scaling SageMaker endpoints
+SageMaker real-time endpoints scale through Application Auto Scaling by changing the instance count of a production variant between a minimum and a maximum.
+- **Target tracking**: keep a metric near a target, for example `SageMakerVariantInvocationsPerInstance` = 200. When traffic drops, instances are removed; when it rises, instances are added.
+- **Scheduled scaling**: change the minimum and maximum at set times, for example minimum 1 and maximum 1 at 22:00, then minimum 4 and maximum 8 at 07:00, ahead of known daily patterns.
+- Combining both prepares for the morning peak while still reacting to unexpected load.
+Scaling out a large model takes time to start instances and load weights, so scheduled scale-out before the daytime peak protects latency. For a classic instance-based production variant the minimum instance count is 1; scaling all the way to zero instances is supported only for endpoints that host models as inference components.
+Example: a GPU endpoint runs 6 instances during the day and 1 at night, cutting nighttime cost by most of that period's spend.
+W: A=Auto scaling that scales in at night: it removes idle GPU instances when traffic falls and adds them back for the day, so cost drops without hurting daytime performance.
+X: B=Delete every morning, recreate at night: this removes the endpoint exactly when traffic is high, so daytime users lose the service entirely.
+C=Move to CPU during the day: the large model would likely miss its latency targets at peak time, so daytime performance suffers.
+D=Peak count 24/7: this pays for full capacity even when traffic is near zero, which is the waste the company wants to remove.
+T: Match endpoint capacity to traffic with scheduled or target tracking auto scaling instead of fixed peak capacity or deleting the endpoint.
+
+@ Q003665 explain
+G: ## Private training jobs
+Two settings keep a SageMaker training job off the internet:
+- **VPC configuration** (`VpcConfig`): the job's network interfaces are placed in your private subnets and security groups, so traffic follows your VPC routes. Private subnets have no route to an internet gateway.
+- **Network isolation** (`EnableNetworkIsolation=True`): the training container cannot make any outbound network calls; SageMaker itself still loads the input data and saves the model output.
+To reach S3 without the internet, add an **S3 VPC endpoint** (a gateway endpoint is common) to the subnets' route tables. A bucket policy with the `aws:SourceVpce` condition can additionally require access through that endpoint.
+Example: a training job in two private subnets reads `s3://secure-data/train/` through a gateway endpoint; even if the training code tried to download a package from the internet, the call would fail.
+W: A=VPC with network isolation and S3 endpoints: the container has no outbound access, and data travels to S3 over private AWS networking through the VPC endpoint.
+X: B=Public bucket: a public bucket lets anyone read the training data and does nothing to keep the training job off the internet.
+C=Disable encryption: encryption does not control the network path, and turning it off weakens data protection instead of improving privacy.
+D=Public subnets with an internet gateway: this gives the job a direct route to the internet, which is the opposite of the requirement.
+T: Private training means VPC mode plus network isolation with S3 VPC endpoints; public buckets, public subnets or disabling encryption move in the wrong direction.
+
+@ Q003666 explain
+G: ## Customer managed KMS keys in SageMaker
+AWS KMS keys come in two main kinds: AWS managed keys that AWS controls, and **customer managed keys** that you create, whose key policy, rotation and deletion you control. Regulated companies often require customer managed keys so they can restrict and audit who can decrypt data.
+SageMaker lets you pass a key ARN at each stage:
+- **Training**: `VolumeKmsKeyId` in the resource configuration encrypts attached ML storage volumes, and `KmsKeyId` in the output configuration encrypts model artifacts written to S3.
+- **Processing and batch transform**: similar volume and output key settings.
+- **Hosting**: `KmsKeyId` in the endpoint configuration encrypts the ML storage volume attached to endpoint instances.
+Instance types with local NVMe instance storage do not accept a volume key, because that storage is always encrypted by the hardware; the output artifacts in S3 still use your key.
+Example: all jobs use `arn:aws:kms:us-east-1:111122223333:key/...`; removing a role's access in the key policy stops it from decrypting artifacts, and every use is logged in CloudTrail.
+W: B=Customer managed KMS keys throughout: SageMaker encrypts training volumes, outputs and endpoint storage with keys the company owns and controls.
+X: A=Unencrypted storage with IAM only: IAM controls who can call APIs, but the data remains unencrypted at rest, which does not meet the requirement for encryption with company-controlled keys.
+C=Manual encryption on a laptop: this protects only uploaded files, not training volumes or endpoint storage, and depends on error-prone manual steps.
+D=Public bucket with obscure names: public access exposes the artifacts to anyone who finds the names, and it provides no encryption with company keys.
+T: To control encryption across the ML lifecycle, specify customer managed KMS keys for training volumes, outputs and endpoints rather than relying on IAM or manual steps.
+
+@ Q003667 explain
+G: ## Inter-container traffic encryption
+In distributed training, several instances (containers) exchange data such as gradients or model parameters over the network. By default this traffic between the training containers is not encrypted by SageMaker.
+Setting `EnableInterContainerTrafficEncryption=True` on the training job (or `encrypt_inter_container_traffic=True` in the SageMaker Python SDK) makes SageMaker encrypt the traffic between nodes.
+- It applies to multi-instance jobs; a single-instance job has no traffic between containers.
+- Encryption adds processing overhead, so training can take somewhat longer and cost more.
+- It complements encryption at rest (KMS for volumes and outputs) and VPC controls.
+Example: a regulated bank trains a model across 8 GPU instances and enables the setting so that gradient exchanges are encrypted in transit.
+W: D=Inter-container traffic encryption: it encrypts the data that training nodes send to each other, which is exactly the security requirement.
+X: A=Debugger hook collection: it saves tensors and metrics for analysis of training behavior; it does not encrypt network traffic.
+B=Larger volume: it adds storage space for data and checkpoints on each instance and has no effect on how nodes communicate.
+C=Managed spot training: it lowers cost by using spare capacity; interruptions and pricing have nothing to do with encryption in transit.
+T: Encryption between distributed training nodes is a specific training job setting, inter-container traffic encryption, not a debugging, storage or cost option.
+
+@ Q003668 explain
+G: ## SageMaker Role Manager
+Least privilege means each role gets only the permissions its job needs. Writing IAM policies for ML by hand is hard because one workflow touches SageMaker, S3, ECR, CloudWatch, KMS and VPC settings.
+**Amazon SageMaker Role Manager** builds these roles from a guided setup:
+- **Personas**: preconfigured starting points such as data scientist, MLOps and SageMaker compute role.
+- **ML activities**: choose what the role may do, for example run Studio applications, manage training jobs, manage models or access specific S3 buckets.
+- **Settings**: add resource restrictions such as allowed S3 buckets, KMS keys, VPC subnets and security groups.
+It generates IAM roles and policies you can review and adjust.
+Example: data scientists get a role that can run notebooks and training jobs, while only the MLOps role can create production endpoints.
+W: C=Role Manager personas and activities: it produces separate least-privilege IAM roles per persona and task, without writing every policy by hand.
+X: A=IAM users with long-term keys: static keys stored in notebooks can leak and never expire, and they do not create task-specific permissions.
+B=Shared root user: the root user has unrestricted access that cannot be limited by IAM policies, and sharing it removes individual accountability.
+D=AdministratorAccess for everyone: this gives every user full control of the account, the opposite of least privilege.
+T: For least-privilege ML roles per persona and activity, use SageMaker Role Manager instead of shared, all-powerful or long-term credentials.
+
+@ Q003669 explain
+G: ## Invoking an endpoint privately
+Applications call a SageMaker endpoint through the **SageMaker Runtime** API (`InvokeEndpoint`). By default that API is reached at a public regional address, so instances in private subnets would need an internet path.
+An **interface VPC endpoint** (AWS PrivateLink) for the service `com.amazonaws.<region>.sagemaker.runtime` places network interfaces with private IPs in your subnets.
+- With private DNS enabled, the normal runtime hostname resolves to those private IPs, so application code does not change.
+- Security groups on the endpoint control which clients can connect.
+- An endpoint policy, or an IAM condition such as `aws:SourceVpce`, can restrict which endpoints may be invoked or require that calls come through the VPC endpoint.
+Example: a Lambda function in private subnets invokes a fraud model with no NAT gateway or internet gateway in the VPC.
+W: A=Interface VPC endpoint for SageMaker Runtime: it gives the VPC a private path to `InvokeEndpoint`, so calls never need an internet route.
+X: B=Public IPs on clients: this makes the instances reachable from the internet and sends calls to the public API address, increasing exposure.
+C=NAT gateway route: a NAT gateway forwards traffic to the public service address through an internet gateway, which is the internet path the requirement wants to avoid.
+D=Internet gateway on private subnets: an internet gateway attaches to the VPC, and routing subnets to it turns them into public subnets rather than keeping calls private.
+T: Private calls to SageMaker endpoints use an interface VPC endpoint for SageMaker Runtime; NAT, internet gateways and public IPs all rely on internet routing.
+
+@ Q003670 explain
+G: ## CloudTrail as the audit record
+AWS CloudTrail records API calls made in an account: who made the call (IAM user or role), when, from where, which API, and with which parameters.
+For SageMaker, management events include `CreateModel`, `CreateEndpointConfig`, `CreateEndpoint`, `UpdateEndpoint` and `DeleteEndpoint`, so they show exactly who deployed or changed a model.
+- **Event history** keeps the last 90 days of management events in each Region and can be searched in the console.
+- For longer or organization-wide retention, create a **trail** (an organization trail covers all accounts) that delivers events to S3 and optionally CloudWatch Logs; the stored logs can be queried with SQL in Amazon Athena.
+Example: an auditor filters for `eventName = UpdateEndpoint` in the last quarter and sees that the role `mlops-deployer` updated the fraud endpoint on 12 August.
+W: B=CloudTrail records of SageMaker API calls: each deployment or update API call is logged with the caller identity and time, which is exactly what auditors asked for.
+X: A=Feature Store offline tables: they hold historical feature values for training and do not record who changed endpoints or models.
+C=Model Monitor data quality reports: they describe violations in captured inference data, not which user performed deployment actions.
+D=CloudWatch latency metrics: metrics show how fast the endpoint responds but carry no information about who created or updated it.
+T: "Who did what, and when" in AWS is answered by CloudTrail API records; ML data stores, monitoring reports and metrics do not track caller identity.

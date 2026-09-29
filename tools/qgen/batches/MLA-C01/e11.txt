@@ -1,0 +1,363 @@
+# MLA-C01 detailed explanations, e11 (explanation-only rewrites; letters are the published ones)
+
+@ Q003621 explain
+G: ## The four SageMaker inference options
+SageMaker offers four ways to get predictions, and the right one depends on latency, payload size and traffic shape.
+- **Real-time inference**: a persistent HTTPS endpoint on instances you choose. The caller sends a request with `InvokeEndpoint` and waits for the answer, typically in milliseconds.
+- **Serverless Inference**: an endpoint without instances to manage; it can scale to zero, so the first request after idle time may see a cold start.
+- **Asynchronous inference**: requests are queued, payloads and results live in S3, and the caller is notified or polls later.
+- **Batch transform**: an offline job that scores a whole dataset in S3 and then shuts down.
+## Example
+A product page calls a recommendation model on every page view and must answer within 100 ms. Traffic is steady all day, so instances that are always warm are both fast and fully used.
+W: Real-time endpoint: it keeps the model loaded on provisioned instances and answers each request synchronously, so latency stays low and predictable; steady traffic means the always-on capacity is not wasted.
+X: B=Batch transform job: it is an offline job that reads a dataset from S3, writes results back to S3 and ends; a web page cannot wait for a job to start and finish per request.
+C=Nightly processing job: predictions produced once a night are precomputed and stale; they cannot score a new request arriving from a user in real time.
+D=Asynchronous endpoint: requests go into an internal queue and results are written to S3, so the caller gets a response later rather than inline within 100 ms.
+T: Synchronous, low-latency answers with steady traffic call for a real-time endpoint; async and batch options trade latency for payload size or throughput.
+
+@ Q003622 explain
+G: ## How SageMaker Serverless Inference bills
+With a real-time endpoint you pay for each instance-hour whether or not requests arrive. **Serverless Inference** instead provisions compute only when requests come in and bills for the compute time used per request (based on the memory size you configure) plus data processed.
+- You set a memory size and a maximum concurrency; SageMaker handles the capacity.
+- When the endpoint is idle it scales to zero, so there is no charge for idle time.
+- The trade-off is a **cold start**: the first request after an idle period waits while compute is prepared and the model is loaded.
+- It runs on CPU only, so it suits smaller models.
+## Example
+A model is called a handful of times per hour. An always-on `ml.m5.large` endpoint bills 24 hours a day; Serverless Inference bills only for the seconds spent processing those few calls.
+W: SageMaker Serverless Inference: it scales to zero between the sparse requests and charges only while processing them, and the stem explicitly accepts the cold-start delay that comes with that.
+X: A=Batch transform every minute: each job provisions instances, loads the model and tears everything down, so the start-up overhead of 60 jobs an hour is paid even when there is nothing to score.
+B=Always-on multi-model endpoint: it still runs instances around the clock; sharing instances helps when many models exist, but with one sparsely used model it pays for idle capacity.
+C=Real-time endpoint on GPU instances: GPU instances are among the most expensive per hour and would sit idle nearly all the time for a few requests per hour.
+T: Sparse, bursty traffic that tolerates cold starts fits Serverless Inference; any always-on endpoint pays for idle hours.
+
+@ Q003623 explain
+G: ## How batch transform works
+**Batch transform** is SageMaker's offline scoring job. You point it at input data in S3, choose an instance type and count, and SageMaker:
+- starts the instances and loads the model,
+- splits the input files (for example by line with `SplitType=Line`) and sends mini-batches to the model containers in parallel,
+- writes the predictions to an S3 output prefix (one `.out` file per input file),
+- shuts the instances down when the job finishes, so you pay only while it runs.
+## Example
+Every Sunday, 50 million customer records land in `s3://bucket/weekly/`. A batch transform job with several instances scores them in parallel and writes churn scores to `s3://bucket/scores/`. No endpoint exists during the other six days.
+W: SageMaker batch transform: it is designed for large, scheduled, offline datasets in S3, parallelizes across instances and writes results straight to S3 without any persistent endpoint to pay for.
+X: A=EC2 web server: you would have to build, patch and scale the serving stack yourself, and pushing 50 million records through a request/response web server is slower and costlier than a managed batch job.
+B=Real-time endpoint: it is built for per-request online predictions and runs continuously; scoring a weekly dataset would mean calling it 50 million times and paying for idle instances the rest of the week.
+D=Serverless Inference: it targets sporadic online requests with limited payload size and concurrency, not bulk scoring of an entire dataset stored in S3.
+T: Large periodic datasets with results written to S3 fit batch transform; endpoints are for online requests.
+
+@ Q003624 explain
+G: ## SageMaker asynchronous inference
+**Asynchronous inference** puts an internal queue in front of the model.
+- The client uploads the payload to S3 and calls `InvokeEndpointAsync` with its S3 location. The call returns immediately with an output location.
+- The endpoint processes queued requests; payloads can be up to 1 GB and processing can take up to about an hour.
+- Results are written to S3, and optional Amazon SNS topics signal success or failure, so clients can poll S3 or subscribe to notifications.
+- The endpoint can scale down to zero instances when the queue is empty.
+## Example
+A user uploads a 500 MB video for object detection that takes several minutes. The app stores the video in S3, submits it asynchronously, and later reads the annotated results from the output prefix.
+W: SageMaker asynchronous inference: it accepts very large payloads through S3 and allows long processing times, and it returns results through S3 and notifications, matching clients that poll for results.
+X: A=Lambda synchronous invocation: a synchronous request payload is limited to a few MB and a function can run for at most 15 minutes, so a 500 MB file cannot be sent inline.
+C=Serverless Inference: it is meant for short synchronous requests with small payloads and a processing timeout of about a minute, so multi-minute video jobs do not fit.
+D=Real-time inference: the request body is limited to far less than 500 MB and the caller must wait for a synchronous response within a short invocation timeout, so large, long-running video jobs do not fit.
+T: Large payloads and long processing with results fetched later fit asynchronous inference; real-time and serverless are for small, quick synchronous requests.
+
+@ Q003625 explain
+G: ## What a multi-model endpoint does
+A **multi-model endpoint (MME)** hosts many models behind one endpoint on a shared fleet of instances that run one serving container.
+- All model artifacts sit in one S3 prefix. The caller picks a model per request with the `TargetModel` parameter, for example `customer-042.tar.gz`.
+- On the first call for a model, SageMaker downloads it from S3 and loads it into memory; later calls reuse the cached copy.
+- When memory runs short, the least recently used models are unloaded and reloaded on demand.
+## Example
+A SaaS company has 500 small per-customer models, each called a few times an hour. One MME on a couple of instances serves all of them; a rarely used model sees a short load delay on its first call instead of paying for its own instance.
+W: Multi-model endpoint loading on demand: 500 lightly used models share the same instances and container, so the company pays for a small fleet instead of 500 separate deployments.
+X: B=Batch transform per request: each job starts instances and loads the model before scoring, so a single request would take minutes and pay start-up overhead every time.
+C=EC2 instance per model: 500 always-running instances cost far more and add patching and scaling work, while most of them would sit idle.
+D=Real-time endpoint per model: each endpoint needs at least one always-on instance, so 500 endpoints means paying for 500 mostly idle instances.
+T: Many small, infrequently used models share one multi-model endpoint; one endpoint per model multiplies idle cost.
+
+@ Q003626 explain
+G: ## SageMaker Inference Recommender
+Picking an endpoint instance type by guesswork usually ends in overpaying or missing latency targets. **Inference Recommender** automates this choice.
+- A **default** recommendation job runs quick load tests against a set of candidate instance types and returns cost, latency and throughput for each.
+- An **advanced** (load test) job lets you define a traffic pattern and requirements such as a maximum p95 latency, and reports configurations that meet them.
+- It works from a model package registered in Model Registry, or from a model with sample payloads.
+## Example
+A model must answer within 50 ms at 200 requests per second. Inference Recommender compares CPU and GPU instances and shows that a mid-size CPU instance meets the target at the lowest cost per inference.
+W: SageMaker Inference Recommender: it benchmarks the model on candidate instance types under load and recommends the configuration that meets latency targets at the lowest cost.
+X: A=Clarify bias reports: Clarify measures bias in data and predictions and explains features; it does not load-test endpoints or compare instance costs.
+B=Data Wrangler flows: Data Wrangler imports, explores and transforms training data; it plays no part in sizing inference infrastructure.
+C=Ground Truth labeling: Ground Truth creates labeled datasets with human or automated labelers; it has no role in endpoint performance or cost.
+T: Choosing the cheapest instance that meets latency is a load-testing task for Inference Recommender, not a data-prep or bias tool.
+
+@ Q003627 explain
+G: ## Compiling models with SageMaker Neo
+A trained model from TensorFlow, PyTorch, MXNet or XGBoost is written for general hardware. **SageMaker Neo** compiles it for a specific target so it runs faster and with less memory.
+- You start a compilation job with the model artifact in S3, the framework, the input shape and a **target device** or platform (for example an NVIDIA Jetson board, an ARM processor or a specific cloud instance family).
+- Neo optimizes the computation graph and produces an artifact plus a compact runtime for that hardware.
+- The compiled model can be deployed to SageMaker endpoints or copied to edge devices.
+## Example
+A defect-detection model must run on a camera module with an ARM CPU. Compiling it with Neo for that target reduces inference time and memory so it fits the device.
+W: SageMaker Neo: it compiles the model for the exact target hardware, which is what lets a model run efficiently on constrained edge devices.
+X: A=SageMaker Canvas: Canvas is a no-code interface for business users to build models and get predictions; it does not optimize models for particular hardware.
+C=SageMaker Clarify: Clarify detects bias and explains predictions; it does not change how a model executes or its size.
+D=SageMaker Autopilot: Autopilot automatically trains and tunes candidate models from tabular data; it does not compile them for edge targets.
+T: Making a trained model run well on specific (edge) hardware is compilation, which is Neo; the other tools build, explain or audit models.
+
+@ Q003628 explain
+G: ## Shadow testing in SageMaker
+**Shadow testing** lets a new model see real production traffic before any user depends on it.
+- The current model is the **production variant**; the candidate is deployed as a **shadow variant** on the same endpoint.
+- SageMaker sends each incoming request to production and a copy (all of it or a sampled percentage) to the shadow.
+- Only the production variant's response is returned to the caller; the shadow's responses are logged for comparison.
+- The console shows latency and error metrics side by side, and you can promote the shadow when it performs well.
+## Example
+A new fraud model is shadowed at 100% for a week. Its latency and error rates, and its logged predictions, are compared with the current model before it is promoted.
+W: Shadow testing (shadow variants): it mirrors live production requests to the candidate while users only ever receive the current model's answers, exactly the no-impact comparison asked for.
+X: A=Canvas quick builds: Canvas builds models quickly in a no-code UI, but it does not route live endpoint traffic to a candidate model.
+B=Batch transform on old data: historical data can miss today's traffic patterns and does not test the candidate's behavior as a live endpoint, such as latency under real load.
+D=Feature Store offline queries: the offline store holds historical feature values for training; querying it does not send production requests to a new model.
+T: Comparing a new model on live traffic without affecting users is shadow testing; offline replays or data queries are not live traffic.
+
+@ Q003629 explain
+G: ## Auto scaling a SageMaker endpoint
+SageMaker endpoints scale through **Application Auto Scaling**. You register the production variant as a scalable target with a minimum and maximum instance count, then attach a policy.
+- A **target tracking** policy keeps a metric near a target value. The usual metric is the predefined `SageMakerVariantInvocationsPerInstance` (requests per instance per minute).
+- If traffic rises above the target, instances are added; when it falls, instances are removed after a cooldown.
+- Step scaling and scheduled scaling are also available for special patterns.
+## Example
+Load tests show one instance handles 1,000 invocations per minute. A target of 700 per instance, with a minimum of 2 and a maximum of 10 instances, scales out at midday and back in overnight.
+W: Target tracking on InvocationsPerInstance: it automatically adds or removes instances as request volume changes, keeping per-instance load near the target without human action.
+X: A=Fixed count at daily peak: capacity never changes, so you pay for peak-sized capacity during every quiet hour of the day.
+B=Hourly manual updates: someone must watch traffic and change the count; hourly changes react slowly to spikes and still depend on human effort.
+D=New endpoint per spike: creating an endpoint takes minutes, clients would have to change endpoint names, and nothing adjusts automatically.
+T: Variable endpoint traffic is handled by target-tracking auto scaling on invocations per instance, not by fixed or manual capacity.
+
+@ Q003630 explain
+G: ## Infrastructure as code for SageMaker endpoints
+Endpoints are built from three resources: a **model** (container image plus artifact), an **endpoint configuration** (instance type, count, variants) and the **endpoint** itself. All three can be declared in AWS CloudFormation (`AWS::SageMaker::Model`, `AWS::SageMaker::EndpointConfig`, `AWS::SageMaker::Endpoint`) or with the AWS CDK.
+- The same template is deployed to dev, staging and prod, with parameters for values that differ, such as instance count.
+- A CI/CD pipeline (for example AWS CodePipeline) deploys to each account in order, with tests and approvals between stages.
+- Every environment is then reproducible, reviewable in version control and free of manual drift.
+## Example
+A model version is approved; the pipeline deploys the template to staging, runs smoke tests, waits for approval, then deploys the same template to the prod account.
+W: CloudFormation or CDK through a pipeline: one versioned definition deployed by automation yields identical endpoint configurations in every account and a repeatable, auditable release process.
+X: A=Emailing the artifact: email is not a secure or traceable delivery method, and manual deployment by each administrator produces inconsistent configurations.
+B=Manual console creation: each release depends on someone clicking the same settings correctly in every account, which leads to drift and mistakes.
+C=One shared dev endpoint for all: production would depend on a development resource, with no isolation, separate permissions or safe testing before release.
+T: Consistent multi-account deployment comes from infrastructure as code run by a pipeline, not from manual or shared setups.
+
+@ Q003631 explain
+G: ## Bring your own container to SageMaker
+SageMaker runs every model inside a Docker container. The built-in algorithms and framework images are already published by AWS; for custom dependencies you build your own image.
+- The image must follow SageMaker's contract: for hosting, a web server that answers `GET /ping` for health checks and `POST /invocations` for predictions on port 8080.
+- You push the image to an **Amazon ECR** repository, and the model definition references it by URI, such as `123456789012.dkr.ecr.us-east-1.amazonaws.com/my-inference:1.0`.
+- The SageMaker execution role needs permission to pull from that repository.
+## Example
+A team needs a special OCR library. They build an image with it, push it to ECR and create a SageMaker model pointing to the ECR image URI and the model artifact in S3.
+W: Amazon ECR: it is the container registry that SageMaker pulls custom images from for training and hosting. (Real-time hosting can also be set up to pull from a private Docker registry in your VPC, but none of the other choices is a container registry.)
+X: B=AWS CodeCommit: CodeCommit is a Git source repository; it can hold a Dockerfile, but SageMaker cannot pull a built container image from it.
+C=Amazon EFS only: EFS is a shared file system; it can supply data or files to some jobs, but it is not an image registry that SageMaker pulls containers from.
+D=Amazon S3 Glacier: Glacier storage classes are for archives with delayed retrieval; S3 holds model artifacts, but container images are not pulled from it.
+T: Custom SageMaker containers live in ECR; S3 holds the model artifacts, and code repositories or file systems are not image registries.
+
+@ Q003632 explain
+G: ## Inference components
+**Inference components** let one SageMaker real-time endpoint host several models, each with its own resource reservation and scaling.
+- The endpoint provides a pool of instances. Each inference component names a model and states what one copy needs: CPU cores, accelerators (GPUs) and memory.
+- SageMaker places copies of each model on the instances where that capacity is free.
+- Each component scales separately by changing its **copy count**, with its own auto scaling policy, and components can scale down to zero copies.
+## Example
+A large language model needs 2 GPUs per copy and a small classifier needs 1 GB of memory and 1 CPU core. Both share one GPU instance fleet; the language model scales to 4 copies at peak while the classifier stays at 1.
+W: Inference components: they are designed exactly for per-model compute allocation plus independent scaling while the models share one endpoint's instances.
+X: A=Single container with all models: every model scales together with that container, and there is no way to reserve GPUs or memory per model.
+C=Lambda per model without GPU: Lambda cannot provide GPUs and has memory and run-time limits, so models that need accelerators cannot be served this way.
+D=Batch transform per model: batch transform scores stored datasets offline and ends; it does not serve live endpoint requests or share instances between models.
+T: Per-model resources and independent scaling on shared instances are what inference components provide; multi-model endpoints and single containers share everything.
+
+@ Q003633 explain
+G: ## Serial inference pipelines
+A **serial inference pipeline** is a SageMaker model made of 2 to 15 containers that run in order for every request.
+- The endpoint receives the request and passes it to the first container, for example a scikit-learn preprocessing container.
+- Each container's output becomes the next container's input, for example the transformed features go to an XGBoost container.
+- The final container's output is returned to the caller. All containers run on the same instances, so no extra network hop to another endpoint is needed.
+- The same pipeline model can be used for real-time endpoints and batch transform, so preprocessing is identical in both.
+## Example
+Raw JSON with text fields is tokenized and scaled by the first container, scored by the model container, and turned into a label by a postprocessing container, all within one `InvokeEndpoint` call.
+W: Serial inference pipeline: it chains the preprocessing container and the model container behind one endpoint so each request flows through both in sequence.
+X: A=Multi-model endpoint with one model: a multi-model endpoint picks one independent model per request; it does not chain a preprocessing step before a model.
+C=Two endpoints called by users: clients would have to call the first endpoint and then pass results to the second, adding latency, cost and orchestration logic on the client side.
+D=Batch transform with a manual step: batch transform is offline, and a manual step between stages cannot serve individual requests at an endpoint.
+T: Running containers in sequence per request at one endpoint is a serial inference pipeline; multi-model endpoints select models, they do not chain them.
+
+@ Q003634 explain
+G: ## What SageMaker Pipelines provides
+**SageMaker Pipelines** is the SageMaker-native workflow service for ML. A pipeline is a directed graph of typed steps defined with the SageMaker Python SDK (or JSON).
+- Step types include processing, training, tuning, model creation, `RegisterModel`/model step, condition, callback, Lambda and fail steps.
+- Steps pass outputs to each other, pipelines accept parameters, and every run is recorded with lineage for artifacts and models.
+- A condition step can register the model in **Model Registry** only when metrics pass, and deployment can follow.
+- Runs can be started manually, on a schedule or by EventBridge events.
+## Example
+A pipeline preprocesses data, trains an XGBoost model, evaluates AUC, and registers the model only if AUC is at least 0.85; an approved model is then deployed.
+W: SageMaker Pipelines: it natively provides ML step types, conditional branching, lineage tracking and Model Registry integration for a repeatable build-train-evaluate-register-deploy workflow.
+X: A=AWS Batch arrays: array jobs run many copies of one batch job; they have no ML step types, conditional model registration or lineage between processing, training and evaluation.
+B=Amazon SQS queues: a queue buffers messages between components; it does not define steps, dependencies or branching logic for a workflow.
+D=Amazon SNS topics: SNS fans out notifications to subscribers; it cannot run or sequence ML steps.
+T: A multi-step ML workflow with conditional registration belongs in SageMaker Pipelines; queues and notifications only move messages.
+
+@ Q003635 explain
+G: ## Gating model registration with a condition step
+In SageMaker Pipelines, a **condition step** evaluates one or more conditions and chooses a branch.
+- An evaluation processing step writes metrics to a JSON report, for example `{"auc": 0.87}`, declared as a `PropertyFile`.
+- The condition uses `JsonGet` to read `auc` from that file and a comparison such as `ConditionGreaterThanOrEqualTo(left=auc, right=0.85)`.
+- `if_steps` run when the condition is true (for example the model registration step); `else_steps` run otherwise (for example a fail step with a message).
+## Example
+Run 1 reaches AUC 0.88, so the model is registered. Run 2 reaches 0.81, so the else branch stops the run with "AUC below threshold" and nothing is registered.
+W: Condition step comparing the metric: it reads the evaluation AUC and runs the registration step only when the value is at least 0.85, which is exactly the required gate.
+X: B=Callback step waiting for a human: a callback step pauses the pipeline until an external system replies through a queue; it does not compare metrics itself, and always waiting for a reviewer is not an automatic threshold.
+C=Fail step before training: a fail step immediately ends the run as failed; placed before training it would stop every run before any metric exists.
+D=Processing step with no outputs: a processing step runs code but has no branching logic, and without outputs it cannot even provide a metric for another step to check.
+T: Branching on a metric threshold is the job of a condition step; callback and fail steps pause or stop a pipeline rather than compare values.
+
+@ Q003636 explain
+G: ## Event-driven deployment from Model Registry
+Each model version in **SageMaker Model Registry** is a model package with a `ModelApprovalStatus`: `PendingManualApproval`, `Approved` or `Rejected`.
+- When the status changes, SageMaker emits a **SageMaker Model Package State Change** event to Amazon EventBridge.
+- An EventBridge rule can match events where the status becomes `Approved` for a particular model package group.
+- The rule's target starts a deployment pipeline, such as CodePipeline or a SageMaker pipeline, which deploys the approved version to staging.
+## Example
+A reviewer approves version 7 of the `churn-model` group. EventBridge matches the event and starts the pipeline, which deploys version 7 to the staging endpoint within minutes, with no one having to ask.
+W: EventBridge rule on approval status change: the approval itself emits the event, so deployment starts automatically and only for versions that were actually approved.
+X: A=Emailing operations: it relies on people noticing and acting, so deployments are slow, inconsistent and easy to forget.
+B=Hourly cron redeploy: it redeploys the newest version whether or not it was approved and wastes deployments when nothing changed.
+C=Deploy every version to production: it skips approval and staging completely, so untested or rejected models could reach users.
+T: Approval in Model Registry should trigger deployment through its EventBridge event; schedules and manual steps ignore or delay the approval.
+
+@ Q003637 explain
+G: ## SageMaker Projects and MLOps templates
+**SageMaker Projects** create a ready-made MLOps setup from a template (provided through AWS Service Catalog).
+- The standard **model building, training and deployment** template creates two code repositories: one for model building and one for model deployment.
+- The build side runs a SageMaker pipeline that trains, evaluates and registers models in Model Registry.
+- The deploy side has its own CI/CD pipeline that deploys approved model versions to staging and then, after manual approval, to production.
+- Variants exist for third-party Git repositories and other CI tools, and organizations can publish custom templates.
+## Example
+A team creates a project from the template and gets separate build and deploy pipelines wired to Model Registry on day one, instead of writing that CI/CD by hand.
+W: SageMaker Projects MLOps templates: they provision separate CI/CD for model building and model deployment from AWS-provided templates, which is exactly what is described.
+X: A=Canvas quick builds: Canvas is a no-code tool for training and using models; it does not set up source repositories or CI/CD pipelines.
+C=Ground Truth jobs: Ground Truth manages data labeling workflows; it has no build or deployment pipelines for models.
+D=Studio Lab notebooks: Studio Lab is a free, separate notebook environment for learning and experiments; it does not provide MLOps templates or CI/CD.
+T: Separate build and deploy CI/CD from SageMaker-provided templates means SageMaker Projects; other SageMaker tools cover labeling, no-code modeling or notebooks.
+
+@ Q003638 explain
+G: ## Amazon MWAA for ML orchestration
+**Amazon Managed Workflows for Apache Airflow (MWAA)** runs Apache Airflow for you: AWS manages the scheduler, workers, web server and metadata database.
+- Workflows are Python **DAGs** stored in an S3 bucket; MWAA picks them up automatically.
+- The Amazon provider package includes operators for many services, including SageMaker training, processing, transform and endpoint operators, as well as AWS Glue, Amazon EMR and Amazon Athena.
+- So ETL tasks and ML training can live in one DAG with shared dependencies, retries and schedules.
+## Example
+A nightly DAG runs a Glue job to clean data, then a SageMaker training job, then a batch transform, each task waiting for the previous one to finish.
+W: Amazon Managed Workflows for Apache Airflow: the team keeps its existing Airflow DAGs and skills while AWS runs the infrastructure, and SageMaker operators let ML training sit next to ETL tasks.
+X: A=Lightsail container service: it runs simple containerized web apps; it has no workflow scheduler or DAG orchestration.
+B=SNS topics: SNS delivers notifications to subscribers; it cannot schedule tasks, track dependencies or run Airflow DAGs.
+C=Elemental MediaConvert jobs: MediaConvert transcodes video files; it is unrelated to orchestrating ETL or ML training.
+T: Teams already using Airflow orchestrate ETL and SageMaker jobs together on MWAA; messaging and media services do not orchestrate workflows.
+
+@ Q003639 explain
+G: ## Deployment guardrails for SageMaker endpoints
+When you update an endpoint with a new endpoint configuration, **deployment guardrails** control how traffic moves from the old fleet (blue) to the new one (green).
+- **All at once**: all traffic moves after the new fleet is ready, followed by a baking period.
+- **Canary**: a small portion, for example 10%, moves first; if no alarm fires during the baking period, the rest follows.
+- **Linear**: traffic moves in equal steps, for example 20% at a time.
+- You list **CloudWatch alarms** (such as 5xx errors or latency); if one fires, SageMaker automatically sends traffic back to the old fleet.
+## Example
+A new model version gets 10% of traffic for 15 minutes. Its latency alarm fires, so SageMaker rolls back to the old version, and 90% of users never saw the problem.
+W: Deployment guardrails with canary or linear shifting: traffic moves to the new version gradually, and alarms trigger an automatic rollback, which is the safe update asked for.
+X: A=All at once at peak hours: every user hits the new model immediately at the busiest time, so any defect affects everyone before anyone can react.
+B=Users switch endpoint names: moving traffic depends on each client changing configuration, which is slow, uncontrolled and has no automatic rollback.
+D=Delete and recreate endpoint: the model is unavailable while the new endpoint is created, and there is no old version left to roll back to.
+T: Safe endpoint updates use blue/green deployment guardrails with canary or linear shifting and alarm-based rollback, not all-at-once or manual cutovers.
+
+@ Q003640 explain
+G: ## What happens during endpoint scale-out
+When auto scaling adds an instance to a SageMaker endpoint, the instance is not ready immediately.
+- The alarm must first fire on the scaling metric, and the policy must decide to scale out.
+- SageMaker launches the instance, pulls the container image from ECR and downloads the model artifact from S3.
+- The container starts, loads the model into memory and must answer the `/ping` health check before it receives traffic.
+Each of these phases can be shortened. A target and cooldown that let scaling react earlier add capacity sooner; a smaller artifact and a lean, optimized image download and load faster.
+## Example
+A 12 GB artifact and a 9 GB image take minutes to load per new instance. Compressing the model and removing unused libraries cuts that time sharply, and a lower target value starts scale-out before latency climbs.
+W: A=Tuned scaling policy: a suitable target and cooldown make the policy start adding instances earlier and without needless delay, so new capacity is ready sooner when load rises.
+E=Smaller artifacts and optimized containers: less to download and load means each new instance passes its health check and starts serving faster.
+X: B=Disable health checks: SageMaker health checks cannot be turned off, and they exist so that traffic only reaches containers that are actually ready.
+C=Glacier Deep Archive for artifacts: objects in Deep Archive must be restored before they can be read, which takes hours, so a new instance could not load the model at all.
+D=Package unused dependencies: extra libraries make the image larger, so pulling and starting it on each new instance takes longer.
+T: Scale-out speed depends on how early scaling triggers and how quickly an instance can download and load the model; bigger images or archived artifacts slow it down.
+
+@ Q003641 explain
+G: ## Serverless options for a small model
+A lightweight scikit-learn model with low traffic needs little compute, so the goal is to avoid managing or paying for idle servers.
+- **SageMaker Serverless Inference** hosts the model behind an endpoint without instances to manage, scales with requests, scales to zero when idle and bills per use. It runs on CPU only, which is all a scikit-learn model needs.
+- **AWS Lambda** can run the model as a function. Packaging it as a **container image** (up to 10 GB) avoids the small ZIP size limit that libraries like scikit-learn and NumPy can exceed. Invocation can come from an API Gateway endpoint or a Lambda function URL.
+- Both options have cold starts, which are acceptable when traffic is low.
+## Example
+A small pricing model is called a few hundred times a day. Either option costs cents per day and needs no patching or capacity planning.
+W: A=SageMaker Serverless Inference: it gives a managed SageMaker endpoint that scales to zero and bills only for the compute time used by requests, with no instances to operate.
+E=Lambda with a container image: Lambda runs the model on demand with no servers to manage, and a container image comfortably fits scikit-learn and its dependencies.
+X: B=Large EMR cluster kept running: EMR is for distributed big-data processing; a permanently running cluster is costly and needs operations work that a tiny model does not justify.
+C=EKS with GPU node groups: running Kubernetes plus GPU nodes means managing a cluster and paying for accelerators that a scikit-learn model cannot even use.
+D=Dedicated GPU real-time endpoint: it bills for an always-on GPU instance, while scikit-learn runs on CPU and traffic is low.
+T: Small, low-traffic CPU models fit serverless serving (SageMaker Serverless Inference or Lambda); clusters and GPUs add cost and operations without benefit.
+
+@ Q003642 explain
+G: ## Deploying JumpStart models with the SageMaker Python SDK
+**SageMaker JumpStart** is a hub of pretrained and foundation models (for example Llama, Mistral or Falcon variants) with ready-made containers and deployment settings.
+- The **SageMaker Python SDK** exposes them through the `JumpStartModel` class.
+- You create it with a `model_id`, then call `deploy()`; the SDK picks a default instance type and container, creates the model, endpoint configuration and endpoint, and returns a predictor.
+- Some models require accepting an end-user license agreement, which is passed as a parameter.
+## Example
+In a few lines: `model = JumpStartModel(model_id="...")`, then `predictor = model.deploy(accept_eula=True)`, then `predictor.predict({"inputs": "Hello"})`.
+W: SageMaker Python SDK: it is the programmatic interface for JumpStart, so a model can be deployed to an endpoint and invoked with only a few lines of Python.
+X: A=Route 53 console: Route 53 manages DNS records and health checks; it does not create SageMaker models or endpoints.
+C=IAM credential report: it lists IAM users and the status of their passwords and access keys; it cannot deploy anything.
+D=AWS Billing console: it shows costs and payments; it has no function for creating or deploying models.
+T: Deploying JumpStart models in code is done with the SageMaker Python SDK (`JumpStartModel().deploy()`); DNS, IAM and billing tools do not deploy models.
+
+@ Q003643 explain
+G: ## Starting a pipeline when data arrives
+Amazon S3 can send object events to **Amazon EventBridge** once EventBridge notifications are turned on for the bucket.
+- Each upload produces an `Object Created` event with the bucket name and object key.
+- An EventBridge rule filters these events, for example only keys under `labeled/`.
+- The rule's target can be a **SageMaker pipeline**, which EventBridge starts directly, passing values as pipeline parameters. No servers or polling are needed.
+## Example
+A labeling job writes `s3://ml-data/labeled/2026-09-29/batch.manifest`. The rule matches the `labeled/` prefix and starts the training pipeline with the new manifest location as a parameter.
+W: EventBridge rule on S3 object events: the arrival of new data itself starts the SageMaker pipeline immediately, with no polling and no manual step.
+X: A=Yearly schedule: it ignores new data for up to a year, so the model can become badly outdated between runs.
+B=Notebook polling every second: an always-running notebook costs money around the clock, sends constant S3 requests and stops working whenever the notebook or kernel stops.
+D=Daily manual check: it depends on a person every morning, adds up to a day of delay and fails on weekends or holidays.
+T: Retraining on new data should be event-driven (S3 event to EventBridge to SageMaker pipeline), not scheduled blindly, polled or manual.
+
+@ Q003644 explain
+G: ## Retry policies in SageMaker Pipelines
+Transient failures, such as a throttled API call, temporarily unavailable capacity or a brief service error, often succeed if simply tried again. SageMaker Pipelines lets you attach **retry policies** to steps instead of writing retry logic in your own code.
+- A `StepRetryPolicy` retries on errors such as service faults or throttling.
+- A `SageMakerJobStepRetryPolicy` retries on job errors, for example when capacity is temporarily unavailable.
+- Each policy sets the maximum attempts or total time and the backoff (interval and rate), so retries are spaced out.
+## Example
+A processing step sometimes fails with a throttling error. A retry policy with up to 3 attempts and exponential backoff lets the step succeed on the second try, and the pipeline continues without anyone restarting it.
+W: Retry policies on the step: they automatically re-run the step when transient errors occur, configured in the pipeline definition rather than in the step's own code.
+X: A=Run once per month: fewer runs do not make a single run any less likely to fail; they only delay results.
+B=Remove the failing step: the workflow would lose that step's output, so later steps would lack the data or model they depend on.
+C=Larger instances for other steps: bigger instances on unaffected steps do nothing for transient errors in the failing step and only raise costs.
+T: Transient step failures are handled with pipeline retry policies (with backoff), not by removing steps or changing unrelated resources.
+
+@ Q003645 explain
+G: ## Response streaming on SageMaker endpoints
+Large language models generate text one token at a time, and a full answer can take many seconds. With a normal `InvokeEndpoint` call the user waits for the whole answer.
+- **Response streaming** uses `InvokeEndpointWithResponseStream`. The model container sends partial output as it is produced, and the client receives a stream of chunks.
+- The container must support streaming, as the large model inference containers used for LLMs do.
+- The application forwards each chunk to the user, for example over a WebSocket or server-sent events, so text appears word by word.
+## Example
+A chatbot answers a question with 400 tokens. The first words appear after a fraction of a second instead of after the full generation time.
+W: Response streaming with InvokeEndpointWithResponseStream: it returns tokens to the client while they are generated, which is exactly the streaming behavior required.
+X: A=Serverless inference with long polling: SageMaker has no long-polling mechanism for retrieving partial results; token-by-token delivery comes from a streaming invocation, not from repeatedly polling an endpoint.
+B=Hourly batch transform: batch transform scores stored data offline, so users would wait up to an hour and receive nothing while the model generates.
+C=Asynchronous inference to S3 only: the full result is written to S3 after processing finishes, so there are no partial tokens for the user to see.
+T: Token-by-token output needs a streaming invocation (`InvokeEndpointWithResponseStream`); async and batch deliver only complete results later.

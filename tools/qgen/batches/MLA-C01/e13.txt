@@ -1,0 +1,258 @@
+# MLA-C01 detailed explanations, e13 (explanation-only rewrites; letters are the published ones)
+
+@ Q003671 explain
+G: ## Two layers of protection for data in S3
+Protecting a training dataset in Amazon S3 means answering two questions: who can reach the objects, and what happens if someone gets the bytes anyway.
+- **Access control** decides who can read. A bucket policy can allow only named IAM roles (for example the SageMaker execution role) and deny any request that does not arrive through a specific VPC endpoint, using the `aws:SourceVpce` condition key.
+- **Encryption at rest** protects the stored bytes. With SSE-KMS and a customer managed key, every read also needs `kms:Decrypt` permission on that key, and KMS key usage is logged in CloudTrail. You control the key policy, rotation and can disable the key.
+## Example
+A bucket `ml-train-data` with a policy that denies `s3:GetObject` unless the caller is the training role and `aws:SourceVpce` equals the VPC endpoint id, plus default encryption with a customer managed KMS key. A leaked user credential without key permission still cannot decrypt the data.
+- S3 Block Public Access stays on as a guardrail so no policy or ACL can accidentally make the data public.
+W: D=SSE-KMS with a customer managed key: the data is encrypted at rest and reading it requires permission on a key you control, adding a second authorization check and a CloudTrail audit trail of key usage.
+E=Restrictive bucket policy: allowing only specific roles and only traffic through approved VPC endpoints shrinks who can reach the data and from where, blocking access from outside the private network path.
+X: A=Disabling Block Public Access: Block Public Access is the account- and bucket-level safety net that overrides public ACLs and public policies. Turning it off makes accidental public exposure possible and adds no protection.
+B=Access keys in object metadata: object metadata is returned to anyone who can read the object's headers, so storing credentials there leaks long-term keys. Workloads should use IAM roles with temporary credentials instead.
+C=Public read access: public read lets anyone on the internet download the dataset. Partners should get access through cross-account roles, bucket policies naming their accounts, or time-limited presigned URLs.
+T: Protect sensitive training data by restricting who and from where (role- and VPC-endpoint-scoped bucket policies) and by encrypting it with a KMS key you control, never by loosening public-access guardrails.
+
+@ Q003672 explain
+G: ## What Amazon SageMaker Model Cards are
+SageMaker Model Cards are structured documents that record the essential facts about a model in one place for governance and audit.
+- Typical sections: model overview and intended uses, business details, training details (data, algorithm, hyperparameters), evaluation results, risk rating, ethical considerations and caveats.
+- Cards can pull details from SageMaker training jobs and be linked to a model in the Model Registry.
+- Cards have versions and an approval status (for example draft, pending review, approved), and can be exported to PDF to share with auditors or risk teams.
+## Example
+Before promoting a credit-scoring model, the team creates a Model Card stating that the model is intended only for pre-screening, listing the training data sources and date range, attaching evaluation metrics by customer segment, and rating the risk as high. Reviewers approve the card as part of the release process.
+- Model Cards sit alongside other SageMaker governance tools such as Role Manager and Model Dashboard.
+W: SageMaker Model Cards: they are purpose-built to document intended use, training data, evaluation results and risks for each model, with versioning and export for governance reviews.
+X: A=Studio themes: themes only change the appearance of the SageMaker Studio interface, such as light or dark mode. They store no information about any model.
+B=Canvas charts: charts in SageMaker Canvas visualize dataset columns and model insights for no-code users. They are not a governed, versioned record of a production model's intended use and risks.
+D=Debugger rules: Debugger rules watch tensors and system metrics during training to detect problems like vanishing gradients or overfitting. They help training quality but do not document a model for governance.
+T: Governance documentation of a model's purpose, data, evaluation and risk belongs in Model Cards; the other features are UI, visualization or training-diagnostics tools.
+
+@ Q003673 explain
+G: ## Reading endpoint latency metrics
+A SageMaker real-time endpoint publishes invocation metrics in the `AWS/SageMaker` namespace, per endpoint and variant.
+- `ModelLatency` is the time the model container takes to answer a request (reported in microseconds).
+- `OverheadLatency` is the extra time SageMaker adds around the container.
+- Instance metrics such as `CPUUtilization`, `MemoryUtilization` and `GPUUtilization` (in the `/aws/sagemaker/Endpoints` namespace) show how hard the container works.
+If traffic is flat but `ModelLatency` jumps right after a deployment, the most likely cause is the new model version itself: a larger model, heavier preprocessing, a different framework version or a smaller instance type.
+## A safe response
+- Compare the new version's latency and resource metrics with the previous version over the same time window.
+- If the regression hurts users, roll back to the previous endpoint configuration while you investigate. Deployment guardrails (blue/green with CloudWatch alarms) can do this automatically.
+W: Compare versions and roll back if needed: the timing ties the regression to the deployment, so comparing old and new metrics isolates the cause, and rolling back restores service quickly while the root cause is found.
+X: A=Delete CloudWatch log groups: logs are the evidence needed to diagnose the regression, and log delivery is not what drives `ModelLatency`, which measures time inside the container.
+B=Retrain on more data first: more data may change accuracy but gives no reason to expect lower latency, and it delays investigating a problem that appeared with the new version.
+D=Data capture at 100%: capturing every request and response adds storage work and cost and does not explain why the model became slower. It is useful for data-quality monitoring, not for a latency regression.
+T: A latency jump right after a deployment with unchanged traffic points to the new version: compare it against the old one and roll back, rather than retraining or changing unrelated settings.
+
+@ Q003674 explain
+G: ## Seasonal drift is predictable drift
+Data drift happens when production inputs or the relationship between inputs and outcomes shift away from what the model saw in training. Seasonal drift repeats on a known calendar: holiday demand, back-to-school buying, weather patterns.
+Because the timing is known, it can be planned for instead of discovered by alarms.
+- **Include seasonal history** in the training set, with features such as day of year, holiday flags or days-to-holiday, so the model learns the pattern.
+- **Schedule retraining** (for example with SageMaker Pipelines triggered by an EventBridge schedule) ahead of the season on the most recent data.
+- **Use a seasonal model** trained specifically on holiday periods and switch to it for that window, then switch back.
+## Example
+A demand forecast underpredicts every December. Adding the last three years of December data plus a `is_holiday_week` feature, and retraining in early November, lets the model anticipate the spike.
+W: Seasonal data plus planned retraining or seasonal models: it teaches the model the recurring pattern and refreshes it before the known shift, so accuracy holds through the season.
+X: A=Stop serving during holidays: the business loses predictions exactly when demand is highest, and the underlying model weakness is never fixed.
+C=Bigger instance for the season: a larger instance adds compute capacity and can help latency under load, but it runs the same model with the same weights, so predictions are just as wrong.
+D=Freeze the model permanently: accepting a known, repeating accuracy drop every year means ignoring an issue that can be fixed with data and retraining.
+T: Predictable, recurring drift calls for training on seasonal data and scheduling retraining or seasonal models in advance; capacity changes or freezing do nothing for accuracy.
+
+@ Q003675 explain
+G: ## Real-time endpoints versus batch transform
+- A **real-time endpoint** keeps instances running 24/7 and bills for every instance-hour, whether or not requests arrive. It suits low-latency, request-by-request traffic.
+- **Batch transform** starts instances for a job, reads input files from S3, writes predictions back to S3, and shuts the instances down when finished. You pay only while the job runs.
+## Example
+A nightly job scores 2 million records. On an always-on `ml.m5.xlarge` endpoint the team pays 24 hours a day but uses it about 1 hour. A batch transform job on the same instance type runs about 1 hour, so compute cost drops by roughly 95%.
+- Batch transform can split large inputs (`SplitType`), batch records per request, and run on several instances in parallel.
+- It can be scheduled with SageMaker Pipelines or EventBridge.
+W: Batch transform for the nightly run: the workload is scheduled and offline, so a job that provisions instances only for the scoring window and then releases them removes the cost of an endpoint idling all day.
+X: A=Enable data capture: data capture writes requests and responses to S3 for monitoring. It adds storage cost and leaves the idle endpoint running.
+B=Add more instances: more instances multiply the hourly cost of an endpoint that is already idle most of the day.
+C=Larger instance type: a bigger instance has a higher hourly price and still runs around the clock, so total cost goes up.
+T: For scheduled, offline scoring, pay per job with batch transform instead of paying around the clock for a real-time endpoint that sits idle.
+
+@ Q003676 explain
+G: ## How a SageMaker endpoint is called
+A SageMaker real-time endpoint is invoked through the `InvokeEndpoint` API, which requires AWS Signature Version 4 signing with IAM credentials. There is no anonymous mode. So a browser should never call it directly: that would require putting AWS credentials in the browser.
+## The standard pattern for a public web app
+- The browser calls a public API, typically **Amazon API Gateway**, which authenticates users (Cognito user pools, JWT or Lambda authorizers) and applies throttling and quotas (stage throttling, usage plans).
+- A backend such as a Lambda function, running with an IAM role that allows `sagemaker:InvokeEndpoint` on that one endpoint, calls the model and returns the result.
+- AWS WAF can be attached to API Gateway to filter abusive traffic.
+## Example
+`POST /predict` in API Gateway with a Cognito authorizer and a limit of 50 requests per second per client, integrated with a Lambda that invokes `churn-endpoint`. Users never see AWS credentials.
+W: A=API Gateway with auth and throttling: it authenticates callers and caps request rates before anything reaches the model, protecting it from anonymous use, abuse and cost spikes.
+E=Invoke from a backend with IAM: credentials stay on the server side in an IAM role scoped to the endpoint, so browsers never hold AWS keys and only trusted code can call the model.
+X: B=Anonymous invocation: SageMaker endpoints require SigV4-signed requests, and allowing unauthenticated callers would remove any control over who uses the model or how much.
+C=Share the execution role with users: the execution role is what SageMaker assumes to run the model and read artifacts. Giving users its permissions breaks least privilege and lets them act as the service.
+D=IAM keys in JavaScript: anything in page JavaScript can be read by every visitor, so the keys would leak and could be used from anywhere until rotated.
+T: Keep endpoint invocation server-side with an IAM role and put an authenticated, throttled API in front; never give browsers AWS credentials or anonymous access.
+
+@ Q003677 explain
+G: ## How SageMaker Model Monitor runs
+Model Monitor compares captured endpoint traffic with a baseline to detect data quality, model quality, bias and feature-attribution drift.
+- **Data capture** on the endpoint writes requests and responses to S3 continuously.
+- A **monitoring schedule** (`CreateMonitoringSchedule`) runs a processing job at intervals set by its `ScheduleExpression`, a cron expression such as `cron(0 * ? * * *)` for hourly or a daily cron for once a day.
+- Each run analyzes the data captured since the previous run and writes a violations report and CloudWatch metrics.
+## Example
+Setting the schedule to hourly means a drift in input distribution that starts at 09:10 is reported after the 10:00 run. Changing it to daily means fewer jobs and lower cost but slower detection.
+W: The monitoring schedule's cron expression: the schedule is the object that tells Model Monitor when to launch each analysis job, so its expression directly sets the monitoring frequency.
+X: A=S3 lifecycle rules: lifecycle rules move or expire stored objects, such as old capture files. They do not start or time any analysis.
+B=Endpoint instance count: instance count sets serving capacity for inference traffic, not when monitoring jobs run.
+C=Training job max runtime: `MaxRuntimeInSeconds` caps how long a training job may run. It belongs to training and has nothing to do with monitoring frequency.
+T: Model Monitor frequency is set by the monitoring schedule's expression; storage rules, serving capacity and training limits do not control it.
+
+@ Q003678 explain
+G: ## Where LLM inference cost comes from
+A large language model endpoint is billed per GPU instance-hour. Cost per request therefore falls when each GPU serves more requests per second (throughput) or when you can use fewer or smaller GPUs.
+## Two main levers
+- **Quantization** stores weights at lower precision, for example 8-bit or 4-bit instead of 16-bit. The model uses less GPU memory and memory bandwidth, so it can fit on fewer or smaller GPUs and often generates tokens faster. Accuracy must be checked because lower precision can reduce quality slightly.
+- **Optimized serving with batching**: serving engines such as vLLM or TensorRT-LLM (available in SageMaker large model inference containers) use continuous batching to process many requests together on the GPU, so the GPU is busy instead of waiting on single requests.
+## Example
+A 16-bit model needing two GPUs might fit on one GPU after 8-bit quantization, and continuous batching can raise tokens per second several times, both cutting cost per request.
+W: B=Quantization: lower-precision weights reduce memory needs and speed up inference, so the same work runs on less or cheaper GPU capacity when accuracy remains acceptable.
+E=Optimized serving with batching: batching many requests together keeps the GPU fully used, increasing throughput per instance and spreading the fixed GPU cost over more requests.
+X: A=Disable prefix caching: caching repeated prompt prefixes avoids recomputing the same attention state for shared system prompts. Turning it off makes the GPU redo that work on every request.
+C=Raise max output tokens: generation cost grows with the number of tokens produced, so allowing longer outputs for every request increases GPU time per request.
+D=One endpoint per user: each endpoint needs its own GPU instances, so per-user endpoints multiply idle capacity instead of sharing it.
+T: Lower LLM cost per request by getting more work from each GPU: quantize the model and serve with batching, rather than removing caches or dedicating capacity per user.
+
+@ Q003679 explain
+G: ## Data exfiltration paths from notebooks
+A notebook user could move training data out of the controlled environment by downloading it from the browser, sending it over the internet from notebook code, or copying it to a bucket outside the organization.
+## Controls that close these paths
+- **SageMaker Studio in VPC-only mode**: the domain's traffic goes through your VPC subnets instead of SageMaker's managed internet access. Without a NAT gateway or internet gateway route, notebook code cannot reach the internet; AWS services are reached through VPC interface and gateway endpoints.
+- **S3 bucket policies tied to VPC endpoints**: a policy with `aws:SourceVpce` denies access that does not come through the approved endpoint, so the data cannot be read from a laptop even with valid credentials. VPC endpoint policies can also limit which buckets the notebooks may reach.
+## Example
+The domain uses private subnets with an S3 gateway endpoint; the data bucket's policy denies every request whose `aws:SourceVpce` is not that endpoint. A user copying credentials to a laptop still cannot download objects.
+W: A=Bucket policies restricted to VPC endpoints: data can be read only from inside the approved network path, blocking downloads from local machines or other networks.
+E=VPC-only Studio without internet: notebook traffic stays in private subnets with no route to the internet, removing outbound paths for sending data away.
+X: B=Full S3 access for notebook roles: access to every bucket widens what can be read and where data can be written, including buckets used to move data out.
+C=One shared user profile: sharing a profile removes per-user accountability and auditing and does not block any network or storage path.
+D=Direct internet access for notebooks: internet access is exactly the outbound path the requirement forbids, letting code upload data anywhere.
+T: Stop notebook exfiltration with network isolation (VPC-only Studio, no internet route) plus bucket policies that accept only VPC endpoint traffic.
+
+@ Q003680 explain
+G: ## Endpoint error metrics in CloudWatch
+SageMaker endpoints publish per-variant metrics in the `AWS/SageMaker` namespace, including `Invocations`, `Invocation4XXErrors` and `Invocation5XXErrors`. These are counts, not rates.
+## Metric math alarms
+CloudWatch metric math lets an alarm evaluate an expression built from several metrics. An error rate is:
+- `m1` = `Invocation5XXErrors` (and optionally `Invocation4XXErrors`), sum over 10 minutes
+- `m2` = `Invocations`, sum over 10 minutes
+- `e1` = `100 * m1 / m2`
+The alarm fires when `e1` is greater than 1 and can notify an SNS topic that sends email, chat or pager messages.
+## Example
+A period of 600 seconds with 1 evaluation period gives "error rate above 1% over 10 minutes". If 3,000 invocations produce 45 errors, `e1` = 1.5 and the alarm goes into ALARM.
+W: CloudWatch alarm with metric math: it computes errors divided by invocations over the 10-minute window and notifies through SNS when the percentage crosses 1%, exactly the requested condition.
+X: A=Weekly Ground Truth review: Ground Truth creates human labeling jobs for datasets. It does not watch metrics or send near-real-time alerts, and weekly is far too slow.
+B=CloudTrail for CreateEndpoint: CloudTrail records management API calls such as endpoint creation. It does not measure invocation errors or compute rates.
+D=Monthly data quality schedule: data quality monitoring checks input distributions against a baseline, not invocation error rates, and monthly runs cannot detect a 10-minute spike.
+T: For a rate-based operational alert, use a CloudWatch alarm with metric math over the endpoint's error and invocation counts, not labeling, audit logs or drift monitoring.
+
+@ Q003681 explain
+G: ## Network isolation for SageMaker jobs
+Setting `EnableNetworkIsolation` to true on a training job (or model) stops the container from making any outbound network calls: no internet, no calls to AWS services, and no calls to other hosts in the VPC.
+- SageMaker itself still copies the training input from S3 into the container and uploads the model artifacts to S3 afterward, so the job works without the container needing network access.
+- This matters when running third-party or untrusted algorithm code (for example from AWS Marketplace): even if the code tries to send data out, it has no network.
+## Difference from a VPC configuration
+Putting a job in a VPC controls **where** traffic can go (subnets, security groups, endpoints). Network isolation removes the container's network access entirely.
+## Example
+A partner's proprietary training container processes sensitive data. With network isolation enabled, any attempt from the code to reach an external server fails, while training data still arrives in `/opt/ml/input/data`.
+W: Network isolation on the training job: it blocks all outbound connections from the container, even inside a VPC, while SageMaker handles input download and artifact upload for it.
+X: A=Warm pools: warm pools keep provisioned instances alive after a job so the next job starts faster. They change startup time, not network access.
+C=Managed spot training: spot training runs on spare capacity to cut cost and may be interrupted. It has no effect on what the container can reach on the network.
+D=Checkpointing to S3: checkpoints save training progress so jobs can resume after interruption. Writing checkpoints actually uses a data path to S3 rather than restricting it.
+T: To stop a training container from calling out anywhere, enable network isolation; a VPC alone only shapes where traffic may go.
+
+@ Q003682 explain
+G: ## Why training jobs start slowly
+Each SageMaker training job normally provisions fresh instances, pulls the container image and prepares the environment before your code runs. For iterative experiments, those minutes repeat on every job.
+## Managed warm pools
+With `KeepAlivePeriodInSeconds` in the job's resource configuration, SageMaker keeps the instances running for a period (up to one hour) after the job ends.
+- A new job with a matching configuration (same instance type and count, and compatible settings) reuses the warm instances instead of provisioning new ones, starting much faster.
+- You pay for the instances while they are kept warm, so the keep-alive should be sized to the gap between experiments.
+- Warm pools can also use persistent cache directories to keep downloaded packages between jobs.
+## Example
+A team runs a job every 10 minutes while tuning code. Setting a 20-minute keep-alive means only the first job waits for provisioning; the rest start on already-running instances.
+W: SageMaker managed warm pools: they keep training instances alive between jobs so the next matching job skips provisioning and starts quickly.
+X: A=Model Monitor: Model Monitor analyzes captured endpoint traffic for drift and quality issues. It has no role in starting training jobs.
+B=Batch transform: batch transform runs offline inference on datasets and provisions its own instances for each job, so it does nothing for training startup time.
+D=Ground Truth: Ground Truth manages data labeling workflows with human or automated labelers. It produces labeled datasets and does not affect training infrastructure.
+T: To cut repeated training startup time, reuse infrastructure with managed warm pools; the other features serve monitoring, inference or labeling.
+
+@ Q003683 explain
+G: ## SageMaker training input modes
+- **File mode** (default): SageMaker downloads the whole dataset from S3 to the instance's storage before training starts. Large datasets mean long waits and big volumes.
+- **Pipe mode**: data is streamed from S3 into the container through Linux named pipes as training runs. Nothing is downloaded first, so training starts quickly and disk size does not limit dataset size. Reads are sequential, which suits formats like `RecordIO` (for example RecordIO-protobuf used by several built-in algorithms) or TFRecord.
+- **FastFile mode** is a newer option that exposes S3 objects as files and streams them on access, useful when code expects file paths.
+## Example
+A 2 TB dataset stored as RecordIO shards: in File mode training waits for the download; in Pipe mode the first records reach the algorithm within moments and flow at high throughput.
+W: Pipe input mode with RecordIO-style formats: it streams records directly from S3 into the container sequentially at high throughput, without downloading the files first.
+X: A=File mode with large EBS volume: a bigger volume only makes room for the download; File mode still copies all data before training starts.
+B=Notebook local disk: a notebook's disk is not attached to the training cluster, and it would require copying data to the notebook first, the opposite of streaming from S3.
+C=Manual download in the script: downloading inside the script still copies files before use and adds custom code to maintain, rather than using SageMaker's built-in streaming.
+T: Stream sequential data from S3 during training with Pipe mode (or FastFile); File mode, whatever its disk size, downloads first.
+
+@ Q003684 explain
+G: ## Knowledge distillation
+Knowledge distillation compresses a large **teacher** model into a smaller **student** model.
+- The teacher makes predictions on training data. Its output probabilities ("soft labels") carry more information than hard labels, such as which wrong classes are almost right.
+- The student is trained to match these soft outputs, often combined with the true labels.
+- The result is a model with far fewer parameters that keeps much of the teacher's accuracy, with lower latency, memory and serving cost.
+## Example
+A 340M-parameter text classifier is used as a teacher to train a 66M-parameter student. The student runs several times faster on a CPU instance while losing only a small amount of accuracy.
+- Related compression techniques include quantization and pruning, which shrink a model without training a new one.
+W: Knowledge distillation: it trains a smaller student model to reproduce a larger teacher's outputs, which is exactly "training a smaller model to mimic a larger one" to reduce size and latency.
+X: B=Feature crossing: feature crossing combines features (for example city times hour of day) to capture interactions. It changes the inputs, not the size of the model.
+C=Label smoothing: label smoothing softens one-hot targets to reduce overconfidence. It is a regularizer for the same model, not a way to create a smaller one.
+D=Data augmentation: augmentation creates varied training examples (flips, crops, paraphrases) to improve generalization. It does not shrink the model or copy another model's behavior.
+T: Train a small student on a large teacher's outputs (distillation) to cut size and latency; regularization and feature tricks do not transfer knowledge between models.
+
+@ Q003685 explain
+G: ## What calibration means
+A classifier is well calibrated when its predicted probabilities match observed frequencies: among cases scored 0.8, about 80% should be positive. Many models, such as boosted trees or deep networks, rank cases well but produce probabilities that are too extreme or too flat.
+## Calibration methods
+Calibration fits a small mapping from raw scores to corrected probabilities on a held-out set, without retraining the main model.
+- **Platt scaling**: fits a logistic regression on the model's scores; simple and works with little data.
+- **Isotonic regression**: fits a monotonic step function; more flexible but needs more data.
+Quality is checked with a reliability diagram or metrics such as the Brier score or expected calibration error.
+## Example
+A fraud model scores 0.9 for transactions that turn out fraudulent only 60% of the time. After isotonic regression on validation data, those cases score about 0.6, so downstream cost rules act on correct risk estimates.
+W: Apply Platt scaling or isotonic regression: these methods remap scores so predicted probabilities match observed frequencies, which is what downstream systems relying on probabilities need.
+X: A=Train until training loss is zero: driving training loss to zero overfits and typically makes predictions more overconfident, worsening calibration on new data.
+C=Remove the validation set: without held-out data you can neither measure calibration nor fit a calibrator, so the problem is hidden, not fixed.
+D=Report only the class label: downstream systems explicitly depend on probabilities, so removing them breaks those consumers instead of fixing their accuracy.
+T: When probabilities drive decisions, fix them with a calibration step on held-out data rather than longer training or discarding probabilities.
+
+@ Q003686 explain
+G: ## Prebuilt inference containers on SageMaker
+AWS provides ready-made Docker images so you do not have to build a serving stack yourself.
+- **AWS Deep Learning Containers (DLCs)**, including Hugging Face DLCs, bundle PyTorch or TensorFlow, the Transformers library and an inference server tuned for SageMaker.
+- **Large model inference (LMI) containers** target big models such as LLMs. They include optimized engines like vLLM and TensorRT-LLM with features such as tensor parallelism across GPUs, continuous batching and quantization.
+- The SageMaker Python SDK can pick the right image automatically, for example `HuggingFaceModel`, and you mostly supply the model id or S3 artifact and a few environment variables.
+## Example
+Deploying a Hugging Face text-generation model: create the model with an LMI image, set `HF_MODEL_ID`, and deploy to a GPU instance. AWS maintains and patches the image.
+W: Deep Learning Container or LMI container: these prebuilt images are optimized and maintained for Hugging Face and large models on SageMaker, giving fast deployment with tuned runtimes and no custom build.
+X: B=AWS Glue job: Glue is a serverless ETL service that runs Spark or Python jobs on data. It does not provide a low-latency HTTP model-serving endpoint.
+C=SQS message handler: SQS is a message queue that decouples producers and consumers. It stores messages but does not run or host models.
+D=Custom container from scratch: building every library by hand is possible but is the opposite of prebuilt and optimized, adding build, tuning and security-patching work that AWS already does.
+T: For Hugging Face and large models on SageMaker, start from AWS-maintained DLC or LMI containers rather than general services or hand-built images.
+
+@ Q003812 explain
+G: ## Preventive versus detective controls
+- **Preventive** controls stop an action before it happens, such as an IAM policy or an AWS Organizations service control policy (SCP) that denies an API call.
+- **Detective** controls find problems after the fact, such as dashboards, reports, Config rules or periodic reviews.
+## The SageMaker condition key
+`CreateNotebookInstance` has a `DirectInternetAccess` setting. IAM supports the condition key `sagemaker:DirectInternetAccess` for this action, so a policy can deny creation unless the value is `Disabled`.
+- In an SCP, the deny applies to every principal in all member accounts under the organizational unit, including administrators of those accounts.
+- A similar pattern exists for Studio domains, which can be forced into VPC-only mode.
+## Example
+An SCP with `Effect: Deny`, action `sagemaker:CreateNotebookInstance`, and a condition `StringNotEquals` on `sagemaker:DirectInternetAccess` = `Disabled` makes any attempt to create an internet-connected notebook fail with an access-denied error, including requests that omit the setting (it defaults to `Enabled`).
+W: SCP or IAM condition on DirectInternetAccess: the policy evaluates the request before the notebook is created and denies it if direct internet access is enabled, enforcing the rule for everyone in the accounts.
+X: A=Email reminder: a reminder relies on people remembering and choosing to comply. Nothing technically stops a notebook with internet access from being created.
+B=CloudWatch dashboard: a dashboard can only show notebooks that already exist with internet access. It observes the violation after it happens.
+D=Monthly security review: a review finds violations up to a month later, leaving notebooks exposed in the meantime. It is detective, not preventive.
+T: To prevent a risky setting, deny it at request time with an SCP or IAM condition key; reminders, dashboards and reviews only detect it afterward.

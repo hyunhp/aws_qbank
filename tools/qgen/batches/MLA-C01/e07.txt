@@ -1,0 +1,346 @@
+# MLA-C01 detailed explanations, e07 (explanation-only rewrites; letters are the published ones)
+
+@ Q001003 explain
+G: ## CloudWatch Logs Insights
+SageMaker endpoints write container logs to CloudWatch Logs, in a log group such as `/aws/sagemaker/Endpoints/<endpoint-name>`. **CloudWatch Logs Insights** is a query engine built into CloudWatch that searches those log groups directly: you pick a time range (hours or days), write a query, and get results in seconds. There is nothing to provision, no data to export and no schema to define up front.
+## How a query looks
+`ModelLatency` is published by default as a CloudWatch **metric** (namespace `AWS/SageMaker`), which gives aggregates such as averages and percentiles but not individual requests. To find specific slow requests, the per-request latency must be in log lines, for example written by the inference container or its serving code.
+Insights uses a pipe-style query language with commands such as `fields`, `filter`, `stats`, `sort` and `limit`. If each log line carries a latency field, a query like `fields @timestamp, @message | filter ispresent(ModelLatency) | sort ModelLatency desc | limit 20` returns the 20 slowest requests with their full log lines.
+- `stats avg(ModelLatency) by bin(1h)` shows how latency changes hour by hour.
+- You pay per GB of log data scanned, so a narrow time range keeps queries cheap.
+W: CloudWatch Logs Insights: it queries the endpoint's existing log groups in place over several days, and can filter, sort and aggregate to find the individual slowest requests without building any pipeline.
+X: A=Athena on CloudTrail: CloudTrail records who called which AWS API and when; it does not contain the model's per-request latency, so querying it cannot surface the slowest inference requests.
+B=X-Ray service map: the service map is a picture of how traced services connect and their aggregate health; it is not a tool for searching several days of endpoint log lines for the highest latency values.
+D=QuickSight: QuickSight is a BI dashboard service that needs a prepared data source; getting log data into it would mean building exactly the analytics pipeline the team wants to avoid.
+T: To dig into specific log records ad hoc, query them where they already live with CloudWatch Logs Insights; CloudTrail is about API callers, not model latency.
+
+@ Q001004 explain
+G: ## What CloudTrail records
+AWS CloudTrail logs API calls made in an account, whether from the console, the CLI, an SDK or another AWS service. Each event includes:
+- `eventName`, for example `DeleteEndpoint`, and `eventSource` (`sagemaker.amazonaws.com`)
+- `userIdentity`: the IAM user or assumed role that made the call
+- `sourceIPAddress` and `eventTime`
+- request parameters, such as the endpoint name
+## Event history versus trails
+**Event history** is on by default and keeps the last 90 days of management events for searching in the console, which covers "last month". A **trail** delivers events to an S3 bucket (and optionally CloudWatch Logs) for as long as you retain them, which is what audits usually rely on for longer periods. Deleting an endpoint is a management event, so it appears in both.
+Example: filtering event history on `DeleteEndpoint` shows that the role `ml-admin` deleted `churn-prod` from `203.0.113.10` on a given date.
+W: CloudTrail event history or trail logs: CloudTrail records the `DeleteEndpoint` API call with the calling identity, time and source IP address, which is exactly who did it and from where.
+X: A=Invocations metric: this CloudWatch metric counts inference requests sent to an endpoint; it holds no information about who issued control-plane calls such as deleting the endpoint.
+B=Conformance pack scores: AWS Config conformance packs report how many resources comply with a set of rules; the score does not identify the principal or IP address behind a specific deletion.
+D=Model Monitor reports: Model Monitor compares captured inference data against a baseline for data and model quality drift; it does not log management API calls or their callers.
+T: "Who did what, when and from where" in AWS is answered by CloudTrail; metrics, Config and Model Monitor describe performance, compliance and model quality instead.
+
+@ Q001005 explain
+G: ## Matching hardware to the model
+A deep learning image classifier does heavy matrix math that GPUs run in parallel, so on a GPU instance (for example the `ml.g5` or `ml.g6` families) each request finishes far faster than on a CPU. Running the same model on CPUs usually means higher latency and more instances to reach the same throughput.
+## Handling bursty traffic
+GPU instances cost more per hour, so you do not want a fixed fleet sized for peak load. **Endpoint auto scaling** uses Application Auto Scaling to change the instance count of a production variant. A target tracking policy on a metric such as `SageMakerVariantInvocationsPerInstance` adds instances when load rises and removes them when it falls, within a minimum and maximum you set.
+- Example: a minimum of 1 and a maximum of 6 GPU instances; a burst scales the fleet out, and quiet hours scale it back to 1.
+- Cool-down periods prevent the fleet from flapping up and down.
+W: GPU instances with endpoint auto scaling: the GPU gives the model the acceleration it needs for low latency, and auto scaling adds capacity only during bursts, so you pay for GPUs roughly in line with demand.
+X: A=Largest CPU-only instance permanently: the model benefits heavily from GPUs, so CPUs give poor latency, and a permanently large instance still pays for peak capacity during quiet periods.
+C=Real-time endpoint on Spot: managed Spot in SageMaker is a training feature; real-time endpoints are not offered on Spot capacity, and an interruptible fleet would not suit a latency-sensitive endpoint anyway.
+D=Serverless Inference: Serverless Inference runs on compute sized by the memory you configure and does not support GPUs, so it cannot provide the acceleration this model needs.
+T: Pick the hardware the model needs (GPU) and control cost with auto scaling; Spot and Serverless Inference are not available for GPU real-time serving.
+
+@ Q001006 explain
+G: ## AWS Trusted Advisor cost checks
+Trusted Advisor inspects an account and reports recommendations in categories such as cost optimization, security, fault tolerance, performance and service limits. The cost optimization checks look for resources you pay for but barely use, for example EC2 instances with very low CPU and network utilization over recent days, idle load balancers, idle databases or underutilized volumes. Coverage differs by service and changes over time, so for SageMaker endpoints the team should confirm idleness with CloudWatch metrics such as `Invocations`.
+- The full set of checks requires a Business Support plan or higher.
+- **Organizational view** combines check results from all member accounts in AWS Organizations into one report, so finance gets a single cross-account list.
+## A starting point, not the whole story
+Trusted Advisor gives a quick list of candidates. For deeper rightsizing, AWS Compute Optimizer and Cost Optimization Hub add detailed recommendations. The team still reviews each flagged resource before deleting or resizing it.
+W: Trusted Advisor cost checks (org view): of the options, only Trusted Advisor looks at utilization to flag idle and underutilized resources, and organizational view aggregates the results across all accounts, which gives finance the cross-account starting list it asked for.
+X: B=Config conformance packs: AWS Config evaluates whether resource configurations comply with rules; it does not measure how much a resource is used, so it cannot tell you which endpoints or instances sit idle.
+C=CloudTrail Lake: CloudTrail Lake lets you run SQL over API activity; it shows who created or changed resources, not their CPU or invocation utilization.
+D=Macie findings: Amazon Macie discovers sensitive data such as PII in S3 buckets; it has nothing to do with compute utilization or cost.
+T: Idle and underutilized resources across accounts show up in Trusted Advisor cost checks with organizational view; Config and CloudTrail describe configuration and activity, not utilization.
+
+@ Q001007 explain
+G: ## Cost allocation tags
+A tag is a key-value pair on a resource, such as `project=fraud-detection`. SageMaker training jobs, endpoints, notebooks and other resources can be tagged. To use a tag in billing data, an administrator **activates** it as a cost allocation tag in the Billing and Cost Management console. From then on, usage carries that tag in cost data; earlier months are not tagged unless a backfill is requested.
+## AWS Cost Explorer
+Cost Explorer shows cost and usage over time, by day or month, with filters and groupings. Grouping by the `project` tag and filtering by the service SageMaker gives a chart and a table of monthly SageMaker spend per project team.
+- Example: `project=churn` spent a certain amount on training this month while `project=search` spent most of its budget on endpoints.
+- Untagged spend appears as its own group, which helps find resources missing tags.
+W: Cost Explorer with cost allocation tags: once the project tag is activated for cost allocation, Cost Explorer can group SageMaker spend by that tag and chart it month by month.
+X: A=Model Registry: the Model Registry catalogs model versions, their metadata and approval status; it does not hold any billing or cost data.
+B=CloudWatch metrics: CloudWatch tracks operational metrics such as invocations, latency and CPU use; it does not break down dollar costs by cost allocation tag.
+D=X-Ray: X-Ray traces requests through distributed applications to find latency and errors; it has no view of billing or project-level spend.
+T: Cost per team needs activated cost allocation tags plus a billing tool such as Cost Explorer; operational tools like CloudWatch and X-Ray do not see costs.
+
+@ Q001008 explain
+G: ## One set of tags, two jobs
+Tags such as `project=churn` and `env=prod` on SageMaker resources can serve two purposes at once.
+- **Cost allocation**: after activating the tags in Billing, Cost Explorer and the Cost and Usage Report can break down spend by project and environment.
+- **Attribute-based access control (ABAC)**: IAM policies compare tags. A condition such as `aws:ResourceTag/project` equal to `${aws:PrincipalTag/project}` lets a user act only on resources whose project tag matches their own. `aws:RequestTag` conditions can also force users to tag new resources correctly when they create them.
+## Why consistency matters
+Both uses break if tags are missing or spelled differently (`Project` versus `project`). Teams usually enforce a tag standard with tag policies in AWS Organizations and require tags at creation with IAM conditions.
+W: Consistent tags for cost allocation and ABAC: the same project and environment tags drive the cost breakdown and the IAM conditions that limit each user to resources of their own project.
+X: A=Separate IAM users with no tags: users can own permissions, but resources without tags cannot be grouped by project in billing, and per-user policies that list resources do not scale as projects grow.
+C=Model Monitor everywhere: Model Monitor checks data and model quality on endpoints; its reports do not allocate cost or control who can access which resources.
+D=Project-specific keys: separate KMS keys can restrict who decrypts data, but they do not split costs by project or environment, and they do not govern access to SageMaker resources themselves.
+T: Tags are the common thread: activate them for cost allocation and reference them in IAM conditions for ABAC, so one tagging standard answers both "who pays" and "who can touch it."
+
+@ Q001009 explain
+G: ## SageMaker Inference Recommender
+Inference Recommender helps choose how to host a model before it goes to production. You register the model (for example in the Model Registry) and start a job:
+- A **default** job runs quick load tests on a set of recommended instance types and returns cost, latency and throughput for each.
+- An **advanced** job runs a custom load test, with your traffic pattern and your constraints such as a maximum P95 latency, and reports configurations that meet the target along with their cost per hour and per inference.
+## Example
+A team needs P95 latency under 100 ms at 200 requests per second. Inference Recommender tests the actual model artifact on several instance types and shows that a certain GPU type meets the SLA at the lowest cost, while a CPU type misses the latency target.
+W: Inference Recommender: it load-tests the real model artifact on candidate instance types and endpoint settings and recommends the most cost-effective configuration that meets the stated latency requirement.
+X: A=Clarify: SageMaker Clarify measures bias in data and models and explains predictions with feature attributions; it does not benchmark hosting configurations.
+B=Ground Truth: Ground Truth creates labeled datasets with human or automated labeling; it plays no role in choosing instance types.
+C=Data Wrangler: Data Wrangler imports, explores and transforms data for training; it does not load-test deployed models.
+T: "Which instance meets my latency target at the lowest cost?" is answered by Inference Recommender load tests, not by data preparation or bias tools.
+
+@ Q001010 explain
+G: ## Two right-sizing tools at different times
+- **SageMaker Inference Recommender** works **before** deployment. It runs load tests against your model on candidate instance types and reports latency, throughput and cost, so you pick a configuration without production history.
+- **AWS Compute Optimizer** works **after** resources are running. It analyzes historical utilization metrics from CloudWatch (by default the last 14 days) for resources such as EC2 instances, Auto Scaling groups, EBS volumes and Lambda functions, and recommends whether to resize them.
+## Example
+A team uses Inference Recommender to choose an instance type for a new model. For the EC2 instances that run their feature pipelines, Compute Optimizer later reports that they are over-provisioned and suggests a smaller size.
+W: Pre-deployment load tests versus analysis of running usage: Inference Recommender measures a model under generated load before it serves users, while Compute Optimizer learns from the utilization history of resources already running.
+X: B=Compute Optimizer only for SageMaker: EC2 instances are one of the core resource types Compute Optimizer analyzes, so saying it cannot analyze EC2 is the reverse of how it works.
+C=Same service under different names: they are separate services with different inputs and methods, one generating synthetic load tests and one analyzing observed metrics; they are not regional rebrands.
+D=Recommender needs 30 days in production: Inference Recommender exists to be used before production; it creates its own test traffic and needs no production history.
+T: Inference Recommender sizes a model before launch by load testing; Compute Optimizer sizes running resources from their history.
+
+@ Q001011 explain
+G: ## SageMaker purchasing options
+- **Managed Spot Training** runs training jobs on spare capacity at a large discount. Spot capacity can be reclaimed, so you set `EnableManagedSpotTraining`, a `MaxWaitTimeInSeconds`, and a checkpoint location in S3. When interrupted, SageMaker resumes the job, and the training script continues from the latest checkpoint instead of starting over.
+- **SageMaker Savings Plans** give a lower rate in exchange for committing to a consistent amount of usage (dollars per hour) for one or three years. They apply to eligible SageMaker usage such as real-time hosting instances, so a steady always-on endpoint is a good fit.
+- **On-Demand** has no commitment and no discount.
+## Matching option to workload
+Fault-tolerant training at unpredictable times can tolerate interruptions and does not suit a commitment, so Spot fits. The endpoint runs all day, every day, so committed usage is almost fully used and the Savings Plan discount is realized.
+W: Spot training with checkpoints and a Savings Plan for the endpoint: Spot cuts training cost and checkpoints make interruptions harmless, while the Savings Plan discounts the predictable, always-on hosting usage.
+X: A=Reserved Instances for training: SageMaker does not offer Reserved Instances; its commitment discount is SageMaker Savings Plans, and a commitment is also a poor fit for training that runs at unpredictable times.
+B=On-Demand for both: the premise is false because SageMaker supports both managed Spot training and Savings Plans, and paying On-Demand for everything gives up both discounts.
+D=Spot for the endpoint: Spot capacity is used for training jobs, not real-time endpoints, and an always-on endpoint must not be interrupted; On-Demand training also forgoes the Spot savings.
+T: Interruptible, irregular work goes on Spot with checkpoints; steady, always-on work goes under a Savings Plan commitment.
+
+@ Q001012 explain
+G: ## Who a SageMaker job acts as
+When you call `CreateTrainingJob`, you pass an **execution role** in `RoleArn`. SageMaker assumes that role and uses its temporary credentials for everything the job does: reading input data from S3, pulling the training image from ECR, writing logs to CloudWatch and saving the model artifact.
+- The caller only needs permission to create the job and `iam:PassRole` on that role.
+- The caller's own S3 or ECR permissions are never used by the job.
+## What the role needs here
+- S3: `s3:GetObject` and `s3:ListBucket` on the training data, plus write access to the output location.
+- ECR: `ecr:GetAuthorizationToken`, `ecr:BatchGetImage` and `ecr:GetDownloadUrlForLayer` for the custom image.
+- If the data is encrypted with a customer managed KMS key, `kms:Decrypt` on that key.
+W: The execution role lacks S3 and ECR permissions: the job reads data and pulls the image with the execution role's credentials, so AccessDenied means that role is missing the needed permissions, whatever the data scientist is allowed to do.
+X: A=Root credentials: SageMaker never uses the account root user's credentials for jobs; it uses the execution role you pass in.
+C=Instance network size: AccessDenied is an authorization error returned by S3 and ECR; the instance size affects performance, not whether a request is permitted.
+D=Data scientist needs more permissions: the data scientist already has access, and the job does not use the caller's identity to read data or pull images, so adding permissions to that user changes nothing.
+T: A SageMaker job acts as its execution role, not as the person who launched it, so data and image permissions belong on that role.
+
+@ Q001013 explain
+G: ## Amazon SageMaker Role Manager
+Writing least-privilege IAM policies for ML work by hand is slow and error-prone. SageMaker Role Manager offers a guided flow in the SageMaker console to build roles from **personas** and **ML activities**.
+- Personas include data scientist, MLOps engineer and a SageMaker compute role for jobs.
+- ML activities are prebuilt permission sets, such as running Studio applications, managing training jobs, managing models or accessing specific S3 buckets.
+- You add settings such as VPC subnets, security groups and KMS keys, and Role Manager generates the IAM role and policies.
+## Example
+The platform team picks the data scientist persona, selects Studio and training activities, restricts S3 access to the team bucket, and gets a ready role to assign to Studio user profiles, without writing policy JSON.
+W: SageMaker Role Manager: it builds scoped IAM roles for common ML personas from predefined activities through a guided flow, which is exactly the need described.
+X: A=IAM Access Analyzer: Access Analyzer finds resources shared outside your trust zone, validates policies and can suggest policies from observed activity, but it does not provide persona-based ML role templates.
+B=Service control policies: SCPs set maximum permission guardrails for accounts in an organization; they never grant permissions and cannot build roles for individual users.
+D=Cognito user pools: Cognito manages sign-up and sign-in for customers of your own applications; it does not create IAM roles for SageMaker personas.
+T: Persona-based, least-privilege ML roles come from SageMaker Role Manager; Access Analyzer checks policies and SCPs only limit them.
+
+@ Q001014 explain
+G: ## Policies versus roles
+- A **policy** is a JSON document listing permissions, for example `s3:GetObject` on `arn:aws:s3:::ml-data/*`. It does nothing on its own until it is attached to an identity or a resource.
+- **Identities** are users, groups and roles. A policy can be attached to any of them. A **group** is just a way to give the same policies to several users.
+- A **role** is an identity without long-term credentials. A trusted principal, such as a user or an AWS service, assumes it and receives temporary credentials.
+## How SageMaker fits in
+A SageMaker training job does not belong to any IAM group. It runs as the execution role whose trust policy allows `sagemaker.amazonaws.com` to assume it. To let jobs read the bucket, attach the S3 read policy (or an equivalent one) to that execution role as well.
+W: Policies grant permissions and SageMaker assumes a role: permissions are defined in policies, and SageMaker jobs use them only when the policy is attached to the execution role the service assumes.
+X: A=Reversed definitions: it is the other way around; roles are assumable identities and policies are the permission documents.
+B=Policies only on roles: identity-based policies can be attached to users, groups and roles, as the team already did with the group.
+D=Group policy applies to jobs: a group policy applies only to the IAM users in that group; a SageMaker job runs as its execution role and never inherits a group's permissions.
+T: Policies hold permissions and roles are what services act as, so a job gets S3 access only through the policy on its execution role.
+
+@ Q001015 explain
+G: ## Encryption keys in SageMaker
+SageMaker encrypts data at rest by default, using AWS managed keys. When a company must control the key itself (its key policy, rotation, and the ability to disable it), it creates an AWS KMS **customer managed key** and passes its ID or ARN in the resource configuration.
+- **Feature Store**: `KmsKeyId` in the offline store's S3 storage configuration and in the online store's security configuration.
+- **Training jobs**: `KmsKeyId` in `OutputDataConfig` for model artifacts, and `VolumeKmsKeyId` in `ResourceConfig` for the attached storage volumes.
+- Endpoints and processing jobs have similar key settings.
+## Key policy matters
+The execution role that runs the job must be allowed to use the key (for example `kms:Decrypt` and `kms:GenerateDataKey`), and every use of the key is logged in CloudTrail.
+W: KMS customer managed keys in SageMaker configs: specifying the company's own KMS key in the Feature Store and training settings encrypts the feature data and output artifacts with a key the company controls.
+X: A=Secrets Manager rotation: Secrets Manager stores and rotates secrets such as database passwords; it does not encrypt Feature Store data or training artifacts.
+C=Certificate Manager: ACM issues and manages TLS certificates for encryption in transit, not the at-rest keys used for stored data.
+D=Macie automatic encryption: Macie discovers and reports sensitive data in S3; it does not encrypt anything.
+T: Encryption at rest with a key you control means a KMS customer managed key set in each SageMaker resource's configuration; ACM and Secrets Manager solve other problems.
+
+@ Q001016 explain
+G: ## Keeping SageMaker traffic private
+By default, SageMaker Studio can reach the internet and the SageMaker APIs through AWS-managed networking. For strict requirements, a Studio domain can use **VPC only** network access: all Studio traffic goes through your own VPC subnets and security groups, and there is no direct internet access.
+In a VPC with no internet path, Studio still needs to call SageMaker. **Interface VPC endpoints** (AWS PrivateLink) provide private IPs in your subnets for services such as:
+- `com.amazonaws.<region>.sagemaker.api` for API calls like `CreateTrainingJob`
+- `com.amazonaws.<region>.sagemaker.runtime` for `InvokeEndpoint`
+- other services the notebooks use, such as STS, CloudWatch Logs, and an S3 gateway endpoint
+Traffic to these endpoints stays on the AWS network and never crosses the public internet.
+W: VPC mode plus PrivateLink endpoints: VPC only mode forces Studio traffic through the company's VPC, and interface endpoints let it reach the SageMaker APIs privately without any internet route.
+X: A=Allow public IP ranges in a security group: a security group rule only permits traffic; calls to public SageMaker addresses still leave the VPC over a public path, which violates the requirement.
+C=NAT gateway: a NAT gateway gives private subnets outbound access to public endpoints through an internet gateway, so the traffic still goes to the public internet.
+D=S3 Transfer Acceleration: Transfer Acceleration speeds long-distance uploads to S3 through edge locations; it has no effect on how Studio reaches the SageMaker APIs.
+T: Private API access means no internet path at all: VPC only mode plus PrivateLink interface endpoints, not NAT or public IP rules.
+
+@ Q001017 explain
+G: ## How a VPC training job connects
+When a training job has a `VpcConfig` with subnets and security groups, SageMaker creates elastic network interfaces (ENIs) in those subnets and attaches the security groups you specify. All network traffic from the training containers goes through those ENIs.
+## Security groups as the ENI firewall
+A security group is a stateful firewall on each ENI. You list the allowed outbound destinations and ports; everything else is dropped, and return traffic is allowed automatically.
+- Outbound rule: TCP 443 to the internal feature API's security group or CIDR.
+- Outbound rule: TCP 443 to the S3 prefix list used by the gateway endpoint.
+- No other outbound rules, so the job cannot reach anything else.
+Network ACLs can add stateless subnet-level rules, but only security groups are applied at the ENI.
+W: Security group on the job's ENIs: security groups filter traffic at each network interface SageMaker creates, so outbound rules limited to the feature API and S3 restrict the job exactly as required.
+X: A=KMS key policy: a key policy controls who may use an encryption key; it does not filter network connections from the job.
+B=Lifecycle configuration: lifecycle configurations are startup scripts for notebook instances and Studio apps; they do not apply to training jobs or control network traffic.
+D=IAM policy on the execution role: IAM decides which AWS API actions the job may call; it does not block TCP connections to an internal service on port 443.
+T: Network paths are controlled by security groups on the ENIs; IAM and KMS control API and key permissions, not packets.
+
+@ Q001018 explain
+G: ## Network isolation for training
+Setting `EnableNetworkIsolation` to true on a training job runs the container with **no network access**. The algorithm code cannot make inbound or outbound calls, not to the internet, and not even to other AWS services.
+- SageMaker itself still copies the input data from S3 into the container and uploads the model artifact after training, outside the container's control.
+- Anything the code needs, such as Python packages, must already be in the image or the input data.
+## Why it helps here
+If a dependency is compromised and tries to send data to an external server, there is simply no network to use. This does not depend on the correct subnets, routes or security group rules. Network isolation can be combined with a VPC configuration and KMS encryption for defense in depth.
+W: Network isolation on the training job: it removes all network access from the training container, so even malicious or accidental code cannot make any outbound call.
+X: B=Disable data capture: data capture is a feature of endpoints that records inference requests and responses; it is not a training job setting and does not block network access.
+C=Public subnet with a public IP: this gives the job a direct path to the internet, the opposite of preventing outbound calls.
+D=Internet gateway on the subnet: an internet gateway adds a route to the internet, again enabling exactly the traffic that must be blocked.
+T: To guarantee a training container cannot talk to anything, enable network isolation; public subnets and internet gateways do the opposite.
+
+@ Q001019 explain
+G: ## Credentials in an MLOps pipeline
+CodePipeline and CodeBuild each run with an IAM **service role**. The service gets short-lived credentials for that role automatically, so no access key ever appears in code, in a buildspec or in environment variables.
+## Cross-account deployment
+To deploy into the prod account, the prod account creates a narrowly scoped role (for example allowed to create SageMaker models and endpoints and pass one execution role). Its trust policy allows the pipeline's role in the tools or dev account to assume it. At deploy time the pipeline calls `sts:AssumeRole` and receives temporary credentials that expire after a short session.
+- Each stage gets only the permissions it needs.
+- Credentials expire automatically, so there is nothing long-lived to leak.
+- CloudTrail shows which pipeline assumed which role.
+W: Service roles assuming scoped cross-account roles: the pipeline uses temporary STS credentials from its service role and assumes limited roles in the target accounts, so no long-term keys exist anywhere in the pipeline.
+X: A=One shared access key: a shared key is a long-term secret that security has banned, and giving one key to every stage over-privileges each stage and makes rotation and auditing hard.
+B=Disabling IAM checks: IAM authorization cannot be turned off for AWS API calls; every request is evaluated against policies, so this is neither possible nor a safe goal.
+C=IAM user keys in the buildspec: this stores long-term credentials in source-controlled build files, exactly the practice the ban targets, and anyone with repository access could read them.
+T: Pipelines should run as roles and assume scoped cross-account roles for temporary credentials; access keys in code or shared keys are exactly what the ban prohibits.
+
+@ Q001020 explain
+G: ## Container supply chain risk
+A container image bundles the model server, libraries and OS packages. Pulling an unauthenticated image from a public registry means you cannot be sure who built it or whether it was changed, and a tampered image runs with the endpoint's execution role.
+## Hardening the pipeline
+- **Private Amazon ECR repository**: the pipeline builds or copies approved images into a repository only your accounts can push to, and endpoints pull only from it.
+- **Image scanning**: ECR basic scanning, or enhanced scanning with Amazon Inspector, reports known vulnerabilities (CVEs) in OS and language packages.
+- **Verification stage**: before deployment, a pipeline step checks scan results against a threshold and can verify an image signature, for example one created with AWS Signer, stopping deployment if checks fail.
+- Tag immutability prevents a tag such as `v1.4` from being silently overwritten.
+W: A scanned private ECR repo plus a verification stage: controlling where images come from, scanning them and gating deployment on verification stops a tampered or vulnerable image before it reaches the endpoint.
+X: A=Disable CloudTrail logging: turning off CloudTrail removes the audit record of who changed the pipeline or endpoint; it adds risk and does nothing to verify images.
+B=Public pulls only off-peak: the image is just as unverified at night; the time of the pull does not change whether it was tampered with.
+C=More endpoint instances: every instance would run the same compromised image, so scaling out spreads the problem rather than limiting it.
+T: Supply chain risk is reduced by trusted private sources, scanning and a verification gate; timing and capacity changes do nothing to verify an image.
+
+@ Q001021 explain
+G: ## Model Registry approval flow
+In the SageMaker Model Registry, each model version is a **model package** in a model package group. Every version has an approval status: `PendingManualApproval`, `Approved` or `Rejected`. CI/CD pipelines commonly deploy to production only when a version becomes `Approved`, often triggered by an EventBridge rule on the status change.
+## Separating the permissions with IAM
+The actions behind each step are separate IAM permissions:
+- Registering a version uses `sagemaker:CreateModelPackage`.
+- Changing its approval status uses `sagemaker:UpdateModelPackage`.
+Data scientists get a policy allowing `CreateModelPackage` on their model package groups but not `UpdateModelPackage`; ML engineers who approve get `UpdateModelPackage`. Because `CreateModelPackage` can also set an initial approval status, teams make sure new versions are registered as `PendingManualApproval` (for example in the registration pipeline), and CloudTrail records who approved each version.
+W: IAM lets scientists register and only ML engineers approve: separate IAM permissions for registering model versions and updating their approval status enforce the required separation of duties inside AWS.
+X: A=Same admin role for everyone: everyone could approve any model, so nothing enforces that only the designated engineers approve, and the audit trail cannot distinguish the roles.
+B=Disable versioning: versions are the core of the Model Registry; without them there is no version history to register and approve, and it does nothing to separate who may approve.
+D=Shared spreadsheet: a spreadsheet records decisions but enforces nothing; anyone with SageMaker permissions could still approve a version in AWS.
+T: Separation of duties in the Model Registry is enforced with IAM permissions on the register and approve actions, not with shared roles or off-platform records.
+
+@ Q001022 explain
+G: ## Amazon GuardDuty
+GuardDuty is a threat detection service. Once enabled, it continuously analyzes data sources such as CloudTrail management events, VPC Flow Logs and DNS logs, without you creating trails or agents for this foundational monitoring.
+It uses threat intelligence and machine learning to learn normal behavior for principals in the account. When an IAM user or role suddenly calls APIs it has never used, in unusual volume or from unusual locations, GuardDuty raises a finding, such as an anomalous behavior finding for that principal.
+## Getting the alert
+GuardDuty sends findings to EventBridge. A rule that matches GuardDuty findings can notify the security team through Amazon SNS or start an automated response, such as a Lambda function that disables the credentials.
+Example: a role used only for S3 reporting suddenly calls `CreateTrainingJob` and `CreateEndpoint` dozens of times in minutes, which could mean stolen credentials used to run expensive compute.
+W: GuardDuty: it analyzes CloudTrail management events with machine learning to spot a principal's unusual API activity, which is the compromised-credential pattern described, and publishes findings that can trigger alerts.
+X: A=AWS Budgets: Budgets alerts when spend or usage crosses a threshold; it may notice higher cost later, but it does not analyze which principal called which APIs or detect behavior changes.
+B=Amazon Rekognition: Rekognition analyzes images and videos; it has no role in monitoring API activity.
+D=Trusted Advisor: Trusted Advisor checks configurations against best practices, such as open ports or unused resources; it does not detect suspicious API behavior as it happens.
+T: Unusual API behavior by a principal is a threat detection problem for GuardDuty; Budgets and Trusted Advisor look at spend and configuration.
+
+@ Q002132 explain
+G: ## Why accuracy misleads on imbalanced data
+With 0.4% fraud, a model that predicts "not fraud" for everything scores 99.6% accuracy while catching zero fraud. Accuracy is dominated by the majority class, so it hides failure on the class you care about.
+## Better metrics
+- **Precision**: of the transactions flagged as fraud, how many really are.
+- **Recall**: of all real fraud, how much the model catches.
+- **PR-AUC**: the area under the precision-recall curve across thresholds; unlike ROC-AUC, it is sensitive to performance on the rare class.
+## Fixing training without leakage
+Class weights (for example `scale_pos_weight` in XGBoost) make errors on fraud cost more. Resampling, such as undersampling the majority or SMOTE oversampling, changes the class mix. Always split first and resample only the training split, so the test set keeps the real 0.4% rate and contains no synthetic rows.
+W: C=Precision, recall and PR-AUC: these measure how well the model finds the rare fraud class, exposing the failure that accuracy hides.
+E=Class weights or resampling on the training split only: this makes the model pay attention to fraud while keeping validation and test data untouched and realistic.
+X: A=Remove all positive examples: without fraud examples the model cannot learn to recognize fraud at all; it would guarantee the failure.
+B=SMOTE before the split: synthetic samples are built from neighbors, so points derived from test rows end up in training and vice versa, which leaks information and inflates test scores.
+D=Keep accuracy as the main metric: accuracy is high only because fraud is rare; it is the metric hiding the problem, not evidence the model works.
+T: On imbalanced data, judge the model with precision, recall and PR-AUC, and rebalance only the training split so evaluation stays honest.
+
+@ Q002133 explain
+G: ## Training-serving skew
+Skew happens when the features a model sees at inference are computed differently, or are fresher or staler, than the features it was trained on. A common cause is two separate code paths: one batch job for training data and another in the endpoint.
+## SageMaker Feature Store
+Feature Store keeps features in **feature groups**, written once through a common ingestion path, with two stores:
+- **Online store**: holds the latest value per record ID (for example `customer_id`) for low-latency `GetRecord` lookups, typically in single-digit milliseconds, at inference time.
+- **Offline store**: an append-only history in S3, cataloged for querying with Athena, used to build training datasets, including point-in-time correct joins so training uses the values known at each event time.
+Because both stores are fed by the same feature definitions and pipeline, training and inference use consistent features.
+W: Feature Store with online and offline stores: the online store serves features at millisecond latency during inference, and the offline store supplies the same features historically for training, which prevents skew.
+X: A=CSV files in S3: reading and scanning files per request is far too slow for single-digit millisecond lookups, and S3 has no index for fetching one customer's record from inside CSV files.
+B=Recompute from raw logs per request: this adds heavy latency and creates a second feature code path that can drift from training logic, which is the definition of training-serving skew.
+D=Redshift queried at inference: a data warehouse is built for analytical queries, not single-digit millisecond point lookups at high request rates, and it does not supply point-in-time training features by itself.
+T: Use one feature pipeline with two stores: online for fast inference lookups and offline for training history, so both sides see the same features.
+
+@ Q002134 explain
+G: ## Data leakage through preprocessing
+Standardization rescales a feature as (x - mean) / standard deviation. The mean and standard deviation are **learned parameters**, just like model weights. If you compute them on the entire dataset before splitting, statistics from the validation rows flow into the training data, so validation is no longer truly unseen.
+## Symptom
+Validation scores look excellent, and production, where data is really new, is much worse. Here the drop from 0.97 to 0.71 AUC points to evaluation that was too optimistic.
+## The correct order
+- Split into train, validation and test first.
+- Fit the scaler on the training split only.
+- Apply that fitted scaler to validation, test and later production data.
+In scikit-learn, putting the scaler inside a `Pipeline` ensures that cross-validation refits it within each fold automatically. The same rule applies to imputers, encoders and feature selection.
+W: Leakage, fit the scaler on training data only: the scaler learned from the whole dataset included validation data, and fitting it only on the training split makes validation scores honest and representative of production.
+X: A=Underfitting: an underfit model scores poorly on validation too; a 0.97 validation AUC is the opposite, and adding layers would not fix leaky evaluation.
+B=Concept drift: drift would explain gradual decline over time, but the investigation already found a leaky preprocessing step, and daily retraining would repeat the same flawed validation.
+D=Class imbalance: imbalance does not create a gap between validation and production when both have the same class mix, and oversampling does nothing about statistics leaked from validation rows.
+T: Every preprocessing statistic must be learned from training data only; fitting on the full dataset leaks information and inflates validation scores.
+
+@ Q002135 explain
+G: ## Pre-training bias in SageMaker Clarify
+SageMaker Clarify can analyze a dataset **before** any model is trained. You specify the label column, the positive label value and a **facet**, the sensitive attribute such as an age group. Clarify then computes pre-training bias metrics and writes a report.
+- **Class Imbalance (CI)**: compares how many rows each facet group has. If under-40 applicants are 85% of the data and over-40 only 15%, CI is large and the model sees few examples of the smaller group.
+- **Difference in Proportions of Labels (DPL)**: compares the share of positive labels between groups. If 70% of one group was approved in the historical data and 45% of the other, DPL shows that gap.
+Other pre-training metrics include KL divergence and Jensen-Shannon divergence of label distributions. After training, Clarify offers post-training bias metrics and SHAP-based explanations.
+W: Clarify pre-training bias metrics (CI, DPL): CI measures how imbalanced the facet groups are in the data, and DPL measures whether positive labels differ between groups, exactly the two checks required before training.
+X: A=Debugger vanishing gradient rules: Debugger monitors training dynamics such as gradients and loss; it runs during training and says nothing about demographic balance in the data.
+B=Macie discovery: Macie finds sensitive data such as PII in S3 buckets; it does not measure how labels are distributed across groups.
+D=Model Monitor model quality: model quality monitoring compares a deployed model's predictions with ground truth labels; it requires a trained, deployed model and does not measure facet imbalance in training data.
+T: Bias in the data itself, before training, is measured with Clarify pre-training metrics such as CI and DPL; Debugger and Model Monitor act later in the lifecycle.
+
+@ Q002136 explain
+G: ## High-cardinality categorical features
+A ZIP code feature with 40,000 values becomes 40,000 mostly zero columns when one-hot encoded. That slows training and memory use, and tree models struggle because each split can only isolate one rare ZIP at a time.
+## Better encodings
+- **Target encoding** replaces each ZIP with a statistic of the target for that ZIP, such as the mean default rate, usually smoothed toward the global mean for rare ZIPs. It must be **fitted within folds**: compute each row's value from other folds' data only, so a row's own label never leaks into its feature.
+- **Grouping** maps ZIPs to broader units such as region, state or the first three digits, keeping geographic signal with far fewer categories.
+- Frequency encoding is another compact option.
+Example: ZIP `10001` becomes 0.042 (its smoothed target rate computed from other folds), one numeric column that a tree can split on.
+W: Fold-fitted target encoding or grouping into regions: both turn 40,000 categories into a compact representation that keeps the location signal, and fitting within folds avoids target leakage.
+X: B=Drop the feature: high-cardinality features often carry strong signal, such as location-related risk; the problem is the encoding, and dropping the feature throws that signal away.
+C=Label encode as continuous: ZIP numbers have no meaningful order or distance, so treating them as continuous gives trees fake numeric relationships that happen to follow postal numbering.
+D=Duplicate one-hot columns: duplicate columns add no new information, double the size of an already huge matrix and make training even slower.
+T: For very high-cardinality categories, use leakage-safe target encoding or grouping instead of huge one-hot matrices or fake ordinal numbers.

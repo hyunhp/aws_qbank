@@ -1,0 +1,346 @@
+# MLA-C01 detailed explanations, e08 (explanation-only rewrites; letters are the published ones)
+
+@ Q002137 explain
+G: ## Recognizing overfitting
+A model overfits when it memorizes the training data instead of learning patterns that generalize. The signature is a growing gap between training and validation results: training accuracy keeps rising toward 100% while validation accuracy stalls and then falls.
+Example: after epoch 10 validation loss is at its lowest; by epoch 40 training accuracy is 99% but validation accuracy has dropped from 80% to 72%. Every epoch after 10 made the model worse on new data.
+## The two standard counter-measures
+- **Early stopping** watches a validation metric (usually validation loss) and stops training, keeping the best checkpoint, once it stops improving for a set number of epochs (the "patience").
+- **Regularization** limits how complex the learned function can get. L2 (weight decay) penalizes large weights; dropout randomly switches off neurons during training so the network cannot rely on any single path.
+Other helpers are more training data, data augmentation and a smaller model.
+W: A=Early stopping on validation loss: it halts training at the point where the model generalized best, before the extra epochs that are pushing validation accuracy down.
+D=L2 or dropout regularization: it constrains model complexity so the network cannot simply memorize the training examples, which narrows the train/validation gap.
+X: B=More epochs: validation accuracy already falls as training continues, so more epochs make the overfitting worse, not better.
+C=Much deeper model: extra depth adds capacity, and more capacity makes it even easier to memorize the training set, widening the gap.
+E=Remove the validation set: this hides the problem instead of fixing it; without held-out data you can no longer measure generalization or use early stopping.
+T: A widening train/validation gap means overfitting, so stop earlier and regularize rather than adding epochs or capacity.
+
+@ Q002138 explain
+G: ## Hyperparameter search strategies
+SageMaker Automatic Model Tuning runs many training jobs with different hyperparameter values and keeps the best according to an objective metric such as `validation:auc`.
+- **Grid search** tries every combination of listed values. With eight hyperparameters and only three values each, that is 3^8 = 6,561 jobs, far beyond a budget of 60.
+- **Random search** samples combinations at random. It is simple and parallel-friendly but does not learn from earlier results.
+- **Bayesian search** builds a probabilistic model of how hyperparameters affect the metric and picks each next combination where improvement is most likely, so it usually finds good values in fewer jobs.
+## Early stopping for tuning jobs
+With early stopping enabled (`TrainingJobEarlyStoppingType` set to `Auto`), the tuner stops training jobs whose intermediate metric is clearly worse than earlier jobs at the same point, saving compute for promising candidates.
+W: Bayesian search with early stopping: Bayesian optimization learns from each completed job to spend a small budget on promising regions, and early stopping cuts off poor jobs early, which is the most efficient use of about 60 expensive jobs.
+X: A=Grid search: the number of combinations grows exponentially with eight hyperparameters, so a full grid cannot fit in 60 jobs and most of the budget would test poor regions.
+B=One parameter at a time: manual one-at-a-time tuning ignores interactions between hyperparameters and is slow and hard to reproduce.
+D=Random search with 5 jobs: five random samples in an eight-dimensional space leave most of the budget unused and are very unlikely to find good values.
+T: With a small budget and many hyperparameters, Bayesian search plus early stopping beats exhaustive grids and tiny random samples.
+
+@ Q002139 explain
+G: ## Why a large model does not fit on one GPU
+Training memory is much more than the weights. For each parameter you also store gradients and optimizer state. A common rule of thumb for Adam in mixed precision is about 16 bytes per parameter (16-bit weights and gradients plus 32-bit master weights and two Adam moments). A 30-billion-parameter model therefore needs on the order of 480 GB before activations, far more than the memory of any single GPU.
+## Two families of parallelism
+- **Data parallelism** copies the full model to every GPU and gives each a different slice of the batch. It speeds up training but each GPU must still hold the entire model.
+- **Model parallelism** splits the model itself: pipeline parallelism places different layers on different GPUs, and tensor parallelism splits individual layers.
+- **Fully sharded data parallelism** (FSDP, or sharded data parallelism in the SageMaker model parallelism library) shards parameters, gradients and optimizer state across GPUs and gathers them only when needed.
+W: Model parallelism or FSDP: both spread the model's memory across many GPUs, which is the only way to train when one full copy of the model does not fit even at batch size 1.
+X: A=Plain data parallelism: every worker still needs a full replica of the model, so adding instances does not solve an out-of-memory error for the model itself.
+C=Larger EBS volume: EBS is disk storage for data and checkpoints; it does not add GPU memory, which is where the model must live during training.
+D=Larger learning rate: the learning rate changes optimization speed and stability, not memory usage, so the model still cannot be loaded.
+T: When the model itself is too big for one GPU, split the model (model parallel or sharded data parallel); plain data parallelism only splits the data.
+
+@ Q002140 explain
+G: ## Managed spot training
+Amazon EC2 Spot capacity is spare capacity sold at a large discount, but it can be reclaimed with a two-minute warning. SageMaker managed spot training uses Spot for training jobs and handles interruptions for you, typically cutting training cost by up to about 90% compared with on-demand.
+## How checkpoints make interruptions safe
+- You set `use_spot_instances=True` and a `max_wait` time that is at least as long as `max_run`, because time spent waiting for Spot capacity counts toward it.
+- Your training script saves checkpoints to a local path (by default `/opt/ml/checkpoints`), and SageMaker copies them to the `checkpoint_s3_uri` in S3.
+- After an interruption, SageMaker restarts the job and copies the checkpoints back, so the script resumes from the last saved epoch instead of from zero.
+Example: a 20-hour job interrupted at hour 15 resumes from its hour-14 checkpoint and loses only about an hour of work.
+W: Managed spot training with S3 checkpoints: Spot pricing gives the large cost reduction, and checkpoints in S3 guarantee that an interruption does not lose progress, which is exactly the condition stated.
+X: A=Notebook instance: running training inside a notebook instance still uses on-demand pricing, has no automatic resume after failure and keeps the instance running when idle.
+C=Disable checkpointing: without checkpoints every Spot interruption restarts the 20-hour job from scratch, which can erase the savings or prevent the job from ever finishing.
+D=On-demand with larger batches: on-demand pricing stays at full price, and a larger batch size does not reliably shorten training enough to cut cost significantly.
+T: Long, interruptible training jobs belong on managed Spot training with S3 checkpoints; checkpoints are what turn a Spot interruption into a short pause.
+
+@ Q002141 explain
+G: ## How regression error metrics weigh mistakes
+Both MAE and RMSE measure how far predictions are from actual values, but they treat large errors differently.
+- **MAE** (mean absolute error) averages the absolute errors. An error of 60 minutes counts exactly six times as much as an error of 10 minutes.
+- **RMSE** (root mean squared error) squares each error before averaging and then takes the square root. Squaring makes large errors dominate.
+Example: two models each have total absolute error of 60 minutes across six deliveries. Model 1 is off by 10 minutes on every delivery (MAE 10, RMSE 10). Model 2 is perfect on five and off by 60 minutes on one (MAE 10, RMSE about 24.5). MAE cannot tell them apart; RMSE clearly penalizes the model with the single large miss.
+W: RMSE: squaring errors makes a few hours-late predictions weigh much more than many small errors, matching a business where big misses are far more costly.
+X: A=MAE: it weights all errors linearly, so it treats one large error the same as several small ones that add up to the same total and does not reflect the higher cost of big misses.
+C=Accuracy: accuracy is a classification metric counting correct labels; delivery time is a continuous value, so there is no single correct class to count.
+D=F1 score: F1 combines precision and recall for classification and has no meaning for a continuous time prediction.
+T: When large errors hurt disproportionately, choose RMSE, which squares errors; MAE treats every minute of error equally.
+
+@ Q002142 explain
+G: ## Global versus local explanations
+- A **global** explanation says which features matter for the model overall, for example "income is the most important feature".
+- A **local** explanation says why the model produced one specific prediction, for example "this applicant was denied mainly because of a high debt-to-income ratio and a short credit history".
+Regulators asking about individual applicants need local explanations.
+## SHAP in SageMaker Clarify
+SageMaker Clarify computes feature attributions with **Kernel SHAP**, based on Shapley values from game theory. For each prediction it assigns every feature a contribution, positive or negative, relative to a baseline, and the contributions add up to the difference between that prediction and the baseline prediction. Clarify can produce these in a batch explainability job, and it can also return them online from a real-time endpoint when explainability is configured.
+W: Clarify SHAP per prediction: it provides per-feature attributions for each individual decision, which is exactly what is needed to explain why a specific applicant was denied.
+X: A=Confusion matrix: it summarizes true and false positives and negatives across the whole validation set; it says nothing about why one applicant was denied.
+C=CloudWatch invocation metrics: these report operational data such as request counts, latency and errors, not the reasoning behind any prediction.
+D=Model Monitor data quality: data quality reports detect drift in input statistics compared with a baseline; they do not attribute an individual prediction to its features.
+T: Per-applicant "why" questions need local feature attributions such as Clarify SHAP values, not aggregate metrics or monitoring reports.
+
+@ Q002143 explain
+G: ## SageMaker inference options by traffic pattern
+- **Real-time endpoints** run instances continuously and bill per instance-hour, whether or not requests arrive.
+- **Serverless Inference** provisions compute only when requests arrive and scales down to zero when idle. You choose a memory size and maximum concurrency; you pay for compute time per request and data processed, not for idle time.
+- **Batch Transform** processes a dataset in S3 as a job and is meant for offline scoring.
+- **Asynchronous inference** queues large or long-running requests.
+## The trade-off: cold starts
+After an idle period, the first request to a serverless endpoint may wait while compute is provisioned and the model is loaded. Here a few hundred bursty requests per day with long idle gaps and tolerance for occasional cold starts is the pattern Serverless Inference was designed for. (Provisioned concurrency can remove cold starts, but it is billed while configured.)
+W: SageMaker Serverless Inference: it scales to zero between bursts so the team pays nothing while idle, and the stated tolerance for cold-start latency removes its main drawback.
+X: A=Multi-model endpoint on large instances: it saves cost when hosting many models, but the large instances run and bill continuously even during long idle periods.
+B=Batch Transform every minute: it starts a job per run with minutes of startup, cannot answer individual interactive requests and wastes cost when no data arrived.
+D=Real-time GPU endpoint: an always-on GPU instance is billed around the clock, which is the opposite of paying nothing while idle.
+T: Sporadic, bursty traffic that tolerates cold starts fits Serverless Inference; always-on endpoints charge for idle time.
+
+@ Q002144 explain
+G: ## Asynchronous inference
+SageMaker asynchronous inference puts requests in an internal queue and processes them in the background. It is built for large payloads (up to 1 GB) and long processing times (up to one hour per request).
+How it works:
+- The client uploads the input (for example an 800 MB image) to S3 and calls `InvokeEndpointAsync` with the S3 location.
+- SageMaker immediately returns an output location; the model writes the result to S3 when done.
+- Optional Amazon SNS topics notify the client of success or failure, or the client polls the S3 output path.
+- With an auto scaling policy whose minimum capacity is 0, the endpoint scales to zero instances when the queue is empty and scales out again when requests arrive.
+## Why the other options hit limits
+Real-time and serverless endpoints are synchronous: the caller waits for the response, request payloads are limited to megabytes rather than hundreds of megabytes, and a standard invocation must finish within about 60 seconds. Lambda functions run for at most 15 minutes and accept a synchronous payload of only a few megabytes.
+W: Asynchronous inference: it accepts payloads up to 1 GB through S3, allows up to an hour of processing, notifies via SNS or lets clients poll, and can scale to zero when idle, meeting every requirement.
+X: A=Lambda with the model in memory: Lambda's maximum runtime is 15 minutes and its invocation payload is only a few megabytes, so 800 MB images and 20-minute predictions do not fit.
+B=Real-time endpoint: it is synchronous with a payload limit far below 800 MB and an invocation timeout far shorter than 20 minutes, and it keeps instances running while idle.
+C=Serverless Inference: it scales to zero but has a small payload limit and a short timeout, and no GPU support, so large images with long processing cannot be served.
+T: Large payloads, long processing and scale-to-zero point to asynchronous inference with S3 input/output and SNS notification.
+
+@ Q002145 explain
+G: ## Multi-model endpoints
+A SageMaker multi-model endpoint (MME) hosts many models behind one endpoint and one set of instances. The models share a single serving container, and the model artifacts live under one S3 prefix.
+- The caller names the model per request with the `TargetModel` parameter, for example `customer-0421.tar.gz`.
+- On the first request, SageMaker downloads that model from S3 and loads it into memory; later requests reuse the cached copy.
+- When memory fills up, least recently used models are unloaded and reloaded on demand.
+Example: 2,000 small XGBoost models, most called rarely, can share a few instances instead of 2,000 endpoints. A rarely used model pays a small load delay on its first call; frequently used models stay warm.
+Multi-model endpoints work best when models use the same framework and are similar in size, which is the case here.
+W: Multi-model endpoint loading from S3: it lets thousands of same-framework models share one endpoint's instances, loading each from S3 only when needed, which removes the cost of one endpoint per customer.
+X: A=Average model weights: averaging the parameters of different customers' tree ensembles does not produce a valid model and would destroy each customer's per-customer behavior.
+C=Batch Transform for real-time requests: Batch Transform runs offline jobs over files in S3 and cannot answer individual requests with low latency.
+D=One endpoint per customer: this is the setup the question already rejects as too expensive, since 2,000 always-on endpoints bill mostly for idle capacity.
+T: Many small, rarely used models of the same framework belong on a multi-model endpoint, not on one endpoint each.
+
+@ Q002146 explain
+G: ## Deployment guardrails for SageMaker endpoints
+When you update an endpoint to a new endpoint configuration, SageMaker can perform a **blue/green deployment**: it creates the new (green) fleet next to the old (blue) one and shifts traffic between them. Deployment guardrails add control over that shift:
+- **Traffic shifting modes**: all at once, **canary** (a small portion first, then the rest) or **linear** (equal steps over time), each with a baking period between steps.
+- **Auto-rollback**: you list Amazon CloudWatch alarms, for example on `ModelLatency` or `Invocation5XXErrors`. If any alarm goes into ALARM during the deployment, SageMaker automatically shifts all traffic back to the old fleet.
+Example: a canary sends 10% of traffic to the new model for 10 minutes; if the latency alarm fires, traffic returns to the old model with no manual action.
+Rolling deployments, which update instances in batches, also support alarm-based rollback.
+W: Deployment guardrails with alarm rollback: they shift traffic gradually with canary or linear steps and automatically roll back when the specified CloudWatch alarms fire, exactly as required.
+X: A=Delete and recreate the endpoint: this causes downtime, shifts no traffic gradually and offers no automatic rollback.
+C=Overwrite the artifact in S3: a running endpoint has already loaded its model, so the change is not picked up in a controlled way, and there is no gradual shifting, versioning or rollback.
+D=Shadow testing only: shadow tests copy traffic to a new variant to compare responses, but users are still served by the old model; it does not shift production traffic to the new version.
+T: Gradual rollout with automatic rollback on alarms is what SageMaker deployment guardrails (canary or linear with auto-rollback) provide.
+
+@ Q002147 explain
+G: ## Data drift and SageMaker Model Monitor
+Data drift happens when production inputs no longer look like the training data, for example a feature whose average doubles after a market change. Accuracy then declines slowly, often before labels are available to prove it.
+Model Monitor detects this in three steps:
+- **Data capture** on the endpoint saves a sample of requests (and optionally responses) to S3.
+- A **baselining job** analyzes the training dataset and writes `statistics.json` and `constraints.json` describing expected types, completeness and distributions.
+- A **monitoring schedule** (for example hourly) compares captured data with the baseline, writes a violations report and publishes metrics to Amazon CloudWatch, where alarms can notify the team.
+Other monitor types cover model quality, bias drift and feature attribution drift.
+W: Data capture plus a baselined data quality monitor: it compares live input distributions with a training baseline on a schedule and emits CloudWatch metrics and violations that drive automated alerts when drift appears.
+X: A=Retrain every hour: blind retraining is costly, gives no alert or insight into what changed and can reinforce bad data if inputs are broken.
+B=More instances: instance count affects throughput and latency, not the statistical shape of the input features.
+D=CloudTrail on the endpoint: CloudTrail records API calls such as who created or updated the endpoint, not the contents or distributions of inference data.
+T: Detecting input drift needs captured production data compared against a training baseline, which is Model Monitor's data quality monitor.
+
+@ Q002148 explain
+G: ## SageMaker Inference Recommender
+Choosing an endpoint instance type by guesswork often leads to over-provisioning. Inference Recommender benchmarks your actual model on candidate instance types.
+- A **default** job runs quick load tests on a set of recommended instance types and reports throughput, latency and cost per inference.
+- An **advanced** job (load test) lets you define the traffic pattern, the instance types to test and stopping conditions such as a maximum p95 latency, for example `ModelLatencyThresholds` of 100 ms. It finds the configuration that meets your requirement at the lowest cost.
+Example: testing `ml.c6i.xlarge`, `ml.g5.xlarge` and `ml.inf2.xlarge` might show that a CPU instance meets 300 requests per second within 100 ms p95 at a fraction of the GPU cost.
+Results appear in SageMaker Studio and through the API, and the recommended configuration can be deployed directly.
+W: Inference Recommender load tests: they measure real latency and throughput of the model on candidate instances under the target load, then rank options by cost while respecting the p95 latency requirement.
+X: A=Model Monitor bias reports: bias monitoring measures fairness drift in predictions and says nothing about latency or instance cost.
+C=Pricing Calculator only: it estimates prices for resources you choose, but it cannot tell whether an instance meets 100 ms p95 at 300 requests per second for this model.
+D=Trusted Advisor idle checks: these flag underused existing resources; they do not benchmark a model or recommend an instance type for a latency target.
+T: To pick the cheapest instance that meets a latency and throughput target, benchmark with Inference Recommender instead of estimating from prices.
+
+@ Q002149 explain
+G: ## Auto scaling SageMaker endpoints
+SageMaker endpoints scale through Application Auto Scaling. You register the production variant as a scalable target (dimension `sagemaker:variant:DesiredInstanceCount`) with a minimum and maximum instance count, then attach a scaling policy.
+- **Target tracking** is the standard policy: you pick a metric and a target value, and Auto Scaling adds or removes instances to keep the metric near it.
+- The usual metric is the predefined `SageMakerVariantInvocationsPerInstance`, the average number of requests per minute each instance receives.
+Example: if load tests show one instance handles about 1,000 invocations per minute comfortably, set a target of 700. When business-hours traffic rises fivefold, Auto Scaling adds instances; when traffic falls, it removes them after a cooldown.
+Step scaling and scheduled scaling also exist, but they are used for special cases.
+W: Target tracking on SageMakerVariantInvocationsPerInstance: it adjusts the variant's instance count automatically to keep requests per instance near a target, so capacity follows the daily traffic curve.
+X: B=Manual morning resize: it depends on people and fixed times, does not react to unexpected peaks and is not automatic.
+C=Disk utilization: disk use on an inference instance does not rise with request volume, so it is not a meaningful load signal for scaling.
+D=Bigger model: a larger model increases compute per request, making latency and capacity worse instead of adding capacity.
+T: Endpoint capacity that follows load is achieved with target tracking on invocations per instance, not with manual or unrelated metrics.
+
+@ Q002150 explain
+G: ## Network isolation for training jobs
+Setting `EnableNetworkIsolation` to true on a SageMaker training job (`enable_network_isolation=True` in the SageMaker Python SDK) means the training container cannot make any outbound network calls, not even to other AWS services. This protects against code or libraries that try to exfiltrate data or download unapproved packages.
+SageMaker itself still delivers the inputs: it copies training data from S3 into the container and uploads the model artifacts to S3 afterwards, outside the container's network.
+## Keeping S3 access private
+When the job also runs in your VPC (private subnets with no NAT gateway or internet gateway), SageMaker's data access to S3 must go through a **VPC gateway endpoint for S3**, with a route in the subnet route tables. The endpoint policy can also restrict which buckets are reachable.
+Example: a training job in private subnets with network isolation and a `com.amazonaws.<region>.s3` gateway endpoint reads `s3://training-data/` without any path to the internet.
+W: VPC plus network isolation plus S3 gateway endpoint: network isolation blocks all outbound calls from the container, and the gateway endpoint lets SageMaker read the data from S3 privately inside the VPC.
+X: A=NAT gateway with deny-all route: a NAT gateway exists to give outbound internet access; a "deny-all route" is not a route table feature and a NAT path is the opposite of blocking the container's outbound calls.
+B=Public subnet with restrictive security group: a public subnet has an internet route, security groups can be misconfigured easily and they do not provide the container-level block that network isolation guarantees.
+C=KMS encryption only: encryption protects data at rest but does nothing to stop the container from sending data over the network.
+T: No outbound calls plus private S3 access means network isolation for the container and an S3 gateway endpoint in the VPC.
+
+@ Q003560 explain
+G: ## SageMaker training input modes
+- **File mode** (default) downloads the whole dataset from S3 to the instance's storage before the training script starts. For 2 TB of many small files, this download can take a long time.
+- **FastFile mode** exposes the S3 objects as a POSIX file system under `/opt/ml/input/data/<channel>`. Training starts right away, and each file is streamed from S3 when the script first reads it.
+- **Pipe mode** streams data through a named pipe, but the script must read that stream instead of files, which usually needs code changes.
+Example: switching the channel's input mode to `FastFile` in the estimator lets the same script that reads `/opt/ml/input/data/train/*.jpg` begin training in minutes instead of waiting for 2 TB to copy.
+FastFile works best with sequential reads of files; very heavy random access patterns may still perform better with FSx for Lustre.
+W: FastFile mode: it presents S3 data as local files and streams them on demand, so training starts almost immediately and the existing file-reading code does not have to change.
+X: A=2,000 separate jobs: splitting the dataset into many jobs changes the training logic, adds overhead per job and does not produce one model trained on all the data.
+C=File mode with larger EBS: more disk space lets the full download fit, but the job still waits for all 2 TB to copy before training begins.
+D=Copy to a notebook instance first: this adds an extra copy step and does not remove the download that the training job still has to perform.
+T: When downloads dominate startup time, FastFile mode streams S3 objects on demand without code changes; File mode always copies everything first.
+
+@ Q003561 explain
+G: ## Amazon FSx for Lustre as an S3 cache for training
+FSx for Lustre is a high-performance parallel file system for compute-heavy workloads such as ML training and HPC. It delivers high throughput and low latency to many clients at once.
+- You can **link** the file system to an S3 bucket through a data repository association. Files appear in the file system, and their contents are loaded from S3 the first time they are read (lazy loading).
+- After the first epoch the data sits on the file system, so later epochs read it at file-system speed instead of fetching from S3 again.
+- SageMaker training jobs can mount FSx for Lustre as an input data source (the job must run in a VPC that can reach the file system).
+Example: 16 GPU instances train on a 5 TB image dataset for 30 epochs. Each instance reads from the shared Lustre file system rather than each downloading the same data from S3 on every run.
+W: FSx for Lustre linked to S3: it gives all training instances a shared, high-throughput file system that loads the S3 dataset once and serves repeated epochs quickly.
+X: A=EFS One Zone with bursting: EFS is a general-purpose shared file system, and bursting throughput depends on stored size and credits, so it is not designed for sustained high throughput to many GPU instances.
+C=S3 Glacier Instant Retrieval: it is an archive storage class with higher retrieval costs, meant for rarely accessed data, not a high-throughput file system for repeated reads.
+D=EBS on the first instance: a normal EBS volume attaches to one instance at a time, so the other nodes of a distributed job cannot share it.
+T: For distributed training that rereads a large S3 dataset, FSx for Lustre linked to S3 is the shared, high-throughput cache.
+
+@ Q003562 explain
+G: ## Amazon Data Firehose
+Amazon Data Firehose (formerly Kinesis Data Firehose) is a fully managed service that captures streaming data and delivers it to destinations such as Amazon S3, Amazon Redshift or OpenSearch Service. There are no servers or shards to manage; it scales automatically.
+- Producers send records directly (Direct PUT) or Firehose reads from a Kinesis data stream.
+- Firehose **buffers** records by size or time and writes batches as objects in S3.
+- **Record format conversion** turns incoming JSON into Apache Parquet or ORC using a table schema from the AWS Glue Data Catalog.
+- Dynamic partitioning can write objects into prefixes such as `event_date=2026-09-29/`.
+Example: a web app sends click events as JSON to a Firehose stream; every few minutes Parquet files land in `s3://clickstream/`, ready for Athena queries and feature engineering.
+W: Data Firehose with format conversion: it continuously ingests the events, converts them to Parquet and delivers them to S3 as a serverless managed service.
+X: A=SQS standard queue: SQS holds messages until a consumer polls them; you still need your own compute to read, convert to Parquet and write files to S3.
+C=Snowball Edge: it is a physical device for offline data transfer or edge computing, not a continuous streaming pipeline into S3.
+D=EBS snapshots of web servers: snapshots copy whole volumes for backup; they do not capture individual click events or produce Parquet datasets.
+T: Continuous, serverless stream-to-S3 delivery with Parquet conversion is Amazon Data Firehose; queues and devices need extra processing.
+
+@ Q003563 explain
+G: ## SageMaker Feature Store
+A feature store keeps feature definitions and values in one place so training and inference use the same features. In SageMaker Feature Store you create a **feature group** with a record identifier (for example `customer_id`) and an event time.
+- The **online store** keeps the latest value for each record and returns it with low millisecond latency through `GetRecord`, for use at inference time.
+- The **offline store** keeps the full history in S3 (registered in the AWS Glue Data Catalog), so you can query it with Athena and build training sets with point-in-time correctness.
+- One `PutRecord` call writes to both stores, which keeps the definitions consistent.
+Example: a fraud model reads `avg_spend_7d` for a customer from the online store during a transaction, while the training pipeline reads the same feature's historical values from the offline store.
+This avoids training-serving skew, where a feature is computed differently for training and for inference.
+W: Feature Store with online and offline stores: the online store serves features in milliseconds for inference, and the offline store keeps the history for training, with one shared feature definition.
+X: A=Shared spreadsheet: a spreadsheet cannot be queried with low latency, has no versioning or access control for ML and cannot guarantee consistent definitions.
+C=ElastiCache without history: it can serve values fast, but without historical data you cannot build training sets or reproduce past feature values.
+D=Weekly CSV in S3: it is stale for up to a week and reading a file from S3 per request is far slower than millisecond serving.
+T: Low-latency serving plus historical training data with the same feature definitions is exactly what Feature Store's online and offline stores provide.
+
+@ Q003564 explain
+G: ## Row versus columnar file formats
+- **Row formats** such as CSV, JSON and XML store each record together. To compute the average of one column, a query engine must read every full record, including all the columns it does not need.
+- **Columnar formats** such as Apache Parquet store the values of each column together. Engines read only the needed columns (column pruning) and can skip data blocks using min/max statistics (predicate pushdown).
+Because similar values sit next to each other, columnar data compresses well, for example with Snappy or Zstandard. Parquet also stores the schema and data types, so values do not have to be parsed from text.
+Example: a 100 GB CSV table with 50 columns might become roughly 20 GB of Parquet, and a query on three columns reads only a small portion of that. Athena, which bills per data scanned, then costs far less.
+W: Apache Parquet: its columnar, compressed layout reduces storage and lets analytics read only the columns they need, which speeds up column-wise queries during data preparation.
+X: A=Uncompressed JSON: each record repeats all the field names as text, so it is large and must be fully read and parsed even when only one field is needed.
+C=Plain CSV: it is a row-based text format without column pruning or built-in types, so column-wise queries still scan every row in full.
+D=Raw XML: the tags around every value make it even more verbose than JSON and it is slow to parse, the opposite of efficient analytics.
+T: For smaller storage and faster column-wise analytics, use a columnar format such as Parquet rather than row-based text formats.
+
+@ Q003565 explain
+G: ## Handling missing numeric values
+Missing values must be handled because many algorithms cannot accept them. The right approach depends on how much is missing and why.
+- **Deletion** of rows or whole features is reasonable only when very much is missing or the feature has little value. With 5% missing, deleting the feature throws away 95% good data.
+- **Imputation** fills gaps with an estimate. The **median** is robust to outliers, unlike the mean, which a few extreme values can pull away.
+- A **missing indicator** is an extra 0/1 feature such as `income_missing`. It lets the model learn if missingness itself carries information.
+Example: income is missing for 5% of customers. Filling with the training median (for example 52,000) and adding `income_missing` keeps every row and every feature.
+Always compute the median on the training data only, then apply the same value to validation, test and production data.
+W: Median imputation plus missing indicator: it keeps the feature and all rows, uses an outlier-robust estimate for the gaps and lets the model learn from whether the value was missing.
+X: A=Delete the whole feature: 5% missing values is a small share, so dropping the feature discards useful information for no good reason.
+C=Duplicate complete rows: copying rows changes the data distribution and adds duplicates that bias training, while the rows with missing values still need handling.
+D=Sentinel value 999,999: an extreme fake value distorts statistics, scaling and linear models, which treat it as a real, very large number.
+T: For a small share of values missing at random, impute with a robust statistic such as the median and add a missing indicator instead of deleting data.
+
+@ Q003566 explain
+G: ## Encoding high-cardinality categorical features
+One-hot encoding creates one 0/1 column per category. With 20,000 unique values, such as product IDs or ZIP codes, that is 20,000 mostly empty columns, which uses a lot of memory and makes rare categories hard to learn.
+Practical alternatives:
+- **Target encoding** replaces each category with a statistic of the label for that category, such as the average fraud rate per merchant. It turns one column into one numeric feature.
+- **Learned embeddings** map each category to a short dense vector (for example 16 numbers) that a neural network learns during training, so similar categories end up close together.
+- **Hashing** or grouping rare values into an "other" category are simpler options.
+## The leakage risk
+Target encoding uses the label, so it must be computed on training folds only (for example out-of-fold) and smoothed toward the global mean for rare categories. Otherwise the feature leaks the answer and validation scores look better than real performance.
+W: Target encoding or embeddings with leakage safeguards: both represent 20,000 categories in a small number of dense features, and out-of-fold computation with smoothing keeps target encoding honest.
+X: A=Drop rows with rare categories: it throws away data, and new rare categories still appear in production, where the model cannot drop requests.
+C=Even more one-hot columns: adding columns makes the sparsity and memory problem worse instead of solving it.
+D=Label encoding as continuous: integer codes invent an order and distance (category 19,000 is "larger" than category 2) that a linear model will treat as meaningful.
+T: For very high-cardinality categories, use target encoding (computed without leakage) or embeddings instead of one-hot or ordinal codes.
+
+@ Q003567 explain
+G: ## Why feature scale matters
+Gradient-based algorithms, such as linear and logistic regression and neural networks, update all weights with one learning rate. If income ranges from 0 to 500,000 and age from 18 to 90, gradients for income are huge compared with those for age. The loss surface becomes stretched, so gradient descent zigzags and needs many more steps, or a tiny learning rate, to converge.
+## Standardization
+Standardization (z-score scaling) transforms each feature as `z = (x - mean) / std`, so it ends up with mean 0 and standard deviation 1.
+Example: with an income mean of 60,000 and standard deviation of 20,000, an income of 100,000 becomes 2.0. An age of 50 with mean 40 and standard deviation 10 becomes 1.0. Both features now have comparable ranges.
+Min-max scaling to 0 to 1 is an alternative. Compute the statistics on the training set only and reuse them at inference. Tree-based models such as XGBoost are largely insensitive to scaling.
+W: Standardization: it puts every feature on a comparable scale with zero mean and unit variance, which balances gradients and lets gradient-based training converge faster.
+X: A=One-hot encoding numbers: it turns each distinct number into its own column, exploding dimensionality and destroying the numeric order of the values.
+C=Sorting rows by income: row order does not change feature scales, and sorted batches can even hurt stochastic gradient descent, which expects shuffled data.
+D=Removing the larger-range feature: it discards potentially important information (income) instead of simply rescaling it.
+T: Features on very different scales should be standardized (or normalized) so gradient descent converges efficiently; dropping or reordering data does not fix scale.
+
+@ Q003568 explain
+G: ## What data leakage is
+Data leakage happens when information that would not be available at prediction time gets into model training. The model then looks better in evaluation than it will in production.
+## Leakage through preprocessing
+Preprocessing steps also "learn" from data: standardization learns a mean and standard deviation, imputation learns a median, and target encoding learns category averages. If those statistics are computed on the full dataset before splitting, the test rows have already shaped the transformation applied to training data.
+Example: the test set contains several very high incomes. Computing the mean on all data shifts the scaling that the training rows receive, so the test set is no longer truly unseen.
+The correct order:
+- Split into train, validation and test first.
+- Fit transformations (for example `StandardScaler.fit`) on the training data only.
+- Apply the fitted transformation to validation, test and production data.
+Using a pipeline inside cross-validation enforces this automatically.
+W: Data leakage: statistics computed on all data let test information influence the training transformation, so evaluation results are optimistically biased.
+X: A=Overflow: computing a mean and standard deviation is straightforward even for very large datasets and has nothing to do with the order of splitting.
+C=Underfitting: normalization rescales values but keeps the relative differences between them, so it does not remove useful variation.
+D=Class imbalance: normalization changes feature values only; it never adds or removes rows, so label counts stay the same.
+T: Fit preprocessing on the training split only; computing it on the full dataset leaks test information into training.
+
+@ Q003569 explain
+G: ## SageMaker Data Wrangler
+Data Wrangler is SageMaker's low-code, visual tool for data preparation, and it now runs inside **SageMaker Canvas**.
+- **Import** data from sources such as Amazon S3, Athena, Redshift and Snowflake.
+- **Explore** with data quality and insights reports showing distributions, missing values, outliers and possible target leakage.
+- **Transform** with more than 300 built-in transformations, such as imputation, encoding, scaling, text and date handling, plus custom code in Python, PySpark or SQL.
+- **Export** the data flow to SageMaker Pipelines, a processing job, SageMaker Feature Store or a Python script, so the same steps run in production.
+Example: an analyst imports a customer table from Athena, one-hot encodes the region column, imputes missing income and exports the flow as a pipeline step that runs every night.
+W: SageMaker Data Wrangler in Canvas: it is the visual ML data-preparation tool with hundreds of built-in transformations and export to pipelines, exactly what the team wants.
+X: A=CloudTrail Lake: it stores and queries AWS API activity for auditing and security, not ML training data.
+B=Amazon Inspector: it scans workloads such as EC2 instances, container images and Lambda functions for software vulnerabilities; it does not prepare data.
+C=Athena with SELECT only: Athena runs SQL queries but is not a visual tool with built-in ML transformations, data quality reports or pipeline export.
+T: Visual, low-code ML data preparation with hundreds of built-in transformations and pipeline export is SageMaker Data Wrangler.
+
+@ Q003570 explain
+G: ## Why an imbalanced model predicts only negatives
+With 0.5% positives, a model that always predicts "not fraud" is 99.5% accurate. The training loss is dominated by the negatives, so the model can minimize it by ignoring the rare class.
+## Two standard fixes
+- **Resampling** changes the class mix the model sees: random oversampling repeats positives, undersampling drops some negatives, and **SMOTE** creates synthetic positives by interpolating between nearby positive examples. Resample only the training data, never the test set.
+- **Class weights** keep the data unchanged but make each error on a positive cost more in the loss function. In XGBoost this is `scale_pos_weight`, often set near the ratio of negatives to positives (about 199 here).
+## Measuring it correctly
+Evaluate with metrics that focus on the rare class: precision, recall, F1, and the area under the precision-recall curve. Then tune the decision threshold to the business cost of missed fraud versus false alarms.
+W: B=Resampling or SMOTE: giving the model more (real or synthetic) positive examples during training forces it to learn the fraud pattern instead of ignoring it.
+E=Class weights: raising the loss for errors on positives makes predicting everything negative expensive, so the model learns to detect the rare class.
+X: A=Remove all positives: without positive examples the model cannot learn fraud at all; this makes the problem worse.
+C=Shuffle labels randomly: random labels destroy the relationship between features and fraud, so the model learns noise.
+D=Overall accuracy only: 99.5% accuracy is reachable by predicting all negatives, so this metric hides exactly the failure being fixed.
+T: For severe imbalance, rebalance the training signal with resampling or class weights and judge results with recall, precision or PR AUC, not accuracy.

@@ -1,0 +1,360 @@
+# SAA-C03 detailed explanations, e07 (explanation-only rewrites; letters are the published ones)
+
+@ Q000581 explain
+G: ## Why full-mesh peering stops scaling
+VPC peering is a one-to-one link and is **not transitive**: if VPC 1 peers with VPC 2 and VPC 2 peers with VPC 3, VPC 1 still cannot reach VPC 3 through it. Connecting every VPC to every other one needs n(n-1)/2 peerings.
+- 26 VPCs (25 plus shared services) need 325 peerings, each with its own route table entries in both VPCs.
+- Every new VPC adds 26 more peerings and route updates across accounts.
+## How a transit gateway changes this
+AWS Transit Gateway is a Regional router that VPCs, VPNs and Direct Connect gateways attach to. Each VPC needs one attachment and one route (for example `10.0.0.0/8` pointing at the transit gateway). The transit gateway route tables decide who can reach whom, and it can be shared with other accounts through AWS Resource Access Manager.
+- Adding VPC number 27 means one new attachment, not 26 new peerings.
+- Route table segmentation lets you allow spoke-to-shared-services traffic while isolating other groups.
+W: Transit Gateway hub-and-spoke: each VPC attaches once, routing is managed centrally in transit gateway route tables, and cross-account sharing via RAM keeps growth linear instead of quadratic.
+X: B=VPN between every pair: this recreates the full mesh with IPsec tunnels, each needing its own gateways, tunnels and hourly charges, so it is more complex and costlier than the peering it replaces.
+C=More peering connections: the number of peerings grows with the square of the VPC count and each needs routes on both sides, which is exactly the operational burden the company is trying to escape.
+D=Direct Connect: Direct Connect is a dedicated link between on-premises networks and AWS; it is not a way to route traffic between VPCs inside AWS.
+T: Many VPCs that all need to talk means one hub (Transit Gateway) with one attachment per VPC, not a mesh of peerings or VPNs.
+
+@ Q000582 explain
+G: ## CNAME versus alias records
+A **CNAME** says "this name is really that other name". DNS rules forbid a CNAME at the zone apex (`example.com`) because the apex must also hold the `SOA` and `NS` records, and a CNAME cannot coexist with other records for the same name.
+A Route 53 **alias record** is a Route 53 extension of an `A` or `AAAA` record. Instead of a fixed IP, it points at an AWS resource such as an Application Load Balancer, a CloudFront distribution or an S3 website endpoint. Route 53 looks up the current IPs of the target and answers with them directly.
+- Aliases are allowed at the zone apex.
+- When the ALB's or CloudFront's IPs change, the answers follow automatically.
+- Route 53 does not charge for queries to alias records whose target is an AWS resource; CNAME queries are billed like other queries.
+## Example
+`example.com` alias `A` and `AAAA` pointing to the ALB, and `cdn.example.com` alias `A` and `AAAA` pointing to the distribution, cover IPv4 and IPv6 clients at no query cost.
+W: Alias A and AAAA records: they work at the apex, track the targets' changing addresses, and queries to aliases for AWS resources are free.
+X: A=CNAME for both: a CNAME is not allowed at the zone apex, and even for `cdn.example.com` the queries would be billed.
+B=TXT records: TXT records hold arbitrary text (for example domain verification); resolvers never use them to find an IP address, so browsers could not reach either site.
+D=CNAME plus fixed ALB IP: an ALB's IP addresses change as it scales, so a hardcoded A record will break, and the CNAME for `cdn` is still billed.
+T: For AWS targets, use alias A/AAAA records: they work at the apex and are free to query, unlike CNAMEs.
+
+@ Q000583 explain
+G: ## Where the cost and the latency come from
+Every object downloaded straight from S3 is billed at S3 data-transfer-out-to-internet rates, and every request travels from the user to the bucket's single Region. Users far away see long round-trip times.
+## What CloudFront does
+Amazon CloudFront is a content delivery network with hundreds of edge locations. The first request for an object is fetched from the S3 origin and cached at the edge; later requests nearby are served from the cache.
+- Latency drops because the edge is close to the user and content is already there.
+- Transfer from S3 to CloudFront is not charged, and CloudFront's own data-transfer-out rates are generally lower than serving from S3 directly, especially at volume.
+- Fewer requests reach S3, which also reduces request charges.
+## Example
+A 50 MB video watched 10,000 times in Europe is pulled from the US bucket a handful of times; the rest is served from European edge caches.
+W: CloudFront in front of the bucket: edge caching brings content close to users worldwide and replaces expensive S3 internet egress with cheaper CloudFront delivery.
+X: A=Move the bucket: a single Region can only be close to some users; the global audience still has distant users, and the data still leaves S3 at internet egress rates.
+B=Transfer Acceleration: it speeds up long-distance transfers to and from the bucket over the AWS edge network, mainly for uploads, but adds a per-GB fee and does not cache anything, so costs go up.
+D=Requester Pays: it makes the requester pay only when the requester is an authenticated AWS account; anonymous public viewers cannot be billed, and it does nothing for latency.
+T: Global static content from S3 is served through CloudFront: caching at the edge cuts both latency and egress cost.
+
+@ Q000584 explain
+G: ## How AWS charges for traffic inside a Region
+Data transfer between EC2 instances is priced by where the two ends are:
+- Same Availability Zone, using private IPs: no charge.
+- Different AZs in the same Region: charged per GB in **each direction** (the sender pays for out, the receiver for in).
+- Different Regions: charged per GB as inter-Region transfer.
+Chatty applications, such as microservices calling each other constantly, can move terabytes per month between AZs, and that shows up as a large data transfer line on the bill.
+## The fix without losing resilience
+Keep tightly coupled components that talk a lot in the same AZ (for example, route each web instance to an app instance in its own AZ, or use AZ-aware service discovery), while still running a copy of each tier in several AZs so the application survives an AZ failure.
+W: Cross-AZ traffic: inter-AZ transfer is billed per GB both ways, so keeping chatty paths within an AZ while each tier stays multi-AZ removes most of that cost.
+X: A=CloudFront not enabled: CloudFront serves content to internet users; it has no role in instance-to-instance traffic inside a VPC.
+B=Internet gateway charges internal traffic: traffic between instances in a VPC uses the local route and never passes through the internet gateway, which has no charge of its own.
+D=Public internet plus NAT gateway: traffic between AZs in a VPC stays on the AWS network via the local route, and a NAT gateway would add hourly and per-GB processing charges instead of removing any.
+T: Same-AZ private traffic is free, cross-AZ traffic is billed both ways: co-locate chatty components per AZ but keep every tier multi-AZ.
+
+@ Q000585 explain
+G: ## Levels of AWS billing data
+- **Cost Explorer** shows aggregated costs by service, account, tag and so on, with charts. Resource-level detail is limited to a short recent window.
+- **AWS Budgets** alerts and reports when actual or forecast spend crosses a threshold.
+- **Cost and Usage Report (CUR)**, now delivered through AWS Data Exports (CUR 2.0), is the most detailed source: one line item per resource, usage type and hour, including resource IDs, usage amounts, rates and tags.
+## How CUR is used
+CUR is delivered as Parquet or CSV files into an S3 bucket and updated several times a day. Amazon Athena can query those files with standard SQL, so a FinOps team can, for example, sum `NatGateway-Bytes` and data transfer usage types per resource ID and per hour for the last three months, then apply its own allocation rules.
+W: CUR in S3 with Athena: it provides hourly, per-resource line items for data transfer and NAT charges over any retained period, and Athena lets the team query them with SQL.
+X: A=Budgets reports: Budgets tracks spend against thresholds and sends summaries; it does not provide hourly line items per resource or SQL access.
+C=Trusted Advisor: its cost checks suggest savings such as idle resources or unused Elastic IPs; it does not expose billing line items.
+D=Cost Explorer by service: it shows aggregated views in a console or API, not raw hourly per-resource rows over three months that can be queried with SQL.
+T: For custom, SQL-based cost allocation at resource and hour level, use CUR (Data Exports) in S3 with Athena, not the summary tools.
+
+@ Q000586 explain
+G: ## What inter-Region transfer costs
+Moving data out of one AWS Region to another is billed per GB (the source Region is charged for transfer out). A job that repeatedly copies terabytes of input from one Region to compute in another pays that fee every time.
+## Move compute to the data
+The cheapest byte is the one that never crosses a Region boundary. Common patterns:
+- Run the processing job (EC2, EMR, Batch, Lambda) in the Region where the dataset lives.
+- Send only small results, such as aggregates or reports, between Regions.
+- Keep copies in other Regions only where there is a real need, such as disaster recovery or local users.
+## Example
+Instead of copying a 5 TB log set from `eu-west-1` to `us-east-1` for nightly analysis, run the analysis cluster in `eu-west-1` and ship the 2 GB summary to the US.
+W: Process data where it is stored: running the job in the dataset's Region avoids the per-GB inter-Region charge, leaving only small results to transfer.
+X: B=Cross-Region Replication for all buckets: replication copies every object to another Region, which itself incurs inter-Region transfer plus extra storage, increasing rather than reducing cost.
+C=Direct Connect between Regions: Direct Connect links on-premises networks to AWS; it does not provide a cheaper private path between AWS Regions for this kind of traffic.
+D=Larger EC2 instances: instance size changes compute capacity, not the amount of data that crosses Regions, so the transfer bill stays the same.
+T: To cut inter-Region transfer cost, bring the compute to the data instead of moving the data to the compute.
+
+@ Q002014 explain
+G: ## Two separate permission checks
+Reading an SSE-KMS encrypted object is two operations: S3 returns the object, and S3 calls AWS KMS to decrypt the object's data key on behalf of the caller. Both must be allowed.
+- The S3 side is already fine: the bucket policy grants the role and the role's identity policy allows `s3:GetObject`.
+- The KMS side is missing. The customer managed key lives in account A, so it is a cross-account KMS call.
+## Cross-account KMS access
+For a principal in another account, KMS requires both:
+- The **key policy** in account A must allow the account B role (or account B) to use `kms:Decrypt`.
+- The **identity policy** of the role in account B must allow `kms:Decrypt` on the key ARN, for example `arn:aws:kms:us-east-1:111122223333:key/...`.
+If either is missing, S3 returns `AccessDenied`, even though the S3 permissions are correct.
+W: A=kms:Decrypt in the role's policy: account B must delegate the permission to its role by allowing `kms:Decrypt` on the specific key ARN in account A.
+E=Key policy allows the role: a customer managed key only trusts other accounts that its key policy names, so account A must grant the account B role use of the key.
+X: B=Enable Versioning: versioning keeps object history and is required for replication, but it has nothing to do with decrypt permissions for existing objects.
+C=Transfer Acceleration: it speeds up transfers over long distances; it does not change who is authorized to decrypt with the KMS key.
+D=SSE-S3 managed from account B: SSE-S3 keys are managed by S3 for the bucket owner, and account B cannot manage encryption of a bucket owned by account A; it also avoids fixing the actual permission gap.
+T: Cross-account SSE-KMS reads need S3 permissions plus KMS permissions on both sides: the key policy and the caller's identity policy.
+
+@ Q002015 explain
+G: ## Why IAM permissions alone are not enough
+An IAM user with `s3:*` can reach the bucket from anywhere: the office, a laptop at home or another VPC. To restrict *where* access comes from, you need a condition that every request must satisfy, and an explicit **Deny** in a resource policy overrides any Allow in identity policies.
+## How a VPC endpoint condition works
+A gateway or interface VPC endpoint for S3 carries traffic from the VPC to S3 privately. Requests that arrive through it carry the endpoint ID, which a bucket policy can check with `aws:SourceVpce` (or `aws:SourceVpc` for the VPC ID).
+Example statement idea:
+- Effect `Deny`, Principal `*`, Action `s3:*`, Resource the bucket and `bucket/*`
+- Condition `StringNotEquals` `aws:SourceVpce` = `vpce-0abc123...`
+Every request that does not come through that endpoint is denied, even for administrators, so plan a break-glass path before applying it.
+W: Bucket policy deny unless aws:SourceVpce: an explicit Deny on the bucket applies to all principals, so only requests arriving through the approved VPC endpoint can access the objects.
+X: A=Object Lock compliance mode: Object Lock prevents objects from being deleted or overwritten for a retention period; it does not restrict who can read them or from where.
+C=Network ACL with S3 prefix list: a NACL only filters traffic in that VPC's subnets; users outside the VPC can still reach S3 over the internet with their credentials.
+D=Security group on the bucket: S3 buckets cannot have security groups; security groups attach to network interfaces such as those of instances or interface endpoints.
+T: To lock a bucket to one VPC, use a bucket policy Deny keyed on `aws:SourceVpce`; network controls inside the VPC cannot stop access from elsewhere.
+
+@ Q002016 explain
+G: ## Temporary credentials for app users
+Amazon Cognito **identity pools** exchange a sign-in token (from a Cognito user pool or another identity provider) for temporary AWS credentials. The app never stores long-term keys; the credentials expire and are refreshed automatically.
+Each signed-in user gets a unique identity ID. The IAM role that the identity pool assigns can use the policy variable `${cognito-identity.amazonaws.com:sub}`, which is replaced at request time with the caller's identity ID.
+## Example policy
+- Allow `s3:GetObject` and `s3:PutObject` on `arn:aws:s3:::photos-bucket/users/${cognito-identity.amazonaws.com:sub}/*`
+- Allow `s3:ListBucket` on the bucket with a `s3:prefix` condition on the same path.
+User A can then read and write only under `users/<A's id>/`, even though all users share one role and one bucket.
+W: Cognito identity pool with a policy variable: users get short-lived credentials, and the per-user variable in the role policy confines each one to their own prefix.
+X: A=Public bucket with long keys: anyone who learns or guesses a key can read the object, and public write would let anyone upload anything; there is no per-user isolation.
+B=One IAM user per app user: IAM users are meant for a limited number of people and workloads (an account has a quota of thousands), and distributing their long-term keys to phones violates the requirement.
+C=Embedded access key: a key inside the app can be extracted by anyone, and naming objects by email does not stop that key from reading every user's prefix.
+T: For per-user S3 access from mobile apps, use Cognito identity pool temporary credentials with a `${cognito-identity.amazonaws.com:sub}` prefix policy, never embedded or per-user IAM keys.
+
+@ Q002017 explain
+G: ## What AWS WAF adds in front of an ALB
+AWS WAF inspects HTTP(S) requests before they reach the Application Load Balancer. A **web ACL** holds rules that allow, block, count or challenge requests.
+- **Managed rule groups** are maintained by AWS. The SQL database rule group (`AWSManagedRulesSQLiRuleSet`) matches common SQL injection patterns in query arguments, request bodies, cookies and the URI path.
+- A **rate-based rule** counts requests per client IP (or another aggregation key) over a sliding evaluation window (5 minutes by default) and blocks IPs that exceed a limit, then unblocks them when the rate drops.
+## Example
+A web ACL associated with the ALB contains the SQL managed rule group plus a rate-based rule with a limit of, for example, 2,000 requests per 5 minutes per IP. Injection attempts are blocked by signature, and flooding IPs are blocked automatically, without anyone maintaining IP lists.
+W: WAF with SQL managed rules and a rate-based rule: one web ACL on the ALB blocks injection payloads at layer 7 and automatically throttles any IP that floods requests.
+X: A=GuardDuty automatic blocking: GuardDuty is a threat detection service that produces findings; it does not inspect HTTP payloads for SQL injection or block traffic at the ALB by itself.
+B=NACL deny per IP: someone must find and add each IP manually, NACLs have a small rule quota, and they cannot see SQL injection inside HTTP requests.
+C=Security group deny rules: security groups only support allow rules, so they cannot deny specific IPs, and they cannot inspect request content either.
+T: SQL injection and per-IP floods on an ALB are handled by AWS WAF: managed SQLi rules plus a rate-based rule, not network-layer controls.
+
+@ Q002018 explain
+G: ## Rotating database credentials without downtime
+AWS Secrets Manager stores secrets such as database credentials and can **rotate** them on a schedule, for example every 30 days.
+- For Amazon RDS, rotation is provided by AWS: either RDS manages the master user secret in Secrets Manager directly, or Secrets Manager uses an AWS-provided rotation function template for the engine. No custom rotation code is needed.
+- Rotation changes the password in the database and updates the secret, using staging labels such as `AWSCURRENT` and `AWSPENDING` so that the new value is tested before it becomes current.
+## How the application avoids downtime
+The application stops reading the password from a file and calls `GetSecretValue` at startup or on a connection error (often with a caching client). After rotation it simply picks up the new value, with no redeploy.
+W: Secrets Manager managed rotation: it rotates the RDS password automatically on schedule with AWS-provided logic, and the app reads the current value at runtime, so no redeploy or downtime is needed.
+X: B=KMS-encrypted file and monthly redeploy: encryption protects the file but does not rotate anything; someone still changes the password and redeploys, which is manual and risks downtime.
+C=Instance role, no password for any engine: an instance role gives AWS credentials, not database logins; IAM database authentication exists only for some engines (such as MySQL and PostgreSQL), so this is not true for every engine.
+D=Parameter Store with manual updates: SecureString parameters store encrypted values but have no built-in rotation, and manual updates contradict the automatic requirement.
+T: Automatic, code-free rotation of RDS passwords is a Secrets Manager feature; Parameter Store and KMS only store or encrypt the value.
+
+@ Q002019 explain
+G: ## How SQS hides a message while it is being worked on
+When a consumer receives a message from an SQS queue, the message is not deleted. It becomes invisible for the **visibility timeout** (default 30 seconds, maximum 12 hours). The consumer must call `DeleteMessage` before the timeout ends.
+If the timeout expires first, SQS assumes the consumer failed and makes the message visible again, so another worker receives and processes it too.
+## What happens here
+- Processing takes up to 90 seconds, but the timeout is 30 seconds.
+- After 30 seconds the message reappears and a second worker starts it; after 60 seconds a third may start.
+- That matches the "two or three times" pattern exactly.
+Fix: set the visibility timeout above the maximum processing time (for example 120 seconds), or have long-running workers extend it with `ChangeMessageVisibility`. Standard queues can still deliver duplicates occasionally, so processing should be idempotent.
+W: Visibility timeout too short: messages reappear while still being processed, so raising the timeout above the 90-second processing time stops the repeated deliveries.
+X: B=Standard queues deliver three times: standard queues guarantee at-least-once delivery with occasional duplicates, not a fixed three deliveries; the systematic duplication here comes from the timeout.
+C=Long polling disabled: long polling reduces empty responses and cost when the queue is idle; it does not cause messages to be delivered again during processing.
+D=Retention period too short: retention controls how long unprocessed messages are kept (up to 14 days); a short retention would lose messages, not duplicate them.
+T: Duplicate processing with long jobs points to a visibility timeout shorter than processing time; raise it or extend it, and make consumers idempotent.
+
+@ Q002020 explain
+G: ## Two Multi-AZ designs in RDS
+- **Multi-AZ DB instance deployment**: one primary and one standby in another AZ with synchronous replication. The standby cannot serve reads. Failover typically takes about one to two minutes.
+- **Multi-AZ DB cluster deployment** (MySQL and PostgreSQL): one writer and **two readable standby** instances in three different AZs. Changes are replicated using semi-synchronous replication, and failover is typically under 35 seconds.
+## How reads are offloaded
+A Multi-AZ DB cluster exposes a **reader endpoint** that spreads read-only connections across the two standbys. The same instances that provide high availability also serve read traffic, so no extra read replicas are needed.
+Example: a reporting service connects to the reader endpoint, while the application writes through the cluster (writer) endpoint.
+W: Multi-AZ DB cluster: its two standbys are readable through the reader endpoint and it typically fails over in under 35 seconds, meeting both requirements with the HA instances themselves.
+X: A=Single-AZ plus cross-Region replica: a read replica can serve reads, but promoting it is a manual or scripted step, not automatic failover in about 35 seconds.
+B=Single-AZ with backups: restoring from backups creates a new instance and takes minutes or longer, and there is no standby to read from.
+D=Multi-AZ DB instance: its single standby is not readable and exists only for failover, which usually takes longer than 35 seconds.
+T: Readable standbys and failover under 35 seconds describe a Multi-AZ DB cluster; a Multi-AZ DB instance's standby cannot serve reads.
+
+@ Q002021 explain
+G: ## Why users get logged out on scale-in
+When sessions live in an instance's memory, only that instance knows the user is logged in. When Auto Scaling terminates the instance, those sessions disappear, and the next request lands on another instance that has never seen the user.
+## Stateless web tier
+The fix is to move session data out of the instances into a shared store that every instance can read:
+- **Amazon ElastiCache** (Redis OSS, Valkey or Memcached): in-memory, sub-millisecond reads, common for session stores.
+- **Amazon DynamoDB**: serverless key-value store, a session item keyed by session ID with a TTL attribute to expire old sessions.
+Any instance can then handle any request, instances can be added or removed freely, and the load balancer can spread traffic evenly without stickiness.
+W: Session state in ElastiCache or DynamoDB: sessions no longer depend on a specific instance, so scale-in terminates instances without logging anyone out and no pinning is needed.
+X: A=Disable scale-in: it avoids terminations only during certain hours, wastes money on idle capacity and still loses sessions whenever an instance fails or scales in later.
+C=Deregistration delay of 1 hour: the delay only lets in-flight requests finish before the target is removed; once the instance terminates, the in-memory sessions are still gone.
+D=Sticky sessions: stickiness pins users to one instance, which the team explicitly wants to avoid, and sessions are still lost when that instance is terminated.
+T: Sessions that must survive scaling go into a shared store such as ElastiCache or DynamoDB; stickiness only pins users to instances that can still disappear.
+
+@ Q002022 explain
+G: ## Why one bad record blocks a Kinesis shard
+Lambda reads a Kinesis shard in order through an **event source mapping**. If the function fails on a batch, Lambda retries the whole batch by default until it succeeds or the records expire from the stream. Because order is preserved per shard, nothing after that batch is processed: a "poison" record stalls the shard.
+## Error handling settings on the event source mapping
+- **Bisect batch on function error** (`BisectBatchOnFunctionError`): splits a failing batch in two and retries each half, narrowing down to the bad record.
+- **Maximum retry attempts** and **maximum record age**: stop retrying after a set count or age.
+- **On-failure destination** (for example an SQS queue or SNS topic): receives details of the discarded batch, such as shard ID and sequence numbers, so the records can be retrieved and analyzed.
+With these set, the bad record is isolated, sent to the destination and skipped, and the shard continues.
+W: Bisect, cap retries, on-failure destination: bisecting isolates the malformed record, the retry cap lets the shard move past it, and the destination keeps a record of the failure for analysis.
+X: B=Batch size 10,000: a larger batch still contains the malformed record, so the whole batch still fails and retries, and more good records get stuck with it.
+C=More timeout and memory: the failure is caused by bad data, not by lack of time or memory, so the function fails the same way on every retry.
+D=More shards: resharding only changes where new records go; the shard holding the bad record stays blocked, and Lambda finishes a parent shard before reading its child shards, so ordering keeps processing stuck.
+T: A poison record in a Kinesis stream is handled with bisect-on-error, bounded retries and an on-failure destination, not with bigger batches or more resources.
+
+@ Q002023 explain
+G: ## Route 53 failover routing
+Failover routing uses two records with the same name:
+- A **primary** record pointing to the application (for example an alias to the ALB in `us-east-1`), associated with a **health check** or with "evaluate target health".
+- A **secondary** record pointing to the backup, here an alias to an S3 static website endpoint that hosts the maintenance page.
+While the primary is healthy, Route 53 answers with it. When the health check fails, Route 53 answers with the secondary instead, so users see the maintenance page without anyone changing DNS.
+## S3 website detail
+For a Route 53 alias to an S3 website endpoint, the bucket name must match the record name, such as a bucket named `www.example.com` for `www.example.com`.
+W: Failover routing with a health check: Route 53 serves the primary while it is healthy and automatically switches answers to the S3 maintenance site when the health check fails.
+X: A=Simple routing with two IPs: Route 53 returns both addresses in random order with no health checks for simple records, so users still hit the failed application.
+B=Geolocation with default to S3: geolocation chooses answers by the user's location; the default record is used for unmatched locations, not when the application is unhealthy.
+D=Latency-based between app and S3: latency routing sends each user to the lowest-latency endpoint, so some users would get the maintenance page even while the application is healthy.
+T: "Show a backup when the primary is unhealthy" is Route 53 failover routing with a health check on the primary.
+
+@ Q002024 explain
+G: ## How EBS SSD volumes get their IOPS
+- **gp2**: IOPS are tied to size, 3 IOPS per GiB (minimum 100). A 200 GiB volume has a 600 IOPS baseline and can burst to 3,000 using credits.
+- **gp3**: every volume gets 3,000 IOPS and 125 MiB/s baseline regardless of size, and you can provision more IOPS and throughput independently of capacity, up to a ratio of 500 IOPS per GiB.
+- **io2 Block Express**: highest durability and performance with sub-millisecond latency, but priced higher per GiB and per provisioned IOPS.
+- **st1**: HDD for large sequential throughput, with very low IOPS limits, not suitable for random database I/O.
+## Example
+A 200 GiB gp3 volume with 12,000 provisioned IOPS stays well within the 500:1 ratio (200 x 500 = 100,000), and you pay only for 200 GiB plus the IOPS above 3,000.
+W: gp3 with 12,000 provisioned IOPS: gp3 decouples IOPS from size, so the database gets the IOPS it needs on exactly 200 GiB at a lower price than io2.
+X: A=io2 Block Express, 4 TiB: it can deliver the IOPS, but buying 4 TiB when 200 GiB is needed, plus io2's higher IOPS pricing, is the over-provisioning the team wants to avoid.
+B=st1 HDD: st1 is optimized for sequential throughput and supports only a few hundred IOPS, far below 12,000 random IOPS.
+C=gp2 with burst credits: a 200 GiB gp2 volume has a 600 IOPS baseline and bursts only to 3,000, so it can never sustain 12,000 IOPS.
+T: When IOPS needs exceed what size alone gives, gp3 lets you provision IOPS without buying extra capacity; gp2 scales IOPS only with size.
+
+@ Q002025 explain
+G: ## How DynamoDB spreads load
+DynamoDB hashes the **partition key** to decide which physical partition stores an item. Each partition has its own throughput limits (about 1,000 write units and 3,000 read units per second). Table-level capacity only helps if requests are spread across many partition key values.
+A date key like `2026-09-29` means every device writes today's readings to the same key, so all writes hit one partition: a **hot key**. Throttling happens even though the table as a whole has spare capacity.
+## Fixes
+- Use a **high-cardinality** partition key, such as `deviceId`, with the timestamp as the sort key.
+- If queries must be by date, use **write sharding**: append a random or calculated suffix such as `2026-09-29#07` (one of N values), and query all N shards when reading a day.
+W: High-cardinality key or write sharding: spreading writes over many partition key values lets DynamoDB distribute them across partitions, removing the hot partition.
+X: B=On-demand mode: on-demand removes table capacity planning, but each partition key still has the same per-partition throughput limits, so a single hot key still throttles.
+C=GSI on the date: a GSI keyed by date concentrates writes on one key in the index too, and a throttled GSI can slow writes to the base table, adding a second hot spot.
+D=DAX in front of the table: DAX is a read cache; writes pass through to DynamoDB, so the hot partition receives exactly the same write load.
+T: Throttling with spare table capacity means a hot partition key; fix the key design (high cardinality or sharding), not the capacity mode or caching.
+
+@ Q002026 explain
+G: ## What AWS Global Accelerator provides
+Global Accelerator gives an application **two static anycast IPv4 addresses** (plus IPv6 with dual-stack). The same IPs are announced from AWS edge locations worldwide, so a player connects to the nearest edge, and traffic then travels over the AWS global network to the application.
+- Supports **TCP and UDP**, so game traffic works.
+- **Endpoint groups** are per Region; each contains endpoints such as Network Load Balancers, EC2 instances or Elastic IPs. Health checks and traffic dials send players to the closest healthy Region.
+- The IPs never change even if endpoints or Regions change, which suits partner firewall allow lists.
+## Example
+Partners allow two IPs. Players in Asia enter at a Tokyo edge and reach the Singapore endpoint group; if it becomes unhealthy, traffic shifts to another Region with the same IPs.
+W: Global Accelerator with Regional endpoint groups: it provides a fixed pair of anycast IPs for allow lists and carries UDP traffic over the AWS backbone to the nearest healthy Region.
+X: A=Route 53 latency routing to Elastic IPs: partners would need every Region's IPs, DNS caching slows failover, and traffic crosses the public internet all the way to the Region.
+C=ALB per Region behind DNS: ALBs handle only HTTP and HTTPS, not UDP game traffic, and their IP addresses change, so they cannot be allow-listed.
+D=CloudFront with custom origins: CloudFront delivers HTTP and HTTPS (including WebSocket) traffic and does not proxy UDP game protocols to origins, so the game servers cannot sit behind it.
+T: Static IPs plus UDP plus global performance points to Global Accelerator; CloudFront and ALB are HTTP-oriented.
+
+@ Q002027 explain
+G: ## Amazon FSx for Lustre for HPC
+Lustre is a parallel POSIX file system used in high performance computing. FSx for Lustre is the managed version: data is striped across many storage servers, so hundreds or thousands of Linux clients can read and write at the same time with aggregate throughput of hundreds of GB/s and sub-millisecond latency.
+## S3 integration
+An FSx for Lustre file system can be linked to an S3 bucket with a **data repository association**:
+- Objects in S3 appear as files; their content is loaded into the file system on first access (lazy loading) or preloaded.
+- New or changed files can be exported back to S3 automatically or on demand.
+Example: genome files in `s3://genomics-input/` are read through `/fsx/input`, jobs write to `/fsx/results`, and results are exported to S3 when the run finishes.
+W: FSx for Lustre linked to S3: it delivers a shared POSIX file system with the parallel throughput HPC needs and reads inputs from and writes results back to S3 natively.
+X: A=EBS Multi-Attach: it works only with io1/io2 volumes, attaches to a limited number of instances in one AZ, and needs a cluster-aware file system; it cannot serve hundreds of instances.
+B=FSx for Windows File Server: it provides SMB shares for Windows workloads, has no native S3 linking, and is not built for Linux HPC throughput at hundreds of GB/s.
+C=EFS Max I/O with provisioned throughput: EFS is a scalable NFS file system, but it is not designed for hundreds of GB/s aggregate throughput and has no built-in S3 import and export.
+T: Linux HPC with massive parallel throughput and S3 data in and out means FSx for Lustre with a data repository association.
+
+@ Q002028 explain
+G: ## What Athena charges for
+Amazon Athena bills by the amount of data **scanned** per query. With plain CSV, Athena must read every byte of every row, including all 60 columns, even if the query uses only 4 of them and only one day.
+## Two changes that reduce the scan
+- **Columnar format (Parquet or ORC)**: values are stored by column with statistics, so Athena reads only the 4 columns referenced and can skip row groups. Parquet is also compressed.
+- **Partitioning by date**: data is stored under prefixes such as `s3://logs/dt=2026-09-29/`. A `WHERE dt = '2026-09-29'` filter lets Athena ignore all other partitions.
+Example: a query that used to scan 5 TB might scan only the 4 columns of a few days, often a tiny fraction of the original, making it faster and cheaper.
+The conversion can be done with an Athena CTAS query or an AWS Glue job.
+W: Parquet partitioned by date: columnar storage reads only the needed columns and date partitions skip irrelevant data, which cuts the scanned bytes and therefore both time and cost.
+X: B=Transfer Acceleration: it speeds client uploads and downloads over long distances; Athena reads data inside AWS and still scans the full dataset.
+C=ZIP-compressed CSV: ZIP archives are not one of the compression codecs Athena uses for tables (those include GZIP, BZIP2 and ZSTD), and even with a supported codec CSV is still row-based, so all 60 columns of every day are still read.
+D=Glacier Instant Retrieval: changing the storage class lowers storage cost for rarely accessed data but adds retrieval charges and does nothing to reduce the amount scanned.
+T: Athena cost and speed depend on bytes scanned: use columnar formats like Parquet and partition on the columns you filter by.
+
+@ Q002029 explain
+G: ## How S3 Intelligent-Tiering works
+S3 Intelligent-Tiering monitors access to each object and moves it automatically between tiers:
+- **Frequent Access**: new or recently accessed objects.
+- **Infrequent Access**: objects not accessed for 30 consecutive days (lower storage price).
+- **Archive Instant Access**: objects not accessed for 90 days (even lower price).
+All three tiers return data in milliseconds. When an object in a cooler tier is accessed, it moves back to Frequent Access, and there are **no retrieval fees**. You pay a small monthly monitoring charge per object; objects under 128 KB are not monitored and always stay in Frequent Access. Optional Archive Access and Deep Archive Access tiers exist but are not millisecond, so they are left off here.
+## Example
+A dataset untouched for four months sits in Archive Instant Access; when a new project reads it heavily, it returns to Frequent Access without fees or delays.
+W: S3 Intelligent-Tiering: it lowers storage cost automatically for objects that go cold, keeps millisecond access in its automatic tiers and charges no retrieval fees when data becomes hot again.
+X: B=S3 Standard: it offers millisecond access with no retrieval fees, but it charges the highest storage price even for objects unused for months.
+C=S3 Standard-IA: it has lower storage cost but charges per-GB retrieval fees and a 30-day minimum, which becomes expensive when cold objects suddenly become heavily used.
+D=S3 Glacier Deep Archive: it has the lowest storage price, but retrieval takes hours and incurs fees, violating the millisecond requirement.
+T: Unknown or changing access patterns with millisecond reads and no retrieval fees point to S3 Intelligent-Tiering.
+
+@ Q002030 explain
+G: ## Savings Plans and Reserved Instances compared
+All commit you to a steady spend or capacity for one or three years in exchange for a discount:
+- **Compute Savings Plans**: a commitment in dollars per hour that applies to EC2 in any Region, instance family, size, OS and tenancy, and also to **AWS Fargate** and **AWS Lambda**. Discounts are up to about 66 percent.
+- **EC2 Instance Savings Plans**: slightly deeper discounts, but locked to one instance family in one Region.
+- **Standard Reserved Instances**: tied to instance attributes such as type and Region; changes are limited.
+- **Spot Instances**: large discounts on spare capacity, but instances can be reclaimed with two minutes' notice.
+## Example
+If the company commits 20 dollars per hour, the commitment is applied automatically to eligible EC2, Fargate and Lambda usage (highest discount percentage first), and it keeps applying after the company moves from `m5` to `m7g` or adds a new Region.
+W: Compute Savings Plans: they discount steady spend across EC2 in any family and Region plus Fargate and Lambda, so planned changes over three years keep receiving the discount.
+X: A=EC2 Instance Savings Plans: they apply only to one instance family in one Region and never to Fargate or Lambda, so family and Region changes would lose the discount.
+C=Spot for all workloads: Spot capacity can be interrupted at any time, which does not suit steady production workloads, and Spot does not apply to Lambda.
+D=Standard Reserved Instances: they are tied to the current instance attributes and Region, cover only EC2, and would not follow the planned family and Region changes.
+T: Mixed EC2, Fargate and Lambda usage with changing families and Regions is covered best by Compute Savings Plans.
+
+@ Q002031 explain
+G: ## Spot Instances and interruptions
+Spot Instances use spare EC2 capacity at large discounts. When EC2 needs the capacity back, it gives a **two-minute interruption notice** and reclaims the instance. Checkpointing jobs can resume from the last checkpoint, so Spot suits them well.
+## Allocation strategies
+- **lowest-price**: picks the cheapest pools, which are often the most heavily used and therefore the most likely to be interrupted.
+- **capacity-optimized**: picks pools with the most spare capacity.
+- **price-capacity-optimized**: picks pools with high available capacity and then the lowest price among them; AWS recommends it for most Spot workloads.
+## Diversify
+Spot capacity is tracked per instance type per AZ (a "pool"). Allowing many types (for example `c5.4xlarge`, `c6i.4xlarge`, `c6a.4xlarge`, `m6i.4xlarge`) in several AZs lets EC2 Fleet or Auto Scaling choose healthy pools and replace interrupted instances quickly.
+W: Diversified Spot with price-capacity-optimized: many pools plus a strategy that favors spare capacity keep costs low and interruptions rare, and checkpoints cover the rest.
+X: A=One type, one AZ, lowest-price: a single pool chosen purely on price is the most likely to be reclaimed, and there is nowhere else to get capacity when it is.
+B=On-Demand only: it avoids interruptions but costs far more than Spot, which the fault-tolerant, checkpointed job does not need.
+C=Three-year Dedicated Hosts: they are for licensing or compliance needs that require physical servers and commit to long-term cost, far more expensive for a nightly batch.
+T: Fault-tolerant batch jobs run cheapest on Spot diversified across types and AZs with price-capacity-optimized allocation, not on a single cheapest pool.
+
+@ Q002032 explain
+G: ## Serving S3 content through CloudFront
+Serving large files straight from S3 to the internet is billed at S3 data transfer out rates, and every user goes to the bucket's Region. Amazon CloudFront caches content at edge locations close to users.
+- Transfer from S3 to CloudFront is not charged, and CloudFront delivery is generally cheaper than S3 internet egress, especially at volume.
+- Repeated requests are served from edge caches, so latency drops and the bucket receives fewer requests.
+## Origin access control (OAC)
+OAC lets CloudFront sign its requests to S3. The bucket policy allows only the distribution (by its ARN in the `aws:SourceArn` condition) to read objects, so the bucket can stay private and nobody can bypass CloudFront to download directly from S3.
+W: CloudFront with OAC: edge caching reduces latency and replaces expensive S3 egress with cheaper CloudFront delivery, while OAC keeps the bucket private behind the distribution.
+X: A=EBS on EC2 web servers per Region: it adds servers, volumes and replication to manage, still pays internet egress from EC2, and only a few Regions would be close to users.
+B=CRR to every Region: each copy costs replication transfer and storage, and users still download from S3 at internet egress rates without edge caching.
+D=Requester Pays: it can bill only authenticated AWS accounts, so anonymous website visitors cannot be charged and would be denied access.
+T: For global static content from S3, put CloudFront with OAC in front: cheaper egress, lower latency and a private bucket.

@@ -1,0 +1,389 @@
+# SAA-C03 detailed explanations, e04 (explanation-only rewrites; letters are the published ones)
+
+@ Q000506 explain
+G: ## Why immediate retries make an outage worse
+A `503 Service Unavailable` usually means the dependency is overloaded. If every client retries at once in a tight loop, the load on the struggling partner multiplies and it takes longer to recover. This is often called a retry storm.
+## Two patterns that work together
+- **Exponential backoff with jitter**: wait longer after each failed attempt (for example 100 ms, 200 ms, 400 ms...) and add a random amount to each wait. The randomness spreads clients out so they do not all retry at the same instant.
+- **Circuit breaker**: count recent failures. After a threshold (say 50% of calls failing over one minute), the breaker "opens" and calls fail fast locally without reaching the partner. After a cool-down it lets a few test calls through ("half-open"); if they succeed, normal traffic resumes.
+Backoff handles short, transient errors; the breaker handles sustained failure, which is exactly the second requirement in the question.
+W: Backoff with jitter plus a circuit breaker: backoff and jitter spread out retries so the partner is not hammered, and the circuit breaker stops calling entirely once failures are sustained, then probes for recovery.
+X: A=Fan-out to three copies: sending every request three times triples the load on an API that is already returning 503, which accelerates the outage instead of easing it, and it can also cause duplicate payments.
+C=Immediate retries with a higher limit: this keeps the tight retry loop that is already causing the problem and just makes it last longer; there is still no delay and no point at which calls stop.
+D=Bulkhead that doubles the thread pool: a bulkhead isolates resources so one failing dependency cannot exhaust the whole service, but doubling the pool lets even more concurrent calls hit the failing partner and does nothing to delay or stop them.
+T: Transient errors call for retries with exponential backoff and jitter; sustained failures call for a circuit breaker that stops calling, not for more or faster retries.
+
+@ Q000507 explain
+G: ## How an RDS Multi-AZ DB instance fails over
+A Multi-AZ DB instance deployment keeps a synchronous standby in a second Availability Zone. The standby does not serve traffic; it exists only to take over.
+When the primary fails, RDS promotes the standby automatically, usually within one to two minutes, and points the same DNS endpoint (for example `mydb.abc123.us-east-1.rds.amazonaws.com`) at the new primary. The endpoint name never changes.
+## Where DNS caching breaks this
+RDS publishes the endpoint record with a short TTL so clients pick up the change quickly. If the application or its runtime (a JVM is a common example) caches the resolved IP for an hour, it keeps connecting to the old, dead primary's address long after RDS has finished failing over.
+- Fix: honor the DNS TTL, or set the runtime cache to a small value such as a few tens of seconds.
+- Also make the app reconnect and retry when a connection drops.
+W: RDS fails over and updates the DNS: the endpoint automatically moves to the promoted standby, so the only thing to fix is the application's one-hour DNS cache, which keeps it pointed at the old IP.
+X: A=Promotes a read replica with a new endpoint: that describes manual read replica promotion, not Multi-AZ. Multi-AZ promotes the standby behind the same endpoint name, so nothing needs to be reconfigured.
+B=Standby serves reads: in a Multi-AZ DB instance deployment the standby cannot serve reads at all, and even after failover the app would still be stuck on the stale cached IP.
+D=Restore from a snapshot: Multi-AZ failover is automatic; restoring a snapshot creates a new instance with a new endpoint and loses data written after the snapshot, which is exactly what Multi-AZ is designed to avoid.
+T: Multi-AZ failover keeps the same endpoint name and moves it by DNS, so clients must respect the short TTL instead of caching the IP for a long time.
+
+@ Q000508 explain
+G: ## How Route 53 failover routing decides
+With failover routing you create a primary record and a secondary record. The primary is associated with a health check. Route 53 answers with the primary while that health check is healthy and switches to the secondary only when the health check reports unhealthy.
+So failover is only as good as what the health check actually tests.
+## What a health check can test
+- An HTTP, HTTPS or TCP check against an endpoint, optionally a specific path such as `/health`, and optionally a search string in the response.
+- A calculated health check that combines several others.
+- A CloudWatch alarm state.
+Example: the health check targets a static `/ping` page served by the load balancer or a cache, while the real application behind it is down. The ping keeps returning 200, Route 53 sees "healthy," and it never switches to the secondary Region.
+A good health check exercises a path that depends on the application and its critical dependencies.
+W: Health check did not monitor what was failing: if the check targets an endpoint or path that still responds during the outage, Route 53 considers the primary healthy and never fails over, even though users see errors.
+X: A=Different VPC in the secondary Region: VPCs are Regional, so a secondary Region always uses a different VPC. Route 53 routing does not depend on VPC placement, and this has no effect on whether failover triggers.
+C=More AZs in the primary: the number of Availability Zones in each Region has nothing to do with the health check result that drives failover routing.
+D=TTL too low: a low TTL helps failover because resolvers re-query sooner and pick up the secondary record faster. It would never stop Route 53 from changing its answer in the first place.
+T: Route 53 fails over only when the health check reports unhealthy, so the check must test the path that actually fails, not a shallow endpoint that stays up.
+
+@ Q000509 explain
+G: ## Mutable versus immutable servers
+With **mutable** infrastructure, people log in (for example by SSH) and change running servers. Over time each server gets a slightly different set of patches and settings: this is configuration drift. Nobody can say exactly what is on a given server, and rolling back means undoing changes by hand.
+With **immutable** infrastructure, running servers are never changed. Instead:
+- A pipeline (for example EC2 Image Builder or a CI/CD tool) builds a new AMI from code, applies patches and runs tests.
+- The new AMI version is rolled out by replacing instances, for example through an Auto Scaling group instance refresh or a blue/green deployment.
+- Rollback means redeploying the previous AMI version, which is still known-good and unchanged.
+Every change is therefore in version control, tested before it reaches production, and reversible by switching image versions.
+W: Immutable infrastructure with pipeline-built AMIs: each change produces a new versioned, tested image; instances are replaced rather than patched, so drift cannot build up and rollback is just redeploying the prior AMI.
+X: A=Manual hotfixes in a change log: logging manual changes still leaves each server changed by hand, so drift continues, nothing is tested automatically and rollback depends on someone reversing each step.
+C=Snapshots before every SSH change: snapshots give a restore point but the changes themselves are still manual, untested and unversioned, and restoring a snapshot is a slow, per-server recovery rather than a controlled rollback.
+D=Rolling in-place updates with a config agent: configuration management reduces drift, but servers are still mutated in place, so anything outside the managed configuration can differ and rollback means applying reverse changes rather than switching to a known-good image.
+T: To stop drift and make rollback trivial, replace servers from versioned, tested images instead of changing running servers in place.
+
+@ Q000510 explain
+G: ## How an ALB provides high availability
+An Application Load Balancer is itself deployed into subnets in at least two Availability Zones. It sends requests only to targets that pass health checks.
+High availability comes from the targets, too. If every registered target lives in one AZ, an outage in that AZ removes all capacity even though the load balancer nodes in other AZs are still running.
+## A concrete layout
+- Two or three subnets, each in a different AZ, such as `10.0.1.0/24` in AZ-a and `10.0.2.0/24` in AZ-b.
+- An Auto Scaling group spanning those subnets, registering instances in the ALB target group.
+- If AZ-a fails, health checks mark those targets unhealthy, the ALB routes everything to AZ-b, and the Auto Scaling group launches replacements in the healthy AZ.
+Cross-zone load balancing is on by default for ALBs, so traffic is spread across all healthy targets regardless of which AZ's load balancer node receives the request.
+W: Targets spread across multiple AZs: losing one AZ then removes only part of the capacity, and the ALB keeps routing to the healthy targets in the remaining zones.
+X: A=A single EC2 instance: one instance is a single point of failure; if it or its AZ fails, the ALB has no healthy target and every request fails.
+C=On-premises servers exclusively: an ALB routes to EC2 instances, IP addresses, Lambda functions and containers in AWS. It can reach on-premises servers through IP targets, but using only on-premises targets is not a high-availability design and the premise is false.
+D=A single AZ only: keeping targets in one AZ means an AZ outage takes all capacity with it; the few milliseconds saved inside one zone are not worth losing availability.
+T: High availability behind an ALB means healthy targets in more than one Availability Zone, not a single instance or single zone.
+
+@ Q000511 explain
+G: ## How ALB target health checks work
+Each target group has a health check configuration. The load balancer periodically sends a request to every target and decides whether it is healthy:
+- **Path and port**: for example `GET /health` on the traffic port. It must return a status code in the success range (default `200`).
+- **Interval** (default 30 seconds) and **timeout** (default 5 seconds).
+- **Unhealthy threshold**: how many consecutive failures mark a target unhealthy; **healthy threshold**: how many successes bring it back.
+## Why healthy apps get removed at peak
+Under heavy load the app still serves users, but a health check can fail if:
+- The timeout is shorter than the slowed-down response time.
+- The health path performs an expensive check (such as a deep database query) that times out under load.
+- The unhealthy threshold is so low that one or two slow responses remove the target.
+Removing a target shifts its load onto the rest, which then slow down too: a cascading failure. Tuning a lightweight path, realistic timeout and thresholds usually fixes it.
+W: Target group health check settings: the symptom is targets removed while the app runs, which points directly at a path, timeout, interval or threshold that is too strict or too expensive under load.
+X: B=Route 53 TTL: DNS TTL controls how long resolvers cache the ALB's address; it has no influence on whether the ALB marks individual targets unhealthy.
+C=VPCs per Region quota: this quota affects creating new VPCs, not the health status of targets already registered behind an existing load balancer.
+D=CloudFront cache behavior: CloudFront settings affect what is cached at the edge; they do not change how the ALB evaluates its own targets, and the question involves no CloudFront distribution.
+T: When an ALB removes targets that are actually working, look first at the target group health check path, timeout and thresholds.
+
+@ Q000512 explain
+G: ## Why Lambda plus a relational database struggles during failover
+Each Lambda execution environment opens its own database connection. At scale that means hundreds or thousands of connections. When Aurora fails over, every one of them breaks, and every environment must detect the failure, re-resolve DNS and reconnect at the same moment, so the app returns errors while this storm settles.
+## What RDS Proxy does
+Amazon RDS Proxy sits between the application and the database:
+- It keeps a pool of database connections and shares them across many Lambda invocations, so the database sees far fewer connections.
+- During a failover, clients keep their connections to the proxy. The proxy detects the new writer and routes traffic to it itself, so most clients see a brief pause rather than connection errors (a transaction in flight at the exact moment of failover can still fail and should be retried).
+- It removes the dependency on client-side DNS caching, because the proxy endpoint does not change.
+Example: the Lambda function connects to `my-proxy.proxy-xxxx.us-east-1.rds.amazonaws.com` instead of the cluster endpoint, with credentials in Secrets Manager or IAM authentication.
+W: RDS Proxy between Lambda and Aurora: pooled connections stay open to the proxy, which reconnects to the new writer on its own, so failover produces a short pause instead of a burst of connection errors.
+X: A=More Aurora Replicas in the same AZ: more replicas give more failover targets and read capacity, but clients still lose their connections and reconnect during failover; putting them all in one AZ also weakens availability.
+B=Increase the Lambda timeout: a longer timeout only lets a function wait longer; the connection is still broken by failover and must be re-established, and longer waits increase cost and concurrency pressure.
+C=Aurora Backtrack: Backtrack rewinds the database to an earlier point in time to undo bad writes (and only for Aurora MySQL); it has nothing to do with connection handling during failover.
+D=Disable Multi-AZ: removing the standby does not prevent failures; it turns a 30-second failover into a much longer outage while the instance is recovered.
+T: For many short-lived Lambda connections to Aurora, RDS Proxy pools connections and absorbs failovers; adding replicas or longer timeouts does not stop the connection storm.
+
+@ Q000513 explain
+G: ## What service quotas are
+Every AWS account has quotas (formerly called limits) per Region, such as:
+- **Running On-Demand instances**, measured in vCPUs per instance family group (for example Standard A, C, D, H, I, M, R, T, Z).
+- **Lambda concurrent executions** per Region.
+When a request would exceed a quota, the API call fails: new instances do not launch, or Lambda throttles invocations with `429` errors. On launch day that looks like an outage.
+## Planning for a known spike
+- Open the **Service Quotas** console (or use `RequestServiceQuotaIncrease`) and ask for the higher values now. Some increases are approved quickly, others need review, so three weeks of lead time matters.
+- Create **CloudWatch alarms** on quota utilization (Service Quotas publishes usage metrics for many quotas) so you are warned, for example at 80%, before you hit the ceiling.
+- Remember quotas are per Region, so request increases in every Region you will use.
+W: Request Service Quotas increases now, with usage alarms: raising the vCPU and Lambda concurrency quotas ahead of time removes the ceiling before launch, and alarms give early warning if usage approaches the new limits.
+X: A=Launch in a second Region on the day: quotas are per Region, so the second Region has its own default limits, and moving traffic mid-launch requires data, DNS and deployments that were not prepared.
+B=Delete unused IAM roles: IAM role counts are a separate IAM quota; they have no relationship to EC2 vCPU or Lambda concurrency quotas.
+C=Wait for automatic increases: AWS does not raise these quotas automatically to match a planned spike; requests that exceed them are rejected or throttled until an increase is approved.
+T: Known growth needs quota increases requested in advance plus utilization alarms; quotas are per Region and do not rise on their own.
+
+@ Q000514 explain
+G: ## Durability and availability are different promises
+- **Durability** is about not losing data: the probability that a stored object is still intact after a year. S3 is designed for 99.999999999% (11 nines) durability. For 10,000,000 objects that means expecting to lose one object about once every 10,000 years.
+- **Availability** is about being able to reach the data right now: the percentage of time requests succeed. An object can be perfectly durable yet temporarily unreachable during a service disruption.
+## The numbers for S3 storage classes
+- S3 Standard: 11 nines durability, designed for 99.99% availability (the SLA commitment is lower, 99.9%).
+- S3 Standard-IA: 11 nines durability, designed for 99.9% availability.
+- S3 One Zone-IA: 11 nines durability within a single AZ, designed for 99.5% availability, and data is lost if that AZ is destroyed.
+So "11 nines" is about keeping data, not about always being able to access it.
+W: 11 nines is durability, availability is 99.99%: S3 Standard is designed to almost never lose an object, while its availability design target is 99.99%, which still allows short periods when requests can fail.
+X: A=11 nines only for One Zone-IA: every S3 storage class is designed for 11 nines of durability; One Zone-IA is actually the class with the extra risk because it keeps data in one AZ.
+B=99.9% durability and 11 nines availability: this swaps the two figures. Durability is 11 nines; no S3 class is designed for 11 nines of availability.
+D=11 nines covers both: availability for S3 Standard is designed at 99.99%, not 11 nines, so the claim that data is always accessible is exactly the misconception the engineer is correcting.
+T: S3's 11 nines is durability (data is not lost); availability (data is reachable) is a separate, lower figure, 99.99% by design for S3 Standard.
+
+@ Q000515 explain
+G: ## What S3 replication does
+S3 Replication copies objects from a source bucket to a destination bucket automatically and asynchronously.
+- **Cross-Region Replication (CRR)**: the destination bucket is in a different AWS Region, which protects against the loss of a whole Region.
+- **Same-Region Replication (SRR)**: the destination is in the same Region, used for things like log aggregation or separate accounts.
+## Setting it up
+- Enable **versioning** on both the source and destination buckets; replication requires it.
+- Create a replication rule on the source bucket, optionally filtered by prefix or tag, with an IAM role S3 can use to write to the destination.
+- Choose options such as a different storage class for the replicas, replicating to another account, or Replication Time Control for a predictable replication time.
+New objects are replicated after the rule exists. Objects that were already in the bucket are not copied by the rule itself; S3 Batch Replication handles those.
+W: S3 Cross-Region Replication: it automatically copies each new object to a bucket in another Region, so a copy survives even if the source Region becomes unavailable.
+X: A=S3 Object Lock: Object Lock provides write-once-read-many protection so objects cannot be deleted or overwritten, but it keeps them in the same bucket and Region, so it does not survive a Regional disaster.
+B=S3 Intelligent-Tiering: this storage class moves objects between access tiers to save cost based on usage; it never creates a copy in another Region.
+D=S3 Transfer Acceleration: Transfer Acceleration speeds up uploads and downloads over long distances through edge locations; it changes the network path, not where copies of data are stored.
+T: For an automatic copy of new objects in another Region, use Cross-Region Replication (with versioning on both buckets); Object Lock protects against deletion, not Regional loss.
+
+@ Q000516 explain
+G: ## Logs versus traces
+Logs and metrics tell you what happened inside one component. In a distributed request that crosses API Gateway, Lambda and DynamoDB, you also need to know how long each hop took for one specific request. That is **distributed tracing**.
+## How AWS X-Ray works
+- Each request gets a **trace ID** that is passed along from service to service.
+- Each component records a **segment** (and **subsegments** for downstream calls, such as a DynamoDB `GetItem`) with timing, status and errors.
+- X-Ray assembles these into a trace timeline and a **service map** showing each component with its latency and error rates.
+Example: a slow request's trace shows 20 ms in API Gateway, 40 ms in Lambda code, and 900 ms in a DynamoDB call, so the latency clearly comes from the database call.
+Setup: enable tracing on the API Gateway stage and active tracing on the Lambda function, and instrument the function's AWS SDK calls to capture DynamoDB subsegments. AWS now points new instrumentation to OpenTelemetry (AWS Distro for OpenTelemetry); the X-Ray SDKs are the older option.
+W: AWS X-Ray: it follows each request across API Gateway, Lambda and DynamoDB with a single trace ID and shows per-component timing, so intermittent slow calls can be pinned to the component that causes them.
+X: B=AWS Config: Config records resource configuration changes and evaluates compliance rules; it has no visibility into individual requests or their latency.
+C=Amazon Inspector: Inspector scans workloads such as EC2 instances, container images and Lambda functions for software vulnerabilities and network exposure; it does not measure request performance.
+D=CloudWatch Logs alone: each service writes its own logs, but without a shared trace ID and timing segments you must correlate entries by hand and cannot easily see where one request spent its time.
+T: To find which hop of a distributed request is slow, use tracing (X-Ray) that follows one request end-to-end; logs, Config and Inspector answer different questions.
+
+@ Q000517 explain
+G: ## Single point of failure in the data tier
+A single point of failure is any component whose loss takes down the whole system. Here the web tier survives an AZ loss, but one RDS instance in one AZ does not: if that instance or its AZ fails, the application has no database.
+## What Multi-AZ adds
+With a Multi-AZ deployment, RDS keeps a standby copy in a different Availability Zone and replicates writes to it synchronously.
+- If the primary instance, its storage or its AZ fails, RDS automatically promotes the standby.
+- The DB endpoint name stays the same; RDS updates DNS to point to the new primary, typically within a couple of minutes.
+- Maintenance such as OS patching can be applied to the standby first to reduce downtime.
+Example: the primary runs in `us-east-1a` and the standby in `us-east-1b`. An outage in `us-east-1a` triggers failover, and the application reconnects to the same endpoint, now served from `us-east-1b`.
+W: Enable Multi-AZ: it adds a synchronous standby in a second AZ with automatic failover behind the same endpoint, which directly removes the single-instance, single-AZ failure point.
+X: A=Larger instance class in the same AZ: more CPU and memory improve performance, but it is still one instance in one AZ, so its failure still stops the application.
+B=Increase allocated storage: more storage prevents running out of space but adds no second copy of the database and no failover.
+C=Read replicas in the same AZ: replicas use asynchronous replication, need promotion to become writable, and placing them in the same AZ as the primary leaves them exposed to the same AZ failure.
+T: To remove a single-AZ database as a point of failure, add a Multi-AZ standby with automatic failover, not a bigger instance or same-AZ replicas.
+
+@ Q000518 explain
+G: ## Choosing an EBS volume type
+EBS volume types fall into two groups:
+- **SSD-backed** (`gp3`, `io2 Block Express`, `io1`) for random, small I/O such as databases, measured mainly in IOPS.
+- **HDD-backed** (`st1`, `sc1`) for large sequential reads and writes such as logs or data warehouses, measured in MiB/s, with low IOPS.
+## What makes io2 Block Express different
+- **Durability**: io2 volumes are designed for 99.999% durability (an annual failure rate around 0.001%), compared with 99.8%-99.9% for gp3.
+- **Performance**: io2 Block Express supports far more than 64,000 provisioned IOPS per volume with consistent sub-millisecond latency, which is why it is aimed at large, critical databases such as SAP HANA, Oracle or SQL Server.
+- **Provisioned IOPS**: you set the IOPS you need, and the volume delivers it consistently.
+Example: a 2 TiB io2 Block Express volume provisioned with 64,000 IOPS gives the database steady performance and the durability figure the requirement asks for.
+W: io2 Block Express: it is the only option listed that meets the 99.999% durability requirement, and it delivers 64,000 sustained IOPS with sub-millisecond latency.
+X: B=gp3: gp3 is a general-purpose SSD whose durability is designed at 99.8%-99.9%, so it fails the 99.999% durability requirement for this critical database.
+C=sc1: Cold HDD is the cheapest type for infrequently accessed sequential data, with very low IOPS and high latency; it cannot come close to 64,000 IOPS.
+D=st1: Throughput Optimized HDD is built for large sequential throughput, not the small random I/O of a relational database, and its IOPS and latency are far from the requirement.
+T: When a requirement combines very high sustained IOPS, sub-millisecond latency and 99.999% durability, choose io2 Block Express; gp3's durability is lower and HDD types lack the IOPS.
+
+@ Q000519 explain
+G: ## Matching storage classes to access patterns
+- **S3 Standard**: highest storage price, no retrieval fee, millisecond access. Best while data is read often.
+- **S3 Standard-IA**: lower storage price, a per-GB retrieval fee, a 30-day minimum storage charge and a 128 KB minimum billable object size. Still millisecond access and stored across multiple AZs.
+- **S3 Glacier Flexible Retrieval**: much cheaper storage, but retrieval takes minutes to hours.
+## Why a lifecycle rule fits here
+The reports are read several times in the first 30 days (Standard is cheapest when reads are frequent) and rarely afterwards (Standard-IA is cheaper when reads are rare). A lifecycle rule automates the move:
+- Rule: transition objects to `STANDARD_IA` 30 days after creation.
+- 50 MB objects are far above the 128 KB minimum, so the small-object penalty does not apply.
+- A rare read still returns in milliseconds; you just pay a small retrieval fee for that read.
+W: Standard for 30 days, then Standard-IA: frequent early reads avoid retrieval fees in Standard, and later the lower Standard-IA storage price applies while keeping millisecond access.
+X: A=One Zone-IA from day one: the frequent reads in the first month would incur retrieval fees on every access, and storing reports in one AZ means they can be lost if that AZ is destroyed.
+B=Glacier Flexible Retrieval after 30 days: retrievals take minutes to hours, which breaks the requirement that reports open in milliseconds.
+C=Standard for the full period: access stays fast, but you keep paying the higher Standard storage price for months of data that is almost never read.
+T: Use lifecycle rules to move data from Standard to Standard-IA once reads become rare; Glacier Flexible Retrieval is cheaper but cannot open files in milliseconds.
+
+@ Q000520 explain
+G: ## The AWS Storage Gateway types
+Storage Gateway is a VM or appliance on premises that connects local applications to AWS storage. Each type presents a different interface:
+- **S3 File Gateway**: NFS or SMB file shares; each file becomes an S3 object.
+- **Volume Gateway**: iSCSI block volumes that servers mount as disks.
+- **Tape Gateway**: an iSCSI virtual tape library for existing backup software.
+## Cached versus stored volumes
+- **Cached volumes**: the primary copy of all data is in AWS (held in S3), and only frequently accessed data is cached on the local gateway disks. This lets you extend capacity beyond what you have on premises.
+- **Stored volumes**: the full data set stays on premises, and it is backed up asynchronously to AWS as snapshots.
+Example: a 20 TiB volume with a 2 TiB local cache; hot blocks are served locally with low latency, everything else is fetched from AWS on demand.
+W: Volume Gateway (cached): it presents iSCSI block volumes to on-premises servers, keeps the full data set durably in AWS, and caches only the frequently accessed data locally for low latency.
+X: A=File Gateway: File Gateway presents NFS or SMB file shares, not iSCSI block devices, so applications that expect a block volume cannot use it.
+C=Tape Gateway: although it uses iSCSI, it exposes virtual tape drives and a tape library for backup software, not a general-purpose block volume for live applications.
+D=DataSync scheduled tasks: DataSync copies data between locations on a schedule; it provides no local cache and no iSCSI device that applications can read and write directly.
+T: iSCSI block storage with the full data set in AWS and hot data cached locally is Volume Gateway in cached mode; stored mode keeps all data on premises instead.
+
+@ Q000521 explain
+G: ## EBS volumes are normally single-attach
+By default an EBS volume is attached to one EC2 instance at a time. Some clustered applications need several nodes writing to the same block device at once.
+## How EBS Multi-Attach works
+- Supported on Provisioned IOPS SSD volumes (`io1` and `io2`).
+- One volume can be attached to up to 16 Nitro-based instances, all in the **same Availability Zone** as the volume.
+- Every attached instance gets full read and write access.
+## The key constraint
+EBS does not coordinate writes between instances. Standard file systems such as `ext4` or `XFS` assume a single owner and will corrupt data if several hosts mount them read-write at once. You must use a **cluster-aware file system** or an application that manages concurrent access itself, such as a clustered database using I/O fencing.
+Example: a two-node failover cluster uses a shared io2 volume with a cluster file system so both nodes can safely access it.
+W: EBS Multi-Attach with a cluster-aware file system: io1/io2 volumes can be attached to multiple instances in one AZ, but the architect must use a file system or application that coordinates concurrent writes to avoid corruption.
+X: A=EBS snapshots: snapshots are point-in-time backups stored separately; they do not let multiple instances access the same live volume, and detaching and reattaching is not concurrent access.
+B=Elastic Volumes: Elastic Volumes changes a volume's size, type or performance without detaching it; it does not add multi-instance access, and EBS never prevents write conflicts on its own.
+C=EFS mount targets in different AZs: EFS is a shared file system (NFS), not block storage, and the requirement is instances in the same AZ sharing one block volume.
+T: Multi-Attach lets io1/io2 volumes be shared by instances in one AZ, but only a cluster-aware file system or application keeps concurrent writes safe.
+
+@ Q000522 explain
+G: ## Why distant uploads are slow
+An upload from Asia or Australia to a bucket in `us-east-1` crosses the public internet over long distances. Every lost packet or congested link slows the TCP connection, and a single stream of a multi-gigabyte file suffers the most.
+## S3 Transfer Acceleration
+Transfer Acceleration lets clients upload to the nearest AWS edge location, which then carries the data over the AWS global network to the bucket.
+- Enable it on the bucket and upload to the `bucketname.s3-accelerate.amazonaws.com` endpoint.
+- The bucket stays in `us-east-1`; only the network path changes.
+## Multipart upload
+A single `PUT` can upload at most 5 GB, so 5-20 GB videos must use multipart upload anyway. The file is split into parts (for example 100 MB each) that upload in parallel; a failed part is retried alone instead of restarting the whole file.
+Together: parallel parts, each traveling a shorter distance over the public internet.
+W: Transfer Acceleration plus multipart upload: acceleration routes each upload through the nearest edge location onto the AWS backbone, and multipart upload sends parts in parallel and retries only failed parts, all without moving the bucket.
+X: A=One Zone-IA storage class: the storage class affects cost and resilience after the data arrives; it does nothing for network speed from distant users.
+B=Versioning and Cross-Region Replication: CRR copies objects after they are written to the source bucket, so users still upload to `us-east-1` over the same slow path.
+D=Larger EC2 instance: the question describes users uploading directly to S3, so no instance sits in the upload path; a bigger instance cannot shorten the distance between users and the bucket.
+T: For large uploads from far away without moving the bucket, use Transfer Acceleration for the network path and multipart upload for parallelism and resilience.
+
+@ Q000523 explain
+G: ## Two separate EFS settings
+Amazon EFS has two independent choices that are easy to confuse:
+- **Performance mode**: `General Purpose` or `Max I/O`. It is chosen at creation time.
+- **Throughput mode**: `Elastic`, `Provisioned` or `Bursting`. It controls how much throughput the file system can drive and can be changed later.
+## General Purpose versus Max I/O
+- **General Purpose** has the lowest per-operation latency and suits most workloads, such as web serving, content management and home directories. AWS recommends it for most use cases.
+- **Max I/O** is designed for highly parallelized workloads with many clients that can tolerate higher latency for each operation. It is not available for One Zone file systems or with Elastic throughput.
+The question's explicit trade-off (maximum parallel scaling, higher per-operation latency acceptable) is the classic signal for Max I/O.
+Example: hundreds of EC2 instances in a big data job all reading and writing the same data set, where total operations matter more than the latency of each one.
+W: Max I/O: it is the performance mode designed for highly parallelized access from many instances that can accept higher per-operation latency, which is exactly the trade-off the question describes.
+X: A=General Purpose: it gives the lowest latency, but the workload explicitly accepts higher latency in exchange for maximum aggregate scaling, which is the purpose of Max I/O.
+B=Provisioned Throughput with General Purpose: Provisioned Throughput fixes throughput in MiB/s but is a throughput mode, not a performance mode; it keeps General Purpose's latency-oriented design rather than the parallel scaling asked for.
+C=Bursting Throughput: this is also a throughput mode, where throughput scales with stored data and burst credits; it is not a performance mode choice and does not target maximum operations per second.
+T: Performance mode (General Purpose or Max I/O) is separate from throughput mode; when many clients need maximum parallel operations and can accept more latency, pick Max I/O.
+
+@ Q000524 explain
+G: ## Elastic Volumes
+Elastic Volumes lets you change an attached EBS volume's **size**, **type**, **provisioned IOPS** (gp3, io1, io2) and **throughput** (gp3) while the instance keeps running.
+- The change is made with the console or `ModifyVolume`; the volume stays in use while it moves through the `optimizing` state.
+- AWS limits how often the same volume can be modified, so plan the target size and performance as one change.
+## Why gp2 to gp3
+- gp2 ties baseline performance to size: 3 IOPS per GiB, so 500 GiB gives a 1,500 IOPS baseline. The only way to raise that baseline is to buy more storage.
+- gp3 starts at 3,000 IOPS and 125 MiB/s regardless of size, and you can provision more IOPS and throughput independently, often at a lower price per GiB than gp2.
+## The step people forget
+Growing the volume does not grow the file system on it. After the resize, extend the partition and file system from inside the OS, for example `growpart` then `resize2fs` (ext4) or `xfs_growfs` (XFS) on Linux.
+W: Elastic Volumes to gp3, then extend the file system: a live modification adds space and raises IOPS independently of size without downtime, and extending the file system makes the new space usable.
+X: A=Multi-Attach and a second volume: Multi-Attach shares one io1/io2 volume among instances; it is not available for gp2 and does not add IOPS or space to the existing database volume.
+C=Detach, snapshot and restore: detaching the database's volume takes the database offline, which violates the no-downtime requirement, and restored volumes also start with slower first reads while blocks are loaded.
+D=Data Lifecycle Manager on a schedule: DLM automates snapshot and AMI creation and retention; it does not resize or change the type of volumes.
+T: EBS volumes can be resized and retyped online with Elastic Volumes; moving from gp2 to gp3 decouples IOPS from size, and you still extend the file system afterwards.
+
+@ Q000525 explain
+G: ## Reading the symptoms
+`VolumeQueueLength` counts I/O requests waiting for the volume. A queue that stays high while the application shows I/O wait means the workload is asking for more IOPS or throughput than the volume delivers. Here the gp3 volume runs at its default baseline of 3,000 IOPS and 125 MiB/s.
+## gp3 performance is provisioned separately
+With gp3 you pay for size, IOPS and throughput independently. The baseline is included in the price, and you can provision more IOPS and throughput on the same volume without changing its size.
+## Elastic Volumes applies the change live
+- Run `ModifyVolume` (or use the console) to raise, for example, IOPS to 10,000 and throughput to 500 MiB/s.
+- The volume stays attached and in use while it is in the `optimizing` state; performance rises gradually during that period.
+- Watch `VolumeQueueLength` and I/O wait fall. AWS limits how often the same volume can be modified, so size the increase with some headroom rather than in small steps.
+W: Raise gp3 IOPS and throughput with Elastic Volumes: the bottleneck is the volume's provisioned performance, and gp3 lets you increase it on the attached volume with no downtime or data movement.
+X: B=S3 Transfer Acceleration: it speeds up transfers to S3 over long distances and has no effect on the I/O performance of an attached EBS volume.
+C=Detach and reattach to a larger instance: detaching the volume means downtime, and a larger instance does not raise the volume's provisioned 3,000 IOPS and 125 MiB/s, which is the real limit.
+D=Snapshot, restore to io2 and swap: the swap requires stopping I/O and remounting, which the application cannot tolerate, and a restored volume can start with slower reads while its blocks load from S3.
+T: When a gp3 volume is saturated, raise its IOPS and throughput in place with Elastic Volumes rather than swapping volumes or instances.
+
+@ Q000526 explain
+G: ## What AWS Batch is for
+AWS Batch runs large numbers of batch computing jobs without you managing a scheduler or cluster.
+- **Jobs** are defined as container images plus the resources they need, such as vCPUs, memory and GPUs.
+- **Job queues** hold submitted jobs with priorities.
+- **Compute environments** are pools of EC2 (On-Demand or Spot), Fargate or EKS capacity that Batch scales up when jobs are waiting and back down to zero when idle.
+## Why it fits transcoding
+- Thousands of files become thousands of jobs, or an **array job** with one child job per file.
+- Jobs can run for hours; there is no short execution limit.
+- A compute environment can use GPU instance types, and jobs request GPUs explicitly.
+Example: a nightly EventBridge schedule submits an array job of 5,000 transcodes; Batch launches GPU Spot instances, runs the jobs, retries failures and scales back to zero when done.
+W: AWS Batch: it queues thousands of long-running jobs, provisions GPU instances on demand, retries failures and scales to zero afterwards, which matches a nightly multi-hour GPU transcoding workload.
+X: A=Amazon API Gateway: API Gateway is a front door for HTTP and WebSocket APIs with short request timeouts; it does not schedule or run hours-long compute jobs.
+B=Step Functions alone: Step Functions coordinates workflow steps but needs a compute service to do the actual work; on its own it cannot transcode anything or provide GPUs.
+D=AWS Lambda: Lambda functions run for at most 15 minutes and have no GPU support, so multi-hour GPU transcoding does not fit.
+T: Long-running, GPU-heavy batch jobs at scale belong on AWS Batch; Lambda is limited to 15 minutes without GPUs, and Step Functions only orchestrates.
+
+@ Q000527 explain
+G: ## EC2 instance families by purpose
+The letter at the start of an instance type names its family, and each family has a different balance of CPU, memory, storage and network:
+- **M** (general purpose): balanced CPU and memory.
+- **C** (compute optimized): more CPU per GiB of memory, for CPU-bound work such as encoding or high-performance web serving.
+- **R** and **X** (memory optimized): a high ratio of memory to vCPU, for in-memory databases, caches and large in-memory analytics.
+- **I** (storage optimized): fast local NVMe instance storage for very high random I/O.
+- **T** (burstable): a low baseline CPU with credits for short bursts.
+Example: `r7g.8xlarge` has 32 vCPUs and 256 GiB of memory, 8 GiB per vCPU, while a `c7g.8xlarge` of the same vCPU count has only 64 GiB.
+For an in-memory genomics job with moderate CPU needs, the R family is the natural starting point; X instances are the next step if even more memory per vCPU is needed.
+W: R-family (memory optimized): it gives the most RAM per vCPU among the choices, so the whole data set fits in memory without paying for CPU the workload does not need.
+X: B=I-family: storage optimized instances are built around fast local NVMe disks for high I/O; the requirement is holding data in RAM, not local disk performance.
+C=C-family: compute optimized instances offer more CPU relative to memory, the opposite of a workload that needs lots of RAM and only moderate CPU.
+D=T-family: burstable instances are small, general purpose and sized for low average CPU; they do not provide the very large memory a big in-memory data set needs.
+T: When the data set must fit entirely in RAM and CPU needs are moderate, start with memory optimized R instances, not compute, storage or burstable families.
+
+@ Q000528 explain
+G: ## How target tracking uses the metric
+A target tracking policy keeps a metric, such as average CPU at 50%, near its target. When the metric is above the target it adds instances; when below, it removes them.
+## What instance warm-up does
+A new instance is not useful right away: it boots, runs start-up scripts, loads caches and often shows a CPU spike while doing so. The **instance warm-up** (or the group's default instance warm-up) tells Auto Scaling how long to wait before counting a new instance's metrics in the group's aggregated metric.
+## Why a short warm-up causes oscillation
+- If warm-up is too short, a new instance's start-up CPU spike is counted while it is not yet serving traffic, so average CPU still looks high and Auto Scaling adds even more instances.
+- Once all the new instances settle, average CPU drops well below the target, and the group scales back in.
+- The cycle repeats every few minutes.
+Setting the warm-up to roughly the real time an instance needs to become ready, for example 300 seconds, stops this.
+W: Warm-up too short, lengthen it: new instances' start-up metrics are counted too early, skewing the average and driving extra scale-out followed by scale-in, and a realistic warm-up breaks that cycle.
+X: B=Invalid AMI in the launch template: instances would fail to launch at all, so scaling activities would fail and no new instances would come into service; that is not a group that scales out successfully and then back in.
+C=Track network utilization instead: nothing indicates the workload is network-bound, and switching metrics does not fix the timing problem of counting new instances before they are ready.
+D=Maximum size too low: hitting the maximum simply stops further scale-out and the group stays at its cap; it does not produce repeated scale-in right after each scale-out.
+T: Scale-out followed by immediate scale-in usually means new instances are counted before they are ready, so fix the instance warm-up rather than the metric or group limits.
+
+@ Q000529 explain
+G: ## Paying only while the job runs
+A Spark job that runs 3 hours per night leaves a cluster idle 21 hours a day if it runs permanently. Two EMR options avoid that:
+- **Transient EMR cluster**: a scheduler (for example Step Functions or EventBridge) launches a cluster, submits the Spark step and sets the cluster to terminate automatically when the steps finish. Data lives in S3, so nothing is lost when the cluster goes away.
+- **EMR Serverless**: you submit the Spark job to an application, and EMR Serverless provisions workers for the run and releases them afterwards, billing for the resources used during the job.
+## Spot for task nodes
+On an EMR cluster, core nodes run HDFS and task nodes only run compute. Task nodes can safely use **Spot Instances** at a large discount: if a Spot node is reclaimed, Spark reruns its tasks on other nodes. Keeping the primary and core nodes On-Demand protects the cluster itself.
+W: Transient EMR (or EMR Serverless) with Spot task nodes: compute exists only during the nightly run, Spark reads the 300 TB directly from S3, and on a transient EMR cluster Spot capacity for task nodes cuts the compute price further.
+X: A=AWS Batch with custom Spark: Batch runs independent containerized jobs, but a distributed Spark job needs coordinated drivers and executors across nodes; building that yourself adds work that EMR already provides.
+B=Redshift loading 300 TB nightly: copying 300 TB into a data warehouse each night is slow and costly, and it replaces a Spark job with SQL rather than running the existing processing more cheaply.
+C=Permanently running EMR cluster: it works, but the cluster is idle about 21 hours a day, which is exactly the cost the team wants to eliminate.
+T: For a periodic Spark job over data in S3, run EMR only while the job runs (transient cluster or EMR Serverless) and use Spot for task nodes.
+
+@ Q000530 explain
+G: ## How the SQS visibility timeout works
+When a consumer receives a message from an SQS queue, the message is not deleted. It becomes invisible to other consumers for the **visibility timeout** (default 30 seconds). If the consumer deletes the message before the timeout ends, processing is complete. If not, the message becomes visible again and another consumer can receive it.
+## When processing time is unpredictable
+If an image sometimes takes longer than the timeout, the message reappears while the first worker is still working on it, and a second worker processes it again.
+The fix is a **heartbeat**:
+- The worker starts processing and, for example every 60 seconds, calls `ChangeMessageVisibility` with its receipt handle to push the timeout further out.
+- When finished, the worker calls `DeleteMessage`.
+- If the worker crashes, the heartbeats stop and the message becomes visible again for another worker, which is the retry you want.
+A message's visibility timeout can be extended up to 12 hours from when it was first received.
+W: Extend the timeout with ChangeMessageVisibility: the worker keeps the message hidden while it is still working on it, so no other worker receives it, while a crashed worker's message still becomes visible again.
+X: B=Switch to SNS: SNS pushes each message to subscribers and does not hold work items for workers to claim and acknowledge, so it loses the queue-based retry and load leveling this design relies on.
+C=Visibility timeout of 0: the message becomes visible to other consumers immediately after being received, making duplicate processing far worse.
+D=Add more consumers: more workers poll the queue more often, so a message that reappears after its timeout is picked up even sooner; it does not stop the reappearance.
+T: For work of unpredictable duration, the worker should extend the message's visibility timeout while processing (a heartbeat), not lower it or add more consumers.

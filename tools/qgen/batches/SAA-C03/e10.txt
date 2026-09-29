@@ -1,0 +1,383 @@
+# SAA-C03 detailed explanations, e10 (explanation-only rewrites; letters are the published ones)
+
+@ Q003194 explain
+G: ## Why Lambda exhausts database connections
+Every Lambda execution environment runs its own copy of your code, so each one opens its own database connection. When traffic bursts, Lambda can start hundreds of environments in seconds, and a relational database such as RDS for MySQL has a fixed `max_connections` limit based on instance memory and settings. Once the limit is reached, new connections are refused and the application fails.
+## How RDS Proxy helps
+Amazon RDS Proxy is a fully managed database proxy that sits between the application and an RDS or Aurora database.
+- It keeps a **pool** of connections open to the database and lets many client connections share them (multiplexing).
+- Lambda functions connect to the proxy endpoint instead of the database endpoint; the proxy absorbs the burst.
+- It can read database credentials from AWS Secrets Manager and supports IAM authentication.
+- During a Multi-AZ failover it keeps client connections open and redirects them, which shortens the outage seen by the app.
+Example: 500 concurrent Lambda environments connect to the proxy, which serves them over a much smaller set of database connections.
+W: Amazon RDS Proxy: it pools and reuses database connections, so bursts of Lambda invocations no longer open one database connection each and the connection limit is not exhausted.
+X: A=Amazon SQS FIFO: a queue can buffer work so fewer functions run at once, but it is not a connection manager, and FIFO ordering adds throughput limits without pooling any connections to the database.
+B=Amazon Route 53: it is a DNS service that resolves names to endpoints; it has no visibility into database sessions and cannot share or limit connections.
+C=Amazon CloudFront: a CDN caches HTTP responses at edge locations; Lambda-to-database connections are made from inside AWS and never pass through CloudFront.
+T: When many short-lived Lambda functions overwhelm a relational database's connection limit, put RDS Proxy in front of it to pool connections, rather than a queue, DNS or a CDN.
+
+@ Q003195 explain
+G: ## Amazon DynamoDB in one paragraph
+DynamoDB is a fully managed, serverless NoSQL database for key-value and document data. Each item is found by its **partition key** (optionally plus a sort key), and DynamoDB spreads partitions across many servers, so reads and writes by key stay in the single-digit millisecond range whether the table holds a few items or many terabytes.
+## Why it suits games
+- **Flexible schema**: only the key attributes are fixed; one player item can have `inventory` and another can have `guild` without a schema migration.
+- **Scale**: on-demand capacity mode absorbs sudden player spikes without capacity planning; provisioned mode suits steady traffic.
+- **Extras**: DynamoDB Accelerator (DAX) adds microsecond cached reads, and global tables replicate data to several Regions for players worldwide.
+Example: a global secondary index with `GameId` as the partition key and `Score` as the sort key returns a game's top players with one query.
+W: Amazon DynamoDB: it delivers consistent single-digit millisecond latency at virtually any scale and stores schemaless items, which matches the gaming requirements.
+X: A=Amazon Redshift: it is a columnar data warehouse built for complex analytical queries over large datasets, not for millisecond lookups of individual player records, and it uses fixed table schemas.
+C=Amazon RDS for MySQL: it is a relational database with a fixed schema that mainly scales up by resizing one writer instance, so it cannot promise consistent latency at any scale the way DynamoDB can.
+D=Amazon Athena: it runs ad hoc SQL over files in S3; queries take seconds and it is not an operational database that an application writes game state to.
+T: For key-based access with single-digit millisecond latency at any scale and a flexible schema, choose DynamoDB; relational and analytics services fit other patterns.
+
+@ Q003196 explain
+G: ## What a content delivery network does
+Amazon CloudFront is AWS's content delivery network (CDN). It runs hundreds of edge locations around the world; users are routed to a nearby edge instead of travelling all the way to your origin (an S3 bucket, a load balancer, EC2 or any HTTP server).
+## Static and dynamic content
+- **Static content** such as images, CSS and videos is cached at the edge, so repeat requests are answered without reaching the origin.
+- **Dynamic content** such as personalised API responses cannot be cached, but CloudFront still speeds it up: TLS is terminated close to the user, connections to the origin are kept open and reused, and traffic between edge and origin rides the AWS global network.
+- Cache behaviors let you set different caching rules per path, for example cache `/static/*` for a day and forward `/api/*` without caching.
+Example: a user in Sydney loading a site hosted in `us-east-1` gets images from a Sydney edge and API calls over an already open, optimised connection.
+W: Amazon CloudFront: it caches static content at edge locations near users and accelerates dynamic requests over optimised connections to the origin, cutting latency for a global audience.
+X: A=AWS Site-to-Site VPN: it creates encrypted IPsec tunnels between an on-premises network and a VPC; public end users on the internet do not use it and it adds no caching or edge presence.
+B=AWS Direct Connect: it is a dedicated private link from a data centre to AWS, useful for corporate network traffic, but it does nothing for anonymous users browsing from around the world.
+C=Amazon VPC peering: it privately connects two VPCs so their resources can talk; it is internal networking and does not bring content closer to end users.
+T: To lower latency for global users of both static and dynamic content, use CloudFront edge locations; VPN, Direct Connect and peering only connect private networks.
+
+@ Q003197 explain
+G: ## How AWS Global Accelerator works
+Global Accelerator gives an application two **static anycast IP addresses** that are announced from AWS edge locations worldwide. A player's packets enter the AWS network at the nearest edge and then travel over the AWS backbone to an endpoint group in a Region.
+- It supports both **TCP and UDP** listeners, so real-time game traffic works.
+- Endpoints can be Network Load Balancers, Application Load Balancers, EC2 instances or Elastic IP addresses in several Regions.
+- It continuously health-checks endpoints and shifts traffic away from an unhealthy Region without any DNS change, because the IPs never change.
+## Why static IPs matter
+Game clients, firewalls and partners can allow-list two fixed IPs once. Failover happens behind those IPs, so clients are not affected by DNS caching.
+Example: players in Europe enter at a Frankfurt edge and reach `eu-central-1`; if that Region fails, the same IPs now lead to `eu-west-1`.
+W: AWS Global Accelerator: it provides static anycast IPs, supports UDP, and routes each user over the AWS network to the closest healthy regional endpoint with fast health-based failover.
+X: B=Application Load Balancer: it handles only HTTP, HTTPS and gRPC at layer 7, does not support UDP, has no static IP addresses and lives in a single Region.
+C=Amazon Route 53 simple: simple routing returns the same record set without health checks, and any DNS-based failover is still delayed by client DNS caching and does not provide static IPs.
+D=Amazon CloudFront: it serves HTTP and HTTPS (including WebSocket) content; it does not proxy arbitrary UDP game traffic.
+T: Non-HTTP (UDP) traffic that needs static IPs and fast failover to the nearest healthy Region points to Global Accelerator, not CloudFront or DNS routing.
+
+@ Q003198 explain
+G: ## The Elastic Load Balancing family
+- **Application Load Balancer (ALB)**: layer 7, understands HTTP, routes by path, host or header.
+- **Network Load Balancer (NLB)**: layer 4, forwards TCP, UDP and TLS connections without reading the payload.
+- **Gateway Load Balancer (GWLB)**: layer 3, sends packets through fleets of security appliances.
+- **Classic Load Balancer (CLB)**: the previous generation, kept only for existing legacy workloads.
+## What makes NLB different
+Because NLB does not inspect application content, it can handle millions of requests per second with very low latency and scale for sudden spikes. It gives the load balancer **one static IP address per Availability Zone**, and you can assign your own Elastic IP to each AZ. It can also preserve the client source IP.
+Example: a trading gateway whose partners allow-list IPs gets an NLB with an Elastic IP in each of three AZs, and partners only ever see those three addresses.
+W: Network Load Balancer: it works at layer 4 for TCP, is built for millions of connections per second at ultra-low latency, and provides a static (or Elastic) IP address in each AZ.
+X: A=Application Load Balancer: it processes HTTP at layer 7, which adds latency, and its IP addresses change as it scales, so it cannot offer a static IP per AZ.
+B=Gateway Load Balancer: it is designed to insert third-party firewalls and inspection appliances using GENEVE encapsulation, not to front an application's TCP clients.
+D=Classic Load Balancer: it is a legacy load balancer with lower performance and no static IP addresses; AWS recommends migrating off it.
+T: Extreme TCP performance plus fixed per-AZ IP addresses means NLB; ALB is for HTTP-aware routing and GWLB is for appliances.
+
+@ Q003199 explain
+G: ## Layer 7 routing with ALB listener rules
+An Application Load Balancer reads each HTTP request, so its listener rules can make decisions based on the content of the request:
+- **path-pattern**, such as `/api/*` or `/images/*`
+- **host-header**, such as `shop.example.com`
+- HTTP headers, HTTP method, query strings and source IP
+Each rule forwards matching requests to a **target group**, which can hold EC2 instances, IP addresses (for example ECS tasks) or Lambda functions. Rules are evaluated in priority order, with a default action for anything that does not match.
+Example: one ALB with a rule `/api/*` forwarding to the API service's target group and `/images/*` forwarding to the image service, all behind a single DNS name.
+This is a common way to put several microservices behind one entry point.
+W: Application Load Balancer with path-based rules: it inspects the URL path of every HTTP request and forwards `/api` and `/images` to different target groups, which is exactly what is needed.
+X: B=Gateway Load Balancer with GENEVE tunnels: it passes packets transparently through inspection appliances at layer 3 and never looks at HTTP paths.
+C=Route 53 weighted records for each service: DNS only sees the hostname being resolved, never the URL path, and weights split traffic by percentage rather than by request content.
+D=Network Load Balancer with TCP listeners: it forwards connections at layer 4 without parsing HTTP, so it cannot route by path.
+T: Any routing decision that depends on the URL path, host or header requires a layer 7 load balancer, which on AWS is the ALB.
+
+@ Q003200 explain
+G: ## Streaming data versus stored data
+Clickstream events arrive continuously from many producers and are most valuable within seconds. A streaming service stores them as an ordered, replayable log that several consumers can read in real time.
+## How Kinesis Data Streams works
+- A stream is split into **shards**; each shard accepts up to 1 MB/s or 1,000 records/s of writes, and on-demand mode adds shards automatically.
+- Producers (web servers, SDKs, the Kinesis Producer Library) put records with a partition key that decides the shard, keeping order per key.
+- Consumers such as AWS Lambda, applications using the Kinesis Client Library, or Amazon Managed Service for Apache Flink read records within about a second of arrival.
+- Data is retained for 24 hours by default and can be kept up to 365 days, so consumers can replay it.
+Example: thousands of browsers send page-view events; a Lambda consumer updates a real-time dashboard while a second consumer detects fraud.
+W: Amazon Kinesis Data Streams: it ingests high-volume events from thousands of producers and makes them available to consumers within seconds, which is real-time stream processing.
+X: A=Amazon RDS for PostgreSQL: it is a transactional database; thousands of sources inserting rows continuously would strain it, and it offers no streaming consumers or replayable ordered log.
+B=AWS Snowball Edge devices: they are physical devices shipped to move data offline in bulk, a process that takes days, not seconds.
+D=Amazon S3 Glacier Deep Archive: it is the lowest-cost archive storage class with retrieval measured in hours, the opposite of real-time processing.
+T: Real-time ingestion from many producers with processing in seconds means a streaming service such as Kinesis Data Streams, not a database, an offline transfer device or an archive.
+
+@ Q003201 explain
+G: ## What Amazon Data Firehose does
+Amazon Data Firehose (formerly Kinesis Data Firehose) is a fully managed delivery service: producers send records and Firehose writes them to a destination such as Amazon S3, Amazon Redshift, Amazon OpenSearch Service, Splunk or an HTTP endpoint. There are no servers or consumer code to run.
+## Features that match this question
+- **Buffering**: records are grouped by size or time interval (for example every 128 MB or 300 seconds) and written as larger S3 objects.
+- **Record format conversion**: JSON input can be converted to Apache Parquet or ORC using a schema from the AWS Glue Data Catalog, which makes later Athena queries faster and cheaper.
+- **Optional transforms and partitioning**: a Lambda function can reshape records, and dynamic partitioning writes to prefixes such as `year=2026/month=09/`.
+Example: application logs flow into a Firehose stream that buffers them, converts them to Parquet and writes them to an S3 data lake.
+W: Amazon Data Firehose: it delivers streaming data to S3 in buffered batches and can convert records to Parquet natively, all as a managed service with no code to manage.
+X: A=Amazon SQS standard: a queue only holds messages until a consumer polls them; you would have to write and run the consumer that batches, converts and writes to S3.
+B=Amazon SNS topics: SNS pushes each message to subscribers immediately; it has no batching into files and no Parquet conversion.
+C=AWS Step Functions: it orchestrates steps you define, so you would still need to build the batching and format conversion yourself, and it is not designed to ingest a continuous stream.
+T: Managed "stream to S3, batched and converted to Parquet" is Data Firehose; queues, topics and workflows need custom code for the same result.
+
+@ Q003202 explain
+G: ## Querying data where it lives
+Amazon Athena is a serverless, interactive query service. You define tables over files already in Amazon S3 (usually in the AWS Glue Data Catalog), then run standard SQL; Athena reads the files directly, with no loading step and no cluster to manage.
+- Works with CSV, JSON, Apache Parquet, ORC and other formats.
+- You pay based on the amount of data each query scans, so columnar formats, compression and partitioning (for example by `dt=2026-09-29`) cut both cost and query time.
+- Results are written back to an S3 location you choose.
+Example: `SELECT status, count(*) FROM access_logs WHERE dt = '2026-09-29' GROUP BY status;` runs directly on ALB log files stored in S3.
+This makes Athena a common choice for ad hoc analysis of logs and data lakes.
+W: Amazon Athena: it runs serverless SQL directly against data in S3 without loading it into a database first, exactly what the analysts want.
+X: A=Amazon ElastiCache: it is an in-memory cache (Valkey, Redis OSS or Memcached) for fast key lookups; it cannot query files stored in S3 with SQL.
+C=Amazon RDS: it is a managed relational database, so the data would first have to be imported into database tables, which the requirement rules out.
+D=Amazon DynamoDB: it is a NoSQL key-value database; data would have to be imported into tables, and it is not a SQL engine for S3 files.
+T: SQL directly on S3 files with no loading and no servers means Athena; databases and caches require the data to be loaded first.
+
+@ Q003203 explain
+G: ## Two ways to bring reads closer to users
+Latency for a global audience mostly comes from distance: a request from Asia to a database in `us-east-1` crosses an ocean each time.
+## Aurora Global Database
+Aurora Global Database has one primary Region that accepts writes and secondary Regions with read-only clusters. Replication happens at the storage layer with typical lag under a second, so users in each Region can read from a local copy, and a secondary Region can be promoted for disaster recovery.
+## Caching at the edge
+Many API responses, such as a product catalogue or configuration, are identical for many users. CloudFront can cache them at edge locations for a chosen TTL, so repeat requests never reach the application or database at all.
+- Only cache what is safe to share; forward personalised requests to the origin.
+Example: a read-heavy store serves catalogue calls from CloudFront and other reads from the nearest Aurora secondary Region.
+W: A=Aurora Global Database with read replicas in other Regions: each Region gets a local read-only copy of the data with low replication lag, so reads no longer travel to a distant primary.
+E=CloudFront caching for cacheable API responses: repeat requests are answered from an edge location near the user, removing both the network distance and the database round trip.
+X: B=Moving the database to a single Availability Zone: this removes the standby and lowers availability, and it does nothing about the distance between global users and the database.
+C=Disabling query caching on the application layer: turning caching off sends every request to the database, raising latency and load rather than lowering it.
+D=A larger writer instance in a single Region only: more CPU and memory do not shorten the distance to users in other continents, and read-heavy traffic still crosses the globe.
+T: For global read-heavy traffic, move data closer to users with cross-Region read copies and edge caching, not with bigger instances in one place.
+
+@ Q003204 explain
+G: ## Block, object and file storage
+- **Block storage** (EBS, instance store) appears as a disk attached to one instance.
+- **Object storage** (S3) is accessed through an API, not mounted as a normal file system.
+- **File storage** offers a shared directory tree that many machines can mount at once, with file locking and POSIX permissions.
+## Shared file systems for Linux on AWS
+- **Amazon EFS** is a serverless NFS file system that grows and shrinks automatically. Thousands of EC2 instances, containers and Lambda functions across multiple AZs can mount it concurrently.
+- **Amazon FSx for Lustre** is a high-performance parallel file system for Linux workloads such as HPC, machine learning and media rendering. Many clients mount it at once, and it can be linked to an S3 bucket.
+Example: a render farm mounts FSx for Lustre at `/scratch`, while a web fleet mounts EFS at `/shared/uploads`.
+W: D=Amazon FSx for Lustre: it is a shared POSIX file system that many Linux instances mount at the same time for concurrent, high-throughput reads and writes.
+E=Amazon EFS: it is a fully managed NFS file system that many Linux instances across AZs can mount and use concurrently.
+X: A=Amazon EC2 instance store volumes: they are temporary disks physically attached to one host; other instances cannot mount them and data is lost when the instance stops.
+B=Amazon S3 Glacier Flexible Retrieval: it is an archive storage class with retrieval times of minutes to hours, and it is object storage rather than a mountable file system.
+C=AWS Storage Gateway Tape Gateway: it presents virtual tapes to on-premises backup software and stores them in S3 and Glacier; it is not a live shared file system.
+T: When many Linux instances must read and write the same files at once, use a shared file system (EFS or FSx for Lustre), not block volumes, archives or virtual tapes.
+
+@ Q003205 explain
+G: ## S3 storage classes follow access frequency
+Each S3 storage class trades storage price against retrieval cost and speed:
+- **S3 Standard**: higher storage price, no retrieval fee; best for data read often.
+- **S3 Standard-IA**: cheaper storage, per-GB retrieval fee, 30-day minimum storage duration; best for data read rarely but needed in milliseconds.
+- **S3 Glacier Deep Archive**: the lowest storage price, 180-day minimum, retrieval within hours; best for compliance copies.
+## Lifecycle rules automate the moves
+A lifecycle configuration tells S3 to transition objects between classes and expire them by age.
+Example rule for this log bucket:
+- day 0 to 30: stay in S3 Standard while logs are read often
+- day 30: transition to Standard-IA for the year of rare access
+- day 365: transition to Glacier Deep Archive for long-term retention
+- after seven years: expire (delete) the objects
+Each object always sits in the cheapest class that still meets how it is being used.
+W: Lifecycle rules moving objects to Standard-IA, then Glacier Deep Archive: they match each phase of the logs' life to the cheapest suitable class automatically, so cost drops as access declines.
+X: A=Store the logs on large EBS volumes attached to a dedicated logging instance: EBS is priced per provisioned GB, far above archive tiers, and you also pay for the instance; seven years of logs would be very expensive.
+B=Move objects to Glacier Deep Archive on the first day: logs read frequently in the first 30 days would need restores that take hours and incur retrieval charges, breaking the access pattern.
+D=Keep all objects in S3 Standard for the entire seven years: Standard is the most expensive class to keep rarely read data in, so years of retention at that rate waste money.
+T: Data whose access drops over time should move through storage classes via lifecycle rules, not sit in one class for its whole life.
+
+@ Q003206 explain
+G: ## How S3 Intelligent-Tiering works
+S3 Intelligent-Tiering watches each object's access and moves it between tiers automatically:
+- **Frequent Access** tier by default.
+- **Infrequent Access** tier after 30 consecutive days without access.
+- **Archive Instant Access** tier after 90 days without access.
+- Optional **Archive Access** and **Deep Archive Access** tiers you can enable for data that can wait for asynchronous retrieval.
+When an object in the Infrequent or Archive Instant tier is accessed, it moves back to Frequent Access automatically.
+## The cost model
+There are no retrieval fees for the automatic tiers, only a small monthly monitoring charge per object. Objects smaller than 128 KB are not monitored and are always billed at the Frequent Access rate.
+Example: a data lake where some datasets are hot for a week and others are untouched for months saves money without anyone writing lifecycle rules.
+W: S3 Intelligent-Tiering: it moves objects between access tiers automatically based on actual use, with no retrieval fees and no lifecycle rules to maintain, ideal for unpredictable access.
+X: A=S3 Standard-IA storage: it charges a per-GB retrieval fee, so if the unpredictable data turns out to be read often, costs can exceed S3 Standard, and nothing moves objects for you.
+C=S3 Glacier Instant tier: Glacier Instant Retrieval is priced for data read about once a quarter, with higher retrieval fees and a 90-day minimum, which is costly if access spikes.
+D=S3 One Zone-IA storage: it keeps data in a single AZ, charges retrieval fees and does not adapt to changing access, so it neither solves the unpredictability nor keeps multi-AZ resilience.
+T: When access patterns are unknown or changing, let S3 Intelligent-Tiering pick the tier; fixed infrequent-access classes penalise surprise reads.
+
+@ Q003207 explain
+G: ## Resilience versus price in S3
+Most S3 storage classes store data across at least three Availability Zones. **S3 One Zone-IA** stores data in a single AZ, which makes its storage cheaper than Standard-IA (roughly 20% less), but the data is lost if that AZ is destroyed.
+- Like Standard-IA, it returns data in milliseconds, charges a per-GB retrieval fee and has a 30-day minimum storage duration.
+- It fits data you can recreate, such as thumbnails, transcoded copies or secondary backups.
+## Do not confuse it with S3 Express One Zone
+S3 Express One Zone also lives in one AZ, but it is a high-performance class in directory buckets that delivers single-digit millisecond latency for frequently accessed data, with a higher storage price than S3 Standard.
+Example: original photos stay in S3 Standard; their thumbnails, which can be regenerated from the originals, go to One Zone-IA.
+W: S3 One Zone-IA: among the options it is the cheapest class that still returns objects in milliseconds, and its single-AZ risk is acceptable because the thumbnails can be regenerated.
+X: B=S3 Express One Zone: it is optimised for the fastest, most frequent access and has a higher storage price than S3 Standard, the opposite of low-cost storage for rarely read data.
+C=S3 Glacier Deep Archive: storage is cheaper, but restores take hours, so it fails the millisecond access requirement.
+D=S3 Standard: it offers millisecond access but costs clearly more per GB than One Zone-IA for data that is rarely read.
+T: Reproducible, infrequently accessed data that still needs instant access belongs in One Zone-IA; Express One Zone is about speed, not savings.
+
+@ Q003208 explain
+G: ## Commitment-based discounts for EC2
+AWS offers lower prices when you commit to steady usage for one or three years:
+- **Savings Plans** commit to a dollar amount of compute per hour (for example `$10/hour`) and discount usage up to that amount.
+- **Compute Savings Plans** apply automatically to EC2 in any instance family, size, Region, operating system or tenancy, and also to AWS Fargate and AWS Lambda.
+- **EC2 Instance Savings Plans** give a larger discount but are tied to one instance family in one Region.
+- **Reserved Instances** are the older model, tied to specific instance attributes.
+## Why flexibility matters here
+The workload is steady for three years, which makes a commitment worthwhile, but the team might move from `m5` to `m7g` or change sizes. A Compute Savings Plan keeps applying the discount after such a change.
+Example: a three-year Compute Savings Plan covers a fleet moved from Intel `c5` instances to Graviton `c7g` without losing the discount.
+W: Compute Savings Plans: they give a significant discount for committed steady usage over three years while still applying if the company changes instance family, size or Region.
+X: A=On-Demand Instances only: they have no commitment, but a workload running 24/7 for three years pays full price the whole time, missing large available discounts.
+C=Dedicated Hosts only: they reserve a whole physical server, mainly for licensing or compliance needs, and cost more than shared-tenancy instances; they add no pricing flexibility.
+D=Spot Instances only: they are cheap but AWS can reclaim them with a two-minute warning, which is unsuitable for a steady workload that must run continuously.
+T: Steady usage plus the need to change instance families points to Compute Savings Plans, which trade some discount for flexibility.
+
+@ Q003209 explain
+G: ## How Spot Instances work
+Spot Instances use spare EC2 capacity at discounts of up to 90% compared with On-Demand prices. The trade-off is that AWS can reclaim the capacity when it needs it, giving a **two-minute interruption notice** (plus an earlier rebalance recommendation in many cases).
+## Designing for interruption
+- Save progress with checkpoints, for example to S3, so a restarted job resumes instead of starting over.
+- Use many instance types and AZs (for example with an Auto Scaling group or EC2 Fleet using a capacity-optimised allocation strategy) to reduce interruptions.
+- Services like AWS Batch and EMR can run on Spot and retry interrupted work automatically.
+Example: an image-processing batch job splits work into small chunks in an SQS queue; if an instance is reclaimed, its unfinished chunk returns to the queue and another instance picks it up.
+Workloads that are fault-tolerant and flexible on timing are the classic Spot use case.
+W: Spot Instances: they give the deepest EC2 discount, and the job's ability to be interrupted and restarted removes the main drawback of Spot.
+X: A=Dedicated Instances: they run on hardware dedicated to one customer and cost more than regular instances; they address isolation needs, not cost.
+B=Reserved Instances: they need a one- or three-year commitment for steady usage, which does not fit an occasional batch job and saves less than Spot.
+C=On-Demand Instances: they are never interrupted, but you pay the full price for a reliability the fault-tolerant job does not need.
+T: When work tolerates interruption, Spot is the cheapest EC2 option; reservations are for steady workloads and On-Demand for work that must not be interrupted.
+
+@ Q003210 explain
+G: ## What right-sizing means
+Right-sizing is matching instance type and size to the real resource needs of a workload. An instance that averages 10% CPU is mostly paid-for idle capacity.
+- Tools such as AWS Compute Optimizer and Cost Explorer's rightsizing recommendations analyse CloudWatch metrics and suggest smaller or different instance types.
+- Check memory, network and disk metrics as well as CPU before downsizing.
+## Right-size, then scale, then commit
+- A **target tracking** scaling policy keeps a metric such as average CPU near a target (for example 50%) by adding or removing instances as demand changes.
+- Smaller instances make scaling finer-grained, so capacity follows demand more closely.
+- Only after sizing is correct should you buy Savings Plans or Reserved Instances, so the commitment is not locked to waste.
+Example: an Auto Scaling group of `m5.2xlarge` at 10% CPU is moved to `m5.large` with a 50% CPU target; it runs more instances at peak and fewer overnight, at a fraction of the cost.
+W: Right-size to smaller instances and keep target tracking scaling: it removes the paid-for idle capacity while scaling still adds instances when demand rises, which gives the biggest saving.
+X: A=Add more large instances to spread the load more evenly: the fleet is already underused, so adding instances only increases cost and pushes utilisation even lower.
+B=Purchase Reserved Instances for the current large instance size: the discount applies to capacity that is mostly idle, locking in waste for one or three years.
+D=Disable Auto Scaling and keep a fixed fleet of large instances: a fixed fleet must be sized for peak and pays for it all the time, removing the savings that scaling provides.
+T: Fix oversized instances first, then let scaling follow demand, and only then commit to discounts.
+
+@ Q003211 explain
+G: ## Paying for idle versus paying per use
+Server-based options (EC2, EKS nodes, dedicated hosts) bill for every hour they run, whether they serve one request or a million. For an API with a few hundred requests a day, almost all of those hours are idle.
+## The serverless alternative
+- **AWS Lambda** bills per request and per GB-second of execution time; when no requests arrive, the cost is zero. It scales out automatically for spikes.
+- **Amazon API Gateway** also bills per API call received, with no hourly charge for REST or HTTP APIs.
+- Lambda includes a monthly free tier of requests and compute time, and a few hundred requests per day costs very little.
+Example: 300 requests a day that each run for 200 ms on a small Lambda function use a tiny fraction of the monthly free tier, while one small EC2 instance running all month is billed for every hour.
+W: AWS Lambda behind API Gateway: both are billed per request with nothing charged while idle, and they scale automatically for spikes, making this the cheapest option for low, bursty traffic.
+X: A=A dedicated host for the API: it reserves an entire physical server billed hourly, one of the most expensive ways to run a tiny workload.
+B=An EKS cluster with three nodes: you pay an hourly control plane fee plus three always-running worker nodes, a large fixed cost for a few hundred requests.
+C=Two EC2 instances running 24/7: they are billed every hour even though they sit idle most of the day, so the cost per request is very high.
+T: For low and spiky traffic, pay-per-request serverless compute beats any option that bills for idle servers.
+
+@ Q003212 explain
+G: ## Stopping an RDS instance
+You can stop an Amazon RDS DB instance (or an Aurora cluster) when it is not needed. While it is stopped:
+- you are **not billed for instance hours**, which is usually the largest part of the bill;
+- you still pay for provisioned storage, backups and snapshots;
+- data, configuration and endpoint are kept.
+A stopped instance automatically starts again after **seven days**, so a schedule should stop it again as needed.
+## Automating the schedule
+Use Amazon EventBridge Scheduler to call the RDS `StopDBInstance` and `StartDBInstance` APIs at set times, or deploy the Instance Scheduler on AWS solution with tags.
+Example: a development database running 10 hours a day on weekdays is stopped the rest of the time, roughly 70% of the week's hours, cutting its compute cost by a similar share.
+W: Stop the RDS instance outside business hours on a schedule: instance-hour charges stop while it is not in use, so the company only pays compute for the hours developers actually work.
+X: A=Enable Multi-AZ for the development database: it adds a standby instance, roughly doubling instance cost, to improve availability that a development database does not need.
+C=Purchase a three-year Reserved Instance for it: a reservation is billed for every hour of the term, so the company would keep paying for nights and weekends when the database sits idle.
+D=Increase the instance size so work finishes faster: a larger instance costs more per hour, and development usage follows working hours, not job length, so it would still run all day.
+T: For non-production databases used only part of the day, stop them on a schedule instead of paying for idle hours.
+
+@ Q003213 explain
+G: ## Provisioned versus serverless database capacity
+With a provisioned database you choose an instance size and pay for it every hour, even when there are no queries. For a new application with unknown and intermittent usage, that means paying for peak capacity during long idle periods.
+## How Aurora Serverless v2 works
+- Capacity is measured in **Aurora Capacity Units (ACUs)**; each ACU is about 2 GiB of memory with matching CPU and networking.
+- You set a minimum and maximum ACU range, and Aurora scales in fine-grained steps within seconds as load changes.
+- You pay for the ACUs actually used, billed per second, plus storage (and I/O when using the Aurora Standard configuration).
+- For supported engine versions, the minimum can be set to 0 ACUs so the database pauses automatically after an idle period and resumes when a connection arrives.
+Example: a new internal tool is busy for an hour in the morning and idle most of the day; Serverless v2 scales up for that hour and scales down the rest of the time.
+W: Aurora Serverless v2: capacity scales up and down automatically with demand and is billed per ACU-second, so long idle periods cost far less than a provisioned instance.
+X: B=Self-managed MySQL on EC2: the instance is billed for every hour even when idle, and the team must also patch, back up and operate the database.
+C=Provisioned Aurora cluster: it requires a fixed instance size that is paid for around the clock, so idle periods are billed at full capacity.
+D=RDS with Multi-AZ always on: it runs a primary and a standby continuously, about twice the instance cost, for a workload that is often idle.
+T: Unpredictable, intermittent database load is the case for Aurora Serverless v2; provisioned options charge for capacity whether or not it is used.
+
+@ Q003214 explain
+G: ## DynamoDB capacity modes
+- **On-demand**: pay per read and write request; no planning, instantly handles spikes. Best for new, unpredictable or very spiky tables.
+- **Provisioned**: you set read capacity units (RCUs) and write capacity units (WCUs) and pay per hour for them whether used or not. When traffic is steady and the capacity is well used, the effective cost per request is lower than on-demand. AWS lowered on-demand prices in late 2024, which narrowed the gap, but well-utilised provisioned capacity is still cheaper for steady traffic.
+## Auto scaling for provisioned tables
+DynamoDB auto scaling (through Application Auto Scaling) adjusts RCUs and WCUs toward a target utilisation, such as 70%, as traffic changes during the day. This keeps provisioned capacity close to real use, which is where the savings come from.
+- Reserved capacity can lower the price of provisioned throughput further for long-term steady use.
+Example: a table handling a steady 500 writes per second all day is provisioned with auto scaling around that level and costs less than paying for each request on-demand.
+W: Provisioned capacity with auto scaling: for steady, predictable traffic, well-utilised provisioned capacity costs less per request than on-demand, and auto scaling keeps it matched to demand.
+X: A=DAX cluster with no table changes: DAX is an in-memory cache for microsecond reads that adds its own node charges; it does not change the table's capacity mode or its cost for writes.
+B=On-demand capacity for all traffic: on-demand is convenient for unpredictable workloads, but for steady, high utilisation it usually costs more per request than provisioned capacity.
+D=Global tables in three Regions: replicating the table to three Regions adds storage and replicated write costs; it is for multi-Region availability, not for saving money.
+T: Steady, predictable DynamoDB traffic is cheapest on provisioned capacity with auto scaling; on-demand is for traffic you cannot predict.
+
+@ Q003215 explain
+G: ## Where the NAT gateway cost comes from
+A NAT gateway lets instances in private subnets reach the internet and public AWS endpoints. It is billed **per hour** and **per GB of data processed**. When instances upload terabytes to Amazon S3 through it, the per-GB processing charge grows with every byte.
+## S3 gateway VPC endpoints
+A gateway endpoint for S3 adds a route to the subnet route tables using the S3 prefix list (for example `pl-xxxxxxxx`). Traffic from the VPC to S3 in the same Region then goes directly to S3 over the AWS network instead of through the NAT gateway.
+- Gateway endpoints for S3 and DynamoDB have **no hourly or data processing charge**.
+- Endpoint policies and bucket policies (such as `aws:SourceVpce`) can restrict which buckets are reachable.
+Example: a data pipeline in private subnets writing 50 TB a month to S3 stops paying NAT processing on that traffic after the endpoint route is added, with no application change.
+W: Add an S3 gateway VPC endpoint: S3 traffic takes the endpoint route instead of the NAT gateway, and gateway endpoints are free, so the NAT data processing charge on that traffic disappears.
+X: A=Enable S3 Transfer Acceleration: it routes uploads through CloudFront edge locations for faster long-distance transfers and adds a per-GB fee; the traffic from private subnets would still pass through the NAT gateway.
+B=Add a second NAT gateway in the AZ: it adds another hourly charge, and each GB is still billed for processing, so total cost rises.
+D=Use public subnets with public IPs: this removes NAT but exposes instances directly to the internet, breaking the private design, and public IPv4 addresses carry their own hourly charge.
+T: Private-subnet traffic to S3 should use a free gateway endpoint instead of a NAT gateway that charges for every gigabyte processed.
+
+@ Q003216 explain
+G: ## Where data transfer costs come from
+Serving files from EC2 to users on the internet incurs **data transfer out** charges for every GB sent. With large videos and a worldwide audience, each viewer pulls the full file from the one Region, so charges and origin load grow with every view.
+## How CloudFront lowers the bill
+- Data transfer from AWS origins such as EC2, ALB or S3 to CloudFront is not charged.
+- CloudFront caches the videos at edge locations, so popular files are fetched from the origin once and then served many times from the edge.
+- CloudFront's own data transfer out is typically priced a little below EC2 internet egress, with volume discounts and optional commitment or flat-rate pricing plans.
+- Fewer requests reach the origin, so the EC2 fleet can also be smaller.
+Example: a 1 GB video watched 10,000 times in Europe is fetched from the origin a handful of times and served from European edges the rest of the time.
+Viewers also get lower latency because the file comes from a nearby edge.
+W: Serve content through CloudFront with caching: edge caching removes most origin egress, origin-to-CloudFront transfer is free, and CloudFront delivery is typically cheaper than serving directly from EC2.
+X: B=Replicate the EC2 video servers to every AWS Region: it multiplies compute, storage and replication costs, and each Region still pays full internet egress for its viewers.
+C=Increase EC2 network bandwidth: a larger instance or faster network moves data faster but is billed the same per GB transferred, and the bigger instance costs more.
+D=Use larger EBS volumes for videos: volume size affects storage capacity and cost only; it has no effect on data transfer charges to users.
+T: For large content served worldwide, cache it at the edge with CloudFront to cut origin data transfer instead of scaling or replicating servers.
+
+@ Q003217 explain
+G: ## How inter-AZ traffic is billed
+Within a Region, data sent between Availability Zones is charged per GB in each direction, while traffic between resources in the same AZ over private IP addresses is free. For chatty tiers that exchange terabytes, this adds up quickly.
+## Balancing cost and resilience
+Spreading every tier across AZs maximises availability, but when the workload can tolerate a short failover, you can:
+- place the components that talk heavily to each other in the same AZ;
+- keep a standby copy (for example a warm standby instance, an Auto Scaling group that can launch elsewhere, or a Multi-AZ database standby) in a second AZ;
+- fail over to the standby if the primary AZ has problems.
+Example: an application tier and its cache are kept in `us-east-1a`, with a scaled-down copy ready in `us-east-1b`; daily cross-AZ transfer drops to replication traffic only.
+The trade-off is a brief interruption during failover, which this workload accepts.
+W: Keep chatty components in the same AZ while retaining a standby elsewhere: most of the heavy traffic stays inside one AZ where it is not charged, and the standby in another AZ preserves recovery from an AZ failure.
+X: A=Route traffic between tiers through the internet: traffic would pay internet or NAT charges and public IPv4 costs, exposes data to the internet, and still costs more than private in-AZ traffic.
+B=Add a NAT gateway between the two tiers: NAT gateways are for reaching outside the VPC; tiers in the same VPC route locally, and forcing traffic through NAT would add per-GB processing charges.
+C=Move one of the tiers to another AWS Region so the traffic is spread more widely: the traffic would still be billed per GB as cross-Region data transfer, and the tiers would suffer much higher latency, so nothing is saved.
+T: To cut inter-AZ charges, co-locate the chatty components in one AZ and rely on a standby in another AZ for resilience.
+
+@ Q003218 explain
+G: ## What versioning does to storage costs
+With S3 Versioning enabled, overwriting or deleting an object does not remove the old data: the previous copy becomes a **noncurrent version**. Every noncurrent version is billed as full storage, so a frequently updated bucket can hold many times more data than its current objects.
+## Lifecycle actions for noncurrent versions
+- **NoncurrentVersionTransition** moves old versions to a cheaper class, for example to Standard-IA 30 days after they become noncurrent or to Glacier Flexible Retrieval later.
+- **NoncurrentVersionExpiration** permanently deletes old versions after a number of days, optionally keeping the newest few (`NewerNoncurrentVersions`).
+- A rule can also clean up expired delete markers.
+Example: keep noncurrent versions in Standard for 30 days for quick rollback, move them to Glacier Flexible Retrieval afterwards, and expire them after 365 days while keeping the three newest.
+W: B=Lifecycle rules to expire noncurrent versions: deleting old versions after a set time removes storage the company is paying for but no longer needs.
+E=Lifecycle rules to transition noncurrent versions: moving old versions to cheaper storage classes lowers the price per GB of the versions that must be kept.
+X: A=Enabling S3 Transfer Acceleration on the bucket: it speeds up long-distance transfers through edge locations and adds a per-GB fee; stored versions and their cost are unchanged.
+C=Enabling Requester Pays on the bucket for all users: requesters pay for requests and data transfer, but the bucket owner still pays for all storage, including every old version.
+D=Copying all versions to a second bucket for safety: it duplicates every version, roughly doubling storage cost instead of reducing it.
+T: Old object versions cost as much as current ones, so control them with noncurrent-version lifecycle rules that transition and then expire them.

@@ -1,0 +1,350 @@
+# SAA-C03 detailed explanations (explanation-only rewrites; letters are the published ones)
+
+@ Q000481 explain
+G: ## Managed file-transfer endpoints
+Many business partners still exchange files over **SFTP**, FTPS, FTP or AS2. Running your own SFTP servers means patching, scaling, high availability and user management.
+**AWS Transfer Family** is a fully managed service that gives you an SFTP (or FTPS/FTP/AS2) endpoint whose storage backend is an Amazon S3 bucket or an Amazon EFS file system.
+- You create a server, choose SFTP, and pick S3 as the domain.
+- Each partner user maps to a home directory such as `/partner-bucket/incoming/acme`, with an IAM role that limits what they can read or write.
+- A file uploaded with `put invoice.csv` appears immediately as an S3 object, so S3 event notifications or EventBridge can trigger downstream processing.
+The partner keeps using a standard SFTP client; the company never runs a server.
+W: AWS Transfer Family: it provides a managed SFTP endpoint that writes uploaded files straight into S3, so the partner keeps its SFTP workflow and the company operates no servers.
+X: B=AWS Storage Gateway: it gives on-premises applications NFS, SMB, iSCSI or tape access to AWS storage through a gateway appliance you deploy; it does not expose an SFTP endpoint for external partners.
+C=Amazon FSx for Windows File Server: it is a managed Windows file system accessed over SMB, not an SFTP service, and files would land on FSx rather than directly in S3.
+D=AWS DataSync: it runs scheduled or on-demand copy tasks between storage systems that you control; it does not host an endpoint that a partner can log in to and upload files.
+T: Partner needs SFTP and files must land in S3 with no servers to run → Transfer Family; DataSync and Storage Gateway move or expose data but do not host a partner-facing SFTP endpoint.
+
+@ Q000482 explain
+G: ## Cache-aside (lazy loading)
+With **cache-aside**, the application checks the cache first and only goes to the database on a miss:
+- Read `product:123` from ElastiCache (Redis OSS, Valkey or Memcached).
+- On a hit, return it in well under a millisecond; no database query.
+- On a miss, query RDS, write the result into the cache with a **TTL** (for example `EX 300` = 5 minutes), then return it.
+## Why it fits this workload
+A catalog read thousands of times per second but changed a few times per hour is ideal: almost every read becomes a cache hit, so the database sees roughly one query per key per TTL instead of thousands. The TTL caps how old a cached item can get, which matches the stated tolerance of 5 minutes of staleness.
+W: ElastiCache cache-aside with a 5-minute TTL: repeated reads are served from memory, the database is queried only on misses, and the TTL keeps staleness within the allowed 5 minutes, so read load on RDS drops the most.
+X: A=CloudFront in front of RDS: CloudFront caches HTTP(S) responses from web origins; it cannot proxy MySQL connections, so it cannot sit in front of a database endpoint.
+B=Larger RDS instance: more memory and CPU raise capacity, but every read still executes against the database, so the read load itself is not reduced and costs go up.
+D=Global Accelerator: it improves the network path from users to application endpoints using static anycast IPs; it caches nothing and does not change how many queries reach RDS.
+T: Hot, rarely changing data with tolerable staleness → put an in-memory cache with a TTL in front of the database; scaling the database or the network path does not remove the repeated reads.
+
+@ Q000483 explain
+G: ## Two ways to populate a cache
+- **Lazy loading (cache-aside)**: data enters the cache only when a read misses. The cache holds only what is actually requested, but an item can be stale until its TTL expires or the app invalidates it.
+- **Write-through**: every write to the database also writes (or updates) the cache in the same operation. Cached data is always current.
+## Costs of write-through
+- Each write now does two operations, so write latency goes up.
+- Data that is written but never read still occupies cache memory ("cache churn").
+- A newly added or restarted cache node is empty until writes arrive, so it is common to combine write-through with lazy loading and still set a **TTL** to evict unused keys.
+Example: a user updates a profile. With write-through the new profile is in cache immediately; with lazy loading the old profile may be served until the TTL of, say, 10 minutes expires.
+W: Write-through keeps the cache current at a price: because each database write also updates the cache, reads see fresh data, but writes take longer and the cache fills with items that may never be read.
+X: B=Lazy loading writes every update first: that describes write-through. Lazy loading adds items only after a cache miss on read and does not touch the cache on writes.
+C=Write-through removes TTLs: TTLs are still recommended with write-through to evict data that is never read and to recover from missed or failed cache updates.
+D=Lazy loading is never stale: the opposite is true. A lazily loaded item stays as it was cached until it expires or is invalidated, so it can be stale after the database changes.
+T: Write-through = always fresh but slower writes and wasted cache space; lazy loading = only requested data cached but possibly stale, so a TTL is used with both.
+
+@ Q000484 explain
+G: ## Push versus pull messaging
+- **Amazon SNS** is publish/subscribe. A publisher sends one message to a topic, and SNS **pushes** a copy to every subscriber: SQS queues, Lambda functions, HTTPS endpoints, email or SMS. Subscribers do not poll a standard SNS topic, and it keeps no backlog for them to read later.
+- **Amazon SQS** is a queue. Producers send messages, SQS **stores** them (up to 14 days), and consumers **poll** with `ReceiveMessage`, process, then call `DeleteMessage`. Messages not deleted become visible again after the visibility timeout.
+## Fan-out pattern
+A common design combines both: an `order-placed` topic fans out to separate queues for billing, shipping and analytics. Each queue buffers its own copy, so a slow consumer does not affect the others.
+Standard SNS topics and SQS queues both deliver at least once, so consumers should be idempotent.
+W: SNS pushes, SQS is polled: SNS immediately delivers each message to all subscribers of a topic, while SQS durably holds messages until a consumer pulls and deletes them, which is why they are often combined for fan-out plus buffering.
+X: B=Identical and interchangeable: one is push-based fan-out without storage and the other is a pull-based buffer with retention and visibility timeouts, so swapping them changes system behavior.
+C=Reversed models: SQS never pushes to subscribers; consumers (or a Lambda event source mapping on their behalf) poll it, and SNS is the service that pushes.
+D=SNS exactly-once processing: standard SNS topics deliver at least once, so duplicates are possible. FIFO topics add ordering and deduplication, but end-to-end exactly-once processing still depends on idempotent consumers, and this does not describe the core difference between SNS and SQS.
+T: Deliver one event to many subscribers now → SNS push; buffer work until a consumer is ready → SQS pull.
+
+@ Q000485 explain
+G: ## Vertical versus horizontal scaling
+- **Vertical scaling (scale up)** changes an instance to a bigger type, such as `m6i.large` to `m6i.2xlarge`. For EBS-backed EC2 instances this requires a stop and start, so there is downtime, and there is a ceiling at the largest instance size.
+- **Horizontal scaling (scale out)** adds more instances. An **Auto Scaling group** launches instances from a launch template across several Availability Zones, and a load balancer spreads requests across them.
+## Example
+A target tracking policy keeps average CPU near 50%. When traffic rises, the group goes from 2 to 6 instances; new instances pass load balancer health checks before receiving traffic, and nothing is restarted. When traffic falls, the group scales back in.
+The application should be stateless (sessions in ElastiCache or DynamoDB) so any instance can serve any request.
+W: Auto Scaling group across AZs behind a load balancer: capacity grows by adding instances rather than resizing one, so there is no stop/start downtime, no instance-size ceiling, and the single instance is no longer a single point of failure.
+X: A=Placement group: placement groups control how instances are physically placed (cluster, partition, spread) for network performance or fault isolation; they do not give an instance more CPU.
+C=Detailed monitoring: it only publishes CloudWatch metrics every 1 minute instead of 5; an instance's vCPU count is fixed by its type and never grows automatically.
+D=Monthly vertical resizes: every resize still needs a stop and start, so downtime continues, and growth eventually hits the largest available instance type.
+T: Bigger box = restart and a ceiling; more boxes behind a load balancer = growth without downtime.
+
+@ Q000486 explain
+G: ## Designing for spikes and failures
+Two goals are combined here: **elasticity** (follow unpredictable traffic) and **fault tolerance** (no single component takes the site down).
+A stateless web tier fits horizontal scaling well:
+- An **Auto Scaling group** spans subnets in at least two Availability Zones.
+- An Application Load Balancer sends traffic only to instances that pass health checks.
+- Scaling policies (target tracking on CPU or request count per target) add instances when a spike starts and remove them afterward.
+- If an instance fails its health check, the group terminates and replaces it; if a whole AZ is impaired, instances in the other AZs keep serving and the group rebalances.
+Example: 4 instances across 2 AZs lose one AZ; the remaining 2 keep serving while the group launches replacements in the healthy AZ.
+W: Horizontal scaling with an Auto Scaling group across AZs: it adds and removes identical instances as load changes, replaces unhealthy ones automatically, and survives the loss of any instance or an entire AZ.
+X: B=Single larger on-premises server: one server is a single point of failure and cannot grow on demand, so a spike beyond its size or any hardware fault causes an outage.
+C=Disabling health checks: without health checks, failed instances stay in service and keep receiving traffic, which increases downtime instead of reducing it.
+D=Vertical scaling: moving to larger instance types needs a stop and start for each change, has a size ceiling, and still leaves one instance as a single point of failure.
+T: Resilience plus elasticity for a stateless tier → scale out across AZs with health-checked Auto Scaling, not scale up a single instance.
+
+@ Q000487 explain
+G: ## What a CDN does
+**Amazon CloudFront** is a content delivery network. Viewers connect to a nearby edge location; if the object is cached there, it is served locally. On a miss, the edge (through regional edge caches) fetches it from the **origin**, here an S3 bucket, and keeps a copy for later viewers.
+## Latency and cost effects
+- Popular video files are fetched from S3 once per edge cache rather than once per viewer, and delivered from close to the viewer.
+- Data transfer from S3 to CloudFront is not charged, and CloudFront's data transfer out pricing is generally lower than serving the same bytes directly from S3 to the internet.
+- **Origin access control (OAC)** can keep the bucket private so viewers must go through CloudFront.
+Example: 10,000 viewers in Asia request the same 5 GB file. Without a CDN, S3 in `us-east-1` serves 10,000 downloads across the globe; with CloudFront, nearby edges serve nearly all of them from cache.
+W: CloudFront with the S3 bucket as origin: edge caching serves repeated large files close to viewers, cutting latency, and it lowers egress cost because S3-to-CloudFront transfer is free and CloudFront delivery pricing is lower than direct S3 internet egress.
+X: B=S3 Transfer Acceleration: it routes individual transfers through edge locations over the AWS network, mainly to speed long-distance uploads; it caches nothing and adds a per-GB fee on top of normal transfer charges.
+C=Global Accelerator: it provides static anycast IPs to ALB, NLB, EC2 or Elastic IP endpoints and has no caching; an S3 bucket is not a supported endpoint, and every byte would still come from the origin.
+D=Cross-Region Replication everywhere: it copies every object into many buckets, multiplying storage and replication costs, and viewers still download each file from a Region rather than a nearby cache.
+T: Same content downloaded repeatedly by a global audience → cache it at the edge with CloudFront; acceleration services speed individual transfers but do not cache.
+
+@ Q000488 explain
+G: ## Layer 7 routing with listener rules
+An **Application Load Balancer (ALB)** understands HTTP and HTTPS. Each listener has ordered **rules**; each rule has conditions and an action such as forward to a target group.
+Conditions can match:
+- path pattern, such as `/api/*` or `/images/*`
+- host header, such as `shop.example.com`
+- any HTTP header, such as `X-Version: beta`
+- query string, HTTP method or source IP
+Target group types include instances, IP addresses (common for ECS tasks) and **Lambda functions**.
+## Example
+Rule 1: header `X-Version` = `beta` → canary target group. Rule 2: path `/api/*` → ECS service target group. Rule 3: path `/images/*` → Lambda target group. Default → web target group. All share one domain and one HTTPS listener.
+W: Application Load Balancer with listener rules: ALB rules match on path and HTTP headers, and ALB can forward to IP targets for containers and to Lambda functions, so all three routing needs are met on one listener.
+X: A=NLB with listeners per port: an NLB works at Layer 4 (TCP/UDP/TLS) and never parses HTTP paths or headers, so it cannot send `/api/*` and `/images/*` on the same port to different targets.
+B=Gateway Load Balancer: it transparently passes IP traffic through third-party appliances such as firewalls using GENEVE; it has no HTTP path or header rules and no Lambda targets.
+C=Classic Load Balancer with sticky sessions: the legacy CLB has no content-based routing rules or Lambda targets, and stickiness only pins a client to an instance.
+T: Route by path, host or header, including to Lambda → ALB listener rules; NLB and GWLB work below HTTP.
+
+@ Q000489 explain
+G: ## Classic three-tier layout on AWS
+- **Presentation / static content**: static files (images, JS, CSS) in S3, delivered globally by CloudFront.
+- **Web entry point**: an internet-facing Application Load Balancer in public subnets across two or more AZs.
+- **Application tier**: EC2 instances (or containers) in private subnets, managed by an Auto Scaling group that scales on its own metrics.
+- **Data tier**: a managed database such as Amazon Aurora in private (database) subnets, with a security group that only allows the app tier's security group.
+## Why separate tiers
+Each tier scales for its own reason: CloudFront absorbs static-asset traffic, the Auto Scaling group follows application CPU or request load, and Aurora scales with read replicas. The database has no public address, so it can only be reached from inside the VPC.
+W: CloudFront + S3, ALB, app Auto Scaling group, private Aurora: static assets are served globally from the edge, the web and app tiers scale independently behind the load balancer, and the database stays in private subnets.
+X: B=One large EC2 instance for all tiers: web, app and database scale together on one box, it is a single point of failure, and CloudFront in front does not change that.
+C=S3 web tier, Route 53 app logic, public DynamoDB: Route 53 is DNS and cannot run application code, and exposing the data tier publicly contradicts keeping the database private.
+D=An ALB in private subnets: a load balancer in private subnets can only be internal (an internet-facing ALB needs public subnets with an internet gateway route), so internet users cannot reach the app; the option also leaves out independent app-tier scaling, the private database and global static-asset delivery.
+T: Map each tier to a service that scales on its own (CloudFront/S3, ALB + Auto Scaling, private managed database) instead of combining tiers or exposing the data layer.
+
+@ Q000490 explain
+G: ## Where Lambda stops
+AWS Lambda is limited to a **15-minute** maximum run time and **10,240 MB** of memory per invocation. Work that runs for hours or needs more memory does not fit.
+## AWS Fargate
+**Fargate** is serverless compute for containers, used with Amazon ECS or EKS. You define CPU and memory for a task (up to 16 vCPU and 120 GB of memory), and AWS provisions and manages the underlying hosts.
+- A Fargate task has no maximum run time; it runs until the container exits or is stopped.
+- Batch jobs can be started by `RunTask`, an EventBridge schedule, Step Functions, or AWS Batch using a Fargate compute environment.
+Example: a nightly container that needs 32 GB of memory and runs for 4 hours starts as an ECS task on Fargate, finishes, and billing stops when it exits.
+W: AWS Fargate: it runs containers for as long as needed with far more memory than Lambda allows, while AWS manages all servers, so the long, memory-heavy batch job needs no infrastructure work.
+X: B=Spot Fleet with custom scripts: it can run the job, but the team must manage instances, AMIs, scaling and interruption handling itself, which violates the no-server-management requirement.
+C=S3 Batch Operations: it performs bulk actions on S3 objects (copy, tag, restore, invoke Lambda per object); it does not run a long-lived container process.
+D=Lambda with timeout above 15 minutes: 15 minutes is a hard maximum that cannot be raised, and memory is also capped below what this job needs.
+T: Short, event-driven functions → Lambda; long-running or memory-heavy containers without servers → Fargate.
+
+@ Q000491 explain
+G: ## Lambda concurrency
+**Concurrency** is the number of function invocations running at the same moment. Each Region has an account-level concurrency quota (1,000 by default, raisable through Service Quotas) shared by all functions.
+- When the limit is reached, new invocations are **throttled** and the `Throttles` metric in CloudWatch increases.
+- S3 invokes Lambda asynchronously, so throttled events are retried by Lambda for a period, which shows up as delays and backlog.
+- **Reserved concurrency** sets aside a fixed amount for one function so other functions cannot starve it (it also caps that function at that amount).
+- **Provisioned concurrency** keeps environments initialized to reduce cold starts.
+Example: a burst of 5,000 uploads arrives while other functions already use most of the 1,000 quota, so many image events are throttled.
+W: Concurrency limit reached: high `Throttles` means invocations are being rejected at the concurrency limit, so request a higher account quota and set reserved concurrency so this function always has capacity.
+X: A=Enable versioning: S3 versioning keeps prior object versions for recovery; it has no effect on how many Lambda invocations can run concurrently.
+C=Expired IAM access key: S3 invokes the function through the function's resource-based policy, not with access keys, and a permission problem would cause failures on every event, not throttling under load.
+D=Larger EBS volume: Lambda functions cannot attach EBS volumes; they use ephemeral `/tmp` storage (configurable up to 10 GB) or EFS, and storage size is unrelated to throttling.
+T: A rising `Throttles` metric under load points to Lambda concurrency limits, not storage or permissions.
+
+@ Q000492 explain
+G: ## Shared file storage for many Linux instances
+**Amazon EFS** is a managed NFS file system with POSIX semantics (permissions, file locking, in-place edits). A Regional EFS file system stores data redundantly across multiple AZs and offers a mount target in each AZ, so thousands of Linux instances can mount it at the same time.
+## Cutting cost with storage classes
+EFS has **Standard**, **Infrequent Access (IA)** and **Archive** storage classes. A lifecycle policy such as "move files not accessed for 30 days to IA" lowers storage cost for rarely touched data; with intelligent tiering, a file is moved back to Standard when it is accessed again.
+Example: `mount -t efs fs-12345678:/ /var/www/content` on every web server gives all instances the same content directory.
+W: Amazon EFS with lifecycle to Infrequent Access: it is a multi-AZ POSIX file system that hundreds of Linux clients can mount concurrently, and lifecycle management moves rarely changed data to the cheaper IA class.
+X: A=S3 mounted as a file system: tools such as Mountpoint for Amazon S3 do not provide full POSIX behavior (for example, no in-place modification of existing files or file locking), so it is not a true shared POSIX file system.
+B=EBS Multi-Attach io2: Multi-Attach works only within one AZ, for up to 16 Nitro instances, and needs a cluster-aware file system; it cannot serve hundreds of instances across three AZs, and io2 is expensive.
+C=FSx for Windows File Server: it serves SMB shares with Windows (NTFS) semantics for Windows workloads; Linux clients would lose POSIX permissions and behavior, and its Multi-AZ option spans only two AZs, so it is not the natural shared file system for Linux instances.
+T: Many Linux instances across AZs sharing POSIX files → EFS, with lifecycle to IA for cheap storage of rarely accessed data.
+
+@ Q000493 explain
+G: ## EBS volume types for databases
+- **gp3** (General Purpose SSD): baseline 3,000 IOPS, more can be provisioned; single-digit-millisecond latency; designed for 99.8-99.9% durability. Good default for most workloads.
+- **io2 Block Express** (Provisioned IOPS SSD): up to 256,000 IOPS per volume, consistent sub-millisecond latency, and **99.999% durability**. Built for business-critical databases.
+- **Instance store**: NVMe disks physically attached to the host; very fast, but data is lost when the instance stops, terminates or the host fails.
+## Reading the requirements
+Three constraints together decide it: 60,000 IOPS on **one volume**, **consistent sub-millisecond** latency, and **99.999%** durability. Only io2 Block Express advertises that durability figure and sub-millisecond consistency for block storage.
+W: EBS io2 Block Express: a single volume delivers 60,000 IOPS well within its limits, with consistent sub-millisecond latency and 99.999% durability, matching every requirement for the critical database.
+X: B=Instance store NVMe: it is fast but ephemeral; a stop, termination or host failure loses the data, so it cannot offer the required durability.
+C=gp3 at 60,000 IOPS: even where gp3 can be provisioned to high IOPS, it is designed for 99.8-99.9% durability, not 99.999%, and for single-digit-millisecond rather than consistent sub-millisecond latency.
+D=EFS Max I/O: EFS is a network file system (NFS), not a block device for one database, and its latency is higher than io2 Block Express; Max I/O mode trades higher latency for more aggregate throughput.
+T: Highest, most consistent single-volume block performance with five-nines durability → io2 Block Express; gp3 is the cost-efficient general-purpose tier.
+
+@ Q000494 explain
+G: ## ECS building blocks
+- **Task definition**: a blueprint (image, CPU, memory, ports, IAM role) for one task, which can include several containers.
+- **Task**: one running instance of a task definition.
+- **Service**: a long-running controller that keeps a **desired count** of tasks running, replaces tasks that stop or fail health checks, registers tasks with an ALB target group, and performs deployments (rolling update, blue/green).
+- **RunTask**: a one-off launch of tasks, typically for batch jobs; nothing restarts them.
+## Example
+`desiredCount: 4` with an ALB target group: if one task crashes, the service scheduler starts a new one and registers it. A new task definition revision is rolled out gradually using `minimumHealthyPercent` and `maximumPercent`.
+W: ECS service with desired count 4 and a load balancer: the service keeps exactly four tasks running, replaces failed ones, registers them with the ALB, and rolls out new versions gradually.
+X: A=4 container definitions in one task definition: that creates one task containing four different containers that run and fail together, not four independent copies behind the load balancer.
+C=Container agent restart policy: container restart policies restart a container inside its existing task; they do not keep a task count, replace a lost task elsewhere or manage deployments.
+D=RunTask every minute: scheduled RunTask calls keep launching new standalone tasks without tracking a desired count, would pile up duplicates, and provide no load balancer registration or rolling deployments.
+T: Long-running, self-healing, load-balanced containers → ECS service; RunTask is for one-off or batch tasks.
+
+@ Q000495 explain
+G: ## Read replicas versus Multi-AZ
+- **Read replicas** are copies of an RDS database kept up to date with **asynchronous** replication. Each has its own endpoint that accepts read-only queries. Reporting or analytics tools connect to the replica endpoint, and the primary keeps its resources for writes.
+- A **Multi-AZ DB instance** deployment has one **standby** in another AZ, kept in sync with **synchronous** replication for high availability. The standby cannot serve any traffic; it only takes over during failover.
+- (A Multi-AZ **DB cluster** deployment does have readable standbys, but the classic standby for a DB instance does not.)
+Example: point the BI tool at `reporting-replica.xxxx.rds.amazonaws.com`; heavy `SELECT` queries now run there, and replica lag of a few seconds is acceptable for reports.
+W: Read replicas for reporting: reporting queries move to separate read-only copies, so they no longer consume CPU, memory and I/O on the primary that handles transactional writes.
+X: A=Multi-AZ standby: in a Multi-AZ DB instance deployment the standby exists only for failover and cannot accept queries, so reporting cannot be sent to it.
+B=More allocated storage: extra storage (and any baseline IOPS increase it brings on some storage types) does not remove the CPU and memory contention caused by reporting queries on the same instance.
+D=Single larger instance: a bigger instance delays the problem, but reads and writes still compete on the same database, and each resize causes a brief outage or failover.
+T: Offload read traffic → read replicas; Multi-AZ standby is for availability, not for serving reads.
+
+@ Q000496 explain
+G: ## Loose coupling with queues
+In a **tightly coupled** pipeline, the uploader calls resize, which calls watermark, which calls thumbnails. One slow or failing step blocks or breaks the whole chain.
+In a **loosely coupled** pipeline, each step is an independent worker that reads from its own **SQS queue** (or receives events) and publishes its result for the next step.
+- If the watermark worker crashes, messages wait in its queue and are retried; after repeated failures they go to a **dead-letter queue**.
+- Each worker scales on its own queue depth, for example a Lambda event source mapping or an Auto Scaling group tracking `ApproximateNumberOfMessagesVisible`.
+- Bursts of uploads are buffered instead of overwhelming downstream steps.
+Example: 10,000 uploads in a minute fill the resize queue; resize workers scale out, while thumbnail workers keep their own pace.
+W: Separate SQS queues or events between independent workers: each step consumes from its own buffer, scales on its own backlog and retries failed messages without affecting the other steps.
+X: A=One monolithic synchronous Lambda: all three steps share one function and one timeout, scale as a single unit, and a failure in any step fails the whole upload request.
+B=All steps on one EC2 instance: the instance is a single point of failure and every step shares its CPU and memory, so no step can scale independently.
+C=Direct in-process calls: in-process calls are the definition of tight coupling; a slow or crashing component directly blocks or crashes its callers.
+T: Put a queue or event bus between pipeline steps so each one scales and fails on its own.
+
+@ Q000497 explain
+G: ## AWS fault boundaries
+- A **Region** is a geographic area, such as `eu-west-1`, that contains multiple Availability Zones.
+- An **Availability Zone (AZ)** is one or more discrete data centers with independent power, cooling and networking, physically separated from other AZs in the Region but connected by high-bandwidth, low-latency links.
+- **Edge locations** are CloudFront and Route 53 points of presence; they do not host your databases.
+## Why AZs for synchronous replication
+Synchronous replication waits for the second copy before confirming a write, so the network round trip adds directly to write latency. Between AZs that round trip is small, while between Regions it can be tens of milliseconds or more. RDS Multi-AZ and Aurora use AZs for this reason: losing one facility triggers automatic failover to another AZ.
+W: Across Availability Zones: AZs are separate facilities that fail independently yet are close enough for low-latency synchronous replication and automatic failover.
+X: A=Across Regions: the distance adds much higher latency, so cross-Region copies usually use asynchronous replication for disaster recovery rather than synchronous high availability.
+C=Across racks in one AZ: racks share the same AZ facility, power and network, so the loss of that facility takes down every copy.
+D=Across edge locations: edge locations serve CloudFront, Route 53 and Global Accelerator traffic; they cannot host database replicas.
+T: Synchronous, automatic high availability → replicate across AZs; cross-Region replication is for disaster recovery and is usually asynchronous.
+
+@ Q000498 explain
+G: ## Route 53 routing policies
+- **Simple**: returns the record's values; no health-based choice.
+- **Failover**: one **primary** and one **secondary** record for the same name. A Route 53 **health check** monitors the primary; while it is healthy, queries get the primary answer, and when it fails, Route 53 answers with the secondary.
+- **Geolocation**: answers based on where the user is.
+- **Latency**: answers with the Region that has the lowest latency for the user.
+- **Weighted**: splits traffic by percentages.
+- **Multivalue answer**: returns up to eight healthy records at random.
+## Example
+`app.example.com` primary → ALB in `us-east-1` with a health check on `/health`; secondary → ALB in `us-west-2`. When the primary check fails, clients resolving the name are sent to `us-west-2` after the record's TTL expires.
+W: Failover routing policy: it is designed for active-passive setups, answering with the primary Region's endpoint while its health check passes and switching to the standby Region when it fails.
+X: A=Geolocation: it chooses records by the user's location (continent, country or state), not by whether the primary endpoint is healthy.
+B=Simple: it cannot be associated with health checks, so it keeps returning the failed endpoint.
+D=Multivalue answer: it returns several healthy values for the client to choose from, spreading traffic across them rather than keeping a designated standby idle until the primary fails.
+T: Primary with automatic switch to a standby when unhealthy → failover routing with health checks.
+
+@ Q000499 explain
+G: ## AWS language AI services by direction
+- **Amazon Polly**: text → speech (lifelike voices in many languages).
+- **Amazon Transcribe**: speech → text.
+- **Amazon Translate**: text in one language → text in another.
+- **Amazon Comprehend**: text → insights (entities, sentiment, key phrases).
+## Custom pronunciation in Polly
+Polly accepts **lexicons** in the W3C Pronunciation Lexicon Specification (PLS) format. A lexicon maps a word or abbreviation to how it should be spoken, for example `AWS` read as "Amazon Web Services" or a product name with a special pronunciation. SSML tags can adjust speech further.
+To cache audio, the app calls `SynthesizeSpeech` (or `StartSpeechSynthesisTask`, which writes the output to an S3 bucket) once per article and language, stores the MP3 in S3, and serves the stored file afterward instead of synthesizing again.
+W: Amazon Polly with custom lexicons: Polly turns article text into speech in several languages, lexicons control how specific words are pronounced, and the generated audio files can be stored in S3 and reused.
+X: A=Transcribe with custom vocabularies: Transcribe converts spoken audio to text, the opposite direction; custom vocabularies improve recognition of words, not how they are spoken.
+B=Comprehend with custom entities: Comprehend analyzes text to find entities and sentiment; it produces no audio at all.
+D=Translate with custom terminology: Translate converts text between languages and custom terminology fixes how terms are translated, but the output is still text, not speech.
+T: Text → speech with custom pronunciation → Polly with lexicons; speech → text is Transcribe.
+
+@ Q000500 explain
+G: ## How a private subnet reaches the internet
+A **NAT gateway** lives in a **public** subnet (whose route table sends `0.0.0.0/0` to the internet gateway) and has an Elastic IP. It translates private source addresses to its own address.
+Private instances only use it if **their** subnet's route table says so:
+- Private route table: `10.0.0.0/16 → local`, `0.0.0.0/0 → nat-0abc123`
+- Public route table: `10.0.0.0/16 → local`, `0.0.0.0/0 → igw-0def456`
+If the private route table has only the `local` route, packets for the internet have nowhere to go, even though the NAT gateway itself is healthy.
+## Other checks
+Network ACLs on both subnets and the instances' security groups must allow the outbound traffic and its return; NAT gateways themselves do not have security groups.
+W: Missing `0.0.0.0/0` route to the NAT gateway: without a default route in the private subnet's route table pointing at the NAT gateway, instances never send internet-bound traffic to it, which is the most common cause.
+X: A=Security group on the NAT gateway: NAT gateways cannot have security groups attached, so there is no NAT gateway security group to block traffic.
+B=Private instances need Elastic IPs: the whole point of a NAT gateway is that it uses its own Elastic IP for translation; instances with their own public IPs in a private subnet still could not use them without an internet gateway route.
+C=Internet gateway attached to the private subnet: internet gateways attach to a VPC, not to a subnet; which subnets use it is decided by route tables.
+T: A healthy NAT gateway does nothing until the private route table sends `0.0.0.0/0` to it.
+
+@ Q000501 explain
+G: ## What makes a subnet public or private
+A subnet is not public or private by a setting; it is defined by its **route table**.
+- **Public subnet**: route table contains `0.0.0.0/0 → igw-...` (internet gateway). Instances with public IPs can reach and be reached from the internet.
+- **Private subnet**: route table contains `0.0.0.0/0 → nat-...` (a NAT gateway). Instances can start outbound connections, but nothing on the internet can initiate a connection to them.
+- The NAT gateway itself must sit in a **public** subnet so its own traffic can use the internet gateway.
+## Route tables and associations
+Each subnet is associated with exactly one route table; a subnet without an explicit association uses the VPC's main route table. Typically you create a public route table and a private route table (often one per AZ, each pointing to that AZ's NAT gateway) and associate subnets accordingly.
+W: Public to IGW, private to a NAT gateway in the public subnet: the public route table sends `0.0.0.0/0` to the internet gateway, and the private route table sends `0.0.0.0/0` to a NAT gateway that itself lives in the public subnet.
+X: B=Both subnets to the internet gateway: a default route to the IGW makes the "private" subnet public, so instances with public IPs could be reached directly from the internet.
+C=Private to IGW, public via NAT: this reverses the design; the NAT gateway needs a public subnet with an IGW route to work, and the private subnet would become public.
+D=Main route table only: one shared route table cannot send `0.0.0.0/0` to both an IGW and a NAT gateway, so public and private subnets need different route tables with explicit associations.
+T: The `0.0.0.0/0` target in a subnet's route table (IGW vs. NAT gateway) is what makes it public or private.
+
+@ Q000502 explain
+G: ## The four AWS DR strategies (cheapest/slowest to fastest/most expensive)
+- **Backup and restore**: only backups exist in the DR Region; everything is rebuilt after a disaster. RPO/RTO in hours.
+- **Pilot light**: the core **data** layer is live and replicated (for example an RDS cross-Region read replica or Aurora Global Database), but application servers are **off**. During a disaster you launch them from AMIs or templates and promote the database. RPO minutes, RTO tens of minutes.
+- **Warm standby**: a complete, **running**, scaled-down copy of the whole stack; scale it up on failover. RTO minutes.
+- **Multi-site active-active**: full capacity in both Regions serving traffic. Near-zero RPO/RTO.
+## Spotting pilot light
+The phrase "database replica running, app servers provisioned from AMIs only during a disaster" is the signature: data is warm, compute is cold.
+W: Pilot light: only the replicated database runs in the second Region and application servers are launched from AMIs at failover, giving RPO in minutes and RTO under an hour at low standing cost.
+X: A=Multi-site active-active: both Regions run full production capacity and serve traffic all the time, which is far more expensive and not what the plan describes.
+B=Warm standby: application servers already run (at reduced size) in the DR Region; here no app servers exist until a disaster.
+D=Backup and restore: nothing runs in the DR Region, and data comes back from backups, so RPO would be the backup interval and RTO typically hours, not a live replica.
+T: Only the data layer running = pilot light; a scaled-down but complete running stack = warm standby.
+
+@ Q000503 explain
+G: ## Lowest RTO and RPO
+**RTO** is how long recovery takes; **RPO** is how much recent data may be lost. The AWS DR strategies trade cost for lower RTO/RPO:
+- **Backup and restore**: hours.
+- **Pilot light**: tens of minutes (compute must be launched).
+- **Warm standby**: minutes (running stack must scale up).
+- **Multi-site active-active**: near zero. Both Regions run full production capacity and serve live traffic, with data replicated continuously (for example Aurora Global Database or DynamoDB global tables).
+## How failover works in active-active
+Route 53 (latency, weighted or health-checked records) or Global Accelerator spreads users across both Regions. If one Region fails, health checks remove it and the other Region, already at full size, keeps serving; there is nothing to launch or scale.
+W: Multi-site active-active: full production capacity runs and serves traffic in both Regions at once, so a Region failure needs only traffic redirection, giving the lowest RTO and RPO at the highest cost.
+X: B=Pilot light: application servers are not running in the DR Region, so they must be launched and the database promoted, which takes longer.
+C=Backup and restore: infrastructure and data must be restored from backups after the event, the slowest option with the largest possible data loss.
+D=Warm standby: the DR copy runs at reduced capacity and does not carry the full production load, so it must scale up before taking over.
+T: Paying for full capacity in two Regions that both serve traffic = active-active, the only strategy with near-zero RTO and RPO.
+
+@ Q000504 explain
+G: ## RPO and RTO
+- **Recovery Point Objective (RPO)**: the maximum acceptable **data loss**, measured as time before the incident. RPO 1 hour means the latest recoverable data may be up to 1 hour old, so backups or replication must happen at least hourly.
+- **Recovery Time Objective (RTO)**: the maximum acceptable **downtime**, measured from the incident until service is restored. RTO 4 hours means the application must be running again within 4 hours.
+## Example timeline
+Last backup at 09:00, failure at 09:50, service back at 12:30. Data from 09:00 to 09:50 is lost (50 minutes, within an RPO of 1 hour) and downtime is 2 hours 40 minutes (within an RTO of 4 hours).
+A memory aid: RP**O** looks back at data (**P**oint in time), RT**O** looks forward to **T**ime to recover.
+W: RPO of 1 hour, RTO of 4 hours: "losing up to 1 hour of data" is the recovery point objective and "restore service within 4 hours" is the recovery time objective.
+X: A=RTO 1 hour, RPO 4 hours: this swaps the terms; data-loss tolerance is RPO and time-to-restore is RTO.
+B=SLA and SLO: these are availability commitments and internal targets for normal operation (for example 99.9% uptime), not the data-loss and restore-time targets of a DR plan.
+D=MTTR and MTBF: these are measured reliability averages (mean time to repair, mean time between failures) observed over many incidents, not the planned maximums a DR plan sets.
+T: RPO = how much data you can lose; RTO = how long you can be down.
+
+@ Q000505 explain
+G: ## Pilot light versus warm standby
+Both keep data replicated in a DR Region; they differ in how much **compute** is already running.
+- **Pilot light**: only the core data layer (for example a cross-Region database replica) runs. Application servers, load balancers and scaling groups are defined (AMIs, CloudFormation) but off or at zero capacity. Recovery means launching and configuring them, so RTO is longer, while standing cost is lower.
+- **Warm standby**: a complete but **scaled-down** copy of production runs all the time, for example an Auto Scaling group at 2 instances instead of 20. It can even handle some traffic and be tested continuously. Recovery means scaling up, so RTO is shorter, but you pay for the always-on compute.
+Example: an e-commerce site that needs to be back within 10 minutes chooses warm standby; an internal tool that can wait an hour chooses pilot light.
+W: Warm standby runs a scaled-down working copy: because the full stack is already running at small size, recovery only needs scaling up, so it is faster than pilot light but costs more to keep running.
+X: B=Warm standby keeps no compute running: that describes pilot light; warm standby always runs compute, which is why it costs more, not less.
+C=Identical RTO and cost: they differ on both; warm standby recovers faster and costs more, pilot light is cheaper and slower.
+D=Pilot light runs full production capacity: full capacity running at all times is multi-site active-active; pilot light keeps only the data layer live.
+T: Warm standby = everything running small (faster, pricier); pilot light = only data running (cheaper, slower).

@@ -1,0 +1,356 @@
+# SAA-C03 detailed explanations, chunk e09 (explanation-only rewrites; letters are the published ones)
+
+@ Q003169 explain
+G: ## What a managed API front door does
+Amazon API Gateway is a managed service that sits in front of your backend (for example AWS Lambda functions) and exposes it as a REST, HTTP or WebSocket API. You define resources and methods, and API Gateway handles the request handling, scaling and security in front of them.
+## Throttling, API keys and usage plans
+For partner access, REST APIs offer three building blocks that work together:
+- **API keys**: a string each partner sends in the `x-api-key` header, so you can tell callers apart.
+- **Usage plans**: attach one or more API keys to a plan with a rate limit (requests per second), a burst limit and an optional quota (for example 10,000 requests per day).
+- **Throttling**: when a partner exceeds its limit, API Gateway answers `429 Too Many Requests` before the request ever reaches the backend.
+Example: partner A gets 50 requests per second, partner B gets 500, and both call the same Lambda-backed API.
+W: Amazon API Gateway: it is the serverless API front door with built-in per-client throttling, API keys and usage plans, and it integrates directly with Lambda, so no servers are needed.
+X: A=AWS Direct Connect: it is a dedicated private network link between an on-premises site and AWS. It carries traffic but has no concept of API methods, API keys or per-client request limits.
+B=Amazon CloudFront: it is a CDN that caches and accelerates content at edge locations. It can sit in front of an API, but it has no API key management or per-partner usage plans.
+C=Elastic Load Balancer: a load balancer spreads traffic across targets such as instances or Lambda functions, but it does not issue API keys, meter usage per client or enforce per-partner quotas.
+T: When a question mentions API keys, usage plans or per-client throttling for a serverless API, the answer is API Gateway, not a network or CDN service.
+
+@ Q003170 explain
+G: ## Standard versus FIFO queues
+Amazon SQS has two queue types:
+- **Standard queues** offer nearly unlimited throughput, but delivery is at-least-once (a message can occasionally arrive twice) and ordering is best-effort.
+- **FIFO queues** deliver messages in the exact order they were sent and support exactly-once processing: duplicates sent within a 5-minute deduplication window are dropped (using a `MessageDeduplicationId` or content-based deduplication).
+## Message groups
+Ordering in a FIFO queue is kept per **message group ID**. Messages with the same group ID are delivered strictly in order, one batch at a time; different groups can be processed in parallel by different consumers.
+Example: using the customer account ID as the group ID means all messages for account `1001` stay in order, while account `1002` is processed at the same time by another consumer.
+W: SQS FIFO queue with account ID as group ID: FIFO gives ordered, deduplicated delivery, and grouping by account keeps order per customer while still allowing parallelism across accounts.
+X: A=Standard queue with a DLQ: a dead-letter queue only captures messages that repeatedly fail processing. It does not change the standard queue's best-effort ordering or its at-least-once delivery.
+B=Standard queue with long polling: long polling reduces empty receives and API cost by waiting for messages, but ordering stays best-effort and duplicates can still occur.
+D=SNS standard topic: a standard topic fans messages out to subscribers with no ordering guarantee and at-least-once delivery, so it cannot promise ordered, exactly-once processing per account.
+T: "Exactly once" plus "in order per customer" means an SQS FIFO queue with the customer key as the message group ID; standard queues and DLQs do not change ordering guarantees.
+
+@ Q003171 explain
+G: ## Availability Zones as failure boundaries
+An AWS Region contains several Availability Zones (AZs): separate data centers with independent power, cooling and networking. An outage usually affects one AZ, so anything that runs only in that AZ goes down with it.
+## The standard highly available web tier
+- An **Auto Scaling group** that spans subnets in two or more AZs keeps a desired number of instances running and replaces unhealthy ones, launching them in the remaining AZs if one AZ fails.
+- An **Application Load Balancer** has nodes in each enabled AZ and sends traffic only to healthy targets, so users keep reaching the application.
+Example: desired capacity 4 across `us-east-1a` and `us-east-1b`. If `1a` fails, the ALB stops sending traffic there and the group launches replacements in `1b`.
+W: Multi-AZ Auto Scaling group behind an ALB: instances run in several AZs, the load balancer routes around the failed AZ, and Auto Scaling replaces lost capacity automatically.
+X: B=Daily AMIs restored manually: recovery depends on a person noticing and rebuilding, which takes a long time and can lose up to a day of changes; the application is down in the meantime.
+C=Elastic IP on the primary: an Elastic IP is a fixed address for one instance in one AZ. It does not add a second instance or protect against the AZ failing.
+D=Larger instance in the same AZ: a bigger instance adds capacity, not redundancy. It is still a single instance in the same AZ and fails along with it.
+T: Surviving an AZ failure needs capacity in more than one AZ plus something that routes around the failure: a multi-AZ Auto Scaling group behind a load balancer.
+
+@ Q003172 explain
+G: ## How RDS Multi-AZ works
+With an Amazon RDS **Multi-AZ** deployment, RDS keeps a standby copy of the database in a different AZ and replicates every write to it **synchronously**: a transaction is committed only after it is stored in both AZs, so the standby never lags behind.
+## Automatic failover
+If the primary fails (instance or storage failure, AZ outage, or a reboot with failover), RDS promotes the standby and updates the DNS name of the database endpoint to point to it. Applications reconnect to the same endpoint name.
+- Failover typically completes within one to two minutes for a Multi-AZ DB instance deployment (Multi-AZ DB clusters with two readable standbys usually fail over faster, often in under 35 seconds).
+- Because replication was synchronous, no committed data is lost.
+W: RDS Multi-AZ deployment: synchronous replication to a standby in another AZ plus automatic DNS failover restores service within a minute or two, with no loss of committed data.
+X: A=Single instance with backups: recovery means restoring a snapshot or point-in-time backup to a new instance, which takes much longer than a minute, and point-in-time restore can lose the last few minutes of transactions.
+B=Hourly manual snapshots: a restore is manual and slow, and anything written since the last snapshot (up to an hour of data) is lost.
+D=Read replica in the same AZ: replication to a read replica is asynchronous, so recent writes can be lost; promotion is a manual step; and a replica in the same AZ fails along with the primary during an AZ outage.
+T: Automatic failover with zero data loss is Multi-AZ (synchronous standby); read replicas and backups are asynchronous or manual and can lose data.
+
+@ Q003173 explain
+G: ## Protecting a static site from a Regional outage
+An S3 bucket lives in one Region. S3 stores data across several AZs within that Region, but if the Region's S3 service is impaired, a website served only from that bucket is unavailable.
+## The two pieces of the design
+- **S3 Cross-Region Replication (CRR)** automatically copies new objects from the primary bucket to a bucket in another Region (versioning must be enabled on both).
+- **CloudFront origin failover** uses an **origin group** with a primary and a secondary origin. If the primary returns certain error codes (for example `500`, `503`) or times out, CloudFront retries the request against the secondary origin.
+Example: primary origin in `us-east-1`, replica bucket in `us-west-2`, both in one origin group behind one CloudFront distribution; users keep one URL.
+W: Cross-Region replication with CloudFront origin failover: a second copy of the site exists in another Region, and CloudFront automatically serves from it when the primary origin fails.
+X: A=Single EC2 instance: one instance lives in one AZ of one Region, so it is less available than S3, not more, and it adds servers to manage.
+B=Versioning and MFA Delete in one Region: these protect against accidental overwrites and deletions, but all data still sits in the single Region, so a Regional outage still takes the site down.
+C=S3 One Zone-IA: this class stores data in a single AZ, which lowers availability even within the Region, and it is priced for infrequent access, not for serving website traffic.
+T: Regional resilience for a static site needs a copy in a second Region (CRR) plus a way to switch to it (CloudFront origin group); versioning or storage classes do not leave the Region.
+
+@ Q003174 explain
+G: ## Route 53 routing policies
+Amazon Route 53 answers DNS queries according to a routing policy on each record:
+- **Simple**: returns the configured value(s), with no health checks.
+- **Weighted**: splits traffic by percentage, for example 90/10.
+- **Failover**: an active-passive pair of records, marked primary and secondary.
+## How failover routing works
+You attach a **health check** to the primary record (for example an HTTPS check on `/health` of the primary Region's load balancer). While the check passes, Route 53 answers with the primary; when it fails, Route 53 answers with the secondary record, pointing users to the healthy Region. A short record TTL means clients pick up the change quickly.
+W: Failover routing with health checks: Route 53 monitors the primary Region and automatically returns the secondary Region's record when the primary is unhealthy.
+X: A=Simple routing with one record: a simple record has no health checks and only one destination, so users keep being sent to the failed Region.
+C=Weighted routing without checks: without health checks, Route 53 keeps returning the failed Region's record in proportion to its weight, so part of the traffic still goes to the outage.
+D=Hard-coded static IP: clients always connect to one address; moving traffic to another Region would need an app update, and DNS-based failover cannot help at all.
+T: DNS-level Regional failover means Route 53 failover records with a health check on the primary; routing policies without health checks keep sending users to a dead endpoint.
+
+@ Q003175 explain
+G: ## NAT gateways are zonal
+A NAT gateway lets instances in private subnets reach the internet (for updates or APIs) while blocking inbound connections. Each NAT gateway is created in one subnet, so it lives in one AZ. It is redundant within that AZ, but it goes down if that AZ fails.
+## The problem with one shared NAT gateway
+If private subnets in `az-a`, `az-b` and `az-c` all route `0.0.0.0/0` to one NAT gateway in `az-a`:
+- An outage in `az-a` cuts outbound internet access for all three AZs.
+- Traffic from `az-b` and `az-c` also crosses AZs, adding data transfer charges.
+## The fix
+Create one NAT gateway in a public subnet of each AZ, and give each AZ's private subnets their own route table whose default route points to the NAT gateway in the same AZ.
+W: One NAT gateway per AZ with per-AZ routes: the failure of one AZ only affects the instances in that AZ, and the other AZs keep outbound access.
+X: A=Move everything into the NAT's AZ: this removes the multi-AZ design entirely, so a single AZ failure now takes down the whole application.
+C=Larger NAT instance: a NAT instance is a single EC2 instance in one AZ that you must patch and fail over yourself; a bigger size adds bandwidth, not AZ redundancy.
+D=Second internet gateway: a VPC can have only one internet gateway attached, and the internet gateway is already a highly available, Region-wide component; the single point of failure is the NAT gateway.
+T: NAT gateways are zonal, so high availability means one NAT gateway per AZ with each AZ routing to its own, not a bigger NAT or more internet gateways.
+
+@ Q003176 explain
+G: ## Block storage versus shared file storage
+- **Amazon EBS** is block storage that lives in one AZ. A standard volume attaches to one instance (Multi-Attach for `io1`/`io2` is limited to instances in the same AZ and needs a cluster-aware file system).
+- **Instance store** is disk physically attached to the host; its data is lost when the instance stops or the host fails.
+- **Amazon EFS** is a managed NFS file system. Many Linux instances can mount it at the same time.
+## Regional EFS
+An EFS file system of the **Regional** type (as opposed to One Zone) stores data redundantly across multiple AZs. You create a mount target in each AZ, and instances mount it through the NFS protocol, for example with `mount -t efs fs-12345678:/ /data`. If one AZ fails, instances in the other AZs keep reading and writing the same data.
+W: EFS Regional file system: it is shared, concurrent NFS storage for Linux with data stored across multiple AZs and mount targets in each AZ, so it stays available when one AZ fails.
+X: A=EBS snapshots: snapshots are point-in-time backups stored in S3; they cannot be mounted as a live shared file system, only restored into a new volume.
+B=EBS volume on one instance: the volume is tied to one AZ and one instance, so other instances cannot share it and an AZ failure makes it unavailable.
+D=Instance store: it is local to one host, cannot be shared between instances, and its data is lost if the instance stops or the host fails.
+T: Shared Linux file storage across AZs is EFS (Regional); EBS and instance store are single-AZ block storage for one instance.
+
+@ Q003177 explain
+G: ## Point-in-time recovery in DynamoDB
+**Point-in-time recovery (PITR)** continuously backs up a DynamoDB table. Once enabled, you can restore the table to any second within the recovery period, which is up to the last 35 days (the period is configurable from 1 to 35 days).
+## How a restore works
+A PITR restore always creates a **new table**; it does not modify the existing one. To recover one deleted item:
+- Restore the table to a time just before the deletion, for example 10:14 two days ago, into a new table.
+- Read the item from the restored table and write it back into the production table.
+- Delete the temporary table.
+PITR must already be enabled before the mistake happens.
+W: Point-in-time recovery: continuous backups let you restore the table to the moment before the item was deleted, then copy the item back.
+X: B=Time to live: TTL automatically deletes items after a timestamp attribute expires. It removes data; it has no way to bring a deleted item back.
+C=DynamoDB Streams: a stream keeps item-level change records for only 24 hours, so a deletion from two days ago is no longer available there, and a stream is not a restore feature.
+D=DynamoDB Accelerator: DAX is an in-memory read cache that speeds up reads; it holds no backups and cannot restore deleted data.
+T: Recovering data deleted days ago needs a backup feature (PITR, up to 35 days); TTL deletes items, Streams keep only 24 hours and DAX is just a cache.
+
+@ Q003178 explain
+G: ## RPO and RTO
+- **RPO (recovery point objective)**: how much data you can afford to lose, measured in time. An RPO of seconds means replication must be nearly continuous.
+- **RTO (recovery time objective)**: how long recovery may take. An RTO of minutes means servers must be launchable quickly and automatically.
+## How AWS Elastic Disaster Recovery works
+AWS Elastic Disaster Recovery (AWS DRS) installs a replication agent on source servers and continuously replicates their disks at block level into a staging area in the target Region, using low-cost instances and storage. No full copy of the application runs until you need it.
+- During a disaster or a drill, DRS launches recovery instances from the latest (or an earlier) point in time within minutes.
+- Ongoing cost stays low because only the lightweight staging resources run day to day.
+W: AWS Elastic Disaster Recovery: continuous block-level replication gives an RPO of seconds, automated launch gives an RTO of minutes, and the low-cost staging area keeps ongoing cost down.
+X: A=Monthly AMI copies: an AMI copied once a month means up to a month of lost data, far from an RPO of seconds.
+B=S3 Cross-Region Replication: CRR copies objects in S3 buckets; it does not replicate EC2 instances or their EBS volumes, so it cannot recover the servers.
+C=Daily AWS Backup plans: a daily backup gives an RPO of up to 24 hours, and restoring and rebuilding instances takes longer than a few minutes.
+T: RPO of seconds needs continuous replication; for EC2 servers at low cost that is Elastic Disaster Recovery, not periodic backups or AMI copies.
+
+@ Q003179 explain
+G: ## What loose coupling means
+In a **tightly coupled** system, component A calls component B directly and waits for it. If B is slow or down, A fails too. In a **loosely coupled** system, components communicate through an intermediary, so each one can fail, scale or change independently.
+## Two AWS building blocks
+- **Amazon SQS** is a message queue. A producer writes messages to the queue; consumers pull them when they are ready. If consumers are down, messages wait in the queue (retained for 4 days by default, up to 14 days).
+- **Amazon EventBridge** is an event bus. Producers publish events such as `OrderPlaced`; rules match events and route them to targets such as Lambda, SQS or Step Functions. The producer does not need to know which consumers exist.
+Example: the order service publishes `OrderPlaced` to EventBridge; one rule sends it to an SQS queue for billing, another to a Lambda function for email.
+W: D=Amazon EventBridge: an event bus decouples producers from consumers; producers publish events and rules route them to any number of targets without direct calls.
+E=Amazon SQS: a queue buffers messages between producers and consumers, so each side can scale or fail independently and work is not lost when consumers are busy.
+X: A=AWS Direct Connect: it is a dedicated network connection between on-premises and AWS; it moves packets but provides no messaging or buffering between application components.
+B=Amazon EBS: it is block storage attached to an EC2 instance in one AZ; it stores data for that instance and does not pass messages between components.
+C=Instance store: it is temporary disk on the EC2 host, lost when the instance stops; it has nothing to do with communication between services.
+T: Loose coupling comes from messaging and eventing intermediaries such as SQS and EventBridge, not from storage or network links.
+
+@ Q003180 explain
+G: ## Aurora cluster layout
+An Amazon Aurora cluster has one **writer** instance and up to 15 **Aurora Replicas** (readers). All instances share one cluster volume that stores six copies of the data across three AZs.
+## Failover and endpoints
+- If the writer fails, Aurora promotes one of the replicas to be the new writer, typically in well under a minute (often around 30 seconds). Without any replica, Aurora must re-create the writer, which takes much longer.
+- The **cluster endpoint** is a DNS name that always points to the current writer. After failover, Aurora updates it to the new writer, so applications only need to reconnect with the same name.
+- Instance IP addresses and instance endpoints refer to one specific instance, which may be the failed one.
+Example: writer in `us-east-1a`, replicas in `1b` and `1c`. If `1a` fails, a replica in `1b` is promoted and the cluster endpoint now resolves to it.
+W: B=Cluster endpoint: it always resolves to the current writer, so after a failover the application reconnects to the new writer without any configuration change.
+E=Replicas in other AZs: they are failover targets; if the writer or its whole AZ fails, a replica in a healthy AZ is promoted quickly.
+X: A=Disable automated backups: Aurora automated backups cannot be turned off (retention is at least one day), and removing backups would only reduce recoverability; it adds no availability.
+C=Writer's IP address: the IP belongs to one instance; after a failover the writer is a different instance, so the application would keep connecting to the failed one.
+D=All replicas in the writer's AZ: if that AZ fails, the writer and every replica fail together, leaving no healthy instance to promote.
+T: Aurora availability comes from replicas in other AZs as failover targets plus connecting through the cluster endpoint, which follows the writer after failover.
+
+@ Q003181 explain
+G: ## Event-driven processing with S3 and Lambda
+Amazon S3 can publish **event notifications** when something happens in a bucket, for example `s3:ObjectCreated:*` when an object is uploaded. A notification can invoke an AWS Lambda function directly (or go through SQS, SNS or EventBridge).
+## How it works
+- A user uploads `photos/cat.jpg`.
+- S3 invokes the Lambda function **asynchronously** with an event that contains the bucket name and object key.
+- The function reads the image, creates a thumbnail and writes it to another prefix or bucket.
+Lambda runs one execution per event and scales out automatically with the number of uploads; you pay only for the time the function runs, and there are no servers to patch.
+W: S3 event notifications invoking Lambda: every upload triggers processing automatically and asynchronously, scaling with demand and with no servers to manage.
+X: A=On-premises cron job: it needs on-premises servers, runs only on a schedule instead of on arrival, and has to list and download objects over the internet.
+B=Kinesis stream for images: users would have to send images into the stream instead of S3, records have a small maximum size that large images can exceed, and consumers still need to be built and run.
+D=EC2 polling the bucket: it requires a server that you manage, adds up to a minute of delay, and repeatedly lists the bucket even when nothing is new.
+T: "Automatically when objects arrive, without servers" points to S3 event notifications triggering Lambda, not polling or scheduled jobs.
+
+@ Q003182 explain
+G: ## Centralized backup with AWS Backup
+**AWS Backup** is a managed service that backs up many AWS resource types from one place, including EC2 instances, EBS volumes, RDS and Aurora databases, EFS file systems, DynamoDB tables and more.
+## Key concepts
+- **Backup plan**: a schedule (for example daily at 03:00) plus lifecycle rules such as "move to cold storage after 30 days, delete after 365 days".
+- **Resource assignment**: select resources by tag (for example `backup=daily`) or by ARN, so new tagged resources are included automatically.
+- **Backup vault**: where recovery points are stored, with its own encryption key and access policy; Vault Lock can prevent deletion before retention ends.
+- With AWS Organizations, backup policies can be applied across many accounts.
+W: AWS Backup: it provides scheduled, policy-based backups with central retention rules for EC2, EBS, RDS, EFS and other services from one console.
+X: B=AWS Storage Gateway: it connects on-premises applications to AWS storage through file, volume and tape interfaces; it does not schedule backups of AWS resources such as RDS or EFS.
+C=AWS DataSync: it copies and synchronizes data between storage systems (for example NFS to EFS or S3), but it has no backup plans, recovery points or retention policies for EC2 or RDS.
+D=AWS Snowball: it is a physical device for moving large amounts of data offline into or out of AWS, not a scheduled backup service.
+T: Scheduled backups with central retention across many AWS services is AWS Backup; Storage Gateway, DataSync and Snowball move data but do not manage backup policies.
+
+@ Q003183 explain
+G: ## Who manages the servers under containers?
+Amazon ECS schedules containers as **tasks** (one or more containers defined in a task definition) and keeps a set number of tasks running as a **service**. ECS can run tasks on two kinds of capacity:
+- **EC2 launch type**: you run and manage the EC2 container instances yourself: choosing instance types, patching the OS, scaling the cluster.
+- **AWS Fargate**: AWS provides the compute for each task. You specify CPU and memory in the task definition (for example `0.5 vCPU`, `1 GB`) and never see or manage the underlying servers.
+Fargate also works with Amazon EKS for Kubernetes pods.
+W: Amazon ECS on AWS Fargate: you define only tasks and services; AWS provisions, patches and scales the servers that run them.
+X: A=Kubernetes on on-premises VMs: the company must operate the VMs, the hypervisor and the Kubernetes control plane itself, which is the opposite of AWS-managed servers.
+B=Docker on a single EC2 host: the company manages the instance and the Docker setup, and a single host is also a single point of failure.
+C=ECS on self-managed EC2: ECS orchestrates the containers, but the company still manages the EC2 instances, including patching and capacity.
+T: For containers without managing servers choose Fargate; ECS on EC2 still leaves the instances to you.
+
+@ Q003184 explain
+G: ## The four AWS DR strategies
+From cheapest and slowest to most expensive and fastest:
+- **Backup and restore**: only backups in the recovery Region; everything is rebuilt after a disaster (RTO of hours).
+- **Pilot light**: core data is replicated live (for example a database replica), but application servers are off or not yet created. Recovery means starting and scaling them (RTO of tens of minutes).
+- **Warm standby**: a complete, working copy of the environment runs at reduced size. Recovery means scaling it up to full capacity (RTO of minutes).
+- **Multi-site active/active**: full capacity in both Regions serving traffic (RTO near zero, highest cost).
+## Pilot light versus warm standby
+The difference is whether the application tier is already running. Warm standby can take some traffic immediately and only needs scaling, so it recovers faster, but it costs more because servers run all the time.
+W: Warm standby runs a scaled-down working copy: the whole stack is already running at small size, so recovery is only scale-up, making it faster than pilot light and more expensive.
+X: A=Pilot light runs full capacity: full production capacity in both Regions describes multi-site active/active; pilot light keeps only core components such as data running.
+B=Warm standby keeps only backups: backups with no running resources is the backup and restore strategy; warm standby always has running resources.
+D=Pilot light faster and more expensive: it is the reverse; pilot light is cheaper because less runs, and slower because servers must be started and scaled.
+T: Pilot light keeps only the core (data) running and is cheaper but slower; warm standby keeps a small full copy running and is faster but costs more.
+
+@ Q003185 explain
+G: ## EBS volume families
+- **SSD volumes** are built for IOPS (many small random reads and writes): `gp3` (general purpose) and `io2` (Provisioned IOPS).
+- **HDD volumes** are built for throughput on large sequential reads: `st1` (Throughput Optimized) and `sc1` (Cold).
+- **Magnetic (standard)** is a previous-generation type kept for older workloads.
+## Provisioned IOPS SSD
+With `io2` (all io2 volumes now run on EBS Block Express) you set the exact IOPS you need, up to 256,000 IOPS per volume, with sub-millisecond latency and consistent performance, plus higher durability (99.999%) than other EBS types. That consistency is what transactional databases such as busy Oracle, SQL Server or PostgreSQL workloads need.
+Example: an OLTP database needs a steady 40,000 IOPS; provision an `io2` volume with 40,000 IOPS.
+W: Provisioned IOPS SSD (io2): it delivers a guaranteed, consistent high IOPS level with low latency, exactly what a demanding transactional database requires.
+X: B=Magnetic previous generation: these volumes offer only around 100 IOPS on average with variable performance, far too little for a busy transactional database.
+C=Cold HDD (sc1): it is the lowest-cost type for rarely accessed, sequential data; its performance is measured in throughput, not IOPS, and random small I/O performs poorly.
+D=Throughput Optimized HDD (st1): it is designed for large sequential reads such as logs and big data; database random I/O needs SSD IOPS, and st1 cannot be a boot volume.
+T: Consistent high IOPS for databases means SSD, specifically io2 Provisioned IOPS; HDD types (st1, sc1) are for sequential throughput.
+
+@ Q003186 explain
+G: ## Throughput versus IOPS
+- **IOPS** counts input/output operations per second and matters for many small random reads and writes, such as databases.
+- **Throughput** measures megabytes per second and matters for large sequential reads, such as scanning log files or big data sets.
+## The EBS HDD types
+- **Throughput Optimized HDD (`st1`)**: low-cost HDD for **frequently accessed**, throughput-heavy sequential workloads such as big data, data warehouses and log processing; up to 500 MiB/s per volume.
+- **Cold HDD (`sc1`)**: the lowest cost per GB, for **infrequently accessed** data; up to 250 MiB/s per volume with lower baseline throughput.
+SSD types (`gp3`, `io2`) can also be fast, but you pay SSD prices per GB for performance a sequential job does not need.
+W: Throughput Optimized HDD (st1): it is built for frequently accessed, large sequential reads at high throughput and costs much less per GB than SSD.
+X: A=Cold HDD (sc1): it is meant for rarely accessed data; its lower baseline throughput makes a job that reads heavily and regularly slower than on st1.
+C=General Purpose SSD (gp3): it works but costs more per GB than st1, and its strength is balanced IOPS rather than cheap sequential throughput for large data sets.
+D=Provisioned IOPS SSD (io2): it is the most expensive type and pays for random IOPS that a sequential big data job does not use.
+T: Large, frequent sequential reads at low cost means st1; sc1 is for cold data and SSD types pay for IOPS you do not need.
+
+@ Q003187 explain
+G: ## Why uploads from far away are slow
+When a user in Sydney uploads to a bucket in `us-east-1`, the data travels over the public internet across many networks. Long distance and congested routes raise latency and packet loss, and TCP slows down.
+## How S3 Transfer Acceleration works
+Transfer Acceleration uses the CloudFront edge network. The client sends data to the nearest edge location, and from there it travels to the bucket over the AWS global network, which is faster and more reliable than the public internet over long distances.
+- Enable it on the bucket, then use the accelerate endpoint, for example `mybucket.s3-accelerate.amazonaws.com`.
+- You pay an extra per-GB fee, charged only when acceleration actually improves the transfer.
+W: S3 Transfer Acceleration: uploads enter the AWS network at the nearest edge location and travel over the AWS backbone, speeding up long-distance transfers to a single bucket.
+X: A=Requester Pays: it changes who pays for requests and downloads; it has no effect on network path or upload speed.
+C=Object Lock: it stores objects in write-once-read-many mode to prevent deletion or overwrite; it is a compliance feature, not a performance one.
+D=Intelligent-Tiering: it automatically moves objects between access tiers to lower storage cost based on access patterns; it does not change upload speed.
+T: Slow long-distance uploads to one bucket are fixed with Transfer Acceleration (edge entry plus AWS backbone); storage classes and billing options do not affect speed.
+
+@ Q003188 explain
+G: ## What multipart upload does
+Multipart upload splits one object into parts that are uploaded separately and then combined by S3:
+- `CreateMultipartUpload` starts the upload and returns an upload ID.
+- `UploadPart` sends each part (5 MiB to 5 GiB, up to 10,000 parts); parts can be sent in parallel.
+- `CompleteMultipartUpload` tells S3 to assemble the parts into one object.
+## Why it helps on unreliable networks
+- If one part fails, only that part is retried instead of the whole file.
+- Parallel parts use more bandwidth, so large files finish faster.
+- A single PUT is limited to 5 GB; larger objects, up to terabytes in size, must be uploaded with multipart upload.
+Example: a 10 GB file in 100 MB parts; if part 57 fails, only those 100 MB are resent. AWS recommends multipart for objects larger than 100 MB, and the AWS CLI and SDKs use it automatically.
+W: Multipart upload with parallel parts and retries: failures cost only one part instead of the whole file, and parallel parts increase speed.
+X: A=One byte at a time: sending bytes sequentially would be extremely slow and still gives no resume or retry model; S3 has no API for byte-by-byte uploads.
+B=One larger archive: combining files makes the single object even bigger, so any network failure forces an even larger retransmission.
+D=Single PUT with longer timeouts: a longer timeout does not help when the connection drops; the whole object must be resent after any failure, and a single PUT is capped at 5 GB.
+T: For large uploads over unreliable links, multipart upload retries only failed parts and uploads in parallel; bigger objects or longer timeouts do not fix failures.
+
+@ Q003189 explain
+G: ## EC2 instance families
+EC2 instance types are grouped by the resource they emphasize:
+- **Compute optimized (C family, for example `c7i`, `c7g`)**: high-performance processors and a high CPU-to-memory ratio.
+- **Memory optimized (R, X families)**: much more RAM per vCPU.
+- **Storage optimized (I, D families)**: fast local NVMe or large local disks.
+- **Burstable (T family)**: low baseline CPU with credits to burst for short periods.
+## Why video encoding fits compute optimized
+Video encoding keeps every CPU core busy for long periods doing arithmetic on frames, while memory needs are moderate. C family instances deliver the most CPU performance per dollar for this kind of work; the same applies to batch processing, scientific modeling and game servers.
+W: Compute optimized C family: it offers high-performance CPUs with many cores at the best price per unit of compute, matching sustained CPU-heavy encoding.
+X: B=Memory optimized R family: it adds large amounts of RAM per vCPU, which encoding does not need, so you pay for memory that sits unused.
+C=Burstable T family: it runs at a low baseline CPU level and depends on credits; sustained encoding exhausts the credits and either throttles or incurs extra charges in unlimited mode.
+D=Storage optimized I family: it is built for very high local disk IOPS (for example NoSQL databases), not for maximum CPU throughput.
+T: Sustained CPU-heavy work such as encoding belongs on compute optimized C family instances; burstable T instances are for low average CPU.
+
+@ Q003190 explain
+G: ## Matching memory needs to instance families
+Each instance family has a typical ratio of memory to vCPU:
+- **Compute optimized, C family**: about 2 GiB per vCPU.
+- **General purpose, M family**: about 4 GiB per vCPU.
+- **Memory optimized, R family**: about 8 GiB per vCPU, for example `r7i.8xlarge` with 256 GiB.
+- **Memory optimized, X family**: about 16 GiB per vCPU or more, with sizes reaching several TiB; **High Memory U family** instances go even higher.
+## Why in-memory analytics needs them
+In-memory analytics engines (for example SAP HANA, Spark caching or large in-memory databases) keep the working data set in RAM. If the data does not fit, the application spills to disk or fails, so the deciding factor is RAM per instance, not CPU.
+W: Memory optimized R or X families: they offer a high memory-to-vCPU ratio and sizes with hundreds of GiB up to TiBs of RAM, which is what in-memory analytics needs.
+X: A=Burstable T family: the largest T sizes offer tens of GiB of RAM, not hundreds, and their credit-based CPU is meant for light, intermittent workloads.
+B=Compute optimized C family: the memory-to-vCPU ratio is low, so reaching hundreds of GiB means paying for far more CPU than needed.
+C=GPU accelerated computing: GPUs speed up parallel math such as machine learning or rendering; buying them only for RAM wastes money and does not target the requirement.
+T: When the requirement is RAM per instance (in-memory workloads), choose memory optimized R or X instances, not compute, burstable or GPU instances.
+
+@ Q003191 explain
+G: ## AWS Lambda for short, event-driven tasks
+AWS Lambda runs your code in response to events without servers to manage. You upload a function, connect it to an event source, and Lambda runs one execution per event.
+- **Event sources**: S3 uploads, SQS messages, API Gateway requests, EventBridge rules and more.
+- **Scaling**: many uploads at once lead to many concurrent executions automatically.
+- **Pricing**: you pay per request and per millisecond of run time, so tasks that last a few seconds cost very little and idle time costs nothing.
+- **Limit**: a single invocation can run up to 15 minutes, which is ample for seconds-long tasks.
+Example: an upload to `s3://uploads/` triggers a function that validates the file and writes metadata to DynamoDB in two seconds.
+W: AWS Lambda: it is triggered directly by S3 events, runs each short task on demand, scales automatically and charges only for the seconds of execution.
+X: A=Amazon EMR: it runs big data clusters (Spark, Hadoop) for large-scale processing; starting or keeping a cluster for seconds-long per-file tasks is slow and costly.
+C=Amazon EC2: instances must be provisioned, patched and kept running (and paid for) even when no uploads arrive, and extra code is needed to receive the events.
+D=AWS Batch: it queues and schedules batch jobs on managed compute, which adds job scheduling and container startup overhead that does not suit seconds-long tasks per upload.
+T: Short, per-event tasks triggered by S3 fit Lambda; EMR, Batch and EC2 are for larger or long-running workloads.
+
+@ Q003192 explain
+G: ## Scaling reads on Amazon RDS
+A single RDS primary instance handles both writes and reads. When read traffic dominates, the primary runs out of CPU or I/O even though writes are light.
+## Read replicas
+A **read replica** is a separate DB instance that receives changes from the primary through **asynchronous** replication and accepts read-only queries.
+- MySQL, MariaDB and PostgreSQL support up to 15 read replicas per source.
+- Each replica has its own endpoint; the application sends `SELECT` traffic to replicas and writes to the primary.
+- Replicas can be in the same AZ, another AZ or another Region.
+Example: reporting queries and product page reads go to two replicas, cutting the primary's CPU from 90% to 40%.
+W: Read replicas with read routing: reads move to separate instances, which takes load off the primary and adds read capacity.
+X: A=Multi-AZ standby for reads: in a Multi-AZ instance deployment the standby does not accept connections; it exists only for failover. (Only the separate Multi-AZ DB cluster option has readable standbys.)
+B=Longer backup retention: this only keeps automated backups for more days; it adds no capacity for queries.
+D=Storage auto scaling: it adds disk space when free storage runs low; the problem is read load on CPU and I/O, not full disks.
+T: Read-heavy RDS load is solved with read replicas; a Multi-AZ instance standby is for availability and cannot serve reads.
+
+@ Q003193 explain
+G: ## Why session stores use an in-memory cache
+Session data (login state, shopping cart) is small, read on almost every request, and must be fast. Disk-based databases add milliseconds per lookup; an in-memory store answers in well under a millisecond.
+## Amazon ElastiCache
+ElastiCache is a managed in-memory data store with Valkey, Redis OSS or Memcached engines.
+- Data lives in RAM, giving sub-millisecond latency.
+- Cluster mode spreads keys across shards, and read replicas add read capacity, so a cluster can handle millions of operations per second.
+- Keys can expire automatically with a TTL, for example `SET session:abc123 ... EX 1800` for a 30-minute session.
+- Multi-AZ with automatic failover (Valkey and Redis OSS) keeps sessions available.
+W: Amazon ElastiCache: it keeps sessions in memory with sub-millisecond latency and scales to millions of reads per second through sharding and replicas.
+X: B=Amazon RDS MySQL: it is a disk-based relational database with typical millisecond latencies, and one primary with a few replicas struggles to serve millions of reads per second.
+C=Amazon Redshift: it is a data warehouse for analytical queries over large data sets; queries take far longer than a millisecond and it is not built for high-rate key lookups.
+D=Amazon S3 Standard: it is object storage accessed over HTTP with latency in the tens of milliseconds, far too slow for per-request session lookups.
+T: Sub-millisecond latency at millions of reads per second means an in-memory store such as ElastiCache, not a disk-based database, warehouse or object store.

@@ -1,0 +1,364 @@
+# SAA-C03 detailed explanations, e08 (explanation-only rewrites; letters are the published ones)
+
+@ Q002033 explain
+G: ## DynamoDB capacity modes and what you pay for
+- **On-demand** mode bills per request (write and read request units). There is nothing to plan, which is ideal for new, spiky or unpredictable traffic, but each request costs more than the same work on well-used provisioned capacity. AWS lowered on-demand prices substantially in late 2024, which narrowed the gap, yet a table that is busy around the clock is still cheaper on provisioned capacity.
+- **Provisioned** mode bills per hour for the write and read capacity units (WCU/RCU) you configure, whether you use them or not. It is cheapest when the table is busy most of the time.
+- **Auto scaling** adjusts provisioned capacity toward a target utilization (for example 70%) so you follow real demand instead of sizing for the worst case.
+- **Reserved capacity** is a one- or three-year commitment to a baseline amount of provisioned WCU/RCU in a Region: an upfront payment plus a much lower hourly rate than standard provisioned pricing.
+## Example
+A table that writes about 5,000 items per second all day, every day, for a year is almost perfectly predictable. Reserve roughly the 5,000 WCU baseline, and let auto scaling add a little on top for small peaks. The result is far cheaper than paying per request for the same steady volume.
+W: Provisioned + auto scaling + reserved capacity: steady, long-running load is where provisioned capacity is cheapest, reserved capacity discounts the known baseline further, and auto scaling covers the small variations without manual overprovisioning.
+X: A=On-demand mode: you pay a per-request price that is designed for unpredictable traffic; for a constant 5,000 writes per second around the clock it costs noticeably more than committed provisioned capacity.
+B=10x provisioned capacity: paying for 50,000 WCU while using about 5,000 wastes roughly 90% of the spend every hour; auto scaling avoids throttling without this kind of blanket overprovisioning.
+D=On-demand with DAX: DAX is an in-memory read cache; writes still go to the table and are billed the same, so it adds cluster cost without reducing the write bill.
+T: For steady, predictable DynamoDB throughput use provisioned capacity with reserved capacity for the baseline; on-demand is for traffic you cannot predict.
+
+@ Q003145 explain
+G: ## How code on EC2 should get AWS credentials
+An application calling S3 needs credentials to sign its requests. The secure way is an **IAM role** attached to the instance through an **instance profile**.
+- The EC2 instance metadata service (use IMDSv2) hands the application **temporary credentials** that AWS rotates automatically.
+- AWS SDKs and the CLI find these credentials on their own, so nothing secret is stored in code, config files or environment variables.
+- The role's policy should follow **least privilege**: only the actions and resources the app needs.
+## Example
+A role policy that allows `s3:PutObject` on `arn:aws:s3:::uploads-bucket/*` lets the app upload to that one bucket and nothing else. If the instance is compromised, the attacker gets short-lived credentials limited to that single action.
+W: Instance role with scoped PutObject: temporary, automatically rotated credentials with no long-term secret on disk, restricted to exactly one action on one bucket, which is least privilege.
+X: A=Public write bucket policy: anyone on the internet could upload, overwrite or fill the bucket with malicious content; it removes authentication rather than granting access securely.
+B=IAM user keys in a config file: long-term access keys never expire on their own, can leak through backups, images or source control, and must be rotated manually.
+D=Root user keys in environment variables: root credentials have unrestricted access to the whole account and cannot be limited by IAM policies; AWS recommends having no root access keys at all.
+T: Code on EC2 should use an instance role with a least-privilege policy, never stored access keys and never public bucket access.
+
+@ Q003146 explain
+G: ## What an S3 presigned URL is
+A **presigned URL** is a normal S3 URL that carries a signature created with the backend's credentials. Anyone holding the URL can perform exactly that one operation (for example `PUT` of one object key) until the URL expires.
+- The backend, which already has an IAM role, calls the SDK to generate the URL with a short expiry such as 5 minutes.
+- The mobile app uploads the file directly to S3 with a plain HTTPS request. The file never passes through the backend servers.
+- The app never holds AWS credentials; the URL only works for the object key and method it was signed for.
+## Example
+The user taps "upload". The app asks the API for an upload URL; the backend checks the user is signed in, signs `PUT photos/user123/abc.jpg` valid for 300 seconds, and returns it. The app sends the photo to that URL.
+W: Short-lived presigned URLs: direct client-to-S3 uploads, no credentials inside the app, and each URL is limited to one object and a short time window.
+X: A=Sharing the root password: gives a whole team full, unrestricted control of the account and still does not provide a credential-free upload path for end users.
+B=IAM user keys in the app package: anyone can extract keys from a mobile app binary, and those long-term keys work for any request the IAM user is allowed to make until someone revokes them.
+D=Publicly writable bucket: anyone on the internet can upload or overwrite objects, which invites abuse, malware hosting and unexpected storage costs.
+T: Let clients upload straight to S3 with short-lived presigned URLs issued by the backend instead of giving the client credentials or opening the bucket.
+
+@ Q003147 explain
+G: ## Workforce sign-in across many AWS accounts
+**AWS IAM Identity Center** is the recommended way to give employees access to AWS accounts.
+- It connects to an external identity provider such as Microsoft Entra ID or Okta over SAML 2.0, and can sync users and groups automatically with SCIM.
+- Administrators define **permission sets** (collections of policies) and assign them to groups for specific accounts in AWS Organizations. Identity Center creates the matching roles in each account.
+- Employees sign in once with their corporate login, open the AWS access portal and pick an account and role. They receive temporary credentials, so no long-term IAM users are needed.
+## Example
+The `Developers` group in the corporate IdP is assigned a `PowerUser` permission set on the dev accounts and `ReadOnly` on production. When someone leaves the company, disabling them in the IdP removes their AWS access everywhere.
+W: IAM Identity Center with the corporate IdP: central federation, one sign-in for all accounts, group-based permission sets and temporary credentials, with joiners and leavers handled in the IdP.
+X: A=IAM users in every account: creates separate passwords and keys per employee per account, which is hard to audit and easy to forget when people leave.
+B=Shared IAM user: no individual accountability in CloudTrail, the password spreads widely, and access cannot be revoked for one person without affecting everyone.
+D=Cognito identity pools: Cognito is built for customer identities in your own applications; it does not provide workforce sign-in to the AWS console across Organizations accounts.
+T: Employees reach AWS accounts through IAM Identity Center federated with the corporate IdP; Cognito is for application end users.
+
+@ Q003148 explain
+G: ## The two halves of Amazon Cognito
+- **User pools** are a user directory and authentication service: sign-up, sign-in, password policies, MFA and social or SAML/OIDC federation (for example Google, Facebook, Apple). After sign-in the user gets JSON Web Tokens (ID and access tokens).
+- **Identity pools** (federated identities) exchange a trusted token, such as a user pool token, for **temporary AWS credentials** by assuming an IAM role. Roles can differ for signed-in and guest users.
+## Example
+A user signs in with Google through the user pool and receives tokens. The app passes the ID token to the identity pool, which returns short-lived credentials for a role whose policy allows `s3:PutObject` only under `uploads/${cognito-identity.amazonaws.com:sub}/*`. Each user can only write to their own prefix.
+W: User pools plus identity pools: the user pool handles sign-up, sign-in and social logins, and the identity pool turns that login into scoped, temporary AWS credentials for S3.
+X: A=IAM users per app user: IAM is meant for people and workloads operating your AWS account, has per-account user quotas, and offers no sign-up or social login flow for customers.
+B=Custom RDS user table: storing plaintext passwords is a serious security flaw, and it still provides neither social login nor AWS credentials.
+C=One shared role without identity: every user gets the same permissions, so you cannot isolate per-user data or tell users apart, and there is no sign-up or sign-in.
+T: Cognito user pools answer "who is this user"; identity pools answer "what temporary AWS credentials does this user get".
+
+@ Q003149 explain
+G: ## Enforcing MFA with an IAM condition
+When a user signs in with MFA, their requests carry the condition key `aws:MultiFactorAuthPresent` with the value `true`. An IAM policy can use this key to **deny** actions when MFA is missing.
+- Attach the policy to a group containing all IAM users (or to each user).
+- The policy denies everything except the few actions needed to set up MFA (such as `iam:CreateVirtualMFADevice`, `iam:EnableMFADevice`, `iam:ListMFADevices`, `sts:GetSessionToken`) when `aws:MultiFactorAuthPresent` is not true.
+- Use the `BoolIfExists` operator so requests that do not include the key at all, like those signed with long-term access keys, are also denied.
+## Example
+A new user signs in with only a password. They can register an MFA device, but any attempt to open EC2 or S3 is denied. After signing in again with their MFA code, the deny no longer applies.
+W: Deny when MultiFactorAuthPresent is false: an explicit deny is evaluated by IAM on every request, so users without MFA are actually blocked, not just reminded.
+X: A=CloudWatch dashboard: shows who has MFA but blocks nothing; users without MFA still work normally.
+B=S3 bucket policies requiring MFA: protects only S3 buckets, leaving every other service open, and is a per-bucket patch instead of an account-wide control.
+D=Monthly email reminder: relies on voluntary compliance and provides no technical enforcement at all.
+T: MFA is enforced by an IAM policy that denies requests without `aws:MultiFactorAuthPresent`; dashboards and reminders only report or remind.
+
+@ Q003150 explain
+G: ## Cross-account access with IAM roles
+The standard secure pattern for one account to use resources in another is **role assumption** with AWS STS.
+- Account B creates a role with a **trust policy** naming the principal allowed to assume it, for example `arn:aws:iam::111111111111:role/app-role` in Account A, and a permissions policy allowing `s3:GetObject` on its bucket.
+- Account A's role gets a policy allowing `sts:AssumeRole` on that role's ARN.
+- The application calls `AssumeRole` and receives temporary credentials that work only for what Account B's role permits.
+## Why this is secure
+No long-term secrets cross accounts, credentials expire automatically, Account B controls exactly what is allowed, and CloudTrail in both accounts records who assumed the role and when. Access can be removed by editing the trust policy. A bucket policy that grants the Account A role directly is another valid pattern for S3.
+W: Assumable role in Account B: temporary credentials, least-privilege read access defined by the resource owner, and a trust relationship limited to Account A's specific role.
+X: A=Nightly copy: creates duplicate data that is up to a day stale, adds storage and transfer cost, and still needs cross-account permissions for the copy job.
+B=Public read bucket: exposes the data to everyone on the internet, not just Account A.
+C=Shared IAM user keys: long-term keys handed to another account can leak, never expire on their own and give no clear audit trail of which workload used them.
+T: Cross-account access uses an assumable role (or a resource policy) with temporary credentials, never shared keys or public buckets.
+
+@ Q003151 explain
+G: ## Security groups that reference other security groups
+A **security group** is a stateful firewall attached to network interfaces. An inbound rule's source can be a CIDR or **another security group**.
+- When the source is a security group, traffic is allowed from any instance that has that group attached, whatever its IP address.
+- Instances can be added or replaced by Auto Scaling and the rule still applies, because it follows group membership, not IPs.
+- Security groups have only allow rules; anything not allowed is denied. Return traffic is allowed automatically because they are stateful.
+## Example
+`sg-web` is on the web instances. `sg-app` on the application instances has one inbound rule: TCP `8080` from source `sg-web`. Nothing else, including the internet or other subnets, can reach port 8080 on the app tier.
+W: App SG allows 8080 from the web SG only: precise tier-to-tier isolation on one port that keeps working as web instances scale in and out.
+X: A=Public IPs plus a firewall script: exposes the application tier to the internet and moves security into fragile, self-managed host software.
+B=Route to the internet gateway: routes decide where packets go, not who is allowed in; a default route to the internet gateway turns the private subnets into public subnets and does nothing to limit which sources can reach port 8080.
+D=NACL allowing everything: allowing all traffic between all subnets is the opposite of isolation and does nothing to limit access to port 8080.
+T: Isolate tiers by allowing a port from a source security group; routes and permissive NACLs do not restrict which instances can connect.
+
+@ Q003152 explain
+G: ## Where web application attacks are stopped
+SQL injection and cross-site scripting (XSS) are **layer 7** attacks hidden inside normal-looking HTTP requests on port 443. Only a component that inspects request content can block them.
+**AWS WAF** is a web application firewall you attach to CloudFront, an Application Load Balancer, API Gateway and some other resources.
+- A **web ACL** holds rules that match request parts such as the URI, query string, headers or body.
+- **AWS managed rule groups** give ready-made protection, for example the core rule set (common exploits including XSS) and the SQL database rule group (SQL injection patterns).
+- Attached to CloudFront, the rules run at edge locations, so bad requests are blocked before they reach your origin.
+## Example
+A request like `/search?q=' OR 1=1--` matches the SQL injection rule and receives a 403 response at the edge.
+W: AWS WAF with managed rule groups: inspects HTTP content and blocks SQL injection and XSS patterns, and on CloudFront it does so at the edge.
+X: A=Shield Standard: automatic protection against common network and transport layer (layer 3/4) DDoS attacks; it does not inspect HTTP requests for injection payloads.
+B=Security groups on 443: they filter by protocol, port and source only; an attack sent over HTTPS on port 443 passes straight through.
+C=Network ACLs: stateless IP and port filters at the subnet level; they cannot see request content, and attackers do not come from a fixed "unknown" range.
+T: Content-based web attacks such as SQLi and XSS need AWS WAF; security groups, NACLs and Shield Standard work below the HTTP layer.
+
+@ Q003153 explain
+G: ## VPC endpoints for AWS services
+Instances in private subnets have no route to the internet. A **VPC endpoint** lets them reach AWS services privately.
+- **Gateway endpoints** exist for Amazon S3 and DynamoDB. You create one and select route tables; AWS adds a route whose destination is the service's **prefix list** (such as `pl-xxxxxxxx`) and whose target is the endpoint.
+- Gateway endpoints have no hourly or data processing charge, and traffic stays on the AWS network.
+- Endpoint policies can limit which tables or actions are allowed through the endpoint.
+- DynamoDB also supports interface endpoints (PrivateLink), mainly for access from on premises or other VPCs; they have hourly and per-GB charges.
+## Example
+Private subnet route table: `10.0.0.0/16 -> local` and `pl-dynamodb -> vpce-1234`. SDK calls to `dynamodb.<region>.amazonaws.com` now travel through the endpoint with no NAT gateway or internet gateway.
+W: DynamoDB gateway endpoint in the private route tables: private access with no internet path and no endpoint charge.
+X: A=Public IPs on the instances: moves them into an internet-facing design (a public IP needs an internet gateway route) which is exactly what the requirement excludes.
+B=NAT gateway: sends DynamoDB traffic toward the internet path and adds hourly and per-GB processing charges that a gateway endpoint avoids.
+C=Internet gateway on private subnets: an internet gateway attaches to the VPC, not to subnets, and routing private subnets to it would make them public.
+T: For S3 or DynamoDB from private subnets, use a free gateway endpoint instead of NAT or internet access.
+
+@ Q003154 explain
+G: ## Shield Standard versus Shield Advanced
+- **AWS Shield Standard** is automatic and free for every AWS customer. It defends against the most common network and transport layer (layer 3/4) DDoS attacks.
+- **AWS Shield Advanced** is a paid subscription (monthly fee with a one-year commitment) for protected resources such as CloudFront distributions, Route 53 hosted zones, Global Accelerator accelerators, Application and Classic Load Balancers, and Elastic IP addresses (for EC2 instances or Network Load Balancers).
+## What Shield Advanced adds
+- Enhanced detection and mitigation for larger and more sophisticated attacks, including application layer help with AWS WAF.
+- 24/7 access to the **Shield Response Team (SRT)**, the AWS DDoS experts, during attacks (requires a qualifying paid AWS Support plan).
+- Near real-time attack visibility and **cost protection** credits for scaling charges caused by a DDoS attack.
+## Example
+A ticketing site expects attacks during a big sale. With Shield Advanced on its CloudFront distribution, the SRT can help write WAF rules while an attack is happening.
+W: Shield Advanced: the only option that adds large-scale DDoS mitigation together with access to the Shield Response Team during attacks.
+X: A=Amazon Inspector: scans EC2, container images and Lambda for software vulnerabilities and network exposure; it does not mitigate DDoS traffic.
+B=Amazon GuardDuty: analyzes logs and events to detect threats such as compromised credentials; it reports findings but does not absorb attack traffic.
+D=Shield Standard: gives baseline layer 3/4 protection only, with no access to AWS DDoS experts and no cost protection.
+T: Need DDoS experts and advanced protection for critical apps? Shield Advanced; Standard is automatic baseline protection.
+
+@ Q003155 explain
+G: ## Connecting on premises to a VPC
+- **AWS Site-to-Site VPN** creates two **IPsec** tunnels over the public internet between your customer gateway device (on-premises router or firewall) and a virtual private gateway or transit gateway. Traffic is encrypted, and setup takes minutes to hours.
+- **AWS Direct Connect** is a dedicated private link from your data center to AWS through a Direct Connect location. It gives consistent bandwidth and latency, but provisioning a connection usually takes weeks and it is not encrypted by default (you add MACsec or run a VPN over it).
+## Example
+A company needs a link this week for a pilot project. It configures its firewall with the tunnel settings AWS provides for a Site-to-Site VPN. Later, if traffic grows, it can add Direct Connect and keep the VPN as a backup.
+W: Site-to-Site VPN: encrypted IPsec tunnels over the existing internet connection, available quickly without new circuits.
+X: A=VPC peering: connects two VPCs to each other; it cannot connect an on-premises network.
+C=Direct Connect: a private dedicated connection that takes weeks to provision, does not use the internet and is not encrypted by default.
+D=Internet gateway: lets VPC resources reach the public internet; it builds no private or encrypted tunnel to the data center.
+T: Quick, encrypted, over the internet means Site-to-Site VPN; Direct Connect is the slower-to-set-up dedicated private line.
+
+@ Q003156 explain
+G: ## S3 server-side encryption options
+- **SSE-S3**: S3 creates and manages the keys completely. It is simple, but you do not control the key or see separate key usage events.
+- **SSE-KMS**: objects are encrypted with a data key protected by an AWS KMS key. With a **customer managed key** you control the key policy, enable or disable it, and choose rotation.
+- **DSSE-KMS** adds a second layer of encryption with KMS, and **SSE-C** uses keys you supply on every request.
+## Audit trail
+KMS API calls such as `GenerateDataKey` and `Decrypt` that S3 makes on your behalf are recorded in **AWS CloudTrail**, showing which principal used which key and when. The key policy also lets you restrict who may use the key, separately from S3 permissions.
+## Example
+A key policy allows only the `finance-app` role to decrypt. CloudTrail then shows every decrypt event for that key, and an access attempt from another role fails even if it has `s3:GetObject`.
+W: SSE-KMS with a customer managed key: the company manages the key and its policy, and key usage is logged in CloudTrail for auditing.
+X: A=Object Lock governance mode: prevents deletion or overwrite during a retention period; it does not encrypt data or manage keys.
+B=SSE-S3: keys are fully managed by S3, so the company neither controls the keys nor gets per-key usage events in CloudTrail.
+C=Versioning without encryption: keeps object versions for recovery but adds no encryption and no key audit at all.
+T: Customer-controlled keys with an audit trail of their use means SSE-KMS with a customer managed key.
+
+@ Q003157 explain
+G: ## S3 Object Lock modes
+**S3 Object Lock** stores objects in a write-once-read-many (WORM) model. Each object version can have a **retention period** and/or a **legal hold**.
+- **Compliance mode**: no user, including the root user, can overwrite or delete the locked version or shorten its retention period until it expires. This fits regulations such as SEC 17a-4.
+- **Governance mode**: users with the `s3:BypassGovernanceRetention` permission can remove or shorten the protection. Good for protecting data from mistakes, not for strict compliance.
+- **Legal hold**: prevents deletion with no end date, but anyone with `s3:PutObjectLegalHold` can remove it.
+Object Lock requires versioning and is set on the bucket; a default retention can apply to all new objects.
+## Example
+A bucket with default retention of compliance mode for 7 years: a record uploaded today cannot be deleted by anyone until the same date seven years later.
+W: Object Lock compliance mode, seven years: WORM protection that even the root user cannot remove or shorten, exactly matching the requirement.
+X: A=Versioning with MFA Delete: makes deletions harder but the root user who enabled MFA Delete can disable it and delete versions.
+B=IAM deny policy: an administrator can edit or detach the policy, and IAM policies do not restrict the root user.
+D=Governance mode with legal hold: privileged users can bypass governance retention and remove a legal hold, so the data is not immutable for everyone.
+T: Only Object Lock compliance mode stops everyone, including root, from deleting data before retention ends.
+
+@ Q003158 explain
+G: ## Encryption at rest on Amazon RDS
+RDS encryption at rest uses an AWS KMS key and covers the DB storage, automated backups, snapshots and read replicas. The setting is chosen when the instance is **created**; an existing unencrypted DB instance cannot be switched to encrypted in place.
+## The migration path
+- Take a manual snapshot of the unencrypted instance.
+- Copy the snapshot and select **enable encryption** with a KMS key. The copy is encrypted.
+- Restore a new DB instance from the encrypted snapshot, then point the application to the new endpoint (or rename instances to keep the old endpoint name).
+Writes that happen after the snapshot need a plan: schedule a short maintenance window, or use AWS DMS to keep the new instance in sync until cutover.
+## Example
+`prod-db` (unencrypted) -> snapshot `prod-snap` -> copy `prod-snap-enc` with KMS key `alias/rds-prod` -> restore `prod-db-enc`.
+W: Snapshot, encrypted copy, restore: the supported way to turn an unencrypted RDS database into an encrypted one.
+X: A=Enable encryption in the console: there is no in-place encryption setting for an existing unencrypted DB instance.
+B=Change instance class: encryption is a property of the storage chosen at creation, not of the instance class, so a class change leaves the storage unencrypted.
+D=Enable Multi-AZ: creates a standby with the same encryption state as the primary; it never encrypts an unencrypted database.
+T: Existing unencrypted RDS: snapshot, copy the snapshot with encryption, restore from the copy.
+
+@ Q003159 explain
+G: ## AWS Certificate Manager
+**ACM** issues and manages TLS certificates for AWS services.
+- **Public certificates** used with integrated services such as CloudFront, Application Load Balancers and API Gateway have no extra charge; you pay only for the resources that use them. (Public certificates marked exportable, so the private key can be used outside AWS, are a separate paid option.)
+- Domain ownership is validated by DNS (a CNAME record) or email. With DNS validation, ACM **renews certificates automatically** before they expire as long as the record stays in place.
+- Certificates are regional. For **CloudFront**, request or import the certificate in `us-east-1`; for an ALB, use the ALB's own Region.
+- The private key is managed by AWS and deployed to the integrated services, so you never copy keys onto servers.
+## Example
+Request `www.example.com` in `us-east-1` for CloudFront and again in `eu-west-1` for the ALB, add the DNS validation records in Route 53, and both certificates renew on their own.
+W: ACM public certificates: free for use with CloudFront and ALB, managed keys, and automatic renewal.
+X: A=Secrets Manager: can store certificate text but cannot attach it to CloudFront or ALB or renew it; it also has a monthly per-secret charge.
+B=Self-signed certificates: browsers do not trust them, and they renew only when someone replaces them by hand.
+C=Certificates in S3: S3 is just storage; CloudFront and ALB do not load certificates from S3, and nothing renews them.
+T: Trusted TLS certificates with automatic renewal on CloudFront and ALB come from ACM.
+
+@ Q003160 explain
+G: ## Finding sensitive data in S3
+**Amazon Macie** is a data security service that discovers and classifies sensitive data in Amazon S3.
+- It keeps an inventory of buckets and flags risks such as public access, missing encryption or sharing with other accounts.
+- **Automated sensitive data discovery** samples objects across all buckets continuously; **sensitive data discovery jobs** scan specific buckets in depth.
+- Managed data identifiers detect personal data such as names, addresses, credit card numbers and passport numbers; you can add custom identifiers with regular expressions.
+- Findings go to the Macie console, EventBridge and Security Hub, and Macie works across accounts in AWS Organizations.
+## Example
+A company with 300 buckets enables Macie in each Region it uses. Macie reports that `hr-exports` contains CSV files with national ID numbers, and an EventBridge rule opens a ticket automatically.
+W: Amazon Macie: purpose-built to discover and classify personal and other sensitive data across many S3 buckets.
+X: A=AWS Config: records and evaluates resource configuration (for example "is the bucket encrypted?") but does not look inside objects for personal data.
+C=Amazon GuardDuty: detects threats from logs and activity such as unusual S3 API calls; it does not classify the content of stored objects.
+D=AWS Shield: protects against DDoS attacks on network-facing resources and has nothing to do with data classification.
+T: Discovering PII inside S3 objects is Macie's job; Config checks settings and GuardDuty detects threats.
+
+@ Q003161 explain
+G: ## Service control policies (SCPs)
+**AWS Organizations** groups accounts under one management account. With all features enabled, you can attach **SCPs** to the root, organizational units or individual accounts.
+- An SCP sets the maximum permissions for principals in member accounts, including their root users. If an SCP denies an action, no IAM policy in that account can allow it.
+- SCPs do not apply to the management account, which is why workloads should run in member accounts.
+## Example SCP
+Deny `cloudtrail:StopLogging`, `cloudtrail:DeleteTrail` and `cloudtrail:UpdateTrail`, and deny `organizations:LeaveOrganization`. Attached at the organization root, no member account admin can turn off the audit trail or leave to escape the controls. An organization trail created from the management account adds further protection, because member accounts cannot change it.
+W: D=Deny SCP: an explicit deny in an SCP blocks disabling CloudTrail and leaving the organization for everyone in member accounts, including administrators and root users.
+E=AWS Organizations: SCPs only exist inside an organization, so every account must be a member with all features enabled for the guardrail to apply.
+X: A=Versioning on the log bucket: protects log files from being overwritten, but does not stop anyone from stopping or deleting the trail itself.
+B=Restricted IAM users: account administrators can change their own IAM policies, and IAM cannot stop the account root user; only an SCP limits the whole account.
+C=MFA on root users: makes root sign-in more secure but does not prevent a signed-in root or admin from disabling CloudTrail or leaving.
+T: Organization-wide "nobody may do X" guardrails are SCP denies attached in AWS Organizations; IAM alone cannot restrict an account's own admins and root.
+
+@ Q003162 explain
+G: ## Reducing the attack surface of EC2
+The attack surface is everything an attacker can reach. For web architectures, the goal is that only the load balancer is exposed and administrators do not need open ports.
+- **Private subnets behind a load balancer**: instances have no public IPs; only the ALB in public subnets accepts internet traffic, and the instance security group allows traffic only from the ALB's security group.
+- **AWS Systems Manager Session Manager**: gives shell access through the SSM Agent, which makes outbound HTTPS calls to Systems Manager. No inbound port 22, bastion host or SSH keys are needed, access is controlled by IAM and sessions can be logged to S3 or CloudWatch Logs.
+## Example
+Instance SG inbound: TCP 80 from `sg-alb` only. No port 22 rule at all. An engineer opens a shell with `aws ssm start-session --target i-0abc...` after authenticating with IAM.
+W: B=Private subnets behind a load balancer: removes direct internet reachability from instances, so only the load balancer is exposed.
+E=Session Manager instead of SSH: closes the inbound admin port completely and replaces shared keys with IAM-controlled, audited sessions.
+X: A=Public IPs on every instance: makes each instance directly reachable from the internet, increasing rather than reducing exposure.
+C=One shared SSH key: a single leaked key compromises every instance, and you cannot tell which engineer did what.
+D=Allow all inbound traffic: opens every port to every source, the largest possible attack surface.
+T: Keep instances private behind a load balancer and use Session Manager for admin access so no instance port faces the internet.
+
+@ Q003163 explain
+G: ## TLS on an Application Load Balancer
+Data in transit is protected by **TLS** (HTTPS). On an ALB this involves two pieces:
+- An **HTTPS listener** on port 443 with a certificate, usually from **ACM**. The ALB terminates TLS using a security policy that defines allowed protocol versions and ciphers.
+- An **HTTP listener** on port 80 whose default action is a **redirect** to HTTPS (status `HTTP_301`). Users who type `http://` are sent to the encrypted version instead of using plaintext.
+If traffic between the ALB and targets must also be encrypted, the target group can use HTTPS as well.
+## Example
+Listener 443: HTTPS, certificate `arn:aws:acm:...:certificate/...`, TLS 1.2+ policy, forward to `tg-app`. Listener 80: redirect to `HTTPS://#{host}:443/#{path}?#{query}` with 301.
+W: C=HTTPS listener with ACM certificate: encrypts client connections with a trusted, automatically renewed certificate.
+E=HTTP-to-HTTPS redirect: makes sure clients that arrive over plain HTTP are moved to the encrypted listener instead of sending data in cleartext.
+X: A=Only port 80: port 80 carries plain HTTP, so all data would travel unencrypted.
+B=Private key in user data: user data can be read by anyone with metadata access or `ec2:DescribeInstanceAttribute`, exposing the key; it also does nothing for the ALB's listener.
+D=Disable TLS: removes encryption entirely; with modern TLS the latency cost is small and not a reason to send data in plaintext.
+T: Protect ALB traffic with an HTTPS listener using an ACM certificate plus an HTTP-to-HTTPS redirect.
+
+@ Q003164 explain
+G: ## Responding to a leaked access key
+Public repositories are scanned by automated bots within minutes, so an exposed key must be treated as **compromised immediately**.
+- **Deactivate** the exposed key (set its status to inactive) so it stops working right away, then create a new key and update the applications that legitimately used it; delete the old key afterward.
+- **Investigate**: search CloudTrail for API calls made with that access key ID, look for new IAM users, roles or keys, unexpected EC2 instances in any Region, and billing spikes. GuardDuty findings can help.
+- Remove the secret from the repository history too, but that does not undo the exposure.
+AWS may also notify you and attach a quarantine managed policy to the user, but you should still act yourself.
+## Example
+`AKIA...EXAMPLE` found on GitHub: mark it inactive, issue a new key, then look in CloudTrail for events with that `accessKeyId`. You find a `RunInstances` call in an unused Region and terminate those instances.
+W: Deactivate, rotate, review CloudTrail: stops the attacker's access immediately and then finds and cleans up anything done with the key.
+X: A=Change the console password: access keys are independent of the password, so the exposed key keeps working.
+B=Add MFA and keep the key: MFA protects console sign-in (and only API calls whose policies require it); a plain access key still works for most calls.
+D=Delete the repository and assume no one saw it: the key may already be copied, and deleting the repository does not revoke it.
+T: A leaked access key is compromised: deactivate and rotate it first, then audit CloudTrail for what it was used for.
+
+@ Q003165 explain
+G: ## Tight versus loose coupling
+In a **synchronous** design, the order service calls shipping and waits. If shipping is slow or down, order requests time out and fail, so one component's problem becomes another's outage.
+**Amazon SQS** decouples them with a queue:
+- The order service sends a message such as `{"orderId": 42}` and returns success to the customer right away.
+- The shipping service polls the queue and processes messages at its own speed. If it slows down, messages simply wait in the queue (retained up to 14 days).
+- Failed messages become visible again after the visibility timeout and can go to a **dead-letter queue** after several failures.
+- Shipping can scale out with more consumers based on queue depth.
+## Example
+During a sales peak, orders arrive at 500 per second but shipping handles 200. The queue grows temporarily and drains after the peak; no orders are lost or rejected.
+W: SQS queue between the services: orders no longer wait on shipping, messages are buffered durably, and each side scales and fails independently.
+X: A=Merge into one application with a shared database: increases coupling; a slow shipping component still slows or breaks order processing.
+B=Longer synchronous timeouts: orders still wait on shipping, customers see slower responses, and threads pile up until the order service also fails.
+C=Same EC2 instance: saves a network hop but keeps the synchronous dependency and adds a shared single point of failure.
+T: To stop a slow downstream service from breaking callers, put an SQS queue between them instead of tuning synchronous calls.
+
+@ Q003166 explain
+G: ## Fan-out with SNS and SQS
+- **Amazon SNS** is publish/subscribe: a publisher sends one message to a **topic**, and SNS delivers a copy to every subscriber.
+- **Amazon SQS** is a queue: each message is processed by one consumer, and messages wait until someone reads them.
+Combining them gives the **fan-out** pattern: subscribe one SQS queue per consuming service to the SNS topic.
+- Each service gets its own copy of every event and reads it at its own pace.
+- If analytics is down for an hour, its queue holds the messages while billing and inventory keep working.
+- Subscription filter policies can send only relevant events to each queue.
+## Example
+Order service publishes `OrderPlaced` to `orders-topic`. Subscribers: `billing-queue`, `inventory-queue`, `analytics-queue`. Adding a new service later means adding one more queue subscription, with no change to the order service.
+W: SNS topic with one SQS queue per service: every service receives every event, with independent buffering, retries and processing speed.
+X: A=One queue shared by three services: consumers compete for messages, so each event is processed by only one of them, not all three.
+C=Shared polling table: couples services to one database schema, adds polling load, and requires custom tracking of which service processed which row.
+D=Direct HTTP calls: the order service must know every consumer and handle their outages and slowness, which is the tight coupling fan-out avoids.
+T: One event to many independent consumers is SNS fan-out to per-service SQS queues; a single queue delivers each message to only one consumer.
+
+@ Q003167 explain
+G: ## Elastic web tiers with EC2 Auto Scaling
+An **Auto Scaling group (ASG)** keeps a number of EC2 instances between a minimum and maximum, launched from a launch template across several Availability Zones.
+- A **target tracking** policy works like a thermostat: you pick a metric and a target, such as average CPU at 50% or `ALBRequestCountPerTarget` at 1,000, and the ASG adds or removes instances to stay near it.
+- An **Application Load Balancer** spreads requests across the instances and registers new ones automatically; health checks replace failed instances.
+- Because the app is **stateless** (sessions kept elsewhere, for example ElastiCache or DynamoDB), any instance can serve any request, so scaling in and out is safe.
+## Example
+Min 2, max 20, target CPU 50%. At 9 a.m. traffic triples, CPU rises, and the ASG launches instances until CPU is back near 50%. At night it scales in to 2 to save cost.
+W: ASG with target tracking behind an ALB: capacity follows real demand automatically, and the ALB distributes traffic to whatever instances exist.
+X: A=Hourly scheduled Lambda: runs once an hour regardless of load, so it cannot react to sudden changes and does not serve web traffic itself.
+C=Manual fixed fleet: staff must watch traffic and resize by hand, which is slow, error-prone and often over- or under-provisioned.
+D=One large instance sized for peak: pays for peak capacity all day, cannot scale beyond that size, and is a single point of failure.
+T: For variable stateless web traffic, use an Auto Scaling group with target tracking behind a load balancer.
+
+@ Q003168 explain
+G: ## Orchestration with AWS Step Functions
+**AWS Step Functions** runs **state machines** defined in Amazon States Language (JSON). Each state is a step, and the service tracks progress, inputs and outputs.
+- **Task** states call Lambda functions and many AWS services directly.
+- **Choice** states branch on data, for example "amount > 10000".
+- **Retry** and **Catch** fields add retries with backoff and error handling without extra code.
+- The **callback pattern** (`.waitForTaskToken`) pauses the workflow until an external system or a person sends the token back with `SendTaskSuccess` or `SendTaskFailure`. Standard workflows can run for up to one year, so they can wait days for an approval.
+## Example
+Validate order (Lambda) -> Choice: large order? -> send approval email containing a task token and wait -> manager clicks approve -> Charge card (Lambda, retry 3 times) -> Ship.
+W: AWS Step Functions: built-in branching, retries and human approval waits, with a visual history of each execution.
+X: B=SNS topics: send notifications to subscribers but keep no workflow state, cannot branch, and cannot pause for an approval.
+C=Amazon Kinesis: streams ordered records for real-time analytics; it does not coordinate a sequence of steps.
+D=SQS FIFO queues: provide ordered, exactly-once message processing between components; any branching, retry logic or approval tracking would have to be coded by hand.
+T: Multi-step Lambda workflows with branching, retries and human approval belong in Step Functions; messaging services only move messages.

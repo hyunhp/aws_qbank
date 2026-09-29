@@ -1,0 +1,356 @@
+# SAA-C03 detailed explanations, e12 (explanation-only rewrites; letters are the published ones)
+
+@ Q003244 explain
+G: ## What IAM Access Analyzer does
+IAM Access Analyzer reads resource-based policies and uses automated reasoning to work out who can actually reach a resource. You create an analyzer with a **zone of trust**: either your account or your whole AWS Organization.
+- Any access granted to a principal outside that zone (another account, a federated user, or the public) becomes a **finding**.
+- Supported resources include S3 buckets, IAM role trust policies, KMS keys, Lambda functions, SQS queues and Secrets Manager secrets.
+## Example
+A role's trust policy allows `arn:aws:iam::222233334444:root` to call `sts:AssumeRole`, and a bucket policy grants `s3:GetObject` to that same external account. With an account-level analyzer in `111122223333`, both show up as findings naming the external account and the actions allowed. You then archive findings that are intended and fix the rest; Access Analyzer can also validate new policies before you deploy them.
+W: IAM Access Analyzer: it is built precisely to find resources, including IAM roles and S3 buckets, that are shared with principals outside your zone of trust, and it reports which external principal has which access.
+X: A=Amazon Detective: Detective builds a behavior graph from CloudTrail, VPC Flow Logs and GuardDuty findings to help investigate suspicious activity after the fact. It does not analyze resource policies to list what is shared externally.
+B=AWS Trusted Advisor: Trusted Advisor runs broad best-practice checks (for example, buckets with open permissions), but it does not reason over trust policies and resource policies to report every role or bucket reachable from specific external accounts.
+D=AWS Batch: Batch is a job scheduler that provisions compute for batch workloads; it has nothing to do with auditing access permissions.
+T: To discover what is shared outside your account or organization, use IAM Access Analyzer; Detective investigates incidents and Trusted Advisor gives general checks.
+
+@ Q003245 explain
+G: ## Inserting appliances into the traffic path
+Firewalls, IDS/IPS and deep packet inspection appliances must see every packet, in both directions, without the application or client knowing they are there ("bump in the wire").
+**Gateway Load Balancer (GWLB)** operates at layer 3. It is deployed with **Gateway Load Balancer endpoints** that you place as the next hop in VPC or transit gateway route tables.
+- GWLB wraps the original packet in `GENEVE` (UDP port `6081`) and sends it to a healthy appliance, so source and destination IPs are preserved.
+- It keeps flow stickiness so both directions of a connection reach the same appliance.
+- The appliance fleet sits in a target group, often in an Auto Scaling group, so you add appliances and GWLB spreads new flows across them.
+## Example
+An ingress route table sends traffic for `10.0.1.0/24` to a GWLB endpoint; the firewall fleet inspects it and returns it to the endpoint, which forwards it to the application subnet.
+W: Gateway Load Balancer: it is purpose-built to deploy, scale and health-check third-party virtual appliances transparently, preserving the original packets and letting route tables steer traffic through the fleet.
+X: B=Application Load Balancer: ALB terminates HTTP/HTTPS connections at layer 7 and opens new ones to targets, so it cannot pass arbitrary IP traffic through an appliance unchanged, and it cannot be a route table next hop.
+C=Network Load Balancer: NLB balances TCP/UDP/TLS connections to targets addressed by the client, but it is not a route table next hop and does not encapsulate traffic for inline inspection of all flows.
+D=Classic Load Balancer: CLB is a previous-generation load balancer for basic layer 4/7 balancing and has no support for transparent appliance insertion.
+T: Scaling inline inspection appliances transparently calls for Gateway Load Balancer with its endpoints, not an ALB or NLB that terminate or target connections.
+
+@ Q003246 explain
+G: ## Stateless web tiers
+If a server keeps session data (login state, cart) in its own memory, that data exists only on that server. When Auto Scaling replaces the instance, scales in, or the load balancer sends the user elsewhere, the session is gone and the user is logged out.
+The fix is to **externalize session state** to a shared store that every instance can read:
+- **Amazon ElastiCache** (Valkey, Redis OSS or Memcached): in-memory, sub-millisecond reads, good for high-traffic sessions.
+- **Amazon DynamoDB**: serverless key-value store; use the session ID as the key and a TTL attribute to expire old sessions automatically.
+## Example
+After login, the app writes `session:abc123` to ElastiCache and sets a cookie with `abc123`. Any instance behind the load balancer reads the session from the cache, so instances can be replaced or scaled freely.
+W: Store sessions in ElastiCache or DynamoDB: the session lives outside the instance, so any instance can serve any request and replacing an instance no longer loses user state.
+X: A=Sticky sessions with no expiration: stickiness only keeps sending a user to the same instance; when that instance is replaced or terminated the in-memory session is still lost, and load becomes uneven.
+B=One large instance: this makes the whole application a single point of failure, and a restart or replacement of that instance still logs out every user.
+C=Disable Auto Scaling: instances can still fail or be replaced during health checks or maintenance, and the application loses its ability to handle load changes.
+T: Make the web tier stateless by moving sessions to ElastiCache or DynamoDB; sticky sessions only hide the problem until an instance goes away.
+
+@ Q003247 explain
+G: ## Event buses and rules
+**Amazon EventBridge** receives events on an **event bus**: the default bus gets events from AWS services, partner event buses get events from SaaS applications (for example Zendesk or Datadog), and custom buses take your own events.
+A **rule** has an **event pattern** that matches on the event's content, and sends matches to targets such as Lambda, Step Functions, SQS, SNS or API destinations.
+## Example
+An event pattern like `{"source": ["aws.ec2"], "detail": {"state": ["stopped"]}}` sends only stopped-instance events to a Lambda function, while another rule on the same bus sends `detail-type` "Ticket Created" events from a SaaS partner to an SQS queue. No custom routing code is needed; filtering happens in the rule.
+W: Amazon EventBridge: it natively ingests events from AWS services and SaaS partners and routes each event to different targets according to content-based rules.
+X: B=Amazon Kinesis: Kinesis Data Streams stores ordered records in shards for consumers to read and process; it has no built-in rules to send different events to different targets, and it has no partner event sources for SaaS applications.
+C=Amazon SQS FIFO: a FIFO queue delivers messages in order with deduplication to whoever polls it; it does not inspect content to route messages to multiple destinations.
+D=AWS Batch jobs: Batch schedules compute jobs; it is not an event router.
+T: Content-based routing of AWS and SaaS events to many targets is EventBridge; Kinesis and SQS move data but leave routing to consumers.
+
+@ Q003248 explain
+G: ## Queue depth as a scaling signal
+With Amazon SQS, producers and consumers are decoupled: a spike just makes the queue longer. The backlog shrinks only if consumers process faster than messages arrive.
+The CloudWatch metric `ApproximateNumberOfMessagesVisible` shows how many messages are waiting. A common pattern is **backlog per instance**: divide the visible messages by the number of consumer instances, then use target tracking on an Auto Scaling group.
+## Example
+Each worker handles 10 messages per second and you accept 60 seconds of delay, so the target is 600 messages per instance. When the queue holds 6,000 messages with 2 workers (3,000 each), Auto Scaling adds workers until the backlog per instance is back near 600, then scales in when the spike passes.
+W: Scale consumers on queue depth: adding workers when the backlog grows increases processing capacity exactly when it is needed, and removing them afterwards keeps cost low.
+X: A=Retention of one minute: the minimum retention of 60 seconds would make unprocessed messages expire and vanish, which loses data instead of processing it faster.
+B=2 GB message size: an SQS message can be at most 1 MiB; larger payloads are stored in S3 with a pointer in the message (for example with the SQS Extended Client Library), and bigger messages would not make consumers process faster anyway.
+D=Delete messages older than a second: that throws away most of the backlog during a spike, which is data loss, not a fix.
+T: A growing SQS backlog is solved by scaling consumers on queue depth, not by shortening retention or discarding messages.
+
+@ Q003249 explain
+G: ## Poison messages and dead-letter queues
+In Amazon SQS, a consumer receives a message, which then becomes invisible for the **visibility timeout**. If the consumer does not delete it (because processing failed), it becomes visible again and is retried. A malformed "poison" message can fail forever, wasting consumer time and delaying other work.
+A **dead-letter queue (DLQ)** is a normal queue linked through a **redrive policy** on the source queue:
+- `deadLetterTargetArn`: the DLQ.
+- `maxReceiveCount`: how many receives are allowed before SQS moves the message to the DLQ.
+## Example
+With `maxReceiveCount` set to 5, a message that fails five times is moved to the DLQ. You alarm on the DLQ depth, fix the bug, and use DLQ redrive to send the messages back to the source queue. A FIFO queue needs a FIFO DLQ.
+W: A dead-letter queue with a max receive count: after the set number of failed receives, SQS moves the message out of the main queue automatically so other messages keep flowing and the failures are kept for analysis.
+X: A=Larger batch size: receiving up to 10 messages per call improves throughput, but a poison message still returns to the queue and fails again every time.
+C=Shorter polling interval: polling more often only fetches messages sooner; failing messages are still retried indefinitely.
+D=Twelve-hour visibility timeout: 12 hours is the maximum, and it only delays each retry; the failing message stays in the queue and legitimate messages that fail once are also held back for hours.
+T: Isolate repeatedly failing SQS messages with a DLQ and maxReceiveCount; timeouts and batching only change when they are retried.
+
+@ Q003250 explain
+G: ## Chaos engineering on AWS
+**AWS Fault Injection Service (FIS)**, formerly Fault Injection Simulator, runs controlled fault experiments against real resources so you can see how the system actually behaves.
+An **experiment template** defines:
+- **Actions**, such as `aws:ec2:stop-instances`, `aws:ec2:terminate-instances`, CPU stress through SSM, or network disruption.
+- **Targets**, chosen by resource ID or tags (for example, one instance with `env=staging`).
+- **Stop conditions**: CloudWatch alarms that halt the experiment automatically if the impact becomes too high.
+## Example
+You terminate one instance in an Auto Scaling group behind a load balancer and watch whether error rates stay flat, the load balancer stops sending traffic to it, and Auto Scaling launches a replacement. If a latency alarm fires, FIS stops the experiment.
+W: AWS Fault Injection Service: it is the managed service for injecting failures such as stopping or terminating EC2 instances in a controlled, scoped and automatically stoppable way.
+X: A=Trusted Advisor checks: Trusted Advisor reviews your account for cost, security, fault tolerance and limits, but it never injects a failure to test real behavior.
+B=Amazon Inspector: Inspector scans EC2 instances, container images and Lambda functions for software vulnerabilities and network exposure; it does not simulate outages.
+C=AWS Config rules: Config records resource configurations and evaluates them against rules; it reports compliance but does not test how the application responds to failure.
+T: To actually test resilience against instance failure, run an FIS experiment; Trusted Advisor, Inspector and Config only assess configuration.
+
+@ Q003251 explain
+G: ## Aurora Global Database
+**Amazon Aurora Global Database** spans Regions with one **primary** Region that accepts writes and one or more **secondary** Regions with read-only clusters.
+- Replication happens at the storage layer, with typical lag under one second, so secondary Regions serve local low-latency reads.
+- In a disaster you fail over by promoting a secondary Region to become the new primary, typically within about a minute; a planned **switchover** does the same without data loss for maintenance or Region rotation.
+- It is a relational database (MySQL- or PostgreSQL-compatible), so SQL, joins and transactions work as usual.
+## Example
+Writes go to `us-east-1`; European users read from a secondary cluster in `eu-west-1`. If `us-east-1` becomes unavailable, you fail over to `eu-west-1`, which becomes the writer, and the application sends its writes there (the global writer endpoint follows the new primary automatically).
+W: Aurora Global Database: it gives a relational database with read replicas in multiple Regions for local reads and fast cross-Region failover, matching all the requirements.
+X: A=DynamoDB global tables: they provide multi-Region, multi-active replication, but DynamoDB is a NoSQL key-value store, not a relational database.
+B=RDS Multi-AZ in one Region: Multi-AZ protects against an Availability Zone failure inside one Region; it gives no reads or failover in other Regions.
+D=Weekly RDS snapshot copies: restoring from a snapshot takes a long time and could lose up to a week of data, and snapshots serve no reads at all.
+T: Multi-Region relational reads plus quick Regional failover point to Aurora Global Database; DynamoDB global tables are multi-Region but not relational.
+
+@ Q003252 explain
+G: ## Static stability
+A **statically stable** design keeps working during a failure without having to launch anything new. Scaling out after an AZ fails depends on capacity being available and takes minutes, which is exactly when demand in the remaining AZs is highest.
+So you pre-provision enough capacity that the surviving AZs can carry the full load on their own.
+## Example with three AZs
+The application needs 6 instances at peak.
+- Normal sizing: 2 instances per AZ. Losing one AZ leaves 4, only two thirds of the capacity.
+- Statically stable sizing: each AZ must hold half of the load (6 / 2 = 3), so run 3 per AZ, 9 in total. Losing any AZ still leaves 6.
+The extra 50% is the cost of the guarantee; with more AZs the overhead shrinks (with four AZs, each needs a third of the load).
+W: Provision so two AZs can handle full load: with capacity pre-provisioned for the loss of one AZ, the application keeps full capacity immediately after an AZ fails, with no reliance on scaling during the event.
+X: B=All instances in one AZ: if that AZ fails, the entire application goes down, which is the opposite of the requirement.
+C=Exactly the capacity for normal operation: losing one of three AZs removes about a third of the capacity, so service is reduced until replacements launch.
+D=Auto Scaling in a single AZ: a single-AZ group cannot launch replacements elsewhere when that AZ fails, so the application is simply down.
+T: No reduction in capacity after an AZ loss means pre-provisioning so the remaining AZs carry full load, not relying on scaling after the failure.
+
+@ Q003253 explain
+G: ## How S3 protects against deletion
+**S3 Versioning** keeps every version of an object in the bucket.
+- An overwrite creates a new version; the old one stays.
+- A simple `DELETE` without a version ID only adds a **delete marker**. The data is still there, and removing the marker restores the object.
+- Only a delete that names a specific version ID removes data permanently.
+**MFA Delete** adds a second layer on a versioned bucket: permanently deleting an object version, or changing the bucket's versioning state, requires a valid MFA code. It can be enabled only by the root user through the CLI or API.
+## Example
+A script runs `aws s3 rm` on a whole prefix by mistake. With versioning, every object just gets a delete marker and can be recovered. An attacker with stolen access keys trying to delete versions permanently is blocked without the root MFA device.
+W: D=MFA Delete: it requires MFA for permanent version deletions and versioning changes, so neither a mistake nor stolen keys alone can destroy data.
+E=S3 Versioning: it keeps previous versions and turns ordinary deletes into delete markers, so accidentally deleted or overwritten objects can be restored.
+X: A=S3 Storage Lens: Storage Lens gives organization-wide dashboards of storage usage and activity; it reports on data but does not prevent deletion.
+B=S3 Transfer Acceleration: it speeds up long-distance uploads and downloads through edge locations; it has no effect on deletion.
+C=S3 Select: it retrieves a subset of an object's contents with SQL expressions (and has been closed to new customers since July 2024); it neither keeps copies nor blocks deletes.
+T: Versioning keeps recoverable copies and MFA Delete guards permanent deletion; the other features are about reporting, speed or querying.
+
+@ Q003254 explain
+G: ## Managed Kubernetes on AWS
+Kubernetes has two parts: the **control plane** (API server, `etcd`, scheduler, controllers) that stores cluster state and makes decisions, and the **data plane** (worker nodes) where pods run.
+**Amazon EKS** runs the control plane for you across multiple Availability Zones, patches and scales it, and exposes the standard Kubernetes API, so `kubectl`, Helm and existing manifests work unchanged.
+- Worker capacity can be managed node groups (EC2), self-managed nodes, AWS Fargate, or EKS Auto Mode, which also manages the nodes.
+- You pay an hourly fee per cluster plus the compute you use.
+## Example
+A team with Kubernetes manifests from on premises creates an EKS cluster, adds a managed node group and runs `kubectl apply -f app.yaml`, without operating `etcd` or API servers themselves.
+W: Amazon EKS: it is AWS's managed Kubernetes service, where AWS operates and scales the control plane and you run standard Kubernetes workloads.
+X: A=Amazon EMR: EMR runs big data frameworks such as Spark and Hive; it is not a general-purpose managed Kubernetes cluster for your containers.
+C=AWS Batch: Batch queues and schedules batch jobs on compute it provisions; it is a job scheduler, not a Kubernetes control plane you deploy workloads to.
+D=Amazon ECS: ECS is a managed container orchestrator, but it uses AWS's own task definitions and API, not Kubernetes, so Kubernetes tooling and manifests do not apply.
+T: Containers on Kubernetes with an AWS-managed control plane means EKS; ECS is container orchestration without Kubernetes.
+
+@ Q003255 explain
+G: ## The four DR strategies
+From cheapest and slowest to most expensive and fastest:
+- **Backup and restore**: back up data and images, copy them to the recovery Region, and build the environment only after a disaster. RTO is hours; almost nothing runs in the second Region.
+- **Pilot light**: core data is continuously replicated (for example a database replica), but application servers are off or not created until needed.
+- **Warm standby**: a scaled-down but fully working copy runs all the time and is scaled up during failover.
+- **Multi-site active/active**: full production capacity serves traffic in both Regions.
+## Example
+Nightly AWS Backup plans create AMIs and EBS snapshots and copy them to `us-west-2`. In a disaster you launch instances from the copied AMIs, restore volumes and switch DNS; the process takes a few hours, and the standby cost is only snapshot storage.
+W: Backup and restore with cross-Region AMI and snapshot copies: an RTO of hours is acceptable, and paying only for stored backups in the other Region is the lowest-cost strategy.
+X: A=Multi-site active-active: running full production in both Regions gives near-zero RTO at roughly double the cost, far beyond what an hours-long RTO needs.
+B=Warm standby at full production scale: running a full-size copy all the time costs almost as much as active-active; even a normal scaled-down warm standby is more than an hours-level RTO requires.
+D=Pilot light with all servers running: pilot light keeps only core data services live, so running every server is not pilot light and costs far more than backup and restore.
+T: When hours of recovery time are acceptable and cost matters most, choose backup and restore; the other strategies buy faster recovery with always-on resources.
+
+@ Q003256 explain
+G: ## Absorbing traffic spikes
+Two complementary techniques keep requests from being dropped during a sudden spike:
+- **Buffering**: the front end writes each request to an Amazon SQS queue and returns quickly. SQS scales to very high throughput and holds messages (up to 14 days) until workers catch up, so a burst becomes a backlog instead of errors.
+- **Elastic capacity**: an Auto Scaling group (or ECS service scaling) for the processing tier adds workers when load or queue depth rises and removes them afterwards.
+## Example
+An order form normally gets 50 requests per second but spikes to 2,000 during a sale. The API puts each order into SQS; workers scale on backlog per instance from 3 to 40 and drain the queue within minutes. No order is lost, and cost drops back when the spike ends.
+W: B=Buffer requests in SQS: the queue absorbs the burst durably, so requests wait instead of failing when the processing tier is temporarily saturated.
+E=Auto Scaling for the processing tier: adding workers as load rises increases throughput so the buffered backlog is processed quickly.
+X: A=Remove the load balancer: without it, traffic cannot be spread across instances or away from unhealthy ones, which makes spikes more likely to overload and drop requests.
+C=Maximum of one worker: a single worker has fixed throughput and cannot grow to meet a spike, and it is also a single point of failure.
+D=Disable client retries: retries with exponential backoff and jitter let clients recover from transient throttling; disabling them turns every temporary error into a lost request.
+T: Buffer with SQS and scale the processing tier to absorb spikes; limiting capacity or removing retries and load balancing makes drops more likely.
+
+@ Q003257 explain
+G: ## Lambda's built-in availability
+AWS Lambda is a Regional service: AWS runs your functions across multiple Availability Zones in the Region and automatically routes invocations away from an impaired AZ. You do not choose or manage AZs for a function that is not attached to a VPC.
+When a function is attached to a VPC, you choose subnets. Best practice is to give it subnets in at least two AZs, and if it needs internet access, to make sure NAT does not depend on a single AZ (for example, a NAT gateway in each of those AZs).
+## Example
+An API Gateway REST API invokes a Lambda function that reads DynamoDB. API Gateway, Lambda and DynamoDB are all Regional multi-AZ services, so losing one AZ requires no action from you; the API keeps serving requests.
+W: Nothing extra, Lambda is multi-AZ by default: Lambda already runs functions across multiple AZs in the Region and handles AZ failures itself, so the API stays available.
+X: B=NAT gateway in a single AZ: a NAT gateway placed in one AZ depends on that AZ, so routing all functions through it would create a new single-AZ dependency rather than remove one; it is also unnecessary unless VPC functions need internet access.
+C=Elastic IP per function: Elastic IP addresses attach to network interfaces of EC2 and similar resources, not to Lambda functions, and a fixed IP has nothing to do with AZ resilience.
+D=Copy of each function in every AZ: Lambda has no per-AZ deployment model; one function version is already served from multiple AZs.
+T: Lambda is inherently multi-AZ; only VPC-attached functions need multi-AZ subnets (and per-AZ NAT) to avoid creating an AZ dependency.
+
+@ Q003258 explain
+G: ## NAT instances versus NAT gateways
+Private subnets reach the internet through a NAT device named as the `0.0.0.0/0` target in their route table.
+- A **NAT instance** is an EC2 instance you run and patch yourself, with source/destination checks disabled. If it fails, private subnets lose outbound access until you fix it or change routes; failover needs your own scripts.
+- A **NAT gateway** is a managed service with built-in redundancy inside its AZ, scales bandwidth automatically, and needs no patching.
+A zonal NAT gateway lives in one AZ, so the classic resilient pattern is one per AZ, with each private subnet's route table pointing to the gateway in its own AZ.
+## Example
+Private subnets in `us-east-1a` and `us-east-1b` use route tables with `0.0.0.0/0` pointing to `nat-aaa` and `nat-bbb` respectively. If AZ `a` fails, instances in `b` keep their internet access, and there are no instances to maintain.
+W: NAT gateways in each Availability Zone: a managed, self-scaling service removes the patching work, and one per AZ means an AZ failure affects only that AZ's subnets.
+X: A=Public IPs everywhere: putting instances in public subnets with public IPs exposes them to inbound internet traffic and breaks the private-subnet design.
+B=Second NAT instance with no route changes: route tables still point to the first instance, so the second receives no traffic and there is no automatic failover; you also now manage two instances.
+C=Larger NAT instance in the same AZ: more bandwidth does not remove the single point of failure, and you still patch and operate it yourself.
+T: Replace a NAT instance with a managed NAT gateway per AZ for resilience without operational overhead; bigger or extra unrouted instances do not remove the single point of failure.
+
+@ Q003259 explain
+G: ## Amazon MQ for existing brokers
+Many applications already speak standard messaging protocols through RabbitMQ or Apache ActiveMQ client libraries. Moving them to a different API would mean rewriting producers and consumers.
+**Amazon MQ** runs managed RabbitMQ and ActiveMQ brokers. AWS handles provisioning, patching, storage and (with cluster or active/standby deployments) multi-AZ high availability.
+- RabbitMQ brokers speak `AMQP 0-9-1`, so existing RabbitMQ clients connect by changing only the endpoint and credentials.
+- ActiveMQ brokers support JMS, OpenWire, `AMQP 1.0`, MQTT and STOMP.
+## Example
+An on-premises order system publishes to a RabbitMQ exchange with the Java client. After migration, the connection string points to the Amazon MQ broker's `amqps://` endpoint, and queues, exchanges and bindings work as before.
+W: Amazon MQ: it provides managed RabbitMQ brokers that speak the same protocols, so existing RabbitMQ clients keep working with minimal changes.
+X: A=Amazon SQS: SQS is a fully managed queue with its own HTTPS API and SDKs; RabbitMQ clients cannot connect to it without rewriting the messaging code.
+B=Amazon SNS: SNS is a pub/sub notification service with its own API and push delivery; it does not implement AMQP or RabbitMQ exchanges.
+D=Amazon MSK: MSK is managed Apache Kafka, which uses the Kafka protocol and a log-based model, not RabbitMQ's protocol.
+T: Keep existing RabbitMQ or ActiveMQ clients with Amazon MQ; SQS, SNS and MSK require code changes to their own APIs or protocols.
+
+@ Q003260 explain
+G: ## Ephemeral versus persistent storage
+An **instance store** is disk physically attached to the host running the instance. It is fast, but its data lives only as long as the instance stays on that host.
+- Data survives a reboot.
+- Data is lost when the instance is stopped, hibernated or terminated, or if the underlying disk fails, because a restarted instance usually lands on a different host.
+Persistent options live independently of the host:
+- **Amazon EBS**: network block volumes that keep data across stops and can be snapshotted.
+- **Amazon EFS**: a shared NFS file system for many instances.
+- **Amazon S3**: durable object storage.
+## Example
+An app writes reports to `/mnt/ephemeral` on an `i4i` instance and loses them at every stop. Writing to an EBS `gp3` volume mounted at `/data`, or uploading to S3, keeps the reports.
+W: Store files on EBS, EFS or S3: these services keep data independently of the instance's host, so stopping or replacing the instance no longer loses the files.
+X: A=Larger instance type: more instance storage is still instance store and is still wiped when the instance stops.
+B=Bigger instance store volume: instance store size is fixed by the instance type, and no size change would make it persistent.
+C=Detailed monitoring: it only sends CloudWatch metrics every minute instead of every five minutes; it does nothing to preserve data.
+T: Instance store is temporary by design; data that must survive a stop belongs on EBS, EFS or S3.
+
+@ Q003261 explain
+G: ## Route 53 routing policies and health checks
+A routing policy decides which records Route 53 returns for a DNS query.
+**Multivalue answer routing** lets you create several records with the same name, each with its own IP and optionally its own health check. For each query Route 53 returns up to eight healthy records chosen at random, and leaves out records whose health check fails.
+- Clients get several addresses and can try another if one fails.
+- It is a simple way to spread load across servers, but it is not a replacement for a load balancer.
+## Example
+`api.example.com` has four multivalue records for four web servers, each with a health check. When one server fails its check, answers contain only the three healthy IPs.
+W: Multivalue answer routing: it combines health checks with returning multiple healthy IP addresses per query, which is exactly the requirement.
+X: A=Latency routing: it can use health checks, but it answers with the record for the lowest-latency Region, and a health check covers that record as a whole, so it cannot drop individual unhealthy IPs from a list.
+C=Geolocation routing: it chooses the record by the user's location for content localization or restrictions, returning one set per location rather than a list of all healthy endpoints.
+D=Simple routing: a simple record can hold several values, but Route 53 cannot associate health checks with it, so unhealthy IPs are still returned.
+T: When DNS must return several IPs and drop unhealthy ones, use multivalue answer routing; simple routing returns multiple values without health checks.
+
+@ Q003262 explain
+G: ## What AWS Batch manages
+**AWS Batch** runs large numbers of batch computing jobs without you building a scheduler.
+- **Job definitions** describe the container image, vCPUs, memory and retry settings.
+- **Job queues** hold submitted jobs with priorities.
+- **Compute environments** (EC2, Spot, Fargate or EKS) are scaled by Batch from zero to hundreds or thousands of instances based on queued work, then scaled back down.
+- Jobs can declare **dependencies** (`dependsOn`) and run as **array jobs** for many similar tasks.
+## Example
+A genomics pipeline submits an array job of 5,000 alignment tasks, then a merge job that depends on the array job. Batch launches Spot instances to run the array, starts the merge only when all tasks succeed, and terminates the instances afterwards.
+W: AWS Batch: it provides job queues, job dependencies and automatic provisioning of compute at the scale of hundreds of instances, which matches the workload.
+X: B=Amazon SQS: SQS can hold work items, but it does not provision compute, schedule jobs or track dependencies; you would have to build all of that yourself.
+C=Amazon SNS: SNS pushes notifications to subscribers; it has no concept of jobs, queues of work or compute capacity.
+D=AWS Lambda: a Lambda invocation can run for at most 15 minutes with limited memory and no job dependency model, which does not suit large, long-running batch jobs.
+T: For large-scale batch jobs with queues and dependencies, AWS Batch manages both the scheduling and the compute; queues or functions alone do not.
+
+@ Q003263 explain
+G: ## Automating EBS snapshots
+An EBS snapshot is a point-in-time, incremental backup of a volume, stored by AWS. Taking and deleting snapshots by hand is error-prone, so AWS offers policy-based automation:
+- **Amazon Data Lifecycle Manager (DLM)**: a lifecycle policy targets volumes or instances by tag, creates snapshots on a schedule (for example every hour) and keeps them by count or age, deleting older ones automatically.
+- **AWS Backup**: a backup plan with a schedule and a lifecycle rule, assigned to resources by tag or ARN, with central monitoring and cross-Region or cross-account copies.
+## Example
+A DLM policy targets volumes tagged `backup=hourly`, runs every hour and has an age-based retention of 7 days. Each hour a new snapshot is created, and snapshots older than 7 days are deleted without anyone intervening.
+W: Data Lifecycle Manager or AWS Backup policies: both create EBS snapshots on a schedule and apply retention rules that delete old recovery points automatically.
+X: A=Manual hourly snapshots: someone must remember to act 24 times a day and also delete old snapshots; missed runs and forgotten cleanups are likely.
+B=Instance store backups with cron: instance store volumes cannot be snapshotted and their data is not persistent; the requirement is about EBS volumes anyway.
+C=S3 lifecycle rules on EBS volumes: S3 lifecycle rules act only on objects in S3 buckets; they cannot create or expire EBS snapshots.
+T: Scheduled EBS snapshots with automatic expiry come from DLM or AWS Backup policies, not manual work or S3 lifecycle rules.
+
+@ Q003264 explain
+G: ## The strangler fig pattern
+Breaking a monolith up in one step is risky. The **strangler fig** pattern puts a routing layer in front of it and moves one feature at a time:
+- All clients call one entry point.
+- Routes for features already extracted go to the new microservice.
+- Everything else still goes to the monolith, until nothing is left.
+**Amazon API Gateway** fits as that entry point: each resource path can have its own integration (Lambda, an HTTP endpoint, or a private service through a VPC link), and a greedy path such as `/{proxy+}` forwards all remaining requests.
+## Example
+`/orders` is extracted into a Lambda function, while `/{proxy+}` still forwards to the monolith behind a load balancer. Clients keep the same URL, and each new service is added by changing one route.
+W: Amazon API Gateway: it gives a single API endpoint that routes each path to either a new microservice or the monolith, so features can be extracted gradually without changing clients.
+X: A=AWS DataSync: DataSync copies files and objects between storage systems; it does not receive or route API requests.
+B=AWS Snowball Edge: Snowball Edge is a physical device for offline data transfer and edge computing; it has no role in routing application requests.
+D=Amazon S3 buckets: S3 stores objects and can host static websites, but it cannot route API paths to different backend services.
+T: Gradual monolith decomposition needs a routing front door such as API Gateway; data transfer and storage services do not route requests.
+
+@ Q003265 explain
+G: ## File storage for Windows
+Windows applications usually expect **SMB** file shares with NTFS permissions tied to **Active Directory** users and groups.
+**Amazon FSx for Windows File Server** provides fully managed Windows file servers:
+- Native SMB access, NTFS ACLs, shadow copies and DFS namespaces.
+- Joins AWS Managed Microsoft AD or your self-managed AD, so existing users and groups control access.
+- SSD storage for low latency, and Single-AZ or Multi-AZ deployments.
+## Example
+A .NET app on several EC2 Windows instances maps `\\fs-0123.corp.example.com\share` as a drive. Users authenticate with their domain accounts, and folder permissions work as they did on premises.
+W: Amazon FSx for Windows File Server: it offers low-latency SMB shares integrated with Active Directory, which is exactly what Windows applications need.
+X: A=Amazon S3 Standard: S3 is object storage accessed through an HTTP API; it does not present SMB shares with NTFS permissions.
+C=EBS gp3 on one host: an EBS volume is block storage for one instance; sharing it would require building and managing your own Windows file server, which is also a single point of failure.
+D=Amazon EFS Standard: EFS is a shared file system accessed over NFS and is not supported on Windows instances, so it offers neither SMB nor AD-based permissions.
+T: Windows SMB file shares with Active Directory call for FSx for Windows File Server; EFS is NFS for Linux and S3 is object storage.
+
+@ Q003266 explain
+G: ## S3 storage classes and latency
+Most S3 storage classes store data across at least three AZs and aim at durability and cost. **S3 Express One Zone** targets performance instead:
+- Data is stored in a single AZ that you choose, in a **directory bucket**, so compute in the same AZ gets consistent single-digit millisecond latency.
+- It supports very high request rates and uses session-based authentication (`CreateSession`) to reduce per-request overhead.
+- Storage costs more per GB than S3 Standard, but request costs are lower, which suits frequently accessed data.
+## Example
+An ML training cluster in `use1-az4` reads millions of small files per epoch. Putting the dataset in an Express One Zone directory bucket in the same AZ speeds up data loading compared with S3 Standard.
+W: S3 Express One Zone: it is designed for frequently accessed data in one chosen AZ with single-digit millisecond latency and the highest request rates of any S3 storage class.
+X: B=S3 One Zone-IA: it also stores data in one AZ, but it is for infrequently accessed data, with retrieval fees and no low-latency performance focus.
+C=S3 Glacier Instant Retrieval: it gives millisecond retrieval for archive data accessed about once a quarter, with high retrieval costs that make frequent access expensive.
+D=S3 Standard-IA: it is for infrequently accessed data stored across multiple AZs, with per-GB retrieval fees; it is not built for maximum request rates.
+T: Frequently accessed, latency-critical data in one AZ belongs in S3 Express One Zone; One Zone-IA shares the single AZ but is for infrequent access.
+
+@ Q003267 explain
+G: ## EC2 instance categories
+EC2 instance types are grouped by the resource they emphasize:
+- **Accelerated computing**: hardware accelerators such as GPUs. **P** instances (for example `p5`) target large-scale ML training and HPC; **G** instances (for example `g6`) target graphics and inference, and also smaller training jobs. AWS Trainium (`trn`) and Inferentia (`inf`) instances are in this category too.
+- **General purpose** and **burstable** (T family): balanced CPU and memory; T instances earn CPU credits for occasional bursts.
+- **Memory optimized** (R, X): large RAM for in-memory databases and analytics.
+- **Storage optimized** (I, D): fast local NVMe or dense HDD storage for heavy I/O.
+## Example
+Training a deep learning model with PyTorch on CUDA needs NVIDIA GPUs, so the team launches a `p5` instance using a Deep Learning AMI. A CPU-only instance would be many times slower for the same job.
+W: Accelerated computing instances (P or G families): they include GPUs that massively parallelize the matrix math of ML training.
+X: B=Burstable T family: T instances provide modest baseline CPU with credits for short bursts and have no GPUs, so sustained training would be slow and throttled.
+C=Storage optimized I or D families: they provide high local disk throughput and IOPS, not GPUs, so they do not accelerate model training.
+D=Memory optimized X family: X instances offer very large memory for workloads such as SAP HANA, but they have no GPUs.
+T: GPU needs map to accelerated computing instances such as P and G; the other families optimize CPU bursts, disks or memory.
+
+@ Q003268 explain
+G: ## AWS Graviton
+**AWS Graviton** processors are Arm-based CPUs designed by AWS. Instance types with a `g` after the generation number, such as `m7g`, `c7g` and `r8g`, use them (the G family, such as `g6`, is GPU instances, not Graviton).
+- AWS positions Graviton as offering the best price-performance in EC2 for many workloads, and it typically uses less energy than comparable x86 instances.
+- Most Linux software runs on Arm64: common Linux distributions, languages such as Java, Python, Node.js and Go, containers built for `arm64`, and many managed services (RDS, ElastiCache, Lambda) offer Graviton options.
+- Workloads with x86-only binaries or libraries need recompiling or cannot move.
+## Example
+A web service on `m6i.large` is rebuilt as a multi-architecture container image and moved to `m7g.large`. It handles the same traffic at a lower hourly price.
+W: AWS Graviton-based instances: for general Linux workloads that run on Arm64, they usually deliver the best price-performance among EC2 options.
+X: A=Bare metal for all apps: bare metal gives direct hardware access for special needs such as custom hypervisors or certain licenses; it is typically priced like the largest sizes of its family and does not improve price-performance for ordinary apps.
+C=Previous-generation types: older generations generally deliver less performance per dollar than current ones and are kept mainly for compatibility.
+D=Dedicated Hosts for every workload: you pay for an entire physical server, which helps with per-socket licensing or compliance but raises cost for general workloads.
+T: For better price-performance on general Linux workloads, move to Graviton instances; bare metal and Dedicated Hosts address special requirements, not cost efficiency.

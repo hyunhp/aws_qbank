@@ -1,0 +1,331 @@
+# SAA-C03 detailed explanations (explanation-only rewrites; letters are the published ones)
+
+@ Q000531 explain
+G: ## Key-value and document databases versus relational ones
+Amazon DynamoDB is a fully managed, serverless NoSQL database. Every item is found by its key, so a read or write touches one partition and returns in single-digit milliseconds whether the table holds a thousand items or billions.
+- **Flexible schema**: only the key attributes are fixed. One item can have `score` and `level`, the next can add `badges`, with no `ALTER TABLE`.
+- **Horizontal scaling**: DynamoDB spreads data across partitions automatically. On-demand capacity mode absorbs sudden spikes without capacity planning, and there are no instances, patches or storage to manage.
+- **The trade-off**: there are no SQL joins across tables. You design the table around known access patterns (for example, `PK = USER#42`, `SK = ORDER#2026-09-01`) instead of normalizing data.
+Relational engines such as Aurora and RDS shine when you need joins and multi-table transactions, which the stem explicitly says are not required.
+W: DynamoDB: it delivers consistent single-digit millisecond key-based access at any scale, has a schemaless item model, scales out automatically (on-demand mode handles unpredictable spikes), and has no servers to run.
+X: A=Amazon Redshift: it is a columnar data warehouse built for analytical queries over large data sets; queries take hundreds of milliseconds to minutes and it is not meant for high-rate, low-latency application reads and writes.
+C=Aurora Provisioned: it is relational with a defined schema, and write capacity depends on the size of a single writer instance you choose and manage, so sudden spikes need instance resizing rather than automatic horizontal scaling.
+D=RDS for PostgreSQL: it also needs a fixed schema and an instance class you size, patch windows and storage settings, and it scales writes only vertically; its relational strengths (joins, multi-table ACID) are exactly what this workload does not need.
+T: When access is by key, schema is flexible and scale is unpredictable with no joins, choose DynamoDB; choose a relational engine only when joins and multi-table transactions matter.
+
+@ Q000532 explain
+G: ## RDS storage types and IOPS
+IOPS (input/output operations per second) is how many reads and writes the storage can serve. Amazon RDS offers several storage types:
+- **General Purpose SSD `gp3`**: includes a baseline of 3,000 IOPS on smaller volumes (larger volumes on some engines get a higher baseline); you can pay to provision more IOPS, but without that the baseline is all you get.
+- **General Purpose SSD `gp2`**: performance is tied to size (3 IOPS per GiB, minimum 100). Volumes smaller than 1 TiB can temporarily burst to 3,000 IOPS using I/O credits; once credits run out, performance drops back to the size-based baseline.
+- **Provisioned IOPS SSD `io1`/`io2`**: you specify the exact IOPS (for example `20000`) and AWS delivers it consistently with low latency, designed for I/O-intensive production databases.
+- **Magnetic**: a previous-generation type kept for backward compatibility, with a low IOPS ceiling.
+Example: a database that needs 20,000 IOPS all day, every day, needs guaranteed capacity, not capacity that depends on burst credits or defaults.
+W: Provisioned IOPS SSD at 20,000 IOPS: io1/io2 are built for sustained, I/O-heavy database workloads and deliver the provisioned rate with consistent low latency, which is exactly the requirement.
+X: A=gp3 at default baseline: 3,000 IOPS is far below the 20,000 required, so leaving the volume at that baseline guarantees the database is throttled.
+B=Magnetic storage: it is legacy hard-disk-backed storage with a low IOPS ceiling and variable latency, so no capacity choice gets it near a consistent 20,000 IOPS.
+D=gp2 with burst credits: burst credits only lift gp2 volumes smaller than 1 TiB to 3,000 IOPS, and only until the credits drain under constant load, so bursting can never deliver 20,000 IOPS; a design built around credits cannot promise sustained, consistent performance.
+T: Sustained, consistent high IOPS means Provisioned IOPS (io1/io2); gp3 defaults and gp2 bursts are for moderate or spiky workloads.
+
+@ Q000533 explain
+G: ## Two different RDS features for two different goals
+**Read replicas** and **Multi-AZ** are often confused because both create a second copy of the database, but they solve different problems.
+- **Read replica**: an asynchronously updated, readable copy. Applications point read-only traffic (for example, reporting queries) at the replica endpoint, taking load off the primary. You can create several replicas, even in other Regions.
+- **Multi-AZ deployment**: a synchronously replicated standby in another Availability Zone. If the primary instance or its AZ fails, RDS flips the DNS endpoint to the standby automatically, typically within a minute or two, and the application reconnects to the same endpoint name.
+Example: a MySQL database with Multi-AZ plus two read replicas survives an AZ outage (failover to the standby) and serves heavy reports from the replicas without slowing down writes on the primary.
+W: A=Read replicas for reporting: sending reporting queries to one or more readable replicas scales read capacity and keeps the primary free for application writes.
+D=Multi-AZ deployment: a synchronous standby in a second AZ with automatic failover keeps the database available when the primary's AZ fails.
+X: B=S3 Cross-Region Replication on backups: it copies backup objects to another Region for disaster recovery of the files, but it neither adds read capacity nor provides automatic failover for the running database.
+C=Larger EBS volume: more storage space (and, for some types, more IOPS) does nothing for AZ failure and does not offload reporting reads from the primary.
+E=Single-AZ with a larger instance: removing the standby makes an AZ failure a full outage, the opposite of the availability goal; a bigger instance is only vertical scaling.
+T: Read replicas are for read scaling and Multi-AZ is for high availability; you need both to meet both goals.
+
+@ Q000534 explain
+G: ## Heterogeneous database migration
+Moving from Oracle to Aurora PostgreSQL changes the engine, so two separate jobs are needed:
+- **Schema and code conversion**: tables, indexes, views and PL/SQL stored procedures must be translated to PostgreSQL (PL/pgSQL). AWS DMS Schema Conversion or the AWS Schema Conversion Tool (SCT) converts most objects automatically and flags the rest for manual work.
+- **Data movement**: AWS Database Migration Service (DMS) copies existing data with a **full load**, then keeps the target in sync with **change data capture (CDC)**, reading ongoing changes from the Oracle redo logs.
+Example: the 3 TB full load runs for hours while the source stays online. CDC replays new changes until the lag is near zero. At cutover you stop writes, let the last changes apply, and point the application at Aurora, so downtime is minutes rather than hours.
+W: SCT plus DMS full load with CDC: conversion handles the stored procedures, and continuous replication lets the source stay live until a short cutover, meeting the under-15-minute downtime goal.
+X: A=Glue and Kinesis: Glue is an ETL service and Kinesis a streaming service; neither converts Oracle schemas or stored procedures, and together they give no managed full-load-plus-CDC path from Oracle.
+C=Data Pump over a weekend: Data Pump produces Oracle-format dump files that PostgreSQL cannot import, and a weekend-long outage far exceeds 15 minutes of downtime.
+D=Restore RMAN into Aurora: RMAN backups are Oracle's physical backup format; Aurora PostgreSQL cannot restore them, and no code conversion would happen.
+T: Engine changes need schema/code conversion (SCT or DMS Schema Conversion) plus DMS full load and CDC for minimal downtime; native Oracle tools only move data to Oracle.
+
+@ Q000535 explain
+G: ## Aurora Serverless v2
+Aurora Serverless v2 is an Aurora capacity mode in which you set a minimum and maximum capacity in **Aurora Capacity Units (ACUs)** instead of choosing a fixed instance size. Each ACU is a combination of roughly 2 GiB of memory with matching CPU and networking.
+- Capacity adjusts in fine-grained increments within seconds as load rises or falls, without dropping connections.
+- You pay per ACU-hour actually used, so quiet periods cost little. On supported engine versions you can set the minimum to 0 ACUs so the instance auto-pauses after a period with no connections; paused hours incur no compute charge (storage is still billed), and the first connection after a pause waits while the instance resumes.
+- It uses the same Aurora storage, endpoints and features, such as Multi-AZ readers.
+Example: a dev database idles overnight at its minimum ACUs, then scales up automatically when a test suite runs at 10:00 and back down afterward, with no one resizing anything.
+W: Aurora Serverless v2: it scales capacity up automatically for spikes and down during near-zero usage, so the team pays for what it uses rather than for idle provisioned capacity.
+X: A=Global Database primary: Global Database replicates a cluster to other Regions for disaster recovery and low-latency global reads; it does nothing to reduce idle cost or scale capacity with demand.
+C=Fixed large instance: a provisioned instance is billed every hour whether busy or idle, so the team pays for peak capacity during all the quiet hours.
+D=Cron-scheduled resizing: changing instance class causes a brief interruption, and a fixed schedule cannot react to unpredictable spikes that arrive outside the planned windows.
+T: For intermittent, unpredictable database load, Aurora Serverless v2 scales capacity with demand; provisioned instances bill for idle time and cron resizing cannot follow real traffic.
+
+@ Q000536 explain
+G: ## Caching in front of DynamoDB
+DynamoDB returns reads in single-digit milliseconds. Some workloads, such as a hot game leaderboard read thousands of times per second, need microseconds.
+**DynamoDB Accelerator (DAX)** is a fully managed, in-memory write-through cache built specifically for DynamoDB:
+- It exposes a DynamoDB-compatible API, so the application swaps its DynamoDB client for the DAX client and keeps the same `GetItem` and `Query` calls.
+- Cache hits return in microseconds; misses are read from DynamoDB and stored in the cache.
+- It serves eventually consistent reads from cache; strongly consistent reads are passed through to DynamoDB.
+- It also absorbs read spikes on hot keys, reducing the read capacity the table consumes.
+Example: the leaderboard page calls `GetItem` for the top scores; after the first miss, repeated reads hit DAX and return in microseconds.
+W: DAX: it adds a purpose-built in-memory cache in front of the existing DynamoDB table, giving microsecond reads for hot data with minimal code changes.
+X: A=RDS Proxy: it pools and shares database connections for RDS and Aurora relational databases; it does not cache data and does not work with DynamoDB.
+C=DynamoDB Streams: it is a time-ordered log of item changes for triggering Lambda or replicating data; it does not serve or speed up reads.
+D=Replace DynamoDB with ElastiCache: ElastiCache is fast, but replacing the durable database means redesigning the data layer and data durability; the requirement is to add a cache to the existing architecture, not to remove the database.
+T: For microsecond reads on an existing DynamoDB table, add DAX; other services either do not cache DynamoDB or require replacing it.
+
+@ Q000537 explain
+G: ## Scaling reads versus scaling writes
+A classic relational database has **one writer**. Read replicas, reader endpoints and standbys can take read load, but every `INSERT`, `UPDATE` and `DELETE` still lands on the primary.
+The metrics tell you which limit you hit:
+- `WriteIOPS` near the provisioned limit, with low CPU and low reads, means the storage layer cannot absorb more writes.
+- Adding read replicas cannot help, because each replica must replay the same writes and cannot accept writes itself.
+Ways to raise the write ceiling:
+- **Scale storage performance**: raise provisioned IOPS (for example, move to io1/io2, or raise the provisioned IOPS on gp3, io1 or io2).
+- **Scale writes horizontally**: shard the data across several databases by key, or move write-heavy data to a NoSQL store such as DynamoDB that spreads writes across partitions.
+W: Raise IOPS or shard/NoSQL: the bottleneck is write I/O on the single primary, so either give it more provisioned IOPS or distribute writes across multiple databases or partitions.
+X: A=Read replica auto scaling: replicas are read-only copies, so auto scaling them adds read capacity only; standard RDS instances do not even offer replica auto scaling (that is an Aurora feature), and writes still go to the primary.
+B=More read replicas: already tried and failed, because replicas cannot accept writes; each replica also replays every write, so they do nothing for write IOPS on the primary.
+C=Multi-AZ standby: the standby receives synchronous copies of writes for failover and does not accept application writes, so it cannot share write load.
+T: Replicas and standbys scale reads or availability, never writes; fix write I/O limits with more IOPS or by spreading writes across shards or a NoSQL store.
+
+@ Q000538 explain
+G: ## Accelerating non-HTTP traffic globally
+**AWS Global Accelerator** gives an application two static anycast IP addresses announced from many AWS edge locations.
+- A player connects to the nearest edge location; from there, traffic rides the AWS global backbone instead of the congested public internet.
+- It supports **TCP and UDP**, so custom game protocols work without changes.
+- Health checks steer players to the closest healthy endpoint (an NLB, ALB, EC2 instance or Elastic IP), and failover happens without waiting for DNS caches to expire.
+Example: a player in Seoul enters AWS at a nearby edge location within a few milliseconds; the UDP packets then travel over AWS's network to the game servers in the best healthy Region.
+Compare: CloudFront is a content delivery network for HTTP/HTTPS (and WebSocket) traffic, and Route 53 only answers DNS queries.
+W: Global Accelerator: it accelerates arbitrary TCP and UDP traffic over the AWS backbone and routes each player to the optimal healthy endpoint, which fits a custom UDP game protocol.
+X: A=Route 53 latency routing alone: it only returns the IP of a lower-latency Region at DNS lookup time; the game traffic itself still crosses the public internet, and failover depends on clients honoring DNS TTLs.
+C=CloudFront: it caches and proxies HTTP/HTTPS requests; it does not carry a custom UDP gameplay protocol.
+D=S3 Transfer Acceleration: it speeds up uploads and downloads to an S3 bucket through edge locations; it cannot front game servers or UDP traffic.
+T: For non-HTTP (UDP or custom TCP) traffic that needs global performance and fast failover, use Global Accelerator; CloudFront is for HTTP content.
+
+@ Q000539 explain
+G: ## ALB listener rules
+An Application Load Balancer listener evaluates **rules in priority order** (lowest number first). Each rule has conditions and an action, and a default rule catches anything that matches nothing else.
+- **Host header** conditions match the requested domain, such as `api.example.com`.
+- **Path pattern** conditions match the URL path, such as `/v2/*`.
+- A rule with several condition types matches only when all of them match.
+Example setup on one HTTPS listener:
+- Priority 10: host `api.example.com` AND path `/v2/*` → forward to `tg-new`.
+- Default rule: forward to `tg-old` (covers the rest of api and all of www).
+A request for `api.example.com/v2/users` hits the new group; `api.example.com/v1/users` and `www.example.com/v2/page` fall through to the old one.
+W: Host and path conditions in ordered rules: a single higher-priority rule combining host header and path pattern routes exactly api + /v2/* to the new target group, and everything else falls through to the old one.
+X: A=Cross-zone load balancing: it controls whether traffic is spread across targets in all Availability Zones; it has no concept of hostnames or paths, so it cannot choose between target groups.
+B=Sticky sessions: they pin a client to the same target within a target group using a cookie; they add no routing logic for choosing a target group by host or path.
+C=Two ALBs with weighted DNS: Route 53 works at the DNS level and sees only the hostname, never the URL path, so it cannot send /v2/* differently; it also doubles load balancer cost for no benefit.
+T: Content-based routing lives in ALB listener rules; combine host-header and path-pattern conditions and use priorities to control which rule wins.
+
+@ Q000540 explain
+G: ## Exposing one service to many VPCs with PrivateLink
+**AWS PrivateLink** lets a provider publish a service privately:
+- The provider puts the application behind a **Network Load Balancer** and creates a **VPC endpoint service** from it.
+- Each customer creates an **interface VPC endpoint** in its own VPC. That endpoint is a network interface with a private IP from the customer's own subnet.
+- Customer apps connect to that local IP; AWS carries the traffic privately to the provider's NLB.
+Why it fits SaaS:
+- No routing between VPCs happens, so overlapping CIDRs (two customers both using `10.0.0.0/16`) do not matter.
+- Connections are only initiated from the customer to that one service; the provider's network is never exposed.
+- Traffic stays on the AWS network, never on the public internet, and the provider can require acceptance of each connection request.
+W: PrivateLink endpoint service: it exposes just the NLB-fronted service to any number of customer VPCs through interface endpoints, with no peering, no internet exposure and no CIDR overlap concerns.
+X: A=VPC peering per customer: peering fails when CIDRs overlap, requires route changes on both sides for each of hundreds of customers, and makes entire networks routable rather than one service.
+C=Public ALB with security groups: the service would be reachable on the public internet, which violates the requirement even if security groups restrict source addresses.
+D=Site-to-Site VPN per customer: hundreds of VPN connections are heavy to operate, and routed VPN connectivity still needs non-overlapping address ranges.
+T: To share one service with many VPCs privately and without CIDR concerns, use PrivateLink; peering and VPNs connect whole networks.
+
+@ Q000541 explain
+G: ## Outbound-only internet access for private subnets
+A subnet is **public** when its route table sends `0.0.0.0/0` to an internet gateway; otherwise it is **private**.
+A **NAT gateway** sits in a public subnet. Private subnets route `0.0.0.0/0` to it (for example `nat-0abc123`). Instances can start connections out, such as `yum update`, and replies come back, but nothing on the internet can start a connection in, because the instances have no public IP and the NAT gateway does not forward unsolicited inbound traffic.
+## Tier-to-tier access with security groups
+A security group rule can use another security group as its source. On the database group, allow port `3306` from `sg-app` only. Any instance in the app tier is allowed, anything else is blocked, and the rule stays correct when app instances scale in or out.
+W: Private subnet with NAT gateway and SG referencing the app tier: the NAT gateway gives outbound-only patch downloads, and a database security group that allows only the app tier's security group limits who can connect.
+X: A=Private subnet routed to the internet gateway: a route to an internet gateway makes the subnet public by definition, and the database instance would need a public IP for it to work, exposing it to inbound connections.
+B=No outbound path, manual copying: it blocks inbound traffic but fails the requirement to download patches from the internet and adds fragile manual work.
+C=Public subnet with an Elastic IP: the database gets a public address and is one security group mistake away from inbound internet exposure; the requirement is that it can never accept inbound internet connections.
+T: Put databases in private subnets, give them outbound-only internet through a NAT gateway, and allow inbound only from the app tier's security group.
+
+@ Q000543 explain
+G: ## Static IPs and fast failover across Regions
+**AWS Global Accelerator** provides two static anycast IPv4 addresses that stay the same for the life of the accelerator, no matter which backend serves them.
+- You create an **endpoint group** per Region, each containing endpoints such as an Application Load Balancer.
+- Users enter at the nearest AWS edge location and travel over the AWS backbone to the closest healthy endpoint group.
+- Global Accelerator health-checks the endpoints. If the ALB in one Region becomes unhealthy, new traffic goes to the other Region within seconds, and clients keep using the same IPs, so no DNS change or TTL expiry is involved.
+Example: users in Europe normally reach the `eu-west-1` ALB; when it fails, the same IP addresses start delivering them to the `us-east-1` ALB.
+Traffic dials let you shift a percentage of traffic between Regions, which is handy for blue/green moves.
+W: Global Accelerator: it gives a single set of static anycast IPs, routes users to the nearest healthy Regional ALB and fails over at the network layer without depending on DNS TTLs.
+X: A=CloudFront origin failover: an origin group always sends requests to the primary origin and retries the secondary only after errors or timeouts (and only for GET, HEAD and OPTIONS requests); it does not route users to the closest healthy Region, and by default CloudFront serves from a large, changing range of IP addresses rather than a fixed set.
+B=Direct Connect gateway: it connects on-premises networks to VPCs over private Direct Connect links; it does nothing for internet users reaching an application.
+C=Route 53 failover routing: it changes DNS answers, so failover waits for resolvers and clients to drop cached records after the TTL, and it provides no static IPs.
+T: Static entry IPs plus health-based cross-Region failover without DNS delays is Global Accelerator; Route 53 failover is DNS-based and bound by TTLs.
+
+@ Q000544 explain
+G: ## Choosing an Elastic Load Balancer type
+- **Application Load Balancer (ALB)**: Layer 7, understands HTTP/HTTPS and gRPC, routes by host and path.
+- **Network Load Balancer (NLB)**: Layer 4, forwards TCP, UDP and TLS connections, handles millions of requests per second with very low latency, gives one static IP per Availability Zone (you can attach your own Elastic IPs) and can preserve the client source IP to targets.
+- **Gateway Load Balancer (GWLB)**: sends traffic through third-party virtual appliances such as firewalls, using the GENEVE protocol.
+- **Classic Load Balancer (CLB)**: previous generation, TCP and HTTP/HTTPS, no UDP.
+Example: a game server on UDP port `7777` and TCP port `7000` sits behind one NLB with two listeners; each AZ has a fixed Elastic IP that players' clients or firewalls can allow-list.
+W: Network Load Balancer: it supports UDP and custom TCP protocols at Layer 4, scales to millions of connections, preserves client source IPs and offers a static or Elastic IP per AZ.
+X: A=Classic Load Balancer: it is a previous-generation load balancer without UDP support and without static IPs per AZ, so the UDP gameplay traffic cannot pass through it.
+C=Application Load Balancer: it only understands HTTP, HTTPS and gRPC; a custom TCP protocol and UDP traffic cannot be forwarded, and it has no static IPs.
+D=Gateway Load Balancer: it is designed to insert inspection appliances into traffic paths, not to distribute client game connections across application servers.
+T: Non-HTTP traffic (UDP or custom TCP) with static IPs and source IP preservation calls for an NLB; ALB is only for HTTP-family protocols.
+
+@ Q000545 explain
+G: ## One Direct Connect link, many Regions
+An AWS Direct Connect connection lands at one Direct Connect location, but a **Direct Connect gateway** is a global object that is not tied to a Region.
+- You create a private or transit virtual interface from the connection to the Direct Connect gateway.
+- You associate the gateway with **virtual private gateways** (one per VPC) or **transit gateways** in different Regions.
+- On-premises routes are advertised to all associated VPCs, and VPC routes are advertised back over BGP.
+Example: headquarters has one DX connection in Seoul. A Direct Connect gateway is associated with a transit gateway in `ap-northeast-2` and a virtual private gateway on a VPC in `us-west-2`; both are reachable over the same physical link.
+Note: a Direct Connect gateway does not route traffic between the associated VPCs themselves; it connects on-premises to each of them.
+W: Direct Connect gateway: associating it with virtual private gateways or transit gateways in multiple Regions lets the single headquarters connection reach VPCs across Regions without extra DX connections.
+X: B=VPC peering to a headquarters VPC: peering connects VPCs to each other and is not transitive, so on-premises traffic arriving in one VPC cannot pass through a peering connection to reach other VPCs.
+C=Site-to-Site VPN per Region: it builds separate encrypted tunnels over the internet instead of using the existing Direct Connect link, adding connections to manage and losing Direct Connect's consistent performance.
+D=Route 53 Resolver forwarding rules: they forward DNS queries between networks; name resolution does not create any network path for the actual traffic.
+T: A Direct Connect gateway lets one DX connection reach VPCs in many Regions; peering and DNS rules do not extend on-premises connectivity.
+
+@ Q000546 explain
+G: ## Streams versus queues versus delivery
+**Amazon Kinesis Data Streams** stores records in shards in the order they arrive and keeps them for a retention period (24 hours by default, extendable).
+- Producers call `PutRecord`/`PutRecords`; records become readable almost immediately.
+- Many consumers can read the same stream independently, each tracking its own position. With **enhanced fan-out**, each consumer gets its own dedicated read throughput with push delivery and low latency.
+- Consumers run your own code (KCL applications, Lambda, Managed Service for Apache Flink), so any custom logic is possible.
+Example: one application computes live session counts, another detects fraud, and a third archives clicks, all reading the same clickstream.
+By contrast, an SQS message is processed by one consumer and then deleted, and Amazon Data Firehose is a delivery service that loads data into fixed destinations such as S3 or Redshift.
+W: Kinesis Data Streams: it ingests records in real time, makes them available to custom consumer code within milliseconds, and lets multiple independent applications read the same data.
+X: B=SQS standard queue: each message is handled by one consumer and deleted, so several independent applications cannot each read the full stream, and standard queues do not guarantee order.
+C=AWS DMS: it migrates and replicates databases; it is not an ingestion endpoint for clickstream events.
+D=Kinesis Data Firehose (now named Amazon Data Firehose): it buffers records and delivers them to configured destinations such as S3, Redshift or OpenSearch, with optional Lambda transforms; it has no stream that multiple custom consumer applications can each read independently from their own position.
+T: Multiple independent real-time consumers with custom logic means Kinesis Data Streams; Firehose delivers to destinations and SQS hands each message to one consumer.
+
+@ Q000547 explain
+G: ## Why file format and layout drive Athena cost
+Amazon Athena charges by the amount of data each query scans and runs faster when it reads less.
+- **CSV** is row-based text: to read one column, Athena must scan every byte of every file.
+- **Apache Parquet** is columnar and compressed: Athena reads only the columns in the query and can skip blocks using stored min/max statistics. Scans often shrink dramatically.
+- **Partitioning** stores data in key-based prefixes, such as `s3://logs/year=2026/month=09/day=29/`. A query with `WHERE year='2026' AND month='09'` reads only those prefixes.
+Example: an AWS Glue ETL job (or an Athena CTAS query) converts daily CSV files into Parquet partitioned by date, and the Glue Data Catalog table points at the new location. A query for one day and three columns now reads a small fraction of the data.
+W: Partitioned Parquet via Glue: columnar storage plus partition pruning cuts the bytes Athena scans, which both speeds queries and lowers per-scan cost.
+X: A=Provisioned request throughput: S3 has no provisioned throughput setting; it scales requests per prefix automatically, and the problem is the volume of data scanned, not request rate.
+B=Transfer Acceleration: it speeds long-distance uploads and downloads between clients and a bucket through edge locations; Athena reads within AWS and would still scan every CSV byte.
+C=Move to Glacier: archive storage classes are for rarely accessed data; they either require a restore before the data can be read or add per-GB retrieval charges, and none of them reduces the bytes Athena scans, so queries get no faster and cost more.
+T: Athena cost and speed depend on bytes scanned; use columnar formats (Parquet or ORC) and partitions to scan less.
+
+@ Q000548 explain
+G: ## Online transfer with AWS DataSync
+AWS DataSync is a managed online transfer service. You deploy a **DataSync agent** (a VM) near the source, point it at the NFS or SMB share, and create a **task** to an S3 bucket.
+- It moves data in parallel across the network and can use a VPC endpoint or Direct Connect.
+- It verifies integrity with checksums during and after transfer.
+- It copies only changed files on later runs, and tasks can be **scheduled** (for example, nightly).
+- It preserves file metadata such as timestamps and POSIX permissions (stored as S3 object metadata).
+Rough math: 10 Gbps is about 1.25 GB/s, or roughly 100 TB per day at full rate. 200 TB therefore fits in a few days of online transfer, so no shipping of devices is needed.
+W: DataSync with an on-premises agent: it handles the large initial copy efficiently, then runs scheduled incremental syncs with built-in integrity verification and metadata preservation.
+X: A=Direct Connect alone, mounting S3 as NFS: Direct Connect is only a network link; S3 is an object store and cannot be mounted as an NFS share by itself, and nothing would perform the copy, scheduling or verification.
+B=Transfer Acceleration with aws s3 sync: it speeds transfers over long distances on the internet, but there is no built-in scheduling, managed integrity verification or preservation of NFS file metadata.
+C=Snowball Edge every night: shipping physical devices takes days per round trip, so nightly incremental syncs are impossible, and a 10 Gbps link already makes the bulk transfer practical online.
+T: For large NFS/SMB-to-S3 copies plus scheduled incremental syncs with verification over a good network link, use DataSync; Snowball is for one-time moves when bandwidth is insufficient.
+
+@ Q000549 explain
+G: ## Serverless analytics on an S3 data lake
+**Amazon Athena** runs standard SQL directly against files in S3 using table definitions in the AWS Glue Data Catalog. There are no clusters to size; you pay for the data scanned, and Parquet keeps scans small.
+**Amazon QuickSight** is a managed business intelligence service for interactive dashboards that are shared with users. (In late 2025 its BI features became part of Amazon Quick Suite; exam questions still use the QuickSight name.)
+- It connects to Athena as a data source, so dashboards query the data lake directly or through the in-memory SPICE engine.
+- **Row-level security (RLS)** uses a permissions dataset that maps users or groups to allowed values, for example `analyst_kr → region = 'APAC'`, so each viewer sees only permitted rows of the same dashboard.
+Example: analysts explore ad hoc in Athena, and a shared "Sales by Region" QuickSight dashboard shows each regional manager only their own region.
+W: Athena plus QuickSight with RLS: Athena gives serverless ad hoc SQL over the Parquet files in place, and QuickSight provides shared interactive dashboards with built-in row-level security by region.
+X: A=Always-on EMR with Hive and Grafana: a permanently running cluster is servers to size, patch and pay for continuously, and the stack has no built-in business-user row-level security for shared dashboards.
+B=Glue crawlers alone: crawlers only discover schemas and populate the Data Catalog; they do not run queries or build dashboards.
+C=RDS for PostgreSQL plus SNS: loading 50 TB into a single relational instance is impractical and adds servers to manage, and SNS is a notification service, not a dashboard tool.
+T: Serverless SQL on S3 is Athena and shared BI dashboards with row-level security is QuickSight; crawlers only catalog and SNS only notifies.
+
+@ Q000550 explain
+G: ## Fine-grained permissions on a data lake
+**AWS Lake Formation** manages permissions on data lake tables registered in the AWS Glue Data Catalog from one place, using database-style grants instead of raw S3 policies.
+- **Table and column permissions**: grant `SELECT` on a table but exclude columns such as `salary`.
+- **Data filters**: define row filters (for example `country = 'KR'`) and column lists, even combined for cell-level security, and grant them to specific principals.
+- Integrated engines such as Athena, Amazon Redshift Spectrum, Amazon EMR and AWS Glue enforce these grants when they read the data, so every team gets its own view of the same tables.
+Example: the HR team gets all columns; the marketing team gets a filter without `salary`, limited to rows where `country = 'US'`.
+W: Lake Formation with column and row filters: it centrally grants table, column and row-level access to each team and has integrated query engines enforce those rules on the shared data.
+X: A=IAM policies listing columns: IAM authorizes API actions and resources such as S3 objects; it cannot inspect a table's columns inside files and hide them from query results.
+C=Bucket policies per prefix: they allow or deny whole objects by prefix; a single file still contains every column and row, so salaries or other countries' rows cannot be hidden without duplicating data.
+D=Amazon Macie: it discovers and reports sensitive data such as PII in S3; it does not grant or restrict access to columns or rows.
+T: Column- and row-level access on data lake tables is Lake Formation (data filters); IAM and bucket policies only work at the object level.
+
+@ Q000551 explain
+G: ## Kinesis shard capacity math
+In provisioned mode, each shard accepts up to **1,000 records per second** or **1 MB per second** of writes, whichever limit is reached first. Going over either limit returns `ProvisionedThroughputExceededException`.
+Worked example for this stream:
+- Records: 8,000 per second versus 5 shards × 1,000 = 5,000 per second, so records alone exceed capacity.
+- Bytes: 8,000 × 1.5 KB = about 12 MB/s versus 5 shards × 1 MB/s = 5 MB/s.
+- The byte limit is the binding one: at least 12 shards are needed, plus headroom for peaks and uneven partition keys.
+To add capacity, call `UpdateShardCount` (or split hot shards with `SplitShard`), or switch the stream to **on-demand** capacity mode so Kinesis scales shards automatically. Use well-distributed partition keys so load spreads evenly across the new shards.
+W: Reshard to add shards: ingestion capacity is per shard, so increasing the shard count (UpdateShardCount) raises both the records-per-second and MB-per-second limits above the peak load.
+X: A=Longer retention: retention controls how long records stay readable; it has no effect on how many records per second a shard can accept.
+C=Server-side encryption: it protects data at rest with KMS keys and adds no write capacity, so producers keep being throttled.
+D=GetRecords instead of the KCL: this changes how consumers read; the throttling is on the producer side, and write limits per shard stay the same.
+T: Producer throttling in Kinesis means shard write limits are exceeded; add shards (or use on-demand mode), because retention, encryption and consumer changes do not raise ingest capacity.
+
+@ Q000552 explain
+G: ## S3 Access Points
+An **S3 Access Point** is a named network endpoint attached to a bucket, with its own access point policy.
+- Each team gets its own access point, such as `team-a-ap`, whose policy allows only `s3:GetObject` and `s3:PutObject` on `team-a/*` for that team's roles.
+- The bucket policy stays short: it delegates access control to access points owned by the account.
+- An access point can also be restricted to requests from a specific VPC.
+- Applications use the access point alias or ARN instead of the bucket name.
+Example: instead of one bucket policy with dozens of statements that every team change touches, the platform team adds or edits a single, small access point policy per team.
+W: Access Points scoped to each prefix: each team receives its own endpoint and simple policy limited to its prefix, replacing one large, fragile bucket policy.
+X: A=Cross-Region Replication rules: replication copies objects to another bucket, often in another Region; it does not control who can read or write a prefix.
+C=Object Lock: it enforces write-once-read-many retention so objects cannot be deleted or overwritten for a period; it is a retention control, not per-team access control.
+D=Requester Pays: it makes the requester pay request and data transfer charges; it changes billing, not which prefixes a team can access.
+T: Many teams sharing one bucket with their own simple permissions means S3 Access Points; replication, Object Lock and Requester Pays solve copying, retention and billing.
+
+@ Q000553 explain
+G: ## EMR node types and purchasing options
+An Amazon EMR cluster has three kinds of nodes:
+- **Primary (master) node**: runs cluster management such as YARN ResourceManager. If it is lost, the cluster fails.
+- **Core nodes**: run tasks and store data in **HDFS**. Losing them can lose data and fail jobs.
+- **Task nodes**: run tasks only and store no HDFS data. They can come and go without data loss.
+**Spot Instances** use spare EC2 capacity at large discounts but can be interrupted with a two-minute warning.
+Common pattern: primary and core on On-Demand (or covered by Savings Plans for long-running clusters), and task nodes on Spot through instance fleets or groups. If Spot capacity is reclaimed, Spark reschedules the lost tasks on the remaining nodes and the job continues.
+W: On-Demand primary/core, Spot task nodes: the nodes that manage the cluster and hold HDFS data stay stable, while stateless task nodes get deep Spot discounts with interruptions only slowing jobs.
+X: B=Spot for all nodes: an interruption of the primary node ends the cluster, and losing core nodes can lose HDFS data and fail the ETL, breaking the stability requirement.
+C=Smallest On-Demand instances: small instances make jobs run longer, which can raise total cost, and they get no Spot discount on the fault-tolerant capacity.
+D=Reserved Instances for every node: RIs bill for the full term whether or not a transient cluster is running, so idle periods waste the commitment.
+T: In EMR, put Spot on stateless task nodes and keep primary and HDFS-holding core nodes On-Demand.
+
+@ Q000554 explain
+G: ## The small files problem
+Spark-based engines such as AWS Glue pay a fixed cost for every file: listing it in S3, opening it, reading its metadata and scheduling work for it.
+- With a few hundred 256 MB files, that overhead is negligible.
+- With millions of 5 KB files, the job spends most of its time listing and planning, S3 request counts explode, and each task processes almost no data.
+The fix is to **compact** the data: periodically merge small files into fewer, larger files (often around 128 MB to 1 GB), ideally in a columnar format like Parquet.
+Example: a nightly compaction job reads the day's small files, uses `coalesce` or `repartition`, and writes a handful of large Parquet files for the main ETL job to read.
+Glue also offers file grouping options (such as `groupFiles`) that combine small input files into larger read groups, which reduces per-task overhead while compaction is put in place.
+W: Compaction before the ETL job: merging millions of tiny files into fewer large ones removes the per-file listing and scheduling overhead that is causing the slowdown.
+X: B=Rewrite in Scala: per-file overhead comes from S3 listing, file opening and task scheduling, which are the same whatever language drives Spark.
+C=Disable job bookmarks: bookmarks only track which data was already processed; turning them off makes the job reprocess old files, making it slower and producing duplicates.
+D=Keep adding DPUs: more workers add cost while the file count keeps growing; it treats the symptom and planning overhead still grows with every new file.
+T: Many tiny files slow Spark and Glue through per-file overhead; compact them into larger files instead of adding compute.
+
+@ Q000555 explain
+G: ## Requester Pays buckets
+Normally the **bucket owner** pays for storage, requests and data transfer out. With **Requester Pays** enabled on a bucket:
+- The requester pays for the requests and data transfer; the owner still pays for storage.
+- Every request must be authenticated with AWS credentials and must acknowledge the charges, for example `--request-payer requester` in the CLI or the `x-amz-request-payer` header.
+- Anonymous (unauthenticated) requests are rejected, because AWS needs an account to bill.
+Example: a genomics lab shares a 500 TB dataset. Partner universities download with their own AWS credentials and the transfer charges appear on their bills, not the lab's.
+W: Requester Pays: it moves request and transfer costs to the downloading institutions' AWS accounts and, because every request must be authenticated, blocks anonymous access as required.
+X: A=Cross-Region Replication: it copies objects to buckets in other Regions, which adds storage and replication cost for the owner and does nothing to bill downloaders or block anonymous access.
+B=CloudFront with signed URLs: signed URLs can restrict access, but the distribution owner pays CloudFront's data transfer and request charges, so the downloaders still do not pay.
+D=Transfer Acceleration: it speeds up transfers through edge locations and adds an extra per-GB charge, and it neither shifts costs to downloaders nor requires authentication.
+T: To make downloaders pay and require authenticated access to a bucket, enable Requester Pays; other features change speed or access but leave the owner paying.

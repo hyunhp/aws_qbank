@@ -1,0 +1,362 @@
+# SAA-C03 detailed explanations, chunk e02 (explanation-only rewrites; letters are the published ones)
+
+@ Q000456 explain
+G: ## How a network ACL evaluates rules
+A network ACL (NACL) is a stateless firewall attached to a subnet. Each rule has a number, a direction (inbound or outbound), a CIDR, a protocol and port range, and an action: `ALLOW` or `DENY`.
+- Rules are checked in ascending order of rule number: 50 before 100, 100 before 200.
+- The first rule that matches the packet decides the outcome; later rules are never looked at.
+- If nothing matches, the final `*` rule denies the packet.
+## Example
+Inbound rule 50 allows `0.0.0.0/0` on all ports. A new rule 100 denies `203.0.113.0/24`. A packet from `203.0.113.7` matches rule 50 first and is allowed, so rule 100 never fires. To block that range, the deny must have a lower number than the broad allow, for example rule 40.
+W: Lowest rule number wins: the broad allow at rule 50 matches every inbound packet, including those from the blocked range, before the deny at rule 100 is ever evaluated.
+X: A=Security groups override NACLs: neither overrides the other. Traffic must pass both the subnet's NACL and the instance's security group, so a matching NACL deny would block the packet no matter what the security group says.
+B=Reverse order: NACLs evaluate from the lowest number upward, not the highest. That ascending order is exactly why rule 50 takes precedence here.
+C=No deny rules: NACLs do support explicit `DENY` rules; that is one of their main differences from security groups, which only have allow rules.
+T: NACL rules are first-match in ascending number order, so a deny must be numbered lower than any broader allow it is meant to override.
+
+@ Q000457 explain
+G: ## Two kinds of attack, two layers of defense
+- **Volumetric / network-layer DDoS** (for example SYN floods or UDP reflection) tries to exhaust bandwidth or connection capacity. It has to be absorbed by very large, distributed infrastructure.
+- **Application-layer attacks** (HTTP floods, SQL injection, bad bots) look like normal HTTPS requests and must be inspected request by request.
+## How the AWS pieces fit
+- **Amazon CloudFront** serves the site from hundreds of edge locations, spreading attack traffic away from the origin.
+- **AWS Shield Standard** is on by default for all customers; **Shield Advanced** adds enhanced detection, the Shield Response Team, cost protection for scaling during attacks, and optional automatic application-layer mitigation.
+- **AWS WAF** attached to CloudFront inspects each request and can apply rate-based rules and managed rule groups.
+Example: an HTTP flood from thousands of IPs is throttled by a WAF rate-based rule at the edge, while a UDP flood never reaches the origin.
+W: CloudFront + Shield Advanced + WAF: the edge network and Shield absorb volumetric floods, and WAF filters HTTP floods and malicious request patterns, giving both layers the question asks for.
+X: B=Security groups only: they allow or deny by port and source, but they cannot absorb a bandwidth flood or tell a malicious HTTPS request from a legitimate one on port 443.
+C=Macie and Config: Macie discovers sensitive data in S3 and Config records resource configuration changes. Neither sits in the traffic path, so neither can block or absorb an attack.
+D=Direct Connect and Trusted Advisor: Direct Connect is a private link to on-premises networks, not a shield for public users' traffic, and Trusted Advisor only gives best-practice recommendations.
+T: Layered DDoS defense means edge absorption (CloudFront + Shield) for volume plus WAF for request-level attacks; network filters like security groups cover neither.
+
+@ Q000458 explain
+G: ## What NAT does for private subnets
+Instances in a private subnet have no route to the internet gateway. To download patches or call external APIs, they send outbound traffic through NAT, which rewrites the source address and returns the responses. Nothing on the internet can open a new connection inward through NAT.
+## Two ways to provide it
+- **NAT gateway**: an AWS managed service. AWS patches it, it is built with redundancy inside its Availability Zone, and its bandwidth scales automatically (up to 100 Gbps). With zonal NAT gateways the usual pattern is one per AZ, with each private route table pointing at the local one, so an AZ failure does not cut off the other AZs.
+- **NAT instance**: an EC2 instance you run with source/destination check disabled. You pick the instance size (which caps bandwidth), patch the OS, and build your own failover with scripts or Auto Scaling.
+Example: a traffic spike through a `t3.small` NAT instance saturates its network; a NAT gateway just scales.
+W: Managed and highly available versus self-managed: the NAT gateway removes patching, scaling and failover work, while a NAT instance leaves all three to you.
+X: A=Roles reversed: it is the NAT gateway that AWS manages and patches; a NAT instance is your own EC2 instance and its OS is your responsibility.
+B=Identical overhead: a NAT instance adds OS patching, instance sizing, source/destination check settings and failover design that a NAT gateway does not need.
+D=Gateways cannot scale: a NAT gateway scales its bandwidth automatically; a NAT instance is the one limited by the network performance of its instance type.
+T: Choose a NAT gateway for managed, automatically scaling NAT; a NAT instance only makes sense when you need custom behavior and accept running it yourself.
+
+@ Q000459 explain
+G: ## What makes a subnet reachable from the internet
+Inbound internet traffic reaches an instance only when all of these hold:
+- The subnet's route table has a route (usually `0.0.0.0/0`) to an **internet gateway**.
+- The instance has a **public IPv4 address** or Elastic IP, which the internet gateway maps to its private IP.
+- The **security group** and **network ACL** allow the traffic.
+## Defense in depth for a database tier
+A DB subnet whose route table has no internet gateway route has no inbound path from the internet at all. On top of that, the database security group allows the DB port only from the app tier's security group (for example source `sg-app`), so even other resources inside the VPC cannot connect.
+Example: an attacker who knows the database's private IP `10.0.3.25` still cannot send packets to it, because that address is not routable from the internet and no gateway leads into that subnet.
+W: No IGW route plus a tight SG: the missing route removes any internet path, and the security group limits connections to the app tier, which are the two real controls an auditor can verify.
+X: A=No public DNS name: hiding the name is obscurity, not a control. If a route and public IP existed, the database could be reached by IP without any DNS name.
+B=Private CIDR: private addressing is not a control. Instances with private IPs in subnets routed to an internet gateway are reachable once they have a public IP, because the gateway translates between the two. The range alone protects nothing.
+C=NAT gateway blocks inbound: a NAT gateway only lets private resources start outbound connections. It is not a firewall, and it is not what keeps inbound traffic away; the absence of an internet gateway route and public IP is.
+T: A private subnet is protected by routing (no IGW route, no public IP) and security groups, not by private addressing, missing DNS names or NAT.
+
+@ Q000460 explain
+G: ## What AWS WAF inspects
+AWS WAF attaches to CloudFront, an Application Load Balancer, API Gateway and other supported resources, and evaluates each HTTP(S) request against rules: headers, query strings, URI and body.
+## Managed rule groups
+Instead of writing detection logic, you add **AWS Managed Rules** rule groups to a web ACL. AWS maintains and updates them as new attack patterns appear.
+- `AWSManagedRulesCommonRuleSet` (Core rule set): common exploits, including cross-site scripting patterns.
+- `AWSManagedRulesSQLiRuleSet` (SQL database): SQL injection patterns in query strings, bodies and cookies.
+- Others cover known bad inputs, IP reputation and bots.
+You can start a rule group in count mode to see what it would block, then switch it to block.
+Example: a request with `?id=1' OR '1'='1` matches the SQL database rule group and gets a 403.
+W: AWS Managed Rules: the Core rule set and SQL database rule groups block common XSS and SQL injection patterns immediately, and AWS keeps them current, so no custom detection logic is needed.
+X: A=Custom Lambda per signature: this is the "write it from scratch" approach the question wants to avoid, and Lambda is not part of WAF's request inspection path, so it would add latency, code and maintenance.
+B=NACL payload inspection: network ACLs filter only by IP, protocol and port at the subnet level. They never look inside HTTP requests, so they cannot see SQL injection strings.
+D=Security groups instead of WAF: security groups also work only on IP, protocol and port, so disabling WAF removes the only layer here that understands HTTP content.
+T: For common web exploits, add AWS Managed Rules to a WAF web ACL; network-level filters (NACLs, security groups) cannot read request payloads.
+
+@ Q000461 explain
+G: ## Security group references
+A security group rule's source can be a CIDR or another **security group ID**. With a group as the source, the rule means "allow traffic from any network interface that has that group attached", whatever its IP.
+## Why it fits Auto Scaling
+Auto Scaling groups launch and terminate instances constantly, so IP addresses change. If the web tier's launch template attaches `sg-web`, the database group can allow port `3306` from `sg-web`:
+- a new web instance is allowed the moment it launches;
+- a terminated instance's IP is no longer allowed;
+- nothing else in the VPC, such as a batch server, can reach the database.
+No IP list ever needs updating, and access stays limited to exactly one tier.
+W: Reference the web tier SG: the rule follows group membership instead of IP addresses, so it adapts automatically to scaling while allowing only web instances to reach the database.
+X: A=0.0.0.0/0 on the DB port: this allows any source that can route to the database, the opposite of least privilege, and would expose it to the internet if it were ever reachable.
+C=NACLs instead of an SG: NACLs work at the subnet level with CIDR ranges only; they cannot reference security groups, so they cannot distinguish web instances from anything else in the same subnet range.
+D=Manual IP list: every scale-out or replacement changes IPs, so the list is always stale: new instances are blocked and old IPs, possibly reused by other resources, stay allowed.
+T: For dynamic tiers, use a security group reference as the source rather than IP addresses or subnet-level NACLs.
+
+@ Q000462 explain
+G: ## Two ways to connect on-premises to a VPC
+- **AWS Site-to-Site VPN**: two IPsec tunnels between your customer gateway device and a virtual private gateway or transit gateway, over the public internet. It can be configured in hours, and traffic is encrypted by IPsec. Because it rides the internet, latency and throughput vary.
+- **AWS Direct Connect**: a private physical connection through a Direct Connect location. It gives consistent latency and bandwidth, but a new connection usually takes weeks to provision (partner and cross-connect work), and traffic is not encrypted by default; you add MACsec on supported connections or run a VPN over it.
+## Matching the requirements
+"Within a few hours", "encrypted in transit" and "variable latency is acceptable" all point to VPN.
+Example: a team configures a customer gateway on its firewall, downloads the VPN configuration, and has both tunnels up the same afternoon.
+W: Site-to-Site VPN: quick to set up, encrypted with IPsec by default, and its only weakness, internet-dependent latency, is explicitly acceptable here.
+X: A=CloudFront: a content delivery network for serving content to users; it does not create a private network link between a data center and a VPC.
+C=VPC peering: peering connects two VPCs inside AWS. It cannot connect an on-premises network.
+D=Direct Connect in hours: new Direct Connect connections typically take weeks, not hours, and the link is not encrypted by default, so it fails both key requirements.
+T: Fast and encrypted with tolerance for variable latency means Site-to-Site VPN; Direct Connect is for consistent performance and takes much longer to set up.
+
+@ Q000463 explain
+G: ## How SSE-KMS calls KMS
+With SSE-KMS, S3 uses envelope encryption: each object is encrypted with a data key, and that data key is protected by your KMS key. Without Bucket Keys, S3 calls KMS (for example `GenerateDataKey` on upload, `Decrypt` on download) for objects individually. KMS has per-account, per-Region request quotas for cryptographic operations, so a burst of many small uploads can hit `ThrottlingException`.
+## S3 Bucket Keys
+With **S3 Bucket Keys** enabled, S3 gets a short-lived bucket-level key from KMS and uses it to produce data keys for many objects locally. KMS is called far less often, which cuts throttling risk and KMS request cost, while objects are still encrypted under your customer managed key.
+Example: 100,000 small uploads that previously meant roughly 100,000 KMS calls now need only a small fraction of that.
+W: S3 Bucket Keys: they reduce SSE-KMS calls to KMS dramatically while keeping the same customer managed key, key policy control and encryption strength.
+X: A=Switch to SSE-C: it avoids KMS but gives up KMS key policies and audit of key use, and forces every client to manage and send the encryption key with each request, a large change that weakens central control.
+C=Encrypt only on download: S3 encrypts objects when they are written, and there is no setting to encrypt on read; stored data would be unencrypted at rest.
+D=One key per object: KMS request quotas are shared across keys in the account and Region, so more keys do not add capacity, and managing a key per object is impractical and costly.
+T: When SSE-KMS causes KMS throttling or cost, enable S3 Bucket Keys rather than changing the encryption model.
+
+@ Q000464 explain
+G: ## ACM public certificates
+AWS Certificate Manager (ACM) issues public TLS certificates at no extra charge when they are used with integrated services such as Elastic Load Balancing, CloudFront and API Gateway. You prove domain ownership with **DNS validation** (a CNAME record) or email validation.
+- With DNS validation, the CNAME stays in place and ACM renews the certificate automatically before it expires and deploys it to the attached resources.
+- ACM certificates are Regional resources: an ALB in `eu-west-1` uses a certificate from `eu-west-1`.
+## The CloudFront rule
+CloudFront is a global service that reads certificates only from **US East (N. Virginia), `us-east-1`**. So a site with an ALB in Frankfurt and a CloudFront distribution needs two ACM certificates: one in `eu-central-1` for the ALB and one in `us-east-1` for CloudFront.
+W: ACM with DNS validation, us-east-1 for CloudFront: free certificates for integrated services, automatic renewal while the DNS record exists, and the CloudFront certificate requested in `us-east-1`.
+X: A=Export to targets, same Region: exporting public certificates carries a charge, and even though ACM renews an exportable certificate, re-exporting and reinstalling it on every target is your job. The ALB also terminates TLS with its own listener certificate, so certificates on the targets do not secure the client connection. CloudFront also cannot use a certificate from the ALB's Region unless that Region is `us-east-1`.
+B=KMS asymmetric keys as TLS keys: KMS keys are not certificates, and ALB listeners and CloudFront distributions are configured with ACM (or imported) certificates, not KMS keys.
+C=Secrets Manager rotation Lambda: it rebuilds renewal by hand with custom code and re-imports; imported certificates are not renewed by ACM, so this adds the work ACM would do for free.
+T: Use ACM with DNS validation for automatic free certificates, and remember CloudFront only uses certificates from `us-east-1`.
+
+@ Q000465 explain
+G: ## Managed renewal with ACM
+Public TLS certificates have a fixed validity period and must be renewed before they expire; an expired certificate makes browsers refuse the connection, which is a full outage.
+With AWS Certificate Manager (ACM):
+- you request a public certificate for `www.example.com` and validate the domain, preferably with **DNS validation**;
+- you attach it to the ALB's HTTPS listener;
+- ACM renews it automatically before expiry and the ALB picks up the renewed certificate, with no action from you.
+Managed renewal applies to certificates ACM issued; a DNS-validated certificate renews without any action as long as its CNAME record stays in place. Certificates you import into ACM from another CA are never renewed by ACM.
+Example: a team that used to track renewal dates in a spreadsheet moves to an ACM-issued certificate on its ALB and removes the manual task entirely.
+W: ACM-issued certificate: ACM renews it automatically and redeploys it to the ALB, which eliminates manual renewal and the risk of an expired certificate.
+X: B=Manual tracking and re-issue: this keeps the exact human process that causes expiry outages when someone forgets or leaves.
+C=Self-signed certificate: browsers do not trust self-signed certificates, so public users would see security warnings; it also still expires.
+D=Export and install on servers: the ALB terminates TLS with its own listener certificate, so installing on targets does not help, exporting a public certificate carries a charge, and every renewed version must be re-exported and replaced on the servers by you.
+T: For TLS on an ALB without renewal work, use an ACM-issued certificate on the listener and let ACM renew it.
+
+@ Q000466 explain
+G: ## Two policies control a KMS key
+Every KMS key has a **key policy**, a resource policy that is the primary access control for that key. IAM policies grant access to a KMS key only if the key policy allows it, usually through a statement that trusts the account root (`arn:aws:iam::111122223333:root`), which delegates access to IAM.
+- Default key policy: includes that statement, so IAM policies work.
+- Custom key policy without it: IAM policies granting `kms:Decrypt` have no effect for principals the key policy does not name.
+## Example
+A user's IAM policy allows `kms:Decrypt` on the key ARN, but the key policy only lists the security team's role. The user's call returns `AccessDeniedException`. Fix it by adding the user or role to the key policy, or by adding the root-account statement so IAM policies apply.
+W: Key policy does not allow the principal: KMS evaluates the key policy first, and without a key policy statement covering the user (directly or via IAM delegation), the IAM allow is not enough.
+X: B=IAM never applies to KMS: IAM policies do grant KMS access when the key policy enables IAM delegation, which the default key policy does.
+C=Different Region: KMS keys are Regional, but calling the wrong Region typically fails because the key is not found there, and nothing in the scenario suggests a Region mismatch; the permission model is the likely cause.
+D=No decryption through the API: `Decrypt` is a core KMS API operation used by SDKs, the CLI and integrated services.
+T: KMS access needs the key policy to allow the principal (directly or by delegating to IAM); an IAM allow alone is not enough.
+
+@ Q000467 explain
+G: ## S3 Versioning
+With versioning enabled, every overwrite creates a new version and a delete only adds a **delete marker**; the earlier versions remain and can be restored.
+Example: `report.csv` is deleted by mistake. Removing the delete marker (or copying the prior version back) restores it.
+## Cross-Region Replication (CRR)
+CRR asynchronously copies new objects from a source bucket to a bucket in another Region. It requires versioning on both buckets and an IAM role that S3 assumes to replicate.
+- Existing objects can be copied with S3 Batch Replication.
+- Delete markers are replicated only if you enable it, and deletions of specific versions are not replicated, so a destructive delete in the source does not remove data from the replica.
+Together they protect against accidental deletion (versions) and the loss of a whole Region (replica elsewhere).
+W: Versioning plus CRR: versioning keeps previous versions recoverable after deletes or overwrites, and CRR keeps a copy in a second Region for disaster recovery.
+X: A=Intelligent-Tiering with archive tiers: it moves objects between access tiers to save cost, but keeps them in the same bucket and Region and does not preserve deleted objects.
+C=Transfer Acceleration: it speeds uploads over long distances through CloudFront edge locations; it does not replicate data or keep old versions.
+D=Removing bucket policies: this weakens access control and does nothing to recover deleted objects or create a second-Region copy.
+T: Recover from deletes with versioning and survive Regional loss with Cross-Region Replication; cost and speed features do neither.
+
+@ Q000468 explain
+G: ## Classification comes first
+Controls such as encryption keys, access rules and retention periods should depend on how sensitive data is. Before automation can apply them, each dataset needs a known **classification**, for example `public`, `internal`, `confidential` or `restricted`.
+## Tags make classification actionable
+Once data is labeled with tags like `classification=confidential`:
+- IAM and bucket policies can use tag conditions to limit access;
+- AWS Backup plans and S3 Lifecycle rules can select resources or objects by tag to apply retention;
+- automation can check that confidential data uses a specific KMS key.
+## Where Amazon Macie helps
+Macie scans S3 buckets with machine learning and pattern matching to find sensitive data such as personal information and financial data, so you can classify data nobody has labeled yet.
+Example: Macie flags a bucket of CSV files containing credit card numbers; the team tags it `restricted` and policies then apply.
+W: Classify and tag, with Macie: classification is the input that decides which controls apply, tags let policies act on it automatically, and Macie discovers sensitive data in S3 to speed classification.
+X: A=Cheapest storage first: moving data before knowing its sensitivity can break retention or access requirements, and it does not tell you which controls each dataset needs.
+B=One KMS key for everything: encryption is useful but a single key gives no per-sensitivity access separation, and postponing classification skips the step that drives all other controls.
+D=Strictest controls everywhere: applying maximum controls to all data is expensive and blocks legitimate use, and it still avoids deciding what is actually sensitive.
+T: Automatic sensitivity-based controls start with classifying and tagging data; Macie helps find sensitive data in S3.
+
+@ Q000469 explain
+G: ## What AWS Backup does
+AWS Backup is a managed service that centralizes backups across many AWS resource types, including EBS volumes, EC2 instances, RDS and Aurora databases, DynamoDB tables, EFS and FSx file systems, and S3.
+## Backup plans
+A **backup plan** defines:
+- a schedule (for example daily at 03:00 UTC);
+- a lifecycle and retention (keep 35 days, optionally move to cold storage);
+- copy rules to a backup vault in another Region or account;
+- resource assignment by tag or ARN, such as every resource tagged `backup=gold`.
+With AWS Organizations, backup policies can push plans to many accounts, and Backup Audit Manager reports on compliance.
+Example: one plan tagged `backup=gold` covers an EBS volume, an RDS instance and a DynamoDB table with the same schedule and a copy to a second Region.
+W: AWS Backup: it is the single service that defines schedules, retention and cross-Region copies for EBS, RDS, DynamoDB and more in one place.
+X: A=AWS Config: it records configuration and evaluates compliance rules; it can report whether resources are covered by backups but does not create or retain them.
+B=Amazon S3 Glacier: it is an archive storage option, not a service that schedules backups of EBS, RDS or DynamoDB.
+D=AWS Trusted Advisor: it gives best-practice recommendations, such as flagging missing snapshots, but it does not run backups or enforce retention.
+T: For central, policy-based backups across many services, use AWS Backup backup plans.
+
+@ Q000470 explain
+G: ## Cross-account use of a KMS key
+A customer managed key in Account A can be used by principals in Account B, but two sides must agree:
+- **Key policy in Account A** (the key owner) must allow Account B, for example `arn:aws:iam::222222222222:root`, or a specific role there, to call `kms:Decrypt`.
+- **IAM policy in Account B** must allow that role to call `kms:Decrypt` on the key ARN in Account A.
+If either side is missing, the call fails with an access denied error. Account B cannot grant itself access to Account A's key.
+## Example
+A role `analytics-reader` in Account B reads S3 objects encrypted with Account A's key. Its IAM policy allows decrypt, but the key policy lists only Account A principals, so S3 cannot decrypt on the role's behalf. Adding Account B (or the role) to the key policy fixes it. AWS managed keys cannot be shared this way; customer managed keys can.
+W: Key policy allows the external account or role: the key owner must grant access in the key policy; the IAM policy in Account B only works once that grant exists.
+X: A=S3 bucket policy grants kms:Decrypt: a bucket policy controls access to the bucket's objects, not to the KMS key. KMS permissions come from the key policy (and IAM, or grants).
+B=Keys can never be shared: customer managed KMS keys support cross-account use through key policies and grants.
+C=Direct Connect between accounts: KMS is called through its API endpoints; network links between accounts have nothing to do with key permissions.
+T: Cross-account KMS access needs both the key owner's key policy and the caller's IAM policy to allow it.
+
+@ Q000471 explain
+G: ## S3 Object Lock
+Object Lock stores objects in a write-once-read-many (WORM) model. It is enabled on a bucket (versioning is required) and sets a **retention period** or a **legal hold** on object versions. While protected, a version cannot be deleted or overwritten.
+## Two retention modes
+- **Governance mode**: users with the special permission `s3:BypassGovernanceRetention` can remove or shorten retention. Useful for testing or internal policies.
+- **Compliance mode**: no one, including the root user, can delete the version or shorten its retention until it expires. This is designed for regulations such as SEC 17a-4 style record keeping.
+Example: trade confirmations stored with a 7-year compliance-mode retention stay undeletable for 7 years even if an administrator account is compromised.
+W: Object Lock compliance mode: it prevents deletion or overwrite of protected versions by any user, including root, for the full retention period, which is the regulatory requirement.
+X: B=Transfer Acceleration: it speeds up uploads through edge locations and has no effect on whether objects can be deleted.
+C=Bucket policies alone: a policy can deny deletes, but anyone with enough permissions, including root, can change or remove the policy, so it is not immutable.
+D=Standard-IA: it is a storage class for infrequently accessed data that lowers storage cost; objects in it can still be deleted or overwritten.
+T: Retention that even root cannot bypass means S3 Object Lock in compliance mode, not policies or storage classes.
+
+@ Q000472 explain
+G: ## EBS encryption by default
+EBS encryption by default is an account setting per Region. Once enabled, every new EBS volume and snapshot copy created in that Region is encrypted automatically, even if the request does not ask for encryption.
+- By default it uses the AWS managed key `aws/ebs`.
+- You can change the default KMS key to a **customer managed key**, so new volumes use your key and your key policy.
+- Existing unencrypted volumes are not changed; you encrypt them by snapshotting and copying with encryption.
+Example: in `us-east-1`, an administrator enables encryption by default and sets `alias/ebs-prod` as the default key. A developer launches an instance with no encryption options, and its root and data volumes are encrypted with `alias/ebs-prod`.
+Because the setting is per Region, enable it in every Region you use.
+W: Encryption by default with the CMK: new volumes are encrypted automatically with the chosen customer managed key, and developers never have to specify encryption settings.
+X: A=Rely on S3 default encryption: S3 default encryption applies only to objects in S3 buckets; it does nothing for EBS volumes.
+B=IAM policy requiring encryption: a condition can deny unencrypted `CreateVolume` calls, but developers must still specify encryption themselves, which is the burden the company wants to remove.
+C=Re-encrypt manually after creation: it is error-prone, leaves volumes unencrypted until someone acts, and re-encrypting requires snapshot-and-copy work for every volume.
+T: To encrypt all new EBS volumes automatically with your own key, enable EBS encryption by default and set a customer managed key as the default.
+
+@ Q000473 explain
+G: ## Three kinds of KMS keys
+- **AWS owned keys**: owned and used by AWS services across many accounts. You cannot see them in your account, view their policies or audit their use.
+- **AWS managed keys** (aliases like `aws/s3`, `aws/ebs`): created in your account for a service. You can view them and see their use in CloudTrail, but you cannot edit their key policy, disable them, or change rotation (AWS rotates them yearly).
+- **Customer managed keys**: created and owned by you. You control the key policy, grants, enable/disable, automatic rotation (with a configurable period) and on-demand rotation, and you can schedule deletion with a waiting period of 7 to 30 days.
+Example: a compliance rule requires 180-day rotation and a documented procedure to disable a key on incident; only a customer managed key supports both.
+W: Customer managed key: it is the only type where you control the key policy, enable/disable state, rotation settings and deletion scheduling.
+X: B=No difference: the three types differ exactly in who controls policy, rotation and lifecycle.
+C=AWS owned key: these are not visible or manageable in your account at all, so you cannot set policies, disable them or change rotation.
+D=AWS managed key: you cannot edit its key policy, disable it, change its rotation schedule or delete it.
+T: Full control over policy, rotation and lifecycle requires a customer managed key; AWS managed and AWS owned keys are controlled by AWS.
+
+@ Q000474 explain
+G: ## AWS's evidence versus your evidence
+Under the shared responsibility model, compliance has two halves:
+- **AWS's side** (security of the cloud): AWS is audited by third parties. **AWS Artifact** is the self-service portal where you download those reports, such as SOC 1/2/3 reports and PCI DSS attestations, and accept agreements like a BAA.
+- **Your side** (security in the cloud): how you configure accounts and resources. **AWS Security Hub** (the posture-management checks, now branded AWS Security Hub CSPM) runs automated checks against security standards, including PCI DSS, and shows which controls pass or fail in your accounts.
+Example: the auditor downloads AWS's PCI attestation from Artifact to cover AWS's infrastructure, and reviews the Security Hub PCI DSS control results to see that, for example, CloudTrail logging and encryption are enabled in the company's accounts.
+W: Artifact for AWS's reports, Security Hub for the accounts: Artifact provides AWS's own audit reports, and Security Hub checks the customer's configuration against PCI DSS controls.
+X: A=Config for reports, Inspector for accounts: AWS Config records and evaluates your own resource configurations and does not host AWS audit reports; Inspector finds software vulnerabilities and network exposure, not PCI control status.
+C=Roles swapped: Security Hub checks your environment and does not provide AWS's audit reports, while Artifact provides documents and does not assess your accounts.
+D=Trusted Advisor for both: it offers best-practice checks for cost, security and limits, but it neither provides AWS's compliance reports nor maps your accounts to PCI DSS controls.
+T: Download AWS's compliance reports from AWS Artifact; assess your own accounts against standards like PCI DSS with Security Hub.
+
+@ Q000475 explain
+G: ## S3 Lifecycle transitions
+An S3 Lifecycle configuration automatically moves objects between storage classes, or expires them, based on age.
+- **S3 Standard**: frequent access, no retrieval fees.
+- **S3 Standard-IA**: lower storage price, per-GB retrieval fee, 30-day minimum storage; good for data read rarely but needed quickly.
+- **S3 Glacier Deep Archive**: the lowest storage price, 180-day minimum, retrieval within about 12 hours (standard) or up to 48 hours (bulk).
+## Example for these logs
+- Day 0-30: Standard.
+- Day 30: transition to Standard-IA.
+- Day 90: transition to Glacier Deep Archive.
+- About day 2,555 (7 years): expire the objects.
+Rules can be scoped by prefix, such as `logs/`, or by tag, so they run with no manual work.
+W: Lifecycle to Standard-IA, then Deep Archive: it matches each phase of declining access with the cheapest suitable class, and Deep Archive's hours-long retrieval is explicitly acceptable.
+X: A=Transfer Acceleration: it speeds up uploads to S3 over long distances; it does not change storage classes or cost over time.
+B=Cross-Region Replication: it copies objects to another Region, which adds storage cost rather than lowering it, and does not move data between classes by age.
+D=Requester Pays: it shifts request and data transfer charges to the requester; storage cost for the logs stays the same.
+T: When access drops predictably with age and slow retrieval is fine, use S3 Lifecycle transitions ending in Glacier Deep Archive.
+
+@ Q000476 explain
+G: ## Replicating SSE-KMS objects
+KMS keys are Regional, so a single-Region key in `us-east-1` cannot be used to decrypt data in `eu-west-1`. For S3 replication of objects encrypted with SSE-KMS:
+- the replication rule must opt in to replicating KMS-encrypted objects;
+- the rule must name a **destination KMS key** in the destination Region (the replica is re-encrypted with it); this can be a separate key or the replica of a **multi-Region key**;
+- the replication IAM role needs `kms:Decrypt` on the source key and `kms:Encrypt` on the destination key, and both key policies must allow it.
+Applications in the destination Region then need permission on the destination key.
+Example: source bucket in `us-east-1` with key `alias/logs-use1`; the rule sets `ReplicaKmsKeyID` to a key in `eu-west-1`, and apps there are granted that key.
+W: Destination-Region key or multi-Region key: replicas must be encrypted with a key that exists in the destination Region and that the replication role and destination apps are allowed to use.
+X: A=Destination must be unencrypted: replication works with encrypted destinations, and leaving it unencrypted would weaken security; S3 also encrypts all new objects by default.
+B=CRR does not support encryption: CRR supports SSE-S3, SSE-KMS and dual-layer SSE-KMS objects when configured to do so.
+D=IAM roles cannot be used: S3 replication requires an IAM role that S3 assumes to read from the source and write to the destination.
+T: KMS keys are Regional, so replicating SSE-KMS objects needs a destination-Region key (or multi-Region key) and a role allowed to use both keys.
+
+@ Q000477 explain
+G: ## KMS versus CloudHSM
+- **AWS KMS** is a managed, multi-tenant key service. Keys are protected by FIPS-validated HSMs that AWS operates, and access is controlled with key policies and IAM. You never administer the HSM itself.
+- **AWS CloudHSM** gives you dedicated, single-tenant HSMs in a cluster inside your VPC. You create the crypto officers and users and hold the credentials; AWS manages the hardware, but cannot see or use your keys.
+Applications call CloudHSM through standard interfaces such as PKCS#11, JCE or OpenSSL, and a KMS custom key store can be backed by a CloudHSM cluster when you want KMS integration with keys in your own HSMs.
+Example: a bank whose regulator requires single-tenant hardware with customer-only administrative control deploys a CloudHSM cluster across two AZs.
+W: AWS CloudHSM: it provides dedicated single-tenant HSMs where the customer, not AWS, holds sole administrative control over users and keys.
+X: B=AWS Certificate Manager: it issues and manages TLS certificates; it does not provide customer-administered hardware security modules.
+C=Amazon Macie: it discovers sensitive data in S3 and has nothing to do with key storage or HSMs.
+D=KMS with AWS managed keys: this is the shared, multi-tenant service the company wants to avoid, and AWS managed keys are the type where AWS controls the key policy and rotation.
+T: A dedicated HSM under your sole control means CloudHSM; KMS is a shared, AWS-operated key service.
+
+@ Q000478 explain
+G: ## Map every hop and every store
+"Encryption everywhere" has two parts:
+- **In transit**: each network hop needs its own TLS session.
+- Browser to ALB: HTTPS listener with an ACM certificate.
+- ALB to EC2: target group using HTTPS, with a certificate on the instances.
+- EC2 to RDS: TLS on the database connection (for example require SSL in the DB parameter group and client driver).
+- **At rest**: each place data is stored needs encryption.
+- EBS volumes on the EC2 instances: KMS encryption.
+- RDS storage, automated backups, snapshots and replicas: KMS encryption enabled at creation.
+Encrypting the first hop only leaves traffic readable inside the VPC; encrypting storage only leaves every connection in cleartext.
+W: TLS on every hop plus KMS at rest: it encrypts all three network segments and both storage locations, which is the only choice covering both requirements.
+X: A=VPN from browsers, no storage encryption: public users cannot be expected to run a VPN, and it leaves EBS and RDS data unencrypted at rest.
+B=HTTPS on the ALB listener only: the ALB-to-EC2 and EC2-to-RDS hops stay unencrypted, and EBS on the instances is not covered.
+C=Storage encryption only: data at rest is protected, but every network hop, including the public one from the browser, is left in cleartext.
+T: List each network hop and each data store, then apply TLS to every hop and KMS encryption to every store.
+
+@ Q000479 explain
+G: ## RPO and RTO
+- **RPO** (Recovery Point Objective): how much data you can lose, measured in time. Near-zero means data must be copied continuously.
+- **RTO** (Recovery Time Objective): how long until service is back. A few minutes means the standby must already be running.
+## Options for a relational database across Regions
+- **Aurora Global Database**: storage-level replication to secondary Regions, typically with lag under a second, and a secondary cluster that can be promoted in minutes.
+- **RDS cross-Region read replica**: asynchronous replication to another Region; promoting it makes it a standalone writable database.
+- **Snapshots copied to another Region**: RPO equals the time since the last snapshot, and restoring takes longer.
+Multi-AZ keeps a standby in another AZ of the same Region, so it does not survive a Regional outage.
+Example: an Aurora primary in `us-east-1` with a secondary in `us-west-2`; on a Regional failure the secondary is promoted and the app's endpoint is switched.
+W: Cross-Region replica or Aurora Global Database: continuous cross-Region replication keeps data loss near zero, and promoting a running replica gives recovery in minutes.
+X: B=Multi-AZ covers Regional failure: Multi-AZ standbys are in the same Region, so a Region-wide outage takes them down too.
+C=Nightly snapshots to another Region: up to about a day of data could be lost, and restoring a snapshot takes far longer than a few minutes.
+D=Weekly exports to Deep Archive: up to a week of data loss, plus retrieval that can take hours before a restore can even begin.
+T: Near-zero RPO and minutes of RTO across Regions require continuous cross-Region replication with a promotable replica; Multi-AZ and backups do not meet it.
+
+@ Q000480 explain
+G: ## Throttling in API Gateway
+API Gateway limits request rates with a token bucket: a **rate** (steady requests per second) and a **burst** (how many requests can arrive at once). Requests over the limit are rejected with HTTP `429 Too Many Requests` (they are not queued), so the backend never sees them.
+Throttling can be set at several levels:
+- account-level limits per Region;
+- stage and method throttling settings;
+- **usage plans**, which apply rate, burst and optional quotas per API key for specific stages and methods.
+## Why it protects Lambda
+Example: a Lambda function can handle about 200 concurrent requests. Setting rate 150 and burst 200 on the API keeps sudden spikes from turning into Lambda throttles and downstream overload; callers that exceed the limit get a 429, which AWS SDKs and well-behaved clients retry with backoff.
+Note that usage plans identify callers by API key; stage or method throttling applies the same limits without keys.
+W: Usage plan with rate and burst throttling: API Gateway caps the request rate and burst at the front door, so spikes are limited before they reach the Lambda function and its downstream systems.
+X: A=S3 static website endpoint: an S3 website serves static files only; it cannot invoke Lambda or throttle API calls.
+C=Response caching for all methods: caching helps only repeated cacheable reads; writes and unique requests still pass through at full burst, and caching every method can return stale or wrong data.
+D=Unlimited reserved concurrency: there is no unlimited setting (concurrency is bounded by the account limit), and more concurrency would push even more load onto the downstream systems that are already throttling.
+T: To shield a backend from bursts, throttle at API Gateway with rate and burst limits rather than caching or raising Lambda concurrency.

@@ -1,0 +1,350 @@
+# DVA-C02 detailed explanations, e05 (explanation-only rewrites; letters are the published ones)
+
+@ Q000687 explain
+G: ## How an S3 trigger calls Lambda
+When an object is uploaded, S3 invokes the function asynchronously and passes an **event** JSON document. The handler never sees the file itself; it reads fields from the event, such as:
+- `Records[0].eventName` (for example `ObjectCreated:Put`)
+- `Records[0].s3.bucket.name` and `Records[0].s3.object.key`
+- `Records[0].s3.object.size`
+## Testing without a real upload
+Because the handler only depends on that JSON, you can hand it a hand-made copy of the same shape:
+- In the Lambda console, create a test event from the `s3-put` template and edit the bucket and key.
+- With the SAM CLI, run `sam local generate-event s3 put` and pipe the output into `sam local invoke`.
+- With the AWS CLI, call `aws lambda invoke --payload file://event.json`.
+Point the key at a small object that already exists in a dev bucket if the code downloads it.
+W: Sample S3 event payload: the function's logic is driven entirely by the event document, so invoking it with a realistic S3 event JSON exercises the same code path as a real upload, repeatably and without touching the trigger.
+X: A=No input payload: the handler would receive an empty event, and code that reads `Records[0].s3.object.key` would throw before any real logic runs, so the test proves nothing about the S3 path.
+C=CloudWatch Events trigger: changing the trigger changes the event shape the function receives, so you would be testing different input, and the production S3 path would still be untested.
+D=Delete the S3 notification: removing the trigger does not help test anything; it only breaks the real integration and has to be recreated afterwards.
+T: Lambda code is driven by the event JSON, so test it by invoking with a realistic sample event, not by changing or removing the trigger.
+
+@ Q000688 explain
+G: ## Why API Gateway shows only 500
+When the Lambda integration fails, API Gateway usually returns a generic `500 Internal Server Error` to the client. The real cause lives further back in the request path, so you need tools that look inside it.
+## Logs versus traces
+- **CloudWatch Logs**: the function's log group (`/aws/lambda/<name>`) holds `console.log` output, stack traces, timeouts and `REPORT` lines with duration and memory. API Gateway execution logging can also show what it sent to and received from the integration.
+- **AWS X-Ray**: with active tracing on the stage and the function, each request becomes a trace with segments for API Gateway, Lambda and instrumented downstream calls (DynamoDB, HTTP APIs). The service map and trace timeline show which hop failed or was slow.
+Example: a trace shows the Lambda segment succeeded but a DynamoDB subsegment threw `ProvisionedThroughputExceededException`; the log for that request ID shows the unhandled error.
+W: CloudWatch Logs plus X-Ray: X-Ray shows where in the request chain the error happens, and the logs give the exact error message and stack trace for that request, which together pinpoint intermittent failures.
+X: A=Route 53 health checks: they only report whether the endpoint answers health probes; they say nothing about which component inside a failing request produced the 500.
+C=S3 server access logs only: these record requests made to an S3 bucket, not API Gateway or Lambda invocations, so they cannot show where an API request failed.
+D=AWS Config rule evaluations: Config checks whether resource configurations comply with rules; it does not observe individual requests or runtime errors.
+T: For "where did this request fail", combine X-Ray traces (which hop) with CloudWatch Logs (what error), not configuration or availability tools.
+
+@ Q000689 explain
+G: ## Two ways SAM pushes changes
+- `sam deploy` packages the application and runs a full CloudFormation stack update through a change set. It is the safe path for test and production, but even a one-line code edit waits for the stack update.
+- `sam sync` is built for development. For code-only changes it calls service APIs directly, for example updating the Lambda function code, which takes seconds. When infrastructure in the template changes, it falls back to a CloudFormation deployment.
+## Typical dev loop
+Run `sam sync --stack-name dev-app --watch`: SAM watches local files and syncs each save. `sam sync --code` pushes only code without touching infrastructure.
+Because direct updates bypass CloudFormation, the stack can drift from the template, so AWS recommends `sam sync` for dev stacks and `sam deploy` for production.
+W: sam sync: it pushes code changes directly to the function for fast feedback and uses a CloudFormation deployment only when infrastructure definitions change, unlike `sam deploy`, which always updates the whole stack.
+X: A=No difference: the commands behave differently; `sam sync` skips the stack update for code-only changes, which is the whole reason it exists.
+C=sam package: it only uploads artifacts to S3 and writes a packaged template; it deploys nothing, so it cannot replace `sam sync`.
+D=sam deploy --fast: there is no such flag; `sam deploy` always goes through CloudFormation, and skipping validation would not be a sound way to speed up development.
+T: Use `sam sync` (optionally `--watch`) for quick dev iterations and `sam deploy` for full, auditable stack deployments.
+
+@ Q000690 explain
+G: ## Stage variables
+A **stage variable** is a name/value pair stored on an API Gateway stage (for REST APIs). The same API definition can reference it, and each stage supplies its own value.
+## Pointing each stage at a Lambda alias
+Set the integration's function ARN to include a stage variable, for example:
+- `arn:aws:lambda:us-east-1:123456789012:function:orders:${stageVariables.lambdaAlias}`
+- Stage `dev` sets `lambdaAlias = dev`, stage `prod` sets `lambdaAlias = prod`.
+Each alias in turn points to a function version, so promoting code means moving the alias, while the API stays identical.
+One extra step: API Gateway needs permission to invoke each alias, so add a resource-based permission (`lambda add-permission`) for every alias ARN used.
+W: Stage variable in the integration ARN: one API definition resolves to a different alias per stage at request time, which is the documented pattern for routing dev, test and prod to different aliases.
+X: A=Resource policies to redirect: a Lambda resource policy only allows or denies who can invoke the function; it cannot forward a request from one alias to another.
+B=Hardcode the alias ARN in code: the function's code runs after API Gateway has already chosen the target, so it cannot choose which alias API Gateway calls, and hardcoding ties every stage to one value.
+D=Separate REST API per stage: this works but duplicates the API definition three times, which is exactly what the team wants to avoid.
+T: Stage variables let one API definition call a different Lambda alias per stage; remember to grant invoke permission for each alias.
+
+@ Q000691 explain
+G: ## How EventBridge delivers custom events
+An application publishes an event to an event bus with `PutEvents`. A **rule** on that bus has an event pattern that matches fields such as `source` and `detail-type`; matching events are sent to targets like a Lambda function.
+## Testing before the real producer exists
+You can act as the producer yourself:
+- `aws events put-events --entries` with `Source` `com.example.orders`, `DetailType` `OrderPlaced`, the target `EventBusName` and a `Detail` JSON body.
+- If the pattern matches, the rule invokes the function, and its CloudWatch Logs show the processed event.
+Custom events cannot use a `source` starting with `aws.`, which is reserved for AWS services. To check only the pattern, the `TestEventPattern` API (or the console sandbox) tells you whether a sample event matches without sending it.
+W: Publish a sample event: sending an event with the expected `source` and `detail-type` to the bus tests the full path, rule matching and Lambda processing, exactly as the real upstream service will use it.
+X: B=Change the trust policy: a trust policy controls who can assume the function's execution role; EventBridge invokes Lambda through the function's resource-based policy, and changing either one does not test the event handling.
+C=Delete the rule and invoke empty: removing the rule skips the matching step, and an empty event does not contain the `detail` fields the function must process.
+D=Wait for production traffic: that tests in production after release, which is the risk the developer is trying to avoid.
+T: Test EventBridge-driven functions by publishing a realistic sample event with `PutEvents`, so both the rule pattern and the handler are exercised.
+
+@ Q000692 explain
+G: ## SAM CLI local commands
+The SAM CLI can run Lambda functions on your machine in Docker containers that mimic the Lambda runtime.
+- `sam local invoke`: runs one function once with an event you supply, then exits.
+- `sam local start-api`: starts a local HTTP server (port 3000 by default) that serves every API route defined in the template. Each request is turned into an API Gateway-style event and passed to the matching function.
+- `sam local start-lambda`: emulates the Lambda Invoke API for SDK or CLI clients.
+## Example
+After `sam local start-api`, `curl http://127.0.0.1:3000/orders/42` runs the `GET /orders/{id}` handler locally. Edits to function code are picked up on the next request without restarting the server (compiled languages need `sam build` first).
+W: sam local start-api: it serves the template's API routes over HTTP on your machine and routes each request to local function code, which is exactly the local API testing loop described.
+X: A=sam logs --tail: it streams CloudWatch Logs from deployed functions in AWS; it does not serve or run anything locally.
+B=sam sync against production: it deploys to a real AWS stack, and pointing it at production is the opposite of safe local testing.
+D=sam local invoke per route: it runs one function with one event and exits; there is no HTTP server, so you cannot send real HTTP requests to routes.
+T: `sam local start-api` gives a local HTTP endpoint for the template's routes; `sam local invoke` is a one-shot function run.
+
+@ Q000693 explain
+G: ## Mocks versus real dependencies
+A **mock** (or stub) stands in for an external service and returns canned responses. For a payment API, the mock might always return `{"status":"approved"}`, or a scripted decline.
+## What a mock gives you
+- Tests run fast and are deterministic: no network latency, rate limits or sandbox outages.
+- You can easily script error cases (timeouts, 500s, declines) that are hard to trigger on demand in the real system.
+## What a mock hides
+The mock only knows what you told it. Changes in the real API's request format, authentication, TLS, timeouts or error codes will not show up. That is why teams usually add a smaller set of contract or end-to-end tests against the provider's real sandbox before release.
+W: Faster, stable tests with a gap: mocks make tests quick and repeatable, but problems that only appear when talking to the real payment API go undetected until a real integration test or production.
+X: A=Removes the need for integration testing: a mock replaces exactly the integration you would need to verify, so some testing against the real API is still required before release.
+B=Eliminates error-path testing: mocks actually make error paths easier to test, because you can return failures on purpose; they do not remove the need for those tests.
+D=Guarantees identical production behavior: a mock is a simplified imitation, so it cannot guarantee how the real service behaves.
+T: Mocks trade realism for speed and stability; keep some tests against the real (sandbox) API to catch integration issues.
+
+@ Q000694 explain
+G: ## What stack drift is
+CloudFormation keeps a record of the properties it last applied to every resource in a stack. When someone changes a resource outside CloudFormation (console, CLI, SDK), the real resource no longer matches that record. This is called **drift**.
+## Why drift breaks later deployments
+CloudFormation plans updates against its recorded state, not the live resource. Depending on what changed, an update can fail or behave unexpectedly, for example when a resource was deleted, renamed or replaced out of band, or when a manual change conflicts with the value the template now sets.
+- Detect it with **Detect stack drift** (`DetectStackDrift`), which lists each drifted resource and the property differences.
+- Fix it by putting the manual change into the template, or reverting the resource, then redeploy.
+- Prevent it by making all changes through the template and pipeline.
+W: Drift: a manual console change means the live resources no longer match what CloudFormation recorded, which is the typical cause of update conflicts on a previously hand-edited stack.
+X: A=SAM CLI cannot update stacks: `sam deploy` routinely updates existing stacks through change sets; updating is its normal job.
+C=API stage deleted by another deployment: nothing in the scenario suggests that, and the stated history (a manual console edit) points to drift instead.
+D=Reserved concurrency exceeded: concurrency limits throttle invocations at runtime; they have no effect on whether a CloudFormation stack update succeeds.
+T: Manual changes to stack resources create drift; detect it, fold the change back into the template, and make changes only through IaC.
+
+@ Q000695 explain
+G: ## Making one template work for many environments
+CloudFormation offers several ways to vary values without copying the template:
+- **Parameters**: inputs supplied at deploy time, such as `Environment` with allowed values `dev`, `test`, `prod`, or `MemorySize`.
+- **Mappings**: fixed lookup tables inside the template, read with `!FindInMap`.
+- **Conditions**: turn resources or properties on or off, for example enabling point-in-time recovery only in prod.
+## Example
+A mapping `EnvConfig` holds `dev: {Memory: 256}` and `prod: {Memory: 1024}`. The function uses `MemorySize: !FindInMap [EnvConfig, !Ref Environment, Memory]`, and the table name is `!Sub "orders-${Environment}"`. Each environment is deployed from the same template with a different parameter file.
+W: Parameters or mappings: they are the built-in way to feed per-environment values into one template, so all three environments stay consistent and differ only in the values supplied.
+X: A=Tags on the template bucket: bucket tags are metadata on S3; CloudFormation does not read them as template input.
+C=Hardcode then edit manually: manual edits before each prod deploy are error prone and mean prod runs a template that was never tested as-is.
+D=Three hand-edited copies: copies drift apart over time, and every fix must be applied three times, which is what reusable templates avoid.
+T: Use parameters, mappings and conditions to vary one template per environment instead of copying or hand-editing it.
+
+@ Q000696 explain
+G: ## Versions and aliases
+- A **version** is an immutable snapshot of function code and configuration (`1`, `2`, ...).
+- An **alias** is a named pointer, such as `live`, to a version. Callers invoke the alias ARN, so you change what they get by moving the alias.
+## Weighted aliases
+An alias can split traffic between two published versions with a routing configuration. For example, `live` points to version `7` with an additional weight of `0.1` for version `8`: about 90% of invocations run version 7 and 10% run version 8.
+- Watch errors and duration for the new version, then shift to 100% or roll back by removing the weight.
+- Both versions must be published versions; `$LATEST` cannot be part of a weighted alias.
+CodeDeploy uses this same mechanism for canary and linear Lambda deployments.
+W: Weighted alias: an alias routing configuration sends a chosen percentage of invocations to the new version and the rest to the stable one, without any change to callers.
+X: A=Second function called at random: splitting in client code is hard to control, cannot be changed centrally, and splits across two separate functions instead of versions.
+C=Usage plan throttling: usage plans limit request rates and quotas per API key; they do not route a share of traffic to a different function version.
+D=Layer version constraint: layers package shared libraries for a function; they have no role in deciding which version serves a request.
+T: A Lambda alias with weighted routing lets a small share of traffic test a new version; callers keep using the same alias.
+
+@ Q000697 explain
+G: ## Tags versus digests in ECR
+A container image in Amazon ECR is identified by a **digest** (`sha256:...`, unique to its content) and by one or more **tags**, which are movable labels.
+- A tag like `latest` can be moved to a new image at any time, so it does not tell you which build is running.
+- A tag like the commit SHA (`orders:3f9c2e1`) or build number names exactly one build.
+## Immutable tags
+Setting the repository's **tag immutability** to `IMMUTABLE` prevents pushing a different image with an existing tag. Combined with unique tags, each deployment points to a fixed image, and rollback is just updating the function's image URI to the previous tag or digest.
+W: Immutable, unique tags: each image is tied to one build, so you can trace exactly what is deployed and roll back by redeploying an earlier tag that is guaranteed not to have changed.
+X: A=Only latest: the tag is overwritten on every push, so you lose traceability and cannot reliably roll back to an older image by tag.
+C=Image in an environment variable: Lambda environment variables are limited to 4 KB of small configuration values; they cannot hold an image or identify deployments.
+D=Disable image scanning: scanning checks images for vulnerabilities and has nothing to do with identifying or rolling back deployments; turning it off only removes a safety check.
+T: Tag every image uniquely (commit SHA) and make tags immutable so each deployment is traceable and rollback is reliable.
+
+@ Q000698 explain
+G: ## Amplify Hosting branch features
+Amplify Hosting connects to a Git repository and builds and deploys on each push. Useful features for team workflows:
+- **Branch auto-detection**: new branches that match a pattern (for example `feature/*`) are connected and deployed automatically, each to its own URL such as `https://feature-login.<appid>.amplifyapp.com`.
+- **Pull request previews**: each pull request gets a temporary preview deployment, and it is removed when the pull request is closed.
+- **Access control**: username/password protection per branch, so non-production branches are not public.
+## Example
+`main` serves the public site; `feature/checkout` gets its own password-protected URL; opening a pull request adds a preview link to it for reviewers.
+W: Branch auto-detection, PR previews and access control: these three Amplify Hosting features together give per-branch URLs, pull request previews and password protection with no extra infrastructure.
+X: A=Deploy only main: feature branches and pull requests would get no deployment at all, which misses every requirement.
+C=Manual zip upload per branch: manual deploys are not connected to Git, so there is no automatic per-branch build and no pull request previews.
+D=S3 plus CloudFront per branch: this means building and tearing down hosting for every branch yourself, and adding password protection needs extra work (for example edge functions); Amplify provides all of it built in.
+T: Amplify Hosting handles per-branch deployments, pull request previews and branch password protection natively from the connected repo.
+
+@ Q000699 explain
+G: ## What a change set is
+A **change set** is a preview of a stack update. You submit the new template or parameters, and CloudFormation compares them with the current stack without changing anything yet.
+For each resource it lists:
+- the **action**: `Add`, `Modify` or `Remove`
+- for modifications, whether **replacement** is `True`, `False` or `Conditional`
+Replacement matters: replacing a DynamoDB table or an RDS instance creates a new resource and deletes the old one, which can mean data loss.
+## Workflow
+`aws cloudformation create-change-set`, review it with `describe-change-set` or in the console, then `execute-change-set` if it looks right, or delete it if not. `sam deploy` shows a change set before it deploys.
+W: Change set: it is the CloudFormation feature that previews exactly which resources will be added, modified, replaced or removed before the update runs.
+X: A=Stack policy: it protects chosen resources from being updated or replaced during stack updates; it blocks changes but does not preview them.
+C=Drift detection: it compares live resources with the stack's recorded state to find manual changes; it does not evaluate a new template.
+D=Nested stack: it is a way to split templates into reusable child stacks, not a tool for previewing an update.
+T: Change sets preview the impact of an update; drift detection finds manual changes; stack policies block updates to protected resources.
+
+@ Q000700 explain
+G: ## SAM is an extension of CloudFormation
+An AWS SAM template is a CloudFormation template with the line `Transform: AWS::Serverless-2016-10-31`. That transform adds shorthand resource types such as:
+- `AWS::Serverless::Function`
+- `AWS::Serverless::Api` and `AWS::Serverless::HttpApi`
+- `AWS::Serverless::SimpleTable`
+## What happens at deploy time
+CloudFormation runs the transform and expands each shorthand resource into standard resources. A few lines defining a `AWS::Serverless::Function` with an API event can become an `AWS::Lambda::Function`, an IAM execution role, an API Gateway API and the `AWS::Lambda::Permission` that lets the API invoke it.
+The stack is then created and updated by CloudFormation like any other, and you can mix normal CloudFormation resources in the same template.
+W: Shorthand transformed into CloudFormation: SAM syntax is expanded by the transform into regular CloudFormation resources, and CloudFormation performs the actual deployment.
+X: A=Only containers, no Lambda: defining Lambda functions (from zip or container images) is SAM's main purpose.
+B=CloudFormation cannot deploy Lambda: CloudFormation has native types such as `AWS::Lambda::Function`; SAM itself relies on them.
+C=SAM replaces CloudFormation: SAM depends on CloudFormation underneath; every SAM app is deployed as a CloudFormation stack.
+T: SAM is a CloudFormation transform: concise serverless syntax in, standard CloudFormation resources and a normal stack out.
+
+@ Q000701 explain
+G: ## Deployments and stages in REST APIs
+In API Gateway REST APIs, editing resources and methods does not change what callers see. You first create a **deployment**, an immutable snapshot of the API's configuration. A **stage** (for example `test` or `prod`) points to one deployment and adds its own settings like stage variables, throttling and logging.
+## Promoting the tested snapshot
+- Create a deployment and associate it with the `test` stage, then test it.
+- To promote, point the `prod` stage at that same deployment, either by selecting the deployment for the stage or by deploying the unchanged API to `prod`.
+Because the snapshot is the same, prod gets exactly the methods and integrations that passed testing. Stage variables can still give prod different values, such as a `prod` Lambda alias.
+W: Associate a deployment with prod: stages simply reference deployment snapshots, so pointing the prod stage at the tested deployment promotes the exact configuration without redefining anything.
+X: B=Delete the test stage: an API can have many stages at once, and deleting test would only remove the environment used for validation.
+C=Recreate everything in a new API: rebuilding by hand invites mistakes and means prod is not the configuration that was tested.
+D=Switch REST to HTTP: that is a different API type with different features, a migration rather than a promotion, and it would not reuse the tested configuration.
+T: In REST APIs, a stage points to a deployment snapshot; promote by moving prod to the tested deployment.
+
+@ Q000702 explain
+G: ## AI-assisted test generation
+**Amazon Q Developer** is a generative AI assistant that runs as a plugin in IDEs such as VS Code and JetBrains. Among other tasks, it can generate unit tests for existing code: you select the handler or ask it in chat (for example with the `/test` command for supported languages) and it proposes test cases, including edge cases like empty input, missing fields or error responses.
+## Keep a human in the loop
+Generated tests are suggestions. The developer should read them, check that assertions reflect the intended behavior rather than the current bugs, run them locally, and only then commit.
+Example: for an order handler, Q might propose tests for a valid order, a missing `orderId`, and a DynamoDB error; the developer adjusts expected status codes before committing.
+W: Amazon Q Developer plus review: it generates unit tests, including edge cases, directly in the IDE, and reviewing them before commit keeps the tests correct.
+X: A=CloudFormation test stubs: CloudFormation provisions infrastructure from templates; it has no feature that writes unit tests for code.
+B=CodeGuru Profiler: it collects runtime performance profiles to find expensive code paths; it does not create test files.
+C=X-Ray: it records traces of requests for debugging and performance analysis; it does not generate tests.
+T: Use Amazon Q Developer in the IDE to draft unit tests, then review them; profiling and tracing tools do not write tests.
+
+@ Q000703 explain
+G: ## The buildspec file
+AWS CodeBuild reads its instructions from `buildspec.yml` in the source root (or a buildspec set on the project). Commands run in phases:
+- `install`: set up runtimes and tools
+- `pre_build`: install dependencies, log in to registries
+- `build`: compile and run tests
+- `post_build`: package or report
+If any command in `pre_build` or `build` returns a non-zero exit code, the build fails, and a CodePipeline stage using that build fails too.
+## Example
+`build` runs `npm ci`, `npm test` and `npm run test:integration`. A `reports` section can upload JUnit XML so results appear as test reports in CodeBuild.
+W: buildspec.yml phases: test commands in the `pre_build` or `build` phase run on every build, and a failing test's non-zero exit code fails the build and the pipeline.
+X: B=Lambda environment variables: they configure a function at runtime; CodeBuild never runs commands from them.
+C=Artifact bucket resource policy: a bucket policy controls access to S3 objects; it cannot contain or run commands.
+D=API Gateway stage description: it is just a text label on a stage and is never executed.
+T: Put test commands in the buildspec's build phases so failing tests fail the CodeBuild build and stop the pipeline.
+
+@ Q000704 explain
+G: ## $LATEST versus published versions
+- `$LATEST` is the unpublished, editable version of a function. Every code or configuration update changes it immediately.
+- A **published version** (`1`, `2`, ...) is an immutable snapshot of code and configuration.
+- An **alias** such as `test` points to a version, so tests call the alias ARN and always hit a known snapshot.
+## Why this matters for testing
+If tests run against `$LATEST`, someone deploying a change midway through the run means some tests hit old code and some hit new code. A failure a week later cannot be reproduced exactly, because that code no longer exists.
+Testing a published version gives a fixed target, and the same version can later be promoted by moving the `prod` alias to it, so what was tested is exactly what ships.
+W: $LATEST is mutable: it can change at any moment, so test results are not tied to a fixed build and cannot be reliably reproduced or promoted.
+X: A=Alias can never point to $LATEST: an alias can point to `$LATEST` (only weighted routing requires published versions), so this is false and is not the tradeoff.
+B=$LATEST cannot be invoked: invoking the unqualified function name runs `$LATEST`, which is the default behavior.
+D=Published versions cannot be invoked: any published version can be invoked by its qualified ARN (for example `:3`) or through an alias.
+T: Test a published version (via an alias) so the tested code is fixed and promotable; `$LATEST` can change under your tests.
+
+@ Q000705 explain
+G: ## Don't copy IDs between environments
+Each environment's stack creates its own resources with its own names and ARNs. A Lambda ARN copied from the dev console points to the dev function, so tests running in the test environment call the wrong thing.
+## Stack outputs
+A CloudFormation template can declare **Outputs**, for example `OrdersFunctionArn: !GetAtt OrdersFunction.Arn` or the API URL. Test scripts then look up values from the stack of the environment they are testing:
+- `aws cloudformation describe-stacks --stack-name orders-test --query "Stacks[0].Outputs"`
+- Or use exported outputs, or write values to SSM Parameter Store under a per-environment path like `/test/orders/functionArn`.
+The pipeline passes only the environment name; everything else is derived, so the same scripts work in dev, test and prod.
+W: Read IDs from stack outputs: deriving ARNs and URLs from the target environment's own stack makes the tests always use the right resources, which removes the whole class of copied-ID errors.
+X: B=Disable the test stage: turning off the test environment hides the problem instead of fixing how tests find resources.
+C=Merge dev and test accounts: the environments would still have different resources and ARNs, and merging reduces isolation without fixing hardcoded IDs.
+D=Grant full admin permissions: permissions are not the issue; the tests call the wrong ARN, and broad admin access only adds risk.
+T: Derive resource identifiers per environment from stack outputs (or Parameter Store) instead of hardcoding values copied from another environment.
+
+@ Q000706 explain
+G: ## Lambda packaging limits
+- **Zip packages**: up to 50 MB zipped for direct upload, and the unzipped function code plus all its layers must fit in **250 MB**.
+- **Container images**: stored in Amazon ECR and up to **10 GB** uncompressed.
+A 1.2 GB set of dependencies (for example ML libraries) cannot fit the zip model at all, including layers, because layers count toward the same 250 MB total.
+## Container images and cold starts
+Lambda caches image layers and loads image content lazily, so large images start much faster than their size suggests. Keeping a stable base image and putting rarely changed dependencies in lower layers helps caching further.
+W: Container image in ECR: the 10 GB image limit fits 1.2 GB of dependencies, and Lambda's image caching keeps cold starts reasonable without runtime downloads.
+X: A=Increase ephemeral storage: `/tmp` can grow to 10 GB, but that is scratch space at runtime; it does not raise the deployment package limit, and something would still have to download the files into it.
+B=Download from S3 every invocation: pulling over a gigabyte at runtime adds long delays and data transfer on every cold start (and more if done per invocation).
+D=Split into five layers: the 250 MB unzipped limit covers the function and all its layers together, so splitting does not help.
+T: When dependencies exceed the 250 MB zip-plus-layers limit, package the function as a container image (up to 10 GB).
+
+@ Q000707 explain
+G: ## Custom domain names for API Gateway
+By default an API is reached at `https://<api-id>.execute-api.<region>.amazonaws.com/<stage>`. To use `api.example.com` you need three pieces:
+- **ACM certificate** for `api.example.com` (or `*.example.com`). For an edge-optimized endpoint it must be in `us-east-1`; for a Regional endpoint it must be in the API's Region.
+- **API Gateway custom domain name** using that certificate, with a **base path mapping** (or API mapping) that links paths to an API and stage, for example `/` to the `prod` stage.
+- **DNS record**: in Route 53, an alias record for `api.example.com` pointing to the domain name API Gateway provides for the custom domain.
+Clients then call `https://api.example.com/orders`, and TLS is terminated with your certificate.
+W: Custom domain, ACM certificate and Route 53 alias: this is the standard combination that serves the API on your own hostname with your own TLS certificate.
+X: A=Enable AWS WAF: WAF filters requests (IP rules, SQL injection) but does not change the hostname or the certificate.
+C=Rename the stage: a stage name is only a path segment in the default URL; it cannot become a hostname.
+D=S3 bucket policy: bucket policies control access to S3 objects and cannot rewrite hostnames for an API.
+T: A custom API hostname needs an API Gateway custom domain name, an ACM certificate and a DNS (Route 53 alias) record.
+
+@ Q000708 explain
+G: ## Blue/green
+Two full environments exist: **blue** (current) and **green** (new version). You deploy and test green, then switch traffic, usually all at once, by changing a load balancer target, DNS record or alias. Rollback means switching back to blue, which is still running.
+## Canary
+The new version first receives a small share of traffic, for example 10% for 10 minutes. If metrics and alarms stay healthy, the rest is shifted; if not, traffic returns to the old version.
+Example with CodeDeploy on Lambda: `LambdaCanary10Percent10Minutes` sends 10% to the new version, then 100% after 10 minutes.
+The two can be combined: a blue/green deployment can shift traffic to green in canary steps.
+W: Separate environment versus small share first: blue/green is about switching between two environments, while canary is about gradually exposing a small percentage of traffic to the new version before full rollout.
+X: B=Canary always replaces infrastructure: canary is about how traffic is shifted, not about rebuilding infrastructure; blue/green is the one that stands up a separate environment.
+C=Same technique: they differ in what changes (whole environment switch versus gradual share of traffic), and they are often combined precisely because they differ.
+D=Lambda only versus EC2 only: both strategies apply to Lambda, ECS and EC2; CodeDeploy supports traffic shifting options for each.
+T: Blue/green switches between two complete environments; canary sends a small slice of traffic to the new version first.
+
+@ Q000709 explain
+G: ## How CodePipeline detects source changes
+- **Polling**: CodePipeline periodically checks the repository for new commits. This is the legacy method, and a change can wait a while before it is noticed. You cannot set a polling interval.
+- **Event-based detection**: for a CodeCommit source, an **EventBridge rule** matches the repository's `CodeCommit Repository State Change` event for the branch and starts the pipeline right away. For GitHub, Bitbucket or GitLab sources, CodeConnections uses webhooks in the same way.
+## Migrating
+Set `PollForSourceChanges` to `false` on the source action and add the EventBridge rule (the console, `aws codepipeline` migration steps or CloudFormation templates can create it). Commits now start the pipeline within seconds.
+W: EventBridge-based change detection: each commit emits an event that immediately starts the pipeline, removing the polling delay entirely.
+X: A=Poll every second: the polling interval is not configurable, and very frequent polling would be wasteful even if it were; events are the supported solution.
+B=Scheduled StartPipelineExecution every 5 minutes: runs would start whether or not code changed, and a commit could still wait up to 5 minutes.
+C=Manual approval at the start: it adds a human wait before anything runs, making starts slower, not faster.
+T: Replace source polling with event-based change detection (EventBridge for CodeCommit) for near-immediate pipeline starts.
+
+@ Q000710 explain
+G: ## Manual approval actions
+CodePipeline has an **Approval** action type (manual approval). When the pipeline reaches it, execution pauses until an authorized user chooses Approve or Reject.
+- It can send a notification through an SNS topic, and include a URL (for example the test environment) and comments for the reviewer.
+- Approvers need IAM permission for `codepipeline:PutApprovalResult`.
+- If no one responds within 7 days, the action fails.
+## Typical layout
+Source, then Build, then Deploy-Test, then an Approval stage, then Deploy-Prod. The artifact built once flows through all stages, so production receives exactly the build that was tested.
+W: Manual approval stage before production: it pauses the same pipeline execution after the test deployment until a person approves, then continues to deploy that build to production.
+X: A=Lambda with no IAM permissions: a function without permissions cannot do anything useful, and it provides no built-in human approval step.
+C=API Gateway resource policy: it controls who can call an API; it has nothing to do with pipeline stages.
+D=Buildspec artifacts section: it lists files CodeBuild outputs; it cannot pause a pipeline for approval.
+T: Put a CodePipeline manual approval action between test and prod deployments to require human sign-off.
+
+@ Q000711 explain
+G: ## How CodeDeploy shifts Lambda traffic
+For Lambda, CodeDeploy moves an alias from the old version to the new one using a deployment configuration such as `Canary10Percent5Minutes` or `Linear10PercentEvery1Minute`. It can also run pre-traffic and post-traffic hook functions.
+## Alarms and automatic rollback
+You can attach CloudWatch alarms to the deployment group, for example on the new version's `Errors` metric. With automatic rollback enabled for alarms:
+- If an alarm enters `ALARM` during the deployment, CodeDeploy stops the deployment.
+- It shifts the alias back so 100% of traffic goes to the original version.
+- The deployment is marked as failed, and the function and both versions are left in place.
+W: Stop and roll back: with alarm-based automatic rollback, CodeDeploy halts the traffic shift and returns all traffic to the previous version, limiting impact to the share that already moved.
+X: A=Ignore the alarm: that is only what happens if no alarms are configured or rollback on alarm is disabled; with it enabled, the alarm stops the deployment.
+B=Pause until the stack is deleted: CodeDeploy does not wait for manual stack deletion; it rolls back automatically and ends the deployment as failed.
+C=Delete the Lambda function: rollback moves the alias back to the earlier version; CodeDeploy never deletes the function.
+T: CloudWatch alarms plus automatic rollback make CodeDeploy stop a Lambda traffic shift and send all traffic back to the old version.

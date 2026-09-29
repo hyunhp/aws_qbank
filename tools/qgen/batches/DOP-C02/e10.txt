@@ -1,0 +1,349 @@
+# DOP-C02 detailed explanations e10 (explanation-only rewrites; letters are the published ones)
+
+@ Q003440 explain
+G: ## How CodeDeploy shifts traffic for Amazon ECS
+With a CodeDeploy blue/green deployment for ECS, the new task set (green) runs next to the old one (blue) behind the same load balancer, and CodeDeploy moves listener traffic between two target groups. A **deployment configuration** decides how fast:
+- **Canary**: shift a small share, wait, then shift the rest in one step. `CodeDeployDefault.ECSCanary10Percent5Minutes` sends 10% to green, waits five minutes, then moves the remaining 90%.
+- **Linear**: shift equal slices at a fixed interval. `CodeDeployDefault.ECSLinear10PercentEvery1Minutes` adds 10% every minute until 100%.
+- **All at once**: `CodeDeployDefault.ECSAllAtOnce` moves everything immediately.
+## Configurations are platform-specific
+EC2/on-premises deployments use a different family (`OneAtATime`, `HalfAtATime`, `AllAtOnce`) that counts **instances**, not traffic percentages, so they cannot be selected for an ECS deployment group. During the canary wait, CloudWatch alarms on the deployment group can stop it and roll traffic back to blue.
+W: ECS canary 10% for 5 minutes: this predefined ECS configuration holds exactly 10% of traffic on the new task set for five minutes and then shifts the rest, matching the requirement word for word.
+X: A=OneAtATime: this is an EC2/on-premises configuration that updates one instance at a time; it has no notion of traffic percentages and is not valid for an ECS compute platform.
+B=ECS linear 10% every minute: linear keeps adding 10% each minute, reaching full traffic after about ten minutes, instead of holding 10% for five minutes and then switching the rest in one step.
+C=HalfAtATime: another EC2/on-premises configuration that deploys to half of the instances at a time; it cannot be used for ECS and does not express a 10% canary.
+T: "10% first, wait, then the rest" is a canary; "10% more every interval" is linear; OneAtATime and HalfAtATime belong to EC2/on-premises only.
+
+@ Q003441 explain
+G: ## Why schema changes break rolling releases
+During a rolling, blue/green or canary release, the old and new application versions run at the same time against **one** database. Any schema change must therefore work for both versions for a while.
+## The expand-and-contract (parallel change) pattern
+- **Expand**: apply only additive, backward-compatible changes first, such as a new nullable column `email_v2`, a new table or a new index. The old version ignores them; the new version can use them.
+- **Migrate**: deploy the new application, which writes to the new structure (often to both old and new for a while), and backfill existing rows.
+- **Contract**: once no running version reads the old structure, remove it in a later release, for example dropping the old column.
+Example: renaming `name` to `full_name` becomes add `full_name`, dual-write and backfill, switch reads, and finally drop `name` releases later. Rollback stays possible at every step because the old version still finds what it needs.
+W: Expand and contract: adding compatible structures before the application change keeps both versions working during the rollout, and deferring removals to a later release keeps rollback safe.
+X: B=Offline for every release: taking the database down makes every deployment an outage; compatible, staged schema changes remove the need for downtime.
+C=App first, schema only on failure: the new version would start against a schema that lacks what it needs and fail immediately; changing the schema reactively turns a planned change into an incident.
+D=Drop old columns first: the currently running version still reads and writes those columns, so dropping them breaks production before the new version is even deployed and makes rollback impossible.
+T: Make schema changes additive first and destructive last, so old and new versions can share the database throughout the rollout.
+
+@ Q003442 explain
+G: ## What makes a rollback fast
+A rollback is quick when the previous version is **still running** and only the traffic routing has to change. It is slow when the old version has been overwritten and must be rebuilt and redeployed.
+- **Blue/green**: the new version (green) runs on separate capacity next to the old one (blue). Traffic moves through a load balancer listener, target group weights, DNS or an Elastic Beanstalk URL swap. Rolling back means pointing traffic at blue again.
+- **Lambda alias traffic shifting**: a function version is immutable. An alias such as `live` can point to version 7 with a weighted routing configuration sending, for example, 10% to version 8. Rolling back is a single update of the alias back to 100% on version 7, which CodeDeploy can do automatically when an alarm fires.
+By contrast, in-place strategies install the new code over the old one on the same instances, so the old version no longer exists anywhere.
+W: B=Lambda alias shifting: published versions never change, so moving the alias weight back to the previous version restores it instantly with no redeploy.
+E=Blue/green: the old environment stays up and untouched, so switching traffic back to it is an immediate routing change.
+X: A=Rolling without extra batch: each batch of instances is overwritten in place with the new version, so rolling back means running another rolling deployment of the old version, and capacity is reduced while it runs.
+C=In-place all at once: every instance is replaced with the new code at the same time, so the old version exists nowhere and must be redeployed, with downtime in both directions.
+D=Rebuild from source: rebuilding and redeploying the old version is by definition a redeploy, and it is the slowest path because it repeats build, test and provisioning.
+T: Fast rollback needs the previous version kept alive: blue/green and immutable Lambda versions behind an alias revert by routing, while in-place strategies must redeploy.
+
+@ Q003443 explain
+G: ## CodePipeline execution modes
+A pipeline can be started many times in a row (several commits, manual releases). The **execution mode** decides how those executions share the stages:
+- **SUPERSEDED** (the default): a stage processes one execution at a time. A newer execution waiting for a busy stage replaces an older one that was waiting, so the latest change wins.
+- **QUEUED** (V2 pipelines): executions wait in order and pass through a stage one at a time, so every change is deployed and none is skipped.
+- **PARALLEL** (V2 pipelines): executions run independently and can be in the same stage at once. Useful for feature branches, but it allows exactly the overlap described here.
+## Applying it to the problem
+Two deployments hitting the same environment at the same time means the pipeline is not serializing stage access (for example, it runs in PARALLEL mode). Setting the mode to QUEUED or SUPERSEDED makes the deploy stage accept only one execution at a time.
+W: Queued or superseded mode: both modes lock a stage to one execution at a time, so two runs can never deploy to the same environment simultaneously; queued keeps every run, superseded skips outdated waiting ones.
+X: A=Random sleep: a random delay only lowers the chance of collision; two executions can still draw similar delays and overlap, so it is not a reliable lock.
+B=Manual deploys from laptops: removing the trigger gives up automation, audit trail and repeatability, and two engineers can still deploy at the same moment.
+C=Longer timeout: the timeout only controls how long an action may run before it fails; it does nothing to stop a second execution from entering the stage while the first is deploying.
+T: Serialize deployments with the pipeline's execution mode (QUEUED or SUPERSEDED) instead of timing tricks or manual processes.
+
+@ Q003444 explain
+G: ## Ephemeral test environments
+An ephemeral environment is created for one pipeline run, used for tests, and deleted afterwards. With infrastructure as code this is cheap and repeatable:
+- A test stage runs a CloudFormation deploy action that creates a stack with a unique name, for example one that includes the pipeline execution ID (`#{codepipeline.PipelineExecutionId}` in a V2 pipeline).
+- A CodeBuild action runs the integration test suite against that stack's outputs (URL, queue name, table name).
+- A final action deletes the stack (CloudFormation action mode `DELETE_ONLY`, or `aws cloudformation delete-stack` in a build step), plus a cleanup path for failed runs so nothing is left running.
+## Why it helps
+- **Isolation**: tests from one run cannot corrupt data or state used by another run.
+- **Fidelity**: the environment is built from the same templates as production, so it also tests the infrastructure code.
+- **Cost**: resources exist only for the duration of the tests.
+W: Temporary CloudFormation stack: creating the stack in a test stage and deleting it after the tests gives each run a clean, isolated, production-like environment that stops costing money when the run ends.
+X: B=Test in production: integration tests create and modify data and may fail in ways that affect real users; production is the environment the tests are meant to protect.
+C=One shared long-lived environment: concurrent runs interfere with each other's data and deployments, leftover state makes results unreliable, and it is not created and destroyed per run as required.
+D=Skip tests, rely on monitoring: monitoring detects defects only after users are affected; it does not replace catching them before release.
+T: Build a fresh stack per pipeline run, test against it, and tear it down; shared or production environments cannot give isolated, repeatable integration tests.
+
+@ Q003445 explain
+G: ## Code signing for AWS Lambda
+Code signing proves that a deployment package came from a trusted publisher and was not changed after signing.
+- **AWS Signer** holds a **signing profile**. A signing job takes a `.zip` package from S3 and writes a signed copy with a signature.
+- A Lambda **code signing configuration** lists the allowed signing profiles and a policy: `UntrustedArtifactOnDeployment` set to `Enforce` rejects the upload, or `Warn` allows it but logs a warning.
+- The configuration is attached to the function. Every `CreateFunction` or `UpdateFunctionCode` call is then checked: an unsigned package, one signed by an unlisted profile, a modified package or an expired signature is refused when enforcement is on.
+In a pipeline, the build stage signs the artifact and the deploy stage uploads the signed package; anything that bypassed the pipeline cannot pass the check. An IAM condition key can also require that functions use a code signing configuration. Code signing applies to .zip packages; container images are verified through image signing tools instead.
+W: Lambda code signing with Signer: Lambda itself verifies the cryptographic signature against the allowed profiles at deploy time and blocks untrusted or altered code.
+X: A=Developer name tag: a tag is editable metadata anyone with tagging permission can set; it carries no cryptographic proof and Lambda does not check it before deployment.
+B=Password-protected archive: a password restricts who can open the archive but proves nothing about who built it, and Lambda cannot accept or verify a password-protected package.
+C=Versioned bucket: versioning keeps old copies for audit and recovery, but it does not verify the origin or integrity of what is deployed, and it does not stop an unapproved object from being deployed.
+T: Only a verifiable signature checked by Lambda at deploy time enforces trusted code; tags, passwords and versioning do not prove origin or integrity.
+
+@ Q003446 explain
+G: ## Elastic Beanstalk deployment policies versus blue/green
+Elastic Beanstalk's built-in policies update the instances of an **existing** environment:
+- **All at once**: every instance is updated together, causing a short outage.
+- **Rolling** / **Rolling with additional batch**: batches are taken out of service and updated in turn.
+- **Immutable** and **Traffic splitting**: new instances are launched inside the same environment.
+## Blue/green with an environment URL swap
+For blue/green you create a **second environment** (for example by cloning the current one) and deploy the new version there. After testing it on its own URL, you use **Swap environment URLs**. Beanstalk swaps the CNAME records, so `myapp.us-east-1.elasticbeanstalk.com` now points to the new environment. Rolling back is another swap. Clients may keep hitting the old environment until DNS TTLs expire, so keep it running for a while before terminating it.
+W: Blue/green with CNAME swap: the new version runs in a completely separate environment and traffic moves by swapping the environment CNAMEs, giving zero downtime and a one-step rollback.
+X: A=All at once: all instances are updated simultaneously in the existing environment, so the application is briefly unavailable and no new environment is created.
+B=Manual SSH: changing instances by hand bypasses Beanstalk's deployment tracking, is not repeatable, and changes are lost when Auto Scaling replaces an instance.
+D=Rolling without extra batch: it updates the existing environment batch by batch and runs with reduced capacity during the update; it does not create a new environment or swap URLs.
+T: When the requirement is "new environment plus URL swap", the answer is Beanstalk blue/green; deployment policies only update the existing environment.
+
+@ Q003447 explain
+G: ## Event-driven pipeline notifications
+CodePipeline emits events to Amazon EventBridge whenever a pipeline, stage or action changes state. A pipeline failure appears with detail-type `CodePipeline Pipeline Execution State Change` and `"state": "FAILED"`.
+- An **EventBridge rule** matches that pattern, optionally only for specific pipelines, and sends it to a target within seconds.
+- **Amazon Q Developer in chat applications** (formerly AWS Chatbot) posts formatted messages to a Slack channel or Microsoft Teams channel, usually through an SNS topic it subscribes to.
+- An **SNS** topic can also fan out to email, a Lambda function or an HTTPS endpoint.
+CodePipeline notification rules (from the Developer Tools console) are a managed wrapper around the same events and targets. Routing per pipeline means each owning team gets only its own failures.
+W: EventBridge rule to chat or SNS: pipeline state changes are pushed as events the moment they happen and delivered to the team's Slack channel without anyone polling.
+X: A=Daily email summary: failures are reported up to a day late, and sending all results to the whole department does not target the owning team.
+C=Office dashboard: a dashboard only helps when someone is looking at it, and it notifies nobody who is remote or busy.
+D=Checking the console: periodic manual checks depend on people remembering, so failures are noticed late and inconsistently.
+T: For immediate, targeted alerts, route CodePipeline state-change events through EventBridge (or notification rules) to SNS and chat integrations.
+
+@ Q003448 explain
+G: ## Quality gates in a pipeline
+A quality gate is an automated check a change must pass before it can move to the next stage. Layering gates catches different kinds of problems early:
+- **Build stage**: unit tests, linting and **static code analysis** find bugs, insecure patterns and style issues in source code. **Dependency (software composition) scanning** checks third-party libraries against known CVEs. Both can run in CodeBuild and fail the build when findings exceed a threshold.
+- **Staging stage**: after deploying to a production-like environment, **integration tests** exercise real connections between services, databases and queues, and can be followed by smoke or load tests.
+- **Production**: deployment runs only after the earlier gates pass, often with a manual approval or alarms-based rollback.
+A gate is only useful if a failure actually stops the pipeline; a routine override turns it back into a suggestion.
+W: C=Static analysis and dependency scanning: they automatically reject insecure or defective code and vulnerable libraries in the build stage, before anything is deployed.
+E=Integration tests in staging: they verify that the deployed components work together in a production-like environment and block promotion when they fail.
+X: A=Deploy before build or test: production would receive code no gate has checked, so defects reach users first.
+B=Always allow manual skip: if any developer can bypass a failed stage, failures stop blocking bad changes and the gate no longer protects production.
+D=Remove all tests: it speeds up deployments only by removing the checks that catch defects, so more regressions reach production.
+T: Real quality gates are automated checks that block promotion: static and dependency scanning at build time, integration tests before production.
+
+@ Q003449 explain
+G: ## Progressive delivery on Kubernetes
+A plain Kubernetes `Deployment` rolling update replaces pods gradually but has no built-in way to judge whether the new version is healthy by business metrics, and no automatic rollback on error rates.
+A **progressive delivery controller** such as Argo Rollouts or Flagger adds this:
+- It replaces or wraps the Deployment and shifts traffic in steps, for example 10%, 30%, 60%, 100%, through a service mesh or an ingress/load balancer such as the AWS Load Balancer Controller.
+- At each step it runs an **analysis**: it queries metrics such as HTTP 5xx rate or latency from Prometheus (for example Amazon Managed Service for Prometheus) or CloudWatch and compares them with thresholds.
+- If the analysis fails, it stops the rollout and sends all traffic back to the stable version automatically.
+Example: the canary gets 10% of traffic; the error rate rises above 1% for two checks, so the controller aborts and the stable pods keep serving users.
+W: Progressive delivery controller: it automates the stepwise traffic shift and the metric-based decision, so a rise in error rate triggers rollback without human reaction time.
+X: A=Scale to zero: removing all replicas takes the whole application down, turning a partial error spike into a full outage.
+C=Delete and recreate: deleting the deployment removes every pod before the old image comes back, causing downtime, and it is a manual reaction rather than an automatic rollback.
+D=Manual kubectl rollout: `kubectl rollout undo` works, but depending on an engineer watching dashboards is slow and inconsistent and is not automatic.
+T: Automatic, metric-driven rollback on EKS comes from a progressive delivery controller that shifts traffic in steps and analyzes metrics at each step.
+
+@ Q003450 explain
+G: ## Building a deployment audit trail
+An auditor wants to answer: which exact build was running in production, and when did it get there? That needs three things that cannot be quietly changed:
+- **Immutable, versioned artifacts**: each build produces a unique artifact, such as an S3 object key with the commit ID and S3 versioning, or a container image with a unique tag in an ECR repository with tag immutability turned on. The artifact deployed can always be retrieved and compared.
+- **Pipeline execution history**: CodePipeline records each execution with its source revision (commit ID), artifacts, stages, approvals and timestamps. CodePipeline keeps execution history for a limited period (about 12 months), so export it or keep CloudTrail and EventBridge records for long-term retention.
+- **CloudTrail**: records the API calls that started executions, approved stages and updated services, with the principal and time. Delivered to an S3 bucket (optionally with object lock), it becomes durable evidence.
+W: Immutable artifacts plus history and CloudTrail: unique versioned artifacts identify exactly what was deployed, while execution history and CloudTrail record when and by whom, in logs that cannot be silently edited.
+X: A=Delete old executions: removing execution history destroys the very evidence the audit trail needs.
+B=Manual spreadsheet: entries depend on engineers remembering, can be wrong or edited later, and are not tied to the real deployment events.
+C=Overwrite one file name: reusing the same key means earlier artifacts are lost (without versioning), so you can no longer show which version was deployed at a given time.
+T: An audit trail needs immutable, uniquely versioned artifacts plus automatic, tamper-resistant records of each deployment.
+
+@ Q003451 explain
+G: ## Monorepos and pipeline triggers
+In a monorepo, several services live in one repository, for example `services/orders/` and `services/billing/`. With a plain push trigger, every commit starts every pipeline, rebuilding and redeploying services that did not change.
+## V2 trigger filters
+CodePipeline **V2** pipelines support **triggers** with filters on source actions that use a CodeConnections connection (GitHub, GitLab, Bitbucket and similar):
+- **Branch** and **Git tag** filters decide which pushes or pull requests start the pipeline.
+- **File path** filters with `includes` and `excludes` glob patterns, such as `services/orders/**`, start the pipeline only when a changed file matches.
+The usual pattern is one pipeline per service, each with a file path filter on that service's folder, so a change to `services/orders/` starts only the orders pipeline.
+W: V2 triggers with file path filters: each service's pipeline starts only when files under that service's path change, so unchanged services are not built or deployed.
+X: B=Manual selection each run: it relies on people choosing correctly for every change and removes the automatic trigger.
+C=Rebuild everything: it is the behavior the team wants to avoid, wasting build time and redeploying services that did not change.
+D=Repository per file: splitting a repository per file is unmanageable and gives up the monorepo; the goal is per-service triggering, which path filters give directly.
+T: For monorepos, use CodePipeline V2 triggers with file path filters so each service's pipeline runs only when its files change.
+
+@ Q003452 explain
+G: ## Two ways to reuse CloudFormation code
+- **Nested stacks**: a parent template declares `AWS::CloudFormation::Stack` with a `TemplateURL` pointing to a child template in S3, such as `vpc.yaml`, and passes `Parameters`. The child is deployed as its own stack, and the parent reads its outputs with `!GetAtt VpcStack.Outputs.VpcId`. Versioning comes from the S3 key or object version.
+- **Modules**: a reusable block of resources registered in the CloudFormation registry as a type ending in `::MODULE`, for example `MyOrg::Network::Vpc::MODULE`. Templates use it like a resource, and its resources are expanded into the consuming stack. The registry keeps versions and lets you set a default version.
+Both let a platform team maintain one reviewed VPC definition that many stacks consume, so a fix is made once and rolled out by updating the version.
+Stack outputs with `Export` and `Fn::ImportValue` solve a different problem: sharing values from an already deployed stack.
+W: Modules or nested stacks: both package one standard, versioned VPC definition that many templates reference instead of copying.
+X: A=Outputs only: outputs and exports share values such as a VPC ID from a deployed stack; they do not let other stacks reuse the definition to create their own VPCs.
+C=Console plus wiki: a console-built VPC is not infrastructure as code, cannot be versioned or reproduced reliably, and a wiki page drifts from reality.
+D=Copy by hand: copies drift apart over time, and every fix must be repeated in every template.
+T: Reuse template definitions with modules or nested stacks; exports only share values from stacks that already exist.
+
+@ Q003453 explain
+G: ## Extending CloudFormation beyond native types
+CloudFormation manages only resource types it has handlers for. For anything else, such as a SaaS setting or an internal system, there are two extension mechanisms:
+- **Custom resource**: a template declares `Type: Custom::SaasConfig` with a `ServiceToken`, usually the ARN of a Lambda function (an SNS topic also works). On create, update and delete, CloudFormation sends a request with the properties; the function calls the external API and sends a SUCCESS or FAILED response back to a presigned S3 URL, optionally with data readable through `Fn::GetAtt`.
+- **Registry resource type**: you build a full resource provider (schema plus create, read, update, delete and list handlers) and register it, for example as `MyOrg::Saas::Config`. It behaves like a native type, including drift detection when the read handler supports it. Many vendors also publish third-party types in the public registry.
+W: Custom resource or registered type: both let CloudFormation call code you provide to create, update and delete the external configuration as part of the stack lifecycle.
+X: A=Mappings: mappings are static lookup tables read with `Fn::FindInMap`; they can supply values but cannot create anything.
+B=Always-true condition: conditions only decide whether supported resources are created; they cannot add support for a resource type CloudFormation does not know.
+C=Permissive stack policy: stack policies control which updates are allowed on existing resources; they do not add new resource types.
+T: When CloudFormation lacks a resource type, extend it with a Lambda-backed custom resource or a registry resource type.
+
+@ Q003454 explain
+G: ## How a stack update can replace a database
+Some property changes on `AWS::RDS::DBInstance`, such as changing `DBInstanceIdentifier` or certain engine settings, require **replacement**: CloudFormation creates a new instance and deletes the old one. Without protection, the old data is gone.
+## Two complementary protections
+- **Stack policy**: a JSON policy that applies to stack updates. A statement with `"Effect": "Deny"`, `"Action": "Update:Replace"` and `"Resource": "LogicalResourceId/ProdDatabase"` makes any update that would replace the database fail, while other updates proceed.
+- **DeletionPolicy** and **UpdateReplacePolicy**: resource attributes. `DeletionPolicy: Snapshot` or `Retain` keeps a final snapshot or the instance when the resource is deleted (including stack deletion); `UpdateReplacePolicy` does the same for the old instance when a replacement happens.
+Together, the first blocks accidental replacement and the second preserves the data if a replacement or deletion still occurs.
+W: C=DeletionPolicy and UpdateReplacePolicy: set to Retain or Snapshot, they keep the old database or a snapshot of it if it is ever replaced or deleted, so data is not lost.
+E=Stack policy denying Update:Replace: it makes CloudFormation refuse any update that would replace the database resource.
+X: A=Mapping of engine version: a mapping is a static lookup table; it records a value but does not stop any update from replacing the resource.
+B=Parameter with a default: a default only supplies an input value; a different value passed during an update can still trigger replacement.
+D=Exported endpoint: exporting the endpoint only shares a value with other stacks; it does not prevent replacement of the database, and replacement changes the endpoint anyway.
+T: Block replacement with a stack policy and keep the data with DeletionPolicy and UpdateReplacePolicy; mappings, parameters and outputs protect nothing.
+
+@ Q003455 explain
+G: ## From CDK code to CloudFormation
+The AWS CDK is a library in TypeScript, Python, Java and other languages. `cdk synth` runs your app and **synthesizes** a CloudFormation template (plus assets) in `cdk.out`; CloudFormation deploys only that template, never the CDK code itself.
+## Previewing and testing
+- **`cdk diff`** compares the synthesized template with the currently deployed stack and lists added, changed and removed resources, IAM and security group changes, and whether a change causes replacement.
+- **Assertion tests** use the `assertions` module in `aws-cdk-lib`. A unit test synthesizes a stack with `Template.fromStack(stack)` and checks it, for example `template.hasResourceProperties('AWS::S3::Bucket', {...})` or `resourceCountIs(...)`. They run in normal test frameworks (Jest, pytest) in CI, with no AWS account needed.
+Hand-editing `cdk.out` is pointless: the next synth overwrites it.
+W: A=Assertion tests: they unit-test the synthesized template in CI, catching wrong or missing resources and properties before any deployment.
+E=cdk diff: it previews exactly what will change in the deployed stack, including replacements, before running `cdk deploy`.
+X: B=Hand-edit synthesized templates: the next `cdk synth` regenerates the template and discards the edits, and the CDK code no longer describes what is deployed.
+C=Upload CDK code to CloudFormation: CloudFormation understands only templates; CDK code must be synthesized first, so this cannot work.
+D=Deploy to production and look afterwards: it gives no preview and no tests; problems are found only after they affect production.
+T: Preview CDK changes with `cdk diff` and test synthesized templates with assertion unit tests; CloudFormation only ever sees the synthesized template.
+
+@ Q003456 explain
+G: ## What Terraform state is
+Terraform keeps a **state file** that maps each resource in the configuration to the real object it manages (for example `aws_instance.web` to `i-0abc...`) together with its attributes. Every `plan` and `apply` reads and updates it. State can contain sensitive values such as generated passwords.
+## Sharing state safely
+- A **remote backend** stores state in one central place, commonly the `s3` backend in an S3 bucket with versioning and encryption.
+- **State locking** ensures only one `apply` changes state at a time; a second run waits or fails instead of corrupting it. Terraform 1.10 and later can lock with a lock file in the S3 bucket itself (`use_lockfile = true`); the older DynamoDB table method still works but is deprecated.
+- **Restricted access**: IAM policies limit who and which pipeline roles can read or write the state bucket, and KMS protects the encrypted data.
+W: Remote backend with locking and restricted access: every engineer and pipeline uses one authoritative state, locking prevents concurrent writes from corrupting it, and access controls protect its sensitive contents.
+X: A=One state per engineer, merged weekly: separate states disagree about what exists, runs can create duplicates or destroy each other's resources, and state files are not designed to be merged by hand.
+B=Local state committed to the app repository: Git has no locking, merges of state conflict, and any secrets in state are exposed to everyone with repository access.
+C=No state: Terraform needs state to know which real resources it manages; without it, every run would try to create everything again instead of updating it.
+T: Shared Terraform state belongs in a remote, locked, access-controlled backend, not in local files or repositories.
+
+@ Q003457 explain
+G: ## Account baselines applied automatically
+A baseline is the set of resources every account must have from day one, such as IAM roles for operations, AWS Config rules and CloudTrail or log forwarding.
+- **CloudFormation StackSets with service-managed permissions** integrate with AWS Organizations. You target OUs and enable **automatic deployment**; when a new account joins a target OU, the stack instances are created in it, and when an account leaves they are removed or retained, depending on the StackSet setting.
+- **AWS Control Tower** sets up a landing zone with centralized logging and controls. It can be extended with **Customizations for AWS Control Tower (CfCT)**, which deploys your templates and SCPs on account lifecycle events, or with Account Factory customization blueprints.
+Example: a StackSet `baseline-roles` targeted at the `Workloads` OU with automatic deployment gives every new workload account the same roles and Config rules without any manual step.
+W: Control Tower customizations or StackSets auto-deployment: both react to a new account appearing in the organization and deploy the baseline into it automatically and consistently.
+X: B=Email to account owners: it depends on each owner reading and applying it correctly; nothing is enforced or automated.
+C=Manual checklist: manual steps are slow, easy to skip and produce inconsistent accounts.
+D=Stack only in the management account: a normal stack creates resources only in the account where it is deployed, so member accounts get nothing.
+T: Baseline new accounts with StackSets automatic deployment to OUs or Control Tower customizations, not with manual steps.
+
+@ Q003458 explain
+G: ## Governed self-service with AWS Service Catalog
+Service Catalog lets a platform team publish approved infrastructure as **products** (CloudFormation templates or Terraform configurations) grouped into **portfolios** that are shared with specific IAM principals or accounts.
+- End users browse the portfolio and launch a product, filling in only the parameters the product exposes.
+- A **launch constraint** names an IAM role that Service Catalog assumes to provision the product. The user needs permissions for Service Catalog, not for EC2, RDS or IAM directly.
+- **Template constraints** restrict parameter values, for example only `t3.micro` or `t3.small` instance types.
+Example: developers launch an "approved web stack" product; the launch role creates the load balancer and instances, while the developers themselves cannot create those resources outside the catalog.
+W: Service Catalog with launch constraints: developers can deploy only the approved products, and the resources are created with the launch role's permissions instead of broad permissions granted to the developers.
+X: A=Resource Groups: they group existing resources by tags or stacks for viewing and bulk operations; they do not offer approved products or control provisioning.
+B=Budgets: budgets track and alert on cost and usage; they neither restrict what can be deployed nor provide preconfigured products.
+D=Trusted Advisor: it inspects existing resources and recommends improvements; it does not provision anything or limit what developers deploy.
+T: Approved, preconfigured self-service with scoped permissions is Service Catalog: products in portfolios plus launch constraints.
+
+@ Q003459 explain
+G: ## Account vending
+Creating an AWS account is easy; creating one that is already governed is the hard part. A governed account needs the right OU (so the correct SCPs apply), networking, logging and security settings.
+- **AWS Control Tower Account Factory** provisions new accounts through the console or Service Catalog: you choose the OU, email and SSO user, and Control Tower enrolls the account with the landing zone baseline and the controls enabled on that OU. Customization blueprints can add a standard VPC or other resources.
+- **Account Factory for Terraform (AFT)** does the same through a GitOps pipeline: an account request file in a repository triggers creation, OU placement and Terraform customizations.
+The Organizations `CreateAccount` API on its own only creates the account (placing it in the root) and applies nothing else.
+W: Account Factory (or AFT): it creates each account through a governed workflow that places it in the chosen OU and applies the standard baseline automatically.
+X: A=Shared email alias sign-ups: standalone sign-ups are outside the organization, so they get no OU, SCPs or baseline, and a shared alias confuses root-user ownership.
+C=Manual CreateAccount calls: the API only creates the account in the organization root; OU placement and the network and security baseline would all be extra manual steps.
+D=IAM users in the management account: IAM users are identities, not accounts; they provide no account isolation and weaken the management account's security.
+T: Governed account creation with OU placement and a baseline is Control Tower Account Factory or AFT, not raw sign-ups or API calls.
+
+@ Q003460 explain
+G: ## IAM Identity Center objects
+IAM Identity Center gives workforce users single sign-on into many accounts:
+- A **permission set** is a template of policies (AWS managed, customer managed references, an inline policy, a permissions boundary) plus a session duration.
+- An **account assignment** links a user or group to a permission set in a specific account; Identity Center then creates a matching IAM role in that account.
+## Managing them as code
+These objects can be declared in CloudFormation (`AWS::SSO::PermissionSet`, `AWS::SSO::Assignment`) or Terraform (`aws_ssoadmin_permission_set`, `aws_ssoadmin_account_assignment`) and deployed from the management account or the delegated administrator account. Changes then go through pull requests, reviews and pipeline deployment, and the same definition produces the same access everywhere.
+W: Permission sets and assignments as code: CloudFormation or Terraform makes access configuration reviewable, versioned and applied identically every time, which is exactly the requirement.
+X: A=IAM users per account: it bypasses Identity Center entirely, creates long-term credentials in every account and multiplies what must be managed.
+B=One admin permission set for all groups: it violates least privilege, and giving everyone the same broad access says nothing about managing configuration as code.
+D=Manual console configuration per account: manual clicks are slow, error-prone and drift between accounts, with no review history.
+T: Manage Identity Center permission sets and assignments with infrastructure as code for consistent, reviewable access.
+
+@ Q003461 explain
+G: ## Rate control in Systems Manager
+Run Command (for one document on many instances) and Automation (for multi-step runbooks) both support **rate control** when targeting many resources, for example by tag:
+- **Concurrency** (`MaxConcurrency`): how many targets run at once, as a number (`50`) or a percentage (`10%`).
+- **Error threshold** (`MaxErrors`): how many failures are tolerated, as a number or percentage. When it is exceeded, Systems Manager stops sending the command to further targets.
+Example: targeting `Environment=prod` with concurrency `5%` and error threshold `2%` updates the fleet in waves of about 5% and halts the rollout automatically if more than 2% of instances fail.
+Output can be sent to S3 or CloudWatch Logs, and each invocation is recorded for audit.
+W: Run Command or Automation with rate controls: concurrency limits stage the change across the fleet, and the error threshold stops it automatically when failures exceed the limit.
+X: A=Email instructions: each team applies the change differently and at different times, with no staging or automatic stop on errors.
+B=SSH script from a laptop: it depends on one machine and network path, has no built-in staging, error threshold or audit trail, and requires SSH access to every instance.
+C=New AMI in one window: replacing every instance at once is not staged and cannot stop partway on errors; a bad image would affect the whole fleet.
+T: Stage fleet-wide changes with Systems Manager concurrency and error thresholds so a bad change stops itself early.
+
+@ Q003462 explain
+G: ## State Manager associations
+Systems Manager **State Manager** keeps managed instances in a defined state. An **association** combines:
+- A **document**, for example `AWS-ConfigureAWSPackage` to install an agent from Distributor, or a custom command document that installs and configures it.
+- **Targets**, such as instances with tag `Role=web` or all managed instances.
+- A **schedule**, such as `rate(30 minutes)` or a cron expression.
+State Manager applies the association when it is created, then again on the schedule, so drift is corrected (an uninstalled agent is reinstalled). Instances that later match the targets, such as new Auto Scaling instances with the tag, receive the association when they become managed. Compliance status shows which instances are out of line.
+W: State Manager associations: they apply the agent configuration to all targeted instances, including new ones, and reapply it on a schedule to keep it in place continuously.
+X: A=Parameter Store: it stores configuration values and secrets for others to read; it does not install software or enforce anything on instances.
+C=Session Manager: it opens interactive shell or port-forwarding sessions without SSH, useful for one-off access but not for continuous, automatic configuration.
+D=Incident Manager: it coordinates incident response with contacts, escalation plans and runbooks; it does not maintain instance configuration.
+T: Continuous desired-state configuration on current and future instances is a State Manager association.
+
+@ Q003463 explain
+G: ## Systems Manager Automation runbooks
+An **Automation runbook** is a document that defines ordered steps, each an action such as:
+- `aws:executeAwsApi` (for example `CreateSnapshot` or `ModifyInstanceAttribute` to change the instance type),
+- `aws:changeInstanceState` (stop or start and wait for the state),
+- `aws:approve` (pause until designated IAM principals approve, optionally notifying through SNS),
+- `aws:assertAwsResourceProperty` or `aws:waitForAwsResourceProperty` (verify the result).
+Each step can define `onFailure` behavior, such as aborting or jumping to a cleanup step. AWS also provides ready-made runbooks, such as `AWS-ResizeInstance`.
+Running a runbook on demand records every step's inputs, outputs and status in the execution history, and the API calls are logged in CloudTrail.
+W: Automation runbook with approval: it codifies snapshot, stop, resize, start and verify as ordered steps with an approval gate, error handling and a recorded execution history, runnable whenever needed.
+X: B=Alarm resizes directly: CloudWatch alarm EC2 actions can only stop, terminate, reboot or recover an instance; an alarm cannot resize it, run several steps or wait for approval.
+C=Lambda without error handling: a failure midway leaves the instance stopped or half-changed, and there is no approval step or step-level record of what happened.
+D=Text document of steps: manual execution is error-prone and inconsistent, with no enforced approval and no automatic log of each step.
+T: Multi-step operational procedures with approvals and logging belong in Systems Manager Automation runbooks.
+
+@ Q003464 explain
+G: ## SSM parameter types in CloudFormation
+CloudFormation parameters can have special types that read their value from Systems Manager Parameter Store. The parameter holds the **name** of the SSM parameter, and CloudFormation resolves the current value each time the stack is created or updated:
+- `AWS::SSM::Parameter::Value<String>` for plain strings.
+- `AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>`, which also validates that the value is an AMI ID.
+Example: a parameter `ImageId` with that type and default `/golden/ami/latest`. The image pipeline updates `/golden/ami/latest` when a new AMI is approved; the next stack update picks it up without editing the template. AWS also publishes public parameters such as `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64`.
+A dynamic reference such as `{{resolve:ssm:/golden/ami/latest}}` inside a property is another way to read a plain SSM value.
+W: SSM parameter type for the AMI: CloudFormation resolves the Parameter Store value at deployment time, so the template always uses the currently approved AMI.
+X: B=Hard-coded AMI ID: the ID goes stale between manual edits, and every AMI release requires a template change and review.
+C=Output from the previous deployment: outputs report values from a stack that already ran; they cannot look up the latest approved AMI in Parameter Store.
+D=Hand-typed Region mapping: mappings are static values in the template and must be edited by hand for every new AMI.
+T: Use an `AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>` parameter to pull the approved AMI from Parameter Store at each deployment.
+
+@ Q003465 explain
+G: ## Dynamic references to Secrets Manager
+A dynamic reference is a placeholder inside a resource property that CloudFormation resolves while it creates or updates the resource:
+- Format: `{{resolve:secretsmanager:secret-id:SecretString:json-key}}`, for example `{{resolve:secretsmanager:prod/db:SecretString:password}}` in `MasterUserPassword`.
+- The secret value is never written in the template, parameters or stack events; CloudFormation fetches it with the deploying role's permissions and passes it to the service.
+- Rotating the secret does not change the template.
+For RDS specifically, `ManageMasterUserPassword: true` lets RDS create and manage the password in Secrets Manager itself.
+## Why NoEcho is not enough
+`NoEcho: true` masks a parameter's value in console and `DescribeStacks` output, but a value written as the parameter's `Default` sits in plain text in the template, and NoEcho does not mask values used elsewhere, such as in metadata.
+W: Secrets Manager dynamic reference: the password is resolved from Secrets Manager at deployment time, so it never appears in the template or in parameter values.
+X: A=Mapping with passwords: mappings are part of the template, so every password would be stored in plain text wherever the template is kept.
+B=Exported output: outputs and exports are visible to anyone who can describe the stack or list exports, so this publishes the password.
+D=NoEcho with default: NoEcho hides the value in stack descriptions, but the default value is written in the template itself, so the secret is still exposed.
+T: Keep secrets out of templates with `{{resolve:secretsmanager:...}}` dynamic references; NoEcho only masks display, not a default stored in the template.

@@ -2,7 +2,7 @@
 
 @ Q001241 explain
 G: ## How CodeArtifact repositories chain together
-AWS CodeArtifact stores packages in **repositories** that live inside a **domain**. A repository can list other repositories as **upstreams**, and it can have an **external connection** to a public registry such as `public:npmjs` or `public:maven-central`.
+AWS CodeArtifact stores packages in **repositories** that live inside a **domain**. A repository can list other repositories as **upstreams**, and it can have an **external connection** to a public registry such as `public:npmjs` or `public:maven-central`. A repository can have only one external connection, so npm and Maven Central are usually connected through separate store repositories that a team repository lists as upstreams.
 When a client asks for a package version, CodeArtifact looks in the repository itself, then in its upstreams in the configured order, and finally through the external connection. A version fetched from a public registry is cached in the repository, so later builds get it even if the public registry is slow or the package is removed there.
 ## A typical layout
 - `internal-approved`: packages the company published or vetted.
@@ -35,11 +35,11 @@ In ECR an image is identified two ways:
 - A **digest** such as `myrepo@sha256:3f9a...` is the SHA-256 hash of the image manifest. It is derived from the content, so it can never point to a different image.
 ## Tag immutability
 Setting a repository to **immutable** tags makes ECR reject any push that would reuse an existing tag, so `prod` cannot be silently overwritten. (ECR also lets you exclude tag patterns, for example `latest`, from immutability when needed.)
-Deploying by digest in task definitions, Kubernetes manifests or CodeDeploy AppSpec files means the deployment references the exact bytes that were tested, even if tags change later.
+Deploying by digest in ECS task definitions or Kubernetes manifests means the deployment references the exact bytes that were tested, even if tags change later.
 W: Tag immutability plus digest deploys: immutability stops anyone from overwriting a tag in the repository, and deploying by `@sha256:` digest pins the exact image, so neither an accidental push nor a later retag can change what runs.
 X: B=Enhanced scanning: it finds vulnerabilities in images; it does nothing to stop a tag from being moved to a different image.
 C=Single CodeBuild project: funneling pushes through one project changes who pushes, not whether a tag can be overwritten; the same project could still push a new image as `prod`.
-D=Untagged-image lifecycle rule: it cleans up images that lost their tag after an overwrite, which removes evidence and storage but does not prevent the overwrite or pin the deployment.
+D=Untagged-image lifecycle rule: it cleans up images that lost their tag after an overwrite, which saves storage but does not prevent the overwrite or pin the deployment.
 T: Prevent overwrites with tag immutability and pin deployments with digests; scanning, pipeline funneling and cleanup rules do not stop a tag from moving.
 
 @ Q001244 explain
@@ -135,7 +135,7 @@ G: ## Hardening AMIs with Image Builder
 **DISA STIGs** (Security Technical Implementation Guides) are US Department of Defense hardening baselines. EC2 Image Builder provides Amazon-managed **STIG components** for Linux and Windows that apply those settings during the image build, at different severity levels.
 A pipeline has two stages that matter here:
 - **Build**: the recipe's components run on a build instance: patching, STIG hardening, your own software.
-- **Test**: a new instance is launched from the resulting image and **test components** run against it. The AMI is only created and distributed if the tests pass.
+- **Test**: a new instance is launched from the resulting image and **test components** run against it. If a test fails, the image build fails and the AMI is not distributed.
 ## Repeating on every patch
 The pipeline can run on a cron schedule or be set to run only when the base image or components have newer versions, so each patched base image produces a new hardened, tested AMI.
 W: Image Builder with STIG and test components: hardening is applied during the build, validation runs before the AMI is released, and the scheduled pipeline repeats the process for every new base image.
@@ -148,7 +148,7 @@ T: Build hardening into the image with Image Builder STIG components and prove i
 G: ## Why untagged images pile up
 When CI pushes a new image with a tag that already exists (for example `latest`), ECR moves the tag to the new image. The previous image stays in the repository but now has no tag. After hundreds of builds, these untagged images consume storage you keep paying for.
 ## ECR lifecycle policies
-A lifecycle policy is a JSON set of rules that ECR evaluates automatically. Each rule selects images by `tagStatus` (`tagged`, `untagged` or `any`) and a count type:
+A lifecycle policy is a JSON set of rules that ECR evaluates automatically. Each rule selects images by `tagStatus` (`tagged`, `untagged` or `any`) and a count type, for example:
 - `sinceImagePushed` with a number of days, or
 - `imageCountMoreThan` to keep only the newest N images.
 Example rule: `tagStatus: untagged`, `countType: sinceImagePushed`, `countNumber: 7`, action `expire`. Every untagged image older than 7 days is deleted automatically, and you can preview the result before applying it.
@@ -163,9 +163,9 @@ G: ## Encrypting ECR with a customer managed key
 An ECR repository can be created with `KMS` encryption using a **customer managed key**. ECR uses the key to protect image layers and decrypts them when an authorized principal pulls.
 ## Cross-account pulls need two policies
 - The **repository policy** in Account A grants Account B's role the pull actions: `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`, and `ecr:BatchCheckLayerAvailability`. Account B also needs `ecr:GetAuthorizationToken` in its own IAM policy.
-- The **key policy** of Account A's key allows Account B's principals to use the key only for what the pull requires (for example `kms:Decrypt`), and Account B's IAM policy must allow that too.
-Account A keeps full control: it can rotate, disable or revoke access to the key at any time, and Account B cannot change the key or its policy.
-W: Key policy plus repository policy: Account A keeps ownership of the key while granting Account B only the pull actions and the key usage needed to read the image, which is least privilege on both the repository and the key.
+- The **key** stays in Account A. When the repository is created, ECR adds KMS grants on the key for itself, and at pull time ECR calls `kms:Decrypt` through that grant to decrypt the layers. The key policy therefore never needs to give Account B administrative rights; any key use it allows beyond ECR's grant should be limited to decryption, ideally only through ECR (`kms:ViaService`).
+Account A keeps full control: it can rotate or disable the key, and Account B cannot change the key or its policy.
+W: Key policy plus repository policy: Account A keeps ownership and administration of the key while Account B gets only the repository pull actions and, at most, decrypt-level use of the key, which is least privilege on both the repository and the key.
 X: B=Full key administration: administrative rights would let Account B change the key policy, disable or schedule deletion of the key, far beyond what pulling an image needs.
 C=Copy the key to Account B: KMS keys cannot be exported or copied between accounts; cross-account use is granted through the key policy instead.
 D=Disable encryption: ECR supports cross-account pulls from KMS-encrypted repositories, and dropping encryption would break the requirement to use Account A's key.
@@ -188,7 +188,7 @@ T: New fleet, pre-traffic validation and instant rollback are the definition of 
 @ Q001255 explain
 G: ## ECS rolling update vs CodeDeploy blue/green
 - **ECS rolling update**: the ECS scheduler replaces old tasks with new ones, controlled by `minimumHealthyPercent` and `maximumPercent`. Traffic reaches new tasks simply because they register in the same target group; you cannot say "send exactly 10% of requests to the new version". It can roll back via the deployment circuit breaker or CloudWatch alarms, but by then many tasks may already run the new version.
-- **CodeDeploy blue/green for ECS**: CodeDeploy creates a new **task set** in a second target group and moves traffic at the load balancer listener according to a deployment configuration such as `CodeDeployDefault.ECSCanary10Percent5Minutes` or `ECSLinear10PercentEvery1Minutes`. If an attached CloudWatch alarm fires during the shift, CodeDeploy routes traffic back to the original task set.
+- **CodeDeploy blue/green for ECS**: CodeDeploy creates a new **task set** in a second target group and moves traffic at the load balancer listener according to a deployment configuration such as `CodeDeployDefault.ECSCanary10Percent5Minutes` or `ECSLinear10PercentEvery1Minutes`. If an attached CloudWatch alarm fires during the shift and automatic rollback is enabled, CodeDeploy routes traffic back to the original task set.
 ## Example
 With the canary config, 10% of requests hit the new version for 5 minutes. A spike in 5xx errors triggers the alarm, and 90% of users never saw the bad release.
 (Amazon ECS has since added its own built-in blue/green, linear and canary strategies, but the choice here is between a rolling update and CodeDeploy.)
@@ -205,7 +205,7 @@ A Lambda **alias** such as `prod` points to a function version. It can also spli
 - **Canary**: `CodeDeployDefault.LambdaCanary10Percent5Minutes`, `...10Minutes`, `...15Minutes`, `...30Minutes`: 10% first, then the rest after the wait.
 - **Linear**: `CodeDeployDefault.LambdaLinear10PercentEvery1Minute`, `...Every2Minutes` and similar: 10% more every interval until 100%.
 - **All at once**: `CodeDeployDefault.LambdaAllAtOnce`.
-If a CloudWatch alarm attached to the deployment group goes into ALARM during the wait, CodeDeploy points the alias back to the old version.
+If a CloudWatch alarm attached to the deployment group goes into ALARM during the wait, CodeDeploy stops the deployment and, with automatic rollback enabled, points the alias back to the old version.
 W: LambdaCanary10Percent10Minutes: it sends exactly 10% to the new version through the alias, waits 10 minutes while alarms are monitored, then shifts the remaining 90% in one step.
 X: B=LambdaAllAtOnce: it shifts 100% immediately, so there is no 10% observation window before everyone is on the new version.
 C=Linear every minute: it keeps adding equal increments on a fixed interval instead of one 10% step followed by a 10-minute wait and a single final shift.
@@ -328,7 +328,7 @@ CodeDeploy Lambda and ECS deployments move traffic from the old version to the n
 - **Canary**: traffic moves in **two increments**. A first slice (for example 10%) goes to the new version, CodeDeploy waits for the configured time, then shifts the remaining traffic at once. Example: `CodeDeployDefault.LambdaCanary10Percent5Minutes` = 10%, wait 5 minutes, then 100%.
 - **Linear**: traffic moves in **equal increments** with the same number of minutes between each. Example: `CodeDeployDefault.LambdaLinear10PercentEvery1Minute` = 10%, 20%, ... 100% over about 10 minutes.
 - **All at once**: 100% immediately.
-Both canary and linear watch the configured CloudWatch alarms throughout and roll back automatically if one fires; no manual approval is involved.
+Both canary and linear can watch CloudWatch alarms during the shift and, with automatic rollback enabled, roll back if one fires; no manual approval is involved.
 W: Canary two steps, linear equal steps: canary sends a first slice, waits, then shifts the rest, while linear keeps adding the same increment at a fixed interval until 100%.
 X: A=Same behavior: they produce different traffic curves: two increments for canary versus many equal ones for linear.
 C=Linear needs manual approval: linear increments happen automatically on a timer; neither pattern requires approval between steps.
@@ -345,6 +345,6 @@ A task that needs about 3 minutes to load caches fails its first checks, gets re
 - Optionally a container health check `startPeriod` in the task definition, which gives the same leeway to container-level checks.
 W: Longer grace period and tuned health checks: ECS stops judging tasks during the warm-up, and the target group health check reflects real readiness, so healthy-but-slow tasks are no longer rolled back.
 X: A=Fewer tasks: startup time is per task and comes from loading caches, so running fewer tasks does not make each one start faster.
-B=Disable health checks: target group health checks cannot simply be turned off, and without effective checks broken tasks would receive traffic.
+B=Disable health checks: health checks can be disabled only on target groups with Lambda targets, not on the IP or instance target groups ECS uses, and without effective checks broken tasks would receive traffic.
 C=Rolling update without health checks: rolling updates also rely on load balancer health checks when a load balancer is attached, and switching would lose blue/green's traffic control.
 T: Slow-starting ECS tasks need a health check grace period and realistic target group health checks, not fewer tasks or disabled checks.

@@ -1,0 +1,329 @@
+# DVA-C02 detailed explanations, e04 (explanation-only rewrites; letters are the published ones)
+
+@ Q000662 explain
+G: ## HIPAA on AWS: shared responsibility
+HIPAA does not certify a cloud provider. Instead, a covered entity that stores Protected Health Information (PHI) with a vendor must sign a **Business Associate Addendum (BAA)** with that vendor. On AWS you review and accept the BAA in **AWS Artifact**.
+The BAA only covers **HIPAA Eligible Services**, a list AWS publishes (for example Amazon S3, Amazon RDS, DynamoDB, Lambda). PHI must only be stored or processed in those services.
+- AWS is responsible for the security **of** the cloud (facilities, hardware, the service itself).
+- You remain responsible for security **in** the cloud: encryption, access control, logging and configuration of each eligible service.
+Example: a team signs the BAA in Artifact, keeps PHI in an encrypted S3 bucket and an RDS database, and never writes PHI into a service that is not on the eligible list.
+W: BAA plus eligible services: the BAA is the legal prerequisite for putting PHI on AWS, and it only applies to HIPAA Eligible Services, so both are required before the first PHI record is stored.
+X: A=Cognito for all storage: Cognito is an identity service for user pools and federated identities, not a general data store for health records, and using one service does not replace the BAA.
+B=Default encryption only: encryption at rest is one safeguard you configure, but without a signed BAA and eligible services the workload is not set up in line with HIPAA.
+D=S3 versioning: versioning protects objects from overwrites and deletions; it is a data-protection feature, not a compliance agreement or a list of permitted services.
+T: PHI on AWS starts with a signed BAA and HIPAA-eligible services; encryption and versioning are configuration you add afterward, not substitutes.
+
+@ Q000663 explain
+G: ## How Lambda protects environment variables
+Lambda always encrypts environment variables at rest. By default it uses the AWS managed key `aws/lambda`, whose key policy you cannot edit, so you cannot narrow who may use it.
+With a **customer managed key (CMK)** you write the key policy yourself:
+- Allow `kms:Decrypt` only for the function's execution role (plus key administrators who manage, but do not use, the key).
+- Every `Decrypt` call is recorded in **AWS CloudTrail**, which gives the required audit trail.
+For the strictest setup, encrypt the value with the CMK before saving it (Lambda's "encryption in transit" helpers). The configuration then shows ciphertext, and the function code calls KMS `Decrypt` at runtime using its role, e.g. `kms.decrypt(CiphertextBlob=...)`.
+W: CMK restricted to the role: a key policy that grants `kms:Decrypt` only to the function's role limits who can read the API key, and KMS usage is logged in CloudTrail.
+X: A=Default managed key: `aws/lambda` protects the data at rest, but its policy cannot be customized, so you cannot restrict decryption to one role as the requirement demands.
+B=Plaintext with console restrictions: the value is still readable to anyone who can call `GetFunctionConfiguration` through the API or CLI, and no decryption event is logged.
+C=Base64 encoding: Base64 is reversible encoding with no key; anyone who sees the value can decode it, so it offers neither access control nor audit.
+T: To control and audit who can decrypt a Lambda secret, use a customer managed key whose policy names the role; the default managed key and encoding cannot do that.
+
+@ Q000664 explain
+G: ## Default key vs customer managed key for Lambda
+Every Lambda function's environment variables are encrypted at rest. The difference is **which KMS key** does it:
+- **AWS managed key** (`aws/lambda`): created and controlled by AWS. You cannot change its key policy, so you cannot decide which principals may use it.
+- **Customer managed key**: you create it in KMS, write its key policy and grants, can rotate or disable it, and every use appears in CloudTrail.
+You select the key in the function configuration (the `KMSKeyArn` property in CloudFormation or SAM). Example: a key policy that allows `kms:Decrypt` only for the app's role and a small admin group, with CloudTrail showing each decrypt of the connection string.
+W: Customer managed KMS key: choosing your own key moves the "who can decrypt" decision into a key policy you control and makes each use auditable, which the default behavior does not allow.
+X: A=Plaintext because custom keys are impossible: the premise is false; Lambda lets you pick a customer managed key for environment variables.
+B=Hardcode in code: the connection string ends up in source control and the deployment package, readable by anyone with the code, with no key-level access control or audit.
+D=Disable encryption: Lambda does not offer a way to turn off at-rest encryption of environment variables, and doing so would weaken rather than strengthen control.
+T: Default encryption is automatic but not controllable; a customer managed key gives you a key policy and an audit trail for decryption.
+
+@ Q000665 explain
+G: ## What Secrets Manager adds over hardcoded credentials
+A password in source code is copied to every clone, build log and artifact, and changing it means editing and redeploying code. **AWS Secrets Manager** stores the secret centrally and the app fetches it at runtime with `GetSecretValue`.
+- **Access control**: IAM policies and optional resource policies decide which roles can read each secret; the secret is encrypted with a KMS key.
+- **Audit**: CloudTrail records every `GetSecretValue` call.
+- **Rotation**: a schedule (for example every 30 days) runs managed rotation or a rotation Lambda function that changes the password in the database and updates the secret. Apps that read the secret at runtime pick up the new value with no code change.
+Secrets Manager does not change the database itself beyond the credential, and API calls and stored secrets are billed.
+W: A=Scheduled rotation: rotation runs on a schedule and updates both the database password and the secret, so the app keeps working without edits.
+B=IAM-controlled, audited access: each secret has its own permissions, and CloudTrail logs who retrieved it and when.
+X: C=Database auto scaling: Secrets Manager stores credentials; database capacity is managed by the database service (for example Aurora Auto Scaling or Serverless), not by where the password lives.
+D=NoSQL to relational conversion: schema conversion is a migration task (for example AWS DMS Schema Conversion); a secrets store has nothing to do with data models.
+E=Free unlimited API calls: Secrets Manager charges per secret per month and per API call, which is why clients usually cache secrets.
+T: Moving credentials into Secrets Manager buys access control, auditing and rotation; it does not change the database's capacity, schema or your bill for API calls.
+
+@ Q000666 explain
+G: ## Secrets Manager vs Parameter Store for passwords
+Both services can hold an encrypted value (`SecureString` in Parameter Store, a secret in Secrets Manager). The difference is lifecycle management.
+- **Secrets Manager** has built-in rotation: managed rotation for supported services, and AWS-provided rotation Lambda templates for databases such as Amazon RDS, Aurora, Redshift and DocumentDB. You set a schedule and it changes the password in the database and the secret together.
+- **Parameter Store** has no native rotation. You would have to write your own Lambda function and schedule to change the password and update the parameter.
+Parameter Store standard parameters cost less, but cost is not the requirement here. Example: an RDS password with rotation every 30 days is one checkbox and a schedule in Secrets Manager.
+W: Secrets Manager with native rotation templates: it provides AWS-built rotation logic for database credentials and runs it on a fixed schedule, exactly what the requirement asks for.
+X: B=Both rotate identically: Parameter Store has no built-in rotation; any rotation there is custom code you write and maintain.
+C=Cannot store DB credentials: storing database credentials is the most common Secrets Manager use case, including a JSON structure with host, username and password.
+D=Parameter Store is cheaper: standard parameters are cheaper, but they lack the AWS-provided rotation the team needs, so price does not decide this.
+T: Need AWS-managed scheduled rotation of a database password? Choose Secrets Manager; Parameter Store stores values but does not rotate them.
+
+@ Q000667 explain
+G: ## Reading a secret takes two permissions
+When a secret is encrypted with a **customer managed KMS key**, `GetSecretValue` works in two steps: Secrets Manager checks your IAM permission on the secret, then calls KMS to decrypt the value **on your behalf**. KMS then checks whether your principal may use the key.
+KMS authorization depends on the **key policy**. The caller needs `kms:Decrypt`, granted either directly in the key policy or through an IAM policy when the key policy delegates to IAM (the default "enable IAM policies" statement).
+- Role allowed on the secret, not on the key: `AccessDeniedException`.
+- Fix: add the task role to the key policy (optionally with the condition `kms:ViaService` = `secretsmanager.<region>.amazonaws.com`).
+Secrets encrypted with the AWS managed key `aws/secretsmanager` do not need this extra step.
+W: Key policy lacks kms:Decrypt for the task role: the IAM permission on the secret is present, so the remaining check that fails is KMS authorization for the customer managed key.
+X: B=Container Insights: it only collects ECS metrics and logs; it has no effect on IAM or KMS authorization of API calls.
+C=No launch type in task definition: the launch type affects where the task runs, and the task is clearly running and calling the API; it does not change permission checks.
+D=Rotation disabled: rotation settings control whether the secret changes over time; a secret without rotation can still be read normally.
+T: A secret under a customer managed key needs permission on both the secret and the key; an allowed GetSecretValue still fails without kms:Decrypt.
+
+@ Q000668 explain
+G: ## Masking sensitive data in CloudWatch Logs
+A **data protection policy** is attached to a log group (or to the whole account) and uses **managed data identifiers** such as Social Security numbers, credit card numbers or email addresses, plus optional custom patterns.
+- As log events are ingested, matches are **masked** in what users see, e.g. `SSN: ***********`.
+- Only principals with the `logs:Unmask` permission can view the original values.
+- Findings can be sent to CloudWatch Logs, S3 or Firehose for auditing, and a metric shows how often sensitive data appears.
+No code change is needed: the application keeps writing logs as before, and the policy applies to the log group.
+W: Data protection policies: they are the native CloudWatch Logs feature that detects patterns like SSNs and masks them, with unmasking controlled by IAM.
+X: B=Composite alarms: they combine alarm states to decide when to notify; they never look at or change the contents of log events.
+C=Logs Insights result caching: this relates to query performance and results, not to finding or hiding sensitive data in stored events.
+D=KMS encryption of the log group: encryption protects data at rest, but anyone allowed to read the logs still sees the SSNs in plaintext.
+T: Encryption hides logs from outsiders; data protection policies hide sensitive fields from the people who can read the logs.
+
+@ Q000669 explain
+G: ## Field-level visibility belongs in the application
+Storage controls such as encryption and IAM decide **who may read a record at all**. They do not decide **which parts of a field** a person sees. A requirement like "show only the last four SSN digits unless the user has elevated rights" is business logic at display time.
+The usual pattern:
+- The user's role or claims come from the identity provider (for example Cognito groups or IAM Identity Center).
+- The API layer returns `***-**-1234` by default, and the full value only when the caller has the elevated permission; the data layer may also expose a masked view.
+- Unmask requests are logged so access can be audited.
+W: Role-based masking in the application layer: the app knows the user's role on every request and can apply masking consistently for each field, returning full values only to authorized users.
+X: A=Administrator permissions for all agents: this gives every agent full SSNs and much more, the opposite of the least-privilege policy described.
+C=S3 bucket encryption: encryption at rest is transparent to authorized readers, so the agent screen still shows the full SSN.
+D=Duplicate masked and full copies with no access control: the full copy remains readable by anyone, so the policy is not enforced, and two copies can drift apart.
+T: Encryption and storage choices do not mask what users see; partial visibility per role is enforced in the application's data access layer.
+
+@ Q000670 explain
+G: ## PostgreSQL row-level security (RLS)
+In a pooled multi-tenant table every row has a `tenant_id`. Relying on each query to include `WHERE tenant_id = ?` means one forgotten filter leaks data. **RLS** moves that filter into the database.
+Example:
+- `ALTER TABLE orders ENABLE ROW LEVEL SECURITY;`
+- `CREATE POLICY tenant_isolation ON orders USING (tenant_id = current_setting('app.tenant_id'));`
+- The app runs `SET app.tenant_id = 'tenant-42'` at the start of each request.
+Now even `SELECT * FROM orders` returns only tenant-42's rows. RLS works on Amazon RDS for PostgreSQL and Aurora PostgreSQL. Note that table owners and superuser-like roles bypass RLS unless it is forced, so the app should connect with a normal role.
+W: Row-level security policies: the database applies the tenant filter to every query automatically, so a missing WHERE clause cannot expose another tenant's rows.
+X: B=Automated backups: they allow point-in-time recovery after data loss; they do nothing to restrict which rows a query returns.
+C=IAM database authentication alone: it replaces passwords with IAM tokens to log in, but once connected the session can read every row the database role can.
+D=Multi-AZ: it keeps a standby for failover and availability; queries see the same data regardless.
+T: Authentication decides who connects; RLS decides which rows each tenant's session can see, even when the query forgets to filter.
+
+@ Q000671 explain
+G: ## Pool, silo and bridge tenancy
+SaaS teams choose how tenants share infrastructure:
+- **Silo**: each tenant gets its own database, stack or even AWS account. Isolation is strong and easy to prove, noisy neighbors are limited, and per-tenant backup or deletion is simple. Cost and operational overhead grow with every tenant.
+- **Pool**: all tenants share the same database and tables, separated by a `tenant_id`. Resources are used efficiently and onboarding is cheap, but isolation depends on controls you build: row-level security, tenant-scoped IAM credentials, and careful testing.
+- **Bridge**: a mix, for example shared compute with a separate database per tenant.
+Example: a free tier in the pool model and premium tenants in silos is a common split.
+W: Pool cheaper with stricter controls, silo stronger at higher cost: this is the core tradeoff; pooling shares resources and therefore needs enforced logical isolation, while silos isolate physically but cost more to run.
+X: A=No difference in isolation: separate databases or accounts give a hard boundary, while a shared table relies on application and database policies, so isolation strength clearly differs.
+B=Pool gives automatic per-tenant keys: sharing one database does not create per-tenant KMS keys; that is extra design work you must add.
+C=Silo weaker than pool: the silo model is the strongest isolation option precisely because tenants share no data store.
+T: Pool trades isolation effort for efficiency; silo trades cost for a hard boundary between tenants.
+
+@ Q000672 explain
+G: ## Blast radius and encryption keys
+If every tenant's data is encrypted with one key, an event affecting that key affects everyone: disabling it makes all data unreadable, and a leaked permission to use it exposes all data.
+With **one customer managed KMS key per tenant**:
+- Each key has its own key policy, so access can be limited to that tenant's role or service path.
+- Disabling or scheduling deletion of `tenant-42`'s key only blocks tenant-42's data.
+- CloudTrail shows usage per key, which makes per-tenant auditing simpler.
+You can additionally pass an **encryption context** such as `{"tenant":"tenant-42"}` to tie ciphertext to a tenant. AWS managed keys cannot be disabled or given custom policies, so they cannot provide this separation.
+W: Separate customer managed key per tenant: each tenant's data depends only on its own key, so compromise or disabling of one key does not affect any other tenant.
+X: A=Static password in code: one shared secret in source means any leak exposes every tenant, and it cannot be disabled per tenant.
+B=Single shared AWS managed key: all tenants share one key whose policy you cannot customize, so there is no per-tenant boundary at all.
+C=Disable encryption: removes the key dependency by removing protection; the data becomes readable to anyone with storage access.
+T: Per-tenant customer managed keys turn a key incident into a single-tenant incident; a shared key makes it everyone's incident.
+
+@ Q000673 explain
+G: ## Realistic test data without real PII
+Staging often needs production-like volume and shape, but developers should not see real names or card numbers. Encryption and IAM do not help once someone is authorized: they still see plaintext. The data itself must be changed.
+Common techniques:
+- **Anonymization / masking**: replace names with fake ones, emails with `user123@example.com`, card numbers with test numbers.
+- **Tokenization**: replace a value with a consistent token so joins still work (the same email always becomes the same token).
+- Tools: AWS Glue (including its sensitive data detection), Glue DataBrew recipes, or a custom ETL job; Amazon Macie can help find where PII lives.
+The transformation runs before data enters the staging account.
+W: Anonymize or tokenize PII: the staging copy keeps realistic structure but no longer contains real customer data, so developers cannot see it no matter what access they have.
+X: A=Copy as-is with IAM restrictions: developers need access to the staging data to test, and once they have it they see the real PII.
+B=Encrypt with the production key: decryption is transparent for authorized users, so developers still read plaintext, and sharing the production key widens its exposure.
+C=Read access to production: this exposes real PII directly and risks developers affecting live data.
+T: Encryption and access control protect data from outsiders; to hide PII from authorized testers you must transform it.
+
+@ Q000674 explain
+G: ## Keep configuration outside the deployment package
+Build one artifact and promote it unchanged through dev, test and prod; only configuration should differ.
+- **Lambda environment variables**: key-value pairs set per function (or per stack in SAM), e.g. `DB_ENDPOINT=dev-db.example.internal`. The code reads `os.environ["DB_ENDPOINT"]`, and the same zip works in each environment. Changing a value is a configuration update, not a new package.
+- **Parameter Store**: store values like `/app/prod/db-endpoint` and read them at runtime with `GetParameter`, caching for a few minutes (the Parameters and Secrets Lambda extension does this). Updating the parameter takes effect after the cache expires, with no function update at all.
+Anything baked into the code or zip requires a rebuild per environment.
+W: C=Parameter Store at runtime with caching: prod values can be changed centrally and are picked up without redeploying, and caching keeps latency and API calls low.
+E=Per-environment environment variables: each function or stage gets its own values while running the identical package.
+X: A=Execution role trust policy: a trust policy only defines who may assume the role (for example `lambda.amazonaws.com`); it cannot carry application settings.
+B=Values embedded in the zip: each environment would need a different package, and any change means rebuilding and redeploying.
+D=Hardcoded in source: values are fixed at build time, so changing a prod endpoint means a code change, a new build and a deployment.
+T: Same package everywhere, configuration from environment variables or Parameter Store; anything inside the artifact forces a rebuild.
+
+@ Q000675 explain
+G: ## How the SAM CLI finds a template
+`sam build` looks for a template in the **current directory** by default, normally `template.yaml` (or `template.yml`). If you run it from a folder without one, it fails with "Template file not found".
+Two fixes:
+- Point at the file: `sam build --template-file infra/app.yaml` (short form `-t`).
+- Or `cd` to the folder with the template before building.
+The build result goes to `.aws-sam/build`, and later `sam deploy` uses the built template from there. Example: `sam build -t infra/app.yaml && sam deploy --guided`.
+W: Use --template-file: it tells the SAM CLI exactly where the template is, so the build finds `infra/app.yaml` without moving or renaming anything.
+X: A=Commit to CodeCommit: `sam build` reads files from the local disk; source control does not affect how the CLI locates a template.
+C=Rename to template.json anywhere: the default lookup is in the current directory, so a renamed file in another folder is still not found.
+D=Move into .aws-sam/build: that directory is build output that `sam build` generates and overwrites; it is not where the source template belongs.
+T: SAM looks for the template in the current directory; use `-t` / `--template-file` when it lives elsewhere.
+
+@ Q000676 explain
+G: ## Connecting CodePipeline to GitHub
+**AWS CodeConnections** (formerly CodeStar Connections) links AWS to GitHub by installing the AWS Connector GitHub App. The connection is authorized once in the console, and AWS holds it, so no personal access token is stored in the pipeline.
+In a pipeline:
+- The source action (`CodeStarSourceConnection`) names the connection ARN, repository and branch, e.g. `main`.
+- Pipeline type V2 **triggers** can filter on Git push events by branch (and file paths or tags), so only pushes to `main` start an execution.
+The older GitHub version 1 source action uses OAuth apps and personal access tokens and is no longer recommended.
+W: CodeConnections source on main with a push trigger: the connection avoids storing tokens, and the branch filter starts the pipeline automatically for pushes to `main` only.
+X: A=Manual StartPipelineExecution: someone has to run it every time, so the pipeline does not start automatically on push.
+B=GitHub v1 with a personal access token: it stores exactly the kind of token the requirement forbids and is a legacy action type.
+D=Hourly EventBridge schedule: runs on a clock rather than on pushes, so it delays releases and starts runs even when nothing changed on `main`.
+T: For GitHub sources, use a CodeConnections connection with a branch-filtered push trigger: event-driven and no stored token.
+
+@ Q000677 explain
+G: ## Feature flags with AWS AppConfig
+**AWS AppConfig** (part of Systems Manager) stores configuration and **feature flags** separately from code. The app retrieves them at runtime, often through the AppConfig Agent or Lambda extension, so a flag flip needs no deployment.
+A deployment uses a **deployment strategy**:
+- Growth type and rate, e.g. linear 10% steps, or a custom schedule.
+- A bake time after reaching 100%.
+- **Monitors**: CloudWatch alarms. If an alarm goes into ALARM during the deployment or bake time, AppConfig rolls back to the previous version automatically.
+Example: enable `new_pricing` gradually while watching an `ErrorRate` alarm.
+W: AppConfig flags with gradual rollout and rollback: it provides staged rollout, alarm monitoring and automatic rollback of the flag, all without redeploying code.
+X: B=Parameter Store with daily manual updates: changes apply all at once to every reader, there is no percentage-based rollout, and nothing rolls back when the alarm fires.
+C=Lambda alias weighted routing: it splits invocations between two published function versions, which means deploying new code rather than toggling a flag in the running code.
+D=CloudFormation change set: previews infrastructure changes before a stack update; it has no notion of gradual feature exposure to users.
+T: Runtime flags with staged exposure and alarm-based rollback are AppConfig's job; alias weights shift code versions, not configuration.
+
+@ Q000678 explain
+G: ## Validating configuration before it ships
+An AppConfig **configuration profile** can have **validators** that check the data when you start a deployment:
+- **JSON Schema validator**: the configuration must match a schema, for example `{"type":"object","required":["timeoutMs"],"properties":{"timeoutMs":{"type":"integer"}}}`.
+- **Lambda validator**: AppConfig calls your function for custom checks (ranges, cross-field rules); the function signals failure by throwing an error.
+If validation fails, the deployment does not start, so no application host ever receives the bad configuration. This complements deployment monitors, which catch problems only after a rollout has begun.
+W: JSON Schema or Lambda validator on the profile: validators are the AppConfig feature that checks structure before deployment and rejects invalid data automatically.
+X: A=CodeBuild buildspec validation: it lives in a CI pipeline outside AppConfig, so anyone updating configuration directly in AppConfig would bypass it.
+B=Permissions boundary on the AppConfig role: it limits what a role may do in IAM; it never inspects the content of configuration data.
+D=Alarm on bake time: alarms react to errors after the configuration is already reaching hosts, not before.
+T: Validators stop bad configuration before rollout; alarms and rollback handle problems that only show up after it.
+
+@ Q000679 explain
+G: ## What sam build produces
+`sam build` prepares each function for deployment: it installs dependencies (for example from `requirements.txt` or `package.json`), compiles code where needed and copies everything into a separate output folder, leaving your source untouched.
+- Output location: `.aws-sam/build/` in the project, with one subfolder per function or layer.
+- A processed copy of the template, `.aws-sam/build/template.yaml`, points at those built folders.
+- `sam deploy` (or `sam package`) then zips or builds images from that output, uploads them to S3 or ECR, and deploys the stack.
+Example: after building, `.aws-sam/build/HelloFunction/` contains `app.py` plus its installed libraries.
+W: .aws-sam/build: this generated directory holds the built artifacts and template that the next packaging and deployment steps use.
+X: B=.git/objects: that is Git's internal object store for commits; SAM never writes build output into it.
+C=Overwriting source files: SAM keeps source and build output separate so your project stays clean and rebuilds are repeatable.
+D=CloudTrail log bucket: that bucket holds API audit logs; deployment artifacts are uploaded to a SAM-managed or specified S3 bucket only at deploy or package time.
+T: Source stays in place; `sam build` writes artifacts to `.aws-sam/build`, which `sam deploy` then packages.
+
+@ Q000680 explain
+G: ## Environment variables vs Parameter Store
+**Lambda environment variables** are part of each function's configuration. They are simple, can be encrypted with KMS, and are fast to read, but each function holds its own copy, and changing one is an update to that function's configuration (and new published versions for aliases).
+**Parameter Store** is a central store:
+- Hierarchical names such as `/app/prod/db/url` and `/app/prod/cache/ttl`; `GetParametersByPath` reads a whole branch at once.
+- Many functions read the same values at runtime, so an update in one place reaches all of them (after any client cache expires).
+- IAM can grant access by path, and changes are versioned.
+For a shared, frequently changing, hierarchical set of values, this avoids updating several functions for every change.
+W: Changes without redeploying plus hierarchies: Parameter Store keeps values outside the functions and organizes them by path, which matches shared, changing configuration.
+X: A=Environment variables cannot be encrypted: they are always encrypted at rest and can use a customer managed KMS key.
+C=Parameter Store is the only way to pass values: environment variables, event payloads and other services like AppConfig or Secrets Manager can all supply values.
+D=Environment variables are numeric only: they are strings and hold any text, such as URLs or JSON.
+T: Per-function values fit environment variables; shared, hierarchical values that change often fit Parameter Store read at runtime.
+
+@ Q000681 explain
+G: ## The ECS task definition
+An **ECS task definition** is a JSON blueprint describing how to run one or more containers together. It includes:
+- Container image (for example from Amazon ECR), port mappings, environment variables and secrets.
+- **CPU and memory**: at the task level (required for AWS Fargate, e.g. `"cpu": "512", "memory": "1024"`) and optionally per container (`cpu`, `memory`, `memoryReservation`).
+- Network mode, IAM task role and execution role, logging configuration.
+Services and `RunTask` launch tasks from a specific revision, and the scheduler uses the CPU and memory values to place tasks on capacity.
+W: ECS task definition: it is where ECS reads the resource requirements of the task and its containers, which drives placement and Fargate sizing.
+X: B=Dockerfile CMD: `CMD` sets the default command a container runs; Docker images do not declare the CPU and memory ECS should reserve.
+C=VPC route table: it controls where network traffic goes between subnets and gateways, not compute resources.
+D=ECR repository policy: it controls which principals can push or pull images, not how the container runs.
+T: Image, CPU, memory, ports and roles for ECS all live in the task definition, not in the image or the registry.
+
+@ Q000682 explain
+G: ## AppConfig deployment strategies and monitors
+AppConfig rolls out a new configuration version gradually according to a **deployment strategy**:
+- **Deployment time**: how long the rollout takes in total.
+- **Growth type and factor**: linear (e.g. 20% more targets per step) or exponential.
+- **Final bake time**: how long AppConfig keeps watching after reaching 100%.
+The environment has **monitors**, which are CloudWatch alarms. If a monitored alarm enters ALARM during the rollout or bake time, AppConfig stops and rolls back to the previous configuration. Predefined strategies such as `AppConfig.Linear50PercentEvery30Seconds` exist, or you define your own.
+W: Deployment strategy plus alarm rollback: growth and bake time limit how many targets see the new flag value, and the alarm triggers automatic rollback.
+X: B=Lambda alias weighted routing: it shifts invocations between function versions, so it applies to code deployments, not to a flag value delivered by AppConfig.
+C=API Gateway stage variable: it is a static per-stage value, with no gradual rollout, monitoring or rollback.
+D=CodeDeploy AppSpec hook: hooks run scripts or functions during CodeDeploy application deployments; they are not part of AppConfig configuration rollouts.
+T: For configuration and flags, AppConfig limits blast radius with a deployment strategy and rolls back on CloudWatch alarms.
+
+@ Q000683 explain
+G: ## Running Lambda locally with SAM
+`sam local invoke` runs a function once inside a Docker container that uses a Lambda runtime image, so the environment is close to the real service. You pass an event file with `-e event.json`.
+For step-through debugging:
+- `sam local invoke MyFunction -e event.json -d 5858` (`--debug-port`) starts the runtime and waits for a debugger to attach.
+- Attach from an IDE (VS Code, PyCharm, and others), and breakpoints in your handler are hit.
+- `sam local start-api` and `sam local start-lambda` support the same debug options for API-style or SDK-style calls.
+W: sam local invoke with debug port options: it runs the handler in a Lambda-like container on your machine and exposes a port for an IDE debugger to attach to.
+X: B=sam package: it uploads build artifacts to S3 and rewrites the template for deployment; it does not execute code.
+C=sam validate then console tests: validation only checks template syntax, and console tests run in AWS without breakpoints in your local IDE.
+D=sam deploy --guided: it deploys the stack to AWS; you would then test in the cloud, not debug locally with breakpoints.
+T: Local, breakpoint-driven debugging in a Lambda-like runtime is `sam local invoke` with `-d`; package, validate and deploy never run your code locally.
+
+@ Q000684 explain
+G: ## API Gateway integration types
+Each method in an API Gateway REST API has an **integration**, the thing that produces the response:
+- **Lambda proxy**: invokes a Lambda function and passes the whole request.
+- **HTTP / HTTP proxy**: forwards to an HTTP endpoint.
+- **AWS service**: calls another AWS API directly (for example SQS `SendMessage`).
+- **Mock**: API Gateway generates the response itself. You set the status code in the integration request mapping and a body in the integration response mapping template, e.g. `{"id": 1, "name": "sample"}`.
+Mock integrations let frontend teams code against the real API contract (paths, methods, status codes, CORS) while the backend is still being written, and later you swap in the real integration.
+W: Mock integration: it returns predefined responses entirely inside API Gateway and never calls a backend, which is exactly what the frontend team needs.
+X: A=Lambda proxy integration: it must invoke a function, and the functions do not exist yet.
+B=HTTP integration: it forwards each request to an HTTP backend, which would also have to exist and respond.
+D=AWS service integration: it calls a real AWS service API, so it depends on real resources rather than returning static data.
+T: When no backend exists yet, a mock integration lets API Gateway answer requests by itself.
+
+@ Q000685 explain
+G: ## Stages and stage variables
+A **stage** is a named snapshot of an API deployment, such as `dev`, `test` and `prod`, each with its own invoke URL (`.../dev`, `.../prod`).
+- **Stage variables** are key-value pairs per stage. A Lambda integration can use `${stageVariables.alias}` in the function ARN, so `dev` calls the `dev` alias and `prod` calls the `prod` alias. The function needs a resource-based permission for each alias API Gateway invokes.
+- **Per-stage settings**: throttling (rate and burst, also per method), logging, caching and metrics.
+One API definition is deployed to several stages, so the environments stay consistent while backends and limits differ.
+W: Stages with stage variables and per-stage throttling: one API definition, deployed to several stages, each pointing to its own alias and with its own throttle limits.
+X: B=Copying the API per environment: it works but duplicates the definition, so changes must be made several times and environments drift apart.
+C=Usage plans without stages: usage plans are associated with API stages and meter API keys; they cannot route to different aliases or exist without a stage.
+D=Different HTTP methods per environment: methods like GET and POST describe operations, not environments, and would break the API contract.
+T: One API, many environments: deploy to stages and use stage variables to switch backends while each stage keeps its own throttling.
+
+@ Q000686 explain
+G: ## Updating a stack with the SAM CLI
+A SAM template is deployed as a CloudFormation stack. To add a resource, such as an `AWS::Serverless::SimpleTable` or `AWS::DynamoDB::Table`, you edit the template and deploy again:
+- `sam build` prepares code and the template in `.aws-sam/build`.
+- `sam deploy` uploads artifacts and creates a **CloudFormation change set** that lists every resource to be added, modified or replaced.
+- With `--confirm-changeset` (the guided deploy can save this as a default in `samconfig.toml`), SAM shows the change set and waits for your approval before executing it.
+CloudFormation then updates only what changed, keeping the existing resources and their data.
+W: sam build then sam deploy with change set review: it updates the existing stack in place and shows exactly what will change before it is applied.
+X: A=Delete and recreate the stack: this destroys existing resources, including data in stateful ones, and causes downtime for a simple addition.
+C=Create the table manually in the console: the stack does not manage the manually created table, so it drifts from the template and a later deploy may try to create a conflicting one.
+D=sam local start-api: it runs the API locally for testing and never touches the deployed CloudFormation stack.
+T: Change a SAM app by editing the template and running `sam build` and `sam deploy`, reviewing the change set before it runs.

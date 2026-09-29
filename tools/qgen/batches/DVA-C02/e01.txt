@@ -1,0 +1,355 @@
+# DVA-C02 detailed explanations, e01 (explanation-only rewrites; letters are the published ones)
+
+@ Q000587 explain
+G: ## Stateful versus stateless web tiers
+A web tier is **stateful** when an instance keeps user data (a session, a shopping cart) in its own memory or local disk. Any request that lands on another instance cannot see that data, so the cart "disappears".
+A tier is **stateless** when every instance keeps only code, and all per-user state lives in a shared store that every instance reads.
+## Where to put session state
+- **Amazon ElastiCache** (Redis OSS or Valkey, Memcached): in-memory, sub-millisecond reads, a common choice for session data with a TTL.
+- **Amazon DynamoDB**: durable key-value store; a table keyed on `session_id` with a TTL attribute removes expired carts automatically.
+Example: the app writes the cart to key `cart#<session_id>`. When the Auto Scaling group adds or removes instances, or an instance fails, the next request goes to any healthy instance, which reads the same key.
+W: Externalized state in DynamoDB or ElastiCache: every instance can serve every request, so scaling in, scaling out and instance failure no longer lose carts, and the load balancer can spread traffic evenly.
+X: A=Sticky sessions plus more instances: stickiness pins a user to one instance with a cookie, but the cart still lives on that instance. When it is terminated by scale-in or fails a health check, the cart is lost, and pinned users also make load uneven.
+B=NLB source IP affinity: an NLB can also do stickiness, but that is the same pinning idea with the same failure mode, and client IPs change behind mobile networks or proxies. State is still stored on one instance.
+C=Lower idle timeout: the idle timeout only controls how long an idle TCP connection stays open. It does not decide which instance serves the next request or where the cart is stored.
+T: Scale web tiers by making instances stateless and storing sessions in a shared store; sticky sessions only hide the problem until an instance goes away.
+
+@ Q000588 explain
+G: ## Synchronous versus asynchronous request handling
+In a **synchronous** call the client waits on an open connection until the work is done. That breaks down for jobs that take minutes: API Gateway REST integrations time out at 29 seconds by default, mobile networks drop long connections, and the client sits idle.
+In an **asynchronous** design the API only accepts the job and replies right away, typically with HTTP `202 Accepted` and a job or request ID. The heavy work runs in the background.
+## A typical AWS layout
+- The client uploads the video to S3, often with a presigned URL so the file does not pass through the API.
+- An S3 event, or a message the API puts on SQS, starts processing in Lambda, Step Functions, AWS Elemental MediaConvert or containers.
+- The job status is stored (for example in DynamoDB under the request ID). The client polls a status endpoint or is notified by push, SNS or a WebSocket message when the job finishes.
+W: Accept, return a request ID, process asynchronously: the client gets an immediate acknowledgment, processing time is decoupled from connection limits, and failed jobs can be retried in the background without the user resubmitting.
+X: A=Blocking WebSocket: WebSockets are useful to push a "done" notification, but holding a connection open and blocking until processing ends ties the result to a fragile long-lived connection and gives no immediate acknowledgment.
+B=15-minute synchronous Lambda: a longer timeout still makes the caller wait for the whole job, and any API Gateway or client timeout in front of it will cut the request long before minutes of transcoding finish.
+D=Synchronous API Gateway to Lambda: the request would wait for transcoding and hit the default 29-second integration timeout, returning a `504` even when processing continues.
+T: For long-running work, acknowledge fast with a job ID and process in the background; do not stretch synchronous timeouts.
+
+@ Q000589 explain
+G: ## How API Gateway timeouts work
+When API Gateway calls a backend (a Lambda function, an HTTP endpoint), it waits only up to the **integration timeout**. For REST APIs the default maximum is 29 seconds (Regional and private REST APIs can request a higher quota, trading off throttle capacity). HTTP APIs have a 30-second maximum.
+If the backend has not answered in time, API Gateway gives up and returns `504 Gateway Timeout` to the client, even though the Lambda function may keep running until its own timeout (up to 15 minutes).
+## Reading the symptom
+- Only the requests that perform the slow third-party lookup fail; the fast ones succeed.
+- The error is `504`, which means "the backend did not respond in time", not "the backend returned an error" (`502`) or "you were throttled" (`429`).
+Typical fixes: cache the third-party result, make the lookup asynchronous and return a job ID, or tighten the call with its own shorter timeout and a fallback.
+W: Integration timeout exceeded: the slow lookup pushes total backend time past API Gateway's 29-second limit, so the gateway returns `504` for exactly that subset of requests.
+X: A=Reserved concurrency too high: a high reserved concurrency only allows more parallel executions. Running out of concurrency causes throttling (`429`/`502`-style errors), not timeouts on slow requests.
+B=Memory too high: more memory also gives more CPU, which makes startup and execution faster, not slower. It cannot explain timeouts limited to the slow lookup path.
+C=DynamoDB throttling: the scenario points to a slow third-party call, and SDK throttling usually surfaces as retried `ProvisionedThroughputExceededException` errors, not as a timeout pattern tied to one external dependency.
+T: A `504` from API Gateway means the backend exceeded the integration timeout; fix the slow path, do not tune unrelated Lambda settings.
+
+@ Q000590 explain
+G: ## Why immediate retries make things worse
+When a dependency returns `429 Too Many Requests` or `503 Service Unavailable`, it is overloaded. If 500 invocations all retry at once, the partner gets another wave of 500 requests at the same moment, which keeps it overloaded (a "retry storm").
+## Exponential backoff with jitter
+- **Exponential backoff**: wait longer after each failure, for example 100 ms, 200 ms, 400 ms, 800 ms.
+- **Cap**: never wait more than a maximum, for example 2 seconds.
+- **Jitter**: pick a random wait between 0 and the computed value, so callers spread out instead of retrying in sync. A common formula is `sleep = random(0, min(cap, base * 2^attempt))`.
+- **Limited attempts**: stop after a few tries so the total time stays inside the budget, here the 10-second function timeout, and then fail or hand the work to a queue.
+The AWS SDKs use the same idea for AWS API calls; for a partner API you implement it yourself or with a retry library.
+W: Capped exponential backoff with jitter and limited attempts: randomized, growing waits spread the 500 callers over time so the partner can recover, and the attempt cap keeps each invocation within its 10-second limit.
+X: A=Fixed 2-second sleep: every invocation still retries at the same moments, so the load arrives in synchronized waves, and a fixed interval does not back off as the partner stays overloaded.
+B=Immediate retries, 10 attempts: this multiplies the burst up to ten times with no pause, deepening the overload that is causing the `429` and `503` errors.
+D=15-minute timeout: the requirement is to finish within 10 seconds, and a longer timeout without backoff just keeps hammering the partner longer while paying for idle compute.
+T: Retry overloaded dependencies with capped exponential backoff plus jitter and a bounded number of attempts, not with fixed or immediate retries.
+
+@ Q000591 explain
+G: ## Breaking versus non-breaking API changes
+A **breaking change** is one that makes existing clients fail, such as renaming or removing a field, adding a required field, or changing a type. Non-breaking changes, such as adding an optional field, can be released in place.
+## Versioning in API Gateway
+- A **stage** (for example `v1`, `v2`, `prod`) is a named snapshot of a deployment with its own URL, such as `https://abc123.execute-api.us-east-1.amazonaws.com/v1`.
+- You can also version by resource path (`/v2/orders`), by a separate API, or by a custom domain with base path mappings (`api.example.com/v1` and `api.example.com/v2`).
+- Stage variables let each stage point to a different Lambda alias or backend, so `v1` keeps calling the old code while `v2` calls the new code.
+Clients migrate to `v2` on their own schedule, and `v1` is retired after a deprecation period.
+W: New version or stage alongside v1: existing clients keep calling the unchanged `v1` contract while new clients adopt `v2`, so the breaking schema change disrupts nobody.
+X: A=Overwrite the stage in place: redeploying the same stage changes the contract under every existing client at once, which is exactly the disruption the team must avoid.
+C=Delete and republish under the same endpoint: deleting the API causes downtime, and even if the endpoint is reused, old clients now send the old schema to the new contract and fail.
+D=Change only the Lambda code: the request schema is part of the contract; if the backend starts expecting the new shape while clients send the old one, requests break just the same.
+T: Ship breaking API changes as a new version (stage, path or domain mapping) and keep the old version running until clients migrate.
+
+@ Q000592 explain
+G: ## Unit tests versus integration tests
+A **unit test** checks one piece of logic in isolation, runs in seconds on a laptop or in CI, and costs nothing. An **integration test** runs against real services and checks that the pieces work together.
+## Keeping the handler testable
+- Put business logic in plain functions that the handler calls, so tests can call them directly with a sample event.
+- Replace AWS SDK calls with **mocks or stubs** that return prepared responses. Examples: `moto` or botocore's `Stubber` in Python, `aws-sdk-client-mock` in JavaScript, Mockito for Java SDK clients.
+- Example: the test mocks `GetItem` on DynamoDB to return an order, mocks `PutObject` on S3 to succeed, invokes the handler with a sample event, and asserts the returned total and the arguments passed to `PutObject`.
+Integration tests in a real account (or with `sam local`) still have value, but they come later and cover different risks.
+W: Local test framework with mocked SDK calls: logic runs in milliseconds without an AWS account, results are repeatable, and there is no cost or dependency on deployed resources.
+X: A=Increase the timeout: timeout is a runtime setting for a deployed function; it does nothing to let you test logic locally or mock AWS calls.
+C=Test account and manual invokes: this deploys to AWS and incurs cost, which the requirement rules out, and manual invocation is slow and not repeatable like an automated unit test suite.
+D=X-Ray in production: tracing shows latency and call paths of real requests; it does not validate business rules, and testing in production is the opposite of pre-deployment unit testing.
+T: Unit test Lambda logic locally with a test framework and mocked AWS SDK clients; reserve deployed tests for integration.
+
+@ Q000593 explain
+G: ## Standard versus FIFO queues
+- **Standard queues**: nearly unlimited throughput, but delivery is **at least once** (a message can arrive twice) and ordering is best effort.
+- **FIFO queues**: strict ordering within a **message group** (`MessageGroupId`) and **exactly-once processing** through deduplication, with lower throughput (300 API calls per second per action, higher with batching or high-throughput mode).
+## Deduplication in FIFO
+SQS drops a message that has the same deduplication ID as one sent in the last 5 minutes. The ID comes either from `MessageDeduplicationId` set by the producer or, with **content-based deduplication**, from a SHA-256 hash of the message body.
+Example: a producer retries `SendMessage` after a network error; with content-based deduplication the second copy of the same order body is discarded, so the order is enqueued only once. Consumers still must delete each message before its visibility timeout ends.
+W: FIFO queue with content-based deduplication: FIFO guarantees ordering and the dedup hash removes duplicate sends within the 5-minute window, which together deliver in-order, exactly-once processing at the accepted lower throughput.
+X: A=FIFO with 14-day retention: retention only controls how long unprocessed messages are kept; it contributes nothing to preventing duplicates, which is the other half of the requirement.
+C=Standard queue, short visibility timeout: a standard queue gives no ordering guarantee, and a short visibility timeout makes duplicates more likely because messages reappear before processing finishes.
+D=Standard queue with a DLQ: a dead-letter queue only captures messages that fail repeatedly; it does not add ordering or stop at-least-once duplicate delivery.
+T: Ordered, exactly-once processing needs a FIFO queue with deduplication; standard queues are at-least-once and unordered no matter how they are tuned.
+
+@ Q000594 explain
+G: ## Transient errors and throttling
+Some API errors are **transient**: the same request would succeed if sent a little later. DynamoDB throttling (`ProvisionedThroughputExceededException`, `ThrottlingException`), `5xx` service errors and brief network failures are typical examples.
+## Built-in retries in the AWS SDKs
+All AWS SDKs, including the SDK for Java 2.x, automatically retry retryable errors with **exponential backoff and jitter**:
+- Each retry waits longer than the last, with randomness so many clients do not retry at the same instant.
+- The retry mode (`standard`, `adaptive`, or legacy) and the maximum attempts can be set through client configuration, environment variables or the shared config file, without changing business logic.
+- `adaptive` mode additionally rate-limits the client when it sees throttling.
+Example: during a spike, a `PutItem` is throttled; the SDK waits briefly and retries, and the call succeeds on the second attempt without the application seeing an exception.
+W: SDK built-in retries with exponential backoff: they absorb short throttling bursts automatically and are tuned through configuration, which matches "without changing application logic".
+X: A=Disable SSL validation: certificate validation protects against man-in-the-middle attacks and has nothing to do with throttling; disabling it only weakens security.
+B=Poll CloudWatch Logs before each call: logs describe past events, reading them adds latency and cost to every call, and it cannot prevent or retry a throttled request.
+C=Catch every exception and terminate: this turns a recoverable, transient error into an outage instead of retrying it.
+T: Let the AWS SDK's automatic retries with exponential backoff handle transient throttling; tune retry mode and attempts through configuration.
+
+@ Q000595 explain
+G: ## Streams versus queues
+A **queue** (SQS) hands each message to one consumer, and the message is deleted once processed. A **stream** (Kinesis Data Streams) is an ordered, retained log: records stay for the retention period no matter how many applications read them.
+## How Kinesis Data Streams works
+- Records are written with a **partition key**; the key is hashed to pick a **shard**, and order is kept within each shard.
+- Retention is 24 hours by default and can be extended up to 365 days.
+- Several applications read the same stream independently, each tracking its own position (sequence number), and any of them can go back and **replay** from an earlier point.
+- Enhanced fan-out gives each consumer its own dedicated read throughput.
+Example: a real-time dashboard, a fraud detector and a Firehose delivery to S3 all read the same clickstream, and a buggy consumer can reprocess the last 6 hours after a fix.
+W: Kinesis Data Streams: it handles high-volume ingestion, keeps data for replay within the retention window, lets multiple consumers read independently, and preserves order per partition key.
+X: A=SQS standard: each message goes to one consumer and is deleted after processing, so there is no replay or independent multi-app reading, and ordering is not guaranteed.
+C=SNS: SNS pushes messages to subscribers but does not store them for replay; a subscriber that was down or wants to reprocess cannot read the history.
+D=SQS FIFO: it orders messages per group, but consumed messages are deleted and cannot be replayed by several independent applications, and its throughput is limited for millions of visitors.
+T: Choose Kinesis Data Streams when many consumers must read and replay the same ordered data; choose SQS when each message is work for one consumer.
+
+@ Q000596 explain
+G: ## Shards and partition keys
+Each Kinesis shard accepts up to **1 MB/s or 1,000 records per second** for writes. The partition key of each record is hashed (MD5) to a value that falls into exactly one shard's hash key range, so every record with the same key always goes to the same shard.
+## Hot shards
+If a few keys carry most of the traffic, the shards that own those keys hit their limit while the others sit idle. Writes to the busy shard fail with `ProvisionedThroughputExceededException`, even though the stream's total capacity (four shards) is enough on paper.
+Example: key = `customer_id`; one VIP customer sends 3,000 records per second. All of them hash to one shard, which accepts only 1,000.
+Fixes:
+- Add randomness or a suffix to hot keys, such as `customer_id#<0-9>`, to spread them across shards (order is then only kept per sub-key).
+- Split the hot shard, or use on-demand capacity mode together with better keys.
+W: Skewed partition keys creating a hot shard: the VIP customers' IDs map to a small number of shards, which exceed their per-shard write limit while the stream as a whole has spare capacity.
+X: B=Retention too low: retention decides how long records are kept for reading; it does not affect write throughput or cause write throttling.
+C=Enhanced fan-out consumer: enhanced fan-out adds dedicated read throughput per consumer; it does not consume the shard's write capacity, so it cannot cause write errors.
+D=Shard count over the account limit: a shard quota would stop creating or resharding the stream; it does not throttle writes to shards that already exist.
+T: Write throttling with enough total shards points to uneven partition keys; spread hot keys so traffic distributes across shards.
+
+@ Q000597 explain
+G: ## Amazon Q Developer
+Amazon Q Developer is AWS's generative AI assistant for software development. It runs as a plugin in IDEs such as VS Code and JetBrains, as well as in the AWS console and the command line.
+## What it does inside the IDE
+- **Chat**: ask questions about your code and about AWS services and SDKs, and get answers with code examples.
+- **Code transformation**: upgrade Java applications, for example from Java 8 to Java 17, including dependency and API updates, with a diff to review.
+- **Unit test generation**: generate tests for selected code, for example with the `/test` command.
+- Inline code suggestions and code reviews for security and quality issues.
+Example: the developer opens the service in VS Code, runs a transformation to Java 17, generates tests for the changed classes, then asks in chat how to configure retries in the SDK for Java 2.x.
+W: Amazon Q Developer in the IDE: it covers all three tasks, Java version upgrade, test generation and AWS SDK questions, directly inside VS Code.
+X: A=Bedrock console playground: the playground can answer prompts, but it is not integrated with the IDE or the project, cannot run an automated Java upgrade, and pasting code by hand is slow and error-prone.
+C=Cloud9 without an AI assistant: AWS Cloud9 is a separate browser IDE that is closed to new customers, and without an assistant it offers none of the upgrade, test generation or Q&A capabilities.
+D=CodeGuru Reviewer comments: it comments on code in pull requests; it does not transform Java versions, generate unit tests or answer SDK questions inside VS Code.
+T: For in-IDE upgrades, test generation and AWS questions, use Amazon Q Developer, not a general playground or a PR review tool.
+
+@ Q000598 explain
+G: ## S3 events in EventBridge
+When a bucket has **Amazon EventBridge** notifications turned on, S3 sends every object event (such as `Object Created`) to the default event bus. Filtering then happens in EventBridge **rules**, not in S3.
+## Event patterns
+A rule's event pattern matches JSON fields of the event. Content filters allow matching on prefixes, **suffixes**, numeric ranges and more.
+Example pattern:
+- `"source": ["aws.s3"]`
+- `"detail-type": ["Object Created"]`
+- `"detail": {"bucket": {"name": ["my-bucket"]}, "object": {"key": [{"suffix": ".csv"}]}}`
+Only events that match every field go to the rule's target, here the Lambda function. Other objects and other buckets never invoke it, so no filtering code or wasted invocations are needed.
+W: Event pattern on bucket and `.csv` suffix: EventBridge evaluates the pattern and invokes the Lambda function only for object-created events from that bucket whose key ends in `.csv`.
+X: A=S3 emits only .csv events: the suffix filter exists for S3's direct notification destinations (SNS, SQS, Lambda), but events sent to EventBridge are all forwarded unfiltered; the filtering for an EventBridge rule must be in the rule's pattern.
+B=Two functions processing every event: this adds cost and duplicate processing and still needs code to ignore non-CSV objects, the opposite of triggering only on the right events.
+D=CloudWatch alarm with a metric filter: metric filters work on log data and alarms react to metric thresholds; they do not match individual S3 object events or pass the object key to a function.
+T: With S3 to EventBridge, filter by bucket and key suffix in the rule's event pattern so the target runs only for matching objects.
+
+@ Q000599 explain
+G: ## Amazon EventBridge as an event router
+An **event bus** receives events from AWS services, SaaS partners and your own applications (`PutEvents`). **Rules** with event patterns match on any field of the event content and send matching events to one or more targets.
+## Features that matter here
+- **Content-based filtering**: patterns match values, prefixes, suffixes, numeric ranges, `anything-but` and more, anywhere in the JSON.
+- **Many targets**: Lambda, Step Functions, Kinesis, SQS, SNS, ECS tasks, other event buses and **API destinations** (any HTTP endpoint with managed authorization and rate limits).
+- **Schema registry and discovery**: when discovery is on, EventBridge infers schemas from events on the bus and stores them, and you can generate code bindings.
+Example: an `OrderPlaced` event from the orders service goes to a Step Functions workflow when `detail.total > 1000`, and to a partner webhook through an API destination for every order.
+W: EventBridge: it combines rich content-based routing, a large set of AWS and HTTP targets, and built-in schema discovery, which is exactly the list of needs.
+X: B=SQS for ordering: SQS is a point-to-point queue with one consumer per message; it has no content-based routing to many target types and no schema discovery, and ordering was not the requirement.
+C=SNS with filter policies: SNS can filter by attributes or payload, but its targets are limited (SQS, Lambda, HTTP/S, Firehose, email, SMS, mobile push) and it has no schema registry or discovery.
+D=Direct Connect: it is a dedicated network link between on-premises and AWS; it does not route application events at all.
+T: For content-based routing of many microservice events to many AWS targets with schema discovery, use EventBridge rather than SNS or SQS.
+
+@ Q000600 explain
+G: ## The circuit breaker pattern
+When a dependency is down, every call waits for a timeout and holds a thread or connection. With many callers, the pool fills up and the calling service slows or fails too: a **cascading failure**.
+A **circuit breaker** wraps calls to the dependency and has three states:
+- **Closed**: calls go through normally; failures are counted.
+- **Open**: after a failure threshold (for example 5 failures in 30 seconds), calls fail immediately without contacting the dependency, returning an error or a fallback such as "payment pending".
+- **Half-open**: after a cool-down, a few trial calls are allowed; success closes the circuit, failure opens it again.
+Example: the payment API fails repeatedly, the breaker opens, and the next requests are answered in milliseconds instead of waiting 10 seconds each, so the connection pool stays free for healthy work.
+W: Circuit breaker failing fast after a threshold: it stops sending calls to a dependency that is known to be failing, which releases connections and prevents the slowdown from spreading.
+X: A=Longer 30-second timeout: each failing call would hold its connection three times longer, exhausting the pool faster and worsening the cascade.
+B=More retry attempts: retries multiply the number of slow, failing calls against a dependency that is already down, increasing both load and wait time.
+C=Remove error handling: unhandled failures crash requests or leak errors to clients and still do not stop the service from calling the dead API and waiting on each timeout.
+T: When a dependency keeps failing, a circuit breaker fails fast and protects the caller; longer timeouts and more retries make the cascade worse.
+
+@ Q000601 explain
+G: ## How a VPC-attached Lambda function reaches the network
+A Lambda function attached to a VPC sends traffic through elastic network interfaces in the subnets you choose. These interfaces get **private IPs only**; Lambda never assigns them public IP addresses.
+- Traffic to resources in the VPC, such as an RDS instance, works through the VPC's local route.
+- Traffic to the internet needs a **NAT gateway**: the function's private subnets route `0.0.0.0/0` to a NAT gateway in a public subnet, and that public subnet routes `0.0.0.0/0` to an internet gateway.
+Example: private subnets `10.0.1.0/24` and `10.0.2.0/24` hold the function and RDS; their route table sends `0.0.0.0/0` to `nat-0abc...`. The NAT gateway translates the private source address to its Elastic IP, so the Stripe API can reply.
+W: Route private subnets to a NAT gateway: the function keeps reaching RDS through the local route, and outbound calls to the Stripe API leave through the NAT gateway with a public address.
+X: A=Public IP in a public subnet: Lambda's network interfaces cannot receive public IPs, so placing the function in a public subnet still gives it no internet access.
+B=Internet gateway route from private subnets: an internet gateway only works for interfaces with a public IP, and Lambda's interfaces have only private IPs, so traffic cannot be translated and replies never return.
+C=Remove the function from the VPC: it would reach the internet but lose private access to RDS in private subnets, breaking the database half of the requirement.
+T: A VPC-attached Lambda function reaches the internet only through a NAT gateway (or VPC endpoints for AWS services), never through a public IP or a direct internet gateway route.
+
+@ Q000602 explain
+G: ## What changes when Lambda joins a VPC
+Without VPC configuration, a Lambda function runs in an AWS-managed network with internet access, so calls to public AWS endpoints such as `dynamodb.us-east-1.amazonaws.com` just work.
+Once the function is attached to VPC subnets, **all** its traffic goes through those subnets. The interfaces have only private IPs, so reaching any public endpoint needs one of:
+- A route to a **NAT gateway** for general internet and AWS API access.
+- **VPC endpoints**: a gateway endpoint for DynamoDB or S3 (added to the subnet route table) or interface endpoints for most other services.
+If neither exists, connections to public endpoints hang until the SDK or the function times out. Access to resources inside the VPC, such as ElastiCache, still works through the local route.
+W: No route to a NAT gateway or VPC endpoint: the subnets give the function no path to public AWS endpoints, so DynamoDB calls hang and every invocation times out after the VPC change.
+X: A=Memory too low: memory size affects CPU and speed, not the ability to open network connections; the calls worked before with the same memory.
+B=ElastiCache security group: a wrong rule would block only ElastiCache traffic; it cannot explain why calls to DynamoDB, which do not involve that group, now time out.
+D=Missing DynamoDB permissions: the same role worked before the VPC change, and a permissions problem returns an immediate `AccessDeniedException`, not a timeout.
+T: When a function times out on AWS APIs right after joining a VPC, add a NAT gateway route or VPC endpoints; timeouts point to networking, not IAM.
+
+@ Q000603 explain
+G: ## Account concurrency and reserved concurrency
+Lambda concurrency is the number of executions running at the same moment. All functions in a Region share the account's concurrency quota (1,000 by default, raisable).
+**Reserved concurrency** set on a function does two things:
+- **Guarantees** that amount for the function, so other functions cannot use it up.
+- **Caps** the function at that amount: invocations beyond it are throttled (synchronous callers get `429 TooManyRequestsException`; async and queue sources retry).
+Example: reserved concurrency `20` on the webhook function means at most 20 copies ever run in parallel, so the database never sees more than 20 connections from it, and a traffic spike in another function cannot starve it.
+Reserved concurrency costs nothing extra. Setting it to `0` stops the function from being invoked at all.
+W: Reserved concurrency of 20: it enforces a hard maximum of 20 concurrent executions for this function and reserves that capacity regardless of other functions' traffic.
+X: A=Provisioned concurrency of 20: provisioned concurrency keeps 20 environments initialized to remove cold starts, but on its own it does not stop the function from scaling beyond 20 with on-demand environments.
+B=Alarm after 20 invocations: an alarm reacts after the fact and counts invocations, not simultaneous executions, so it cannot enforce a concurrency limit in real time.
+D=SQS visibility timeout of 20 seconds: visibility timeout controls how long a received message stays hidden; it does not limit Lambda concurrency, and the function is not described as using SQS.
+T: Reserved concurrency caps and guarantees a function's parallel executions; provisioned concurrency only pre-warms environments.
+
+@ Q000604 explain
+G: ## What a cold start is
+When Lambda has no idle execution environment for a request, it creates one: downloads the code, starts the runtime and runs the initialization code outside the handler. That extra time, often hundreds of milliseconds or more, is the **cold start**. Sudden spikes create many new environments at once, so many users see it.
+## Provisioned concurrency
+**Provisioned concurrency** keeps a chosen number of environments initialized and ready ahead of time, on a published version or alias.
+- Requests up to that number start with no initialization delay.
+- It can be scaled with Application Auto Scaling, including **scheduled scaling**, which fits a predictable morning peak: raise it before the spike and lower it afterward to control cost.
+Example: scheduled action at 08:45 sets provisioned concurrency on alias `live` to 200; at 11:00 it drops to 20.
+W: Provisioned concurrency: pre-initialized environments serve the morning spike without cold-start latency, and scheduled scaling matches it to the predictable timing.
+X: A=Longer timeout: the timeout only limits how long an invocation may run; it does not reduce initialization time.
+B=X-Ray active tracing: tracing shows how long initialization takes, which helps diagnose cold starts, but does not remove them.
+D=Reserved concurrency: reserving concurrency guarantees and caps capacity but does not keep any environments warm, so spikes still create cold environments.
+T: Only provisioned concurrency pre-initializes environments to remove cold starts; reserved concurrency and timeouts do not.
+
+@ Q000605 explain
+G: ## Lambda extensions
+A **Lambda extension** is a companion process that runs inside the function's execution environment next to the function code. It is usually delivered as a layer, so the function code does not change.
+- **External extensions** run as separate processes with their own lifecycle: they start before the function initializes, keep running while it handles invocations, and get a **shutdown** phase and time after invocations to flush buffered data.
+- Through the **Telemetry API**, an extension receives the function's logs, platform events and traces and can forward them to any destination.
+Example: a vendor's observability extension layer is added to the function; it batches logs and metrics in memory and sends them to the vendor's endpoint, finishing the send after the invocation has already returned.
+Many observability vendors publish ready-made extensions.
+W: Lambda extension: it runs alongside the function with its own lifecycle, receives telemetry through the Telemetry API, and can keep sending data during and after invocations without code changes.
+X: A=More memory: memory size changes CPU and performance but adds no capability to capture or forward telemetry.
+B=CloudWatch Logs subscription filter: it can stream logs after they reach CloudWatch Logs, but it does not run inside the execution environment, cannot capture platform telemetry directly, and adds CloudWatch ingestion in the path.
+D=Layer with only a logging SDK: a library runs only when the handler calls it, which means code changes, and it has no independent lifecycle to keep sending data after the invocation ends.
+T: To capture and ship Lambda telemetry without changing code, including after an invocation, use a Lambda extension rather than a library layer.
+
+@ Q000606 explain
+G: ## Fanning out S3 events
+Native **S3 event notifications** send an event to one destination per configuration (SNS, SQS or Lambda). For the same event type, configurations with **overlapping** prefix or suffix filters are not allowed, so one bucket cannot send `.jpg` object-created events to two different notification targets directly.
+## S3 with EventBridge
+When EventBridge is enabled on the bucket, S3 sends all object events to the default event bus. You then create one **rule per consumer**:
+- Rule 1: pattern on `detail.object.key` with `{"suffix": ".jpg"}`, target the thumbnail Lambda function.
+- Rule 2: pattern on the bucket only, target the audit pipeline (for example a Step Functions workflow or SQS queue).
+Each rule delivers independently with its own retry policy and dead-letter queue, so a failure in one target does not affect the other.
+W: S3 events to EventBridge with one rule per consumer: each consumer gets its own filtered stream, and failures are isolated because each rule delivers and retries separately.
+X: A=One notification to Lambda calling the audit pipeline: the audit path depends on the thumbnailer, so if the Lambda function fails, auditing fails too, and non-JPG objects would still need the Lambda function to run.
+C=Scheduled Lambda listing objects: listing every minute adds delay, cost and complexity, and can miss or double-process objects compared with event-driven delivery.
+D=Two overlapping S3 notifications: S3 rejects notification configurations with overlapping prefix and suffix filters for the same event type, so this setup cannot be saved.
+T: For multiple independent consumers of S3 events, route through EventBridge (or SNS fan-out) with a rule per consumer, not overlapping S3 notifications.
+
+@ Q000607 explain
+G: ## Three ways Lambda gets invoked
+- **Synchronous (push)**: the caller waits for the result, for example API Gateway, an Application Load Balancer, or an SDK `Invoke` call.
+- **Asynchronous (push)**: the service hands the event to Lambda's internal queue and moves on, for example S3, SNS and EventBridge.
+- **Poll-based (event source mapping)**: Lambda itself reads from the source, builds **batches** and invokes the function with them.
+## Event source mappings
+Poll-based sources include **SQS**, **Kinesis Data Streams**, DynamoDB Streams, Amazon MSK, self-managed Kafka, Amazon MQ and Amazon DocumentDB change streams.
+Settings such as `BatchSize`, batching window, starting position (for streams), filtering, and partial batch failure reporting live on the mapping, which you create with `CreateEventSourceMapping`.
+Example: a mapping on a queue with `BatchSize` 10 means Lambda long-polls SQS, invokes the function with up to 10 messages, and deletes them after a successful return.
+W: SQS and Kinesis Data Streams: both are read through an event source mapping, where Lambda polls the source and manages batching and checkpoints.
+X: A=SNS and S3: both push events to Lambda through asynchronous invocation; Lambda does not poll them.
+B=EventBridge and Step Functions: EventBridge rules invoke Lambda asynchronously, and Step Functions calls Lambda as a task (usually synchronously); neither uses an event source mapping.
+D=API Gateway and ALB: both invoke Lambda synchronously with one request per invocation and wait for the response; there is no polling or batching.
+T: Lambda polls queues and streams (SQS, Kinesis, DynamoDB Streams, Kafka) through event source mappings; SNS, S3, EventBridge, API Gateway and ALB push events.
+
+@ Q000608 explain
+G: ## Asynchronous invocation settings
+SNS invokes Lambda **asynchronously**: the event goes into Lambda's internal queue. If the function throws, Lambda retries it **twice by default**. Two settings control this:
+- **Maximum retry attempts**: 0, 1 or 2.
+- **Maximum event age**: 60 seconds to 6 hours.
+## Keeping failed events
+- **On-failure destination** (SQS, SNS, Lambda, EventBridge or S3): receives an invocation record with the original request, the response and error details, such as the error type and message, plus context like the attempt count.
+- **Dead-letter queue** (SQS or SNS): an older feature that receives the original event with only a few error attributes.
+Example: set maximum retry attempts to `1` and an on-failure destination to an SQS queue; a malformed message is tried twice in total, then its full record lands in the queue for inspection and replay.
+W: Max retries 1 plus an on-failure destination: it limits processing to one retry as required and stores each failed event together with detailed error information.
+X: A=Synchronous invocation: SNS always invokes Lambda asynchronously, and synchronous calls have no Lambda-managed retries or failure destinations, so failed events would not be kept.
+B=Swallow all errors: the function then reports success, so no retry or failure handling happens and malformed messages are silently lost.
+C=DLQ with default retries: the default is 2 retries, not 1, and a DLQ records less failure context than an on-failure destination.
+T: For async sources like SNS, set maximum retry attempts and an on-failure destination to control retries and keep failed events with their error details.
+
+@ Q000609 explain
+G: ## Lambda destinations for asynchronous invocations
+For asynchronous invocations, Lambda can send a record of each result to a **destination**:
+- **On-success** or **on-failure** conditions, configured separately.
+- Targets: SQS, SNS, Lambda, EventBridge event bus, or S3 (on-failure).
+The **invocation record** is JSON that includes the `requestContext` (request ID, function ARN, condition, retry attempts), the original `requestPayload`, and a `responsePayload` or error details such as the error type and message.
+## Why EventBridge as the target
+With an EventBridge bus as the on-failure destination, rules can match specific failures (for example by function ARN or error type) and send them to Step Functions remediation workflows, SNS alerts or other targets.
+By contrast, a **dead-letter queue** supports only SQS or SNS and receives the original event with just a few error attributes.
+W: On-failure destination to an EventBridge bus: it delivers the full invocation record, event, response and error details, straight to the bus where rules can start remediation.
+X: A=X-Ray tracing with sampling: traces show timing and errors for a sample of requests but do not capture the payload for every failure or route anything to EventBridge.
+C=SQS standard queue as DLQ: a DLQ receives only the original event with limited error attributes, and it cannot target an EventBridge bus directly.
+D=Logs subscription filter: it streams log lines, not a structured record with the original event and response, and it depends on what the code happens to log.
+T: For rich failure records routed to EventBridge, use a Lambda on-failure destination; DLQs keep only the event and support only SQS or SNS.
+
+@ Q000610 explain
+G: ## Local testing with AWS SAM CLI
+The **AWS Serverless Application Model (SAM) CLI** is a command-line tool for building, testing and deploying serverless applications.
+`sam local invoke` runs a function locally inside a Docker container that emulates the Lambda runtime and execution environment for the chosen runtime and architecture.
+- Pass a sample event with `-e event.json`; generate realistic payloads with `sam local generate-event`, for example `sam local generate-event s3 put`.
+- `sam local start-api` runs API Gateway routes locally, and `sam local start-lambda` exposes a local Lambda endpoint for automated tests.
+- Environment variables and the template's settings (memory, timeout, handler) are applied as in the cloud.
+Example: `sam local invoke OrderFunction -e events/sqs.json` runs the handler with a sample SQS batch and prints the response and logs in seconds.
+W: AWS SAM CLI with `sam local invoke`: it emulates the Lambda environment on the developer's machine and invokes the function with sample event payloads before any deployment.
+X: A=CloudTrail: it records API calls made in an AWS account for auditing; it cannot run code locally.
+B=AWS Config: it records and evaluates the configuration of deployed resources; it does not execute functions.
+C=CloudWatch Synthetics: canaries run scripted checks against deployed endpoints on a schedule; they do not emulate Lambda locally.
+T: Use the SAM CLI (`sam local invoke`, `sam local start-api`) to run Lambda functions locally with sample events before deploying.
+
+@ Q000611 explain
+G: ## Test events in the Lambda console
+The Lambda console's **Test** tab invokes the deployed function with a JSON event you choose and shows the result, logs and duration.
+- Event **templates** give ready-made payloads for common sources, such as an SQS message batch, S3 put or API Gateway proxy request.
+- Events can be saved as **private** (only the creator sees them) or **shareable**.
+- **Shareable test events** are stored as schemas in the EventBridge schema registry, so any user with the needed permissions on that registry can open the function and use the same event.
+Example: a developer builds an SQS batch with three sample records, saves it as a shareable event named `order-batch`, and teammates select `order-batch` from the Test tab and run it repeatedly without writing code.
+W: Shareable test events in the Lambda console: they let the team save one sample SQS batch, rerun it on the deployed function at any time, and share it with teammates with no code.
+X: A=AWS Config rules: they check resource configuration for compliance; they do not invoke a function with a payload.
+B=X-Ray traces: traces show how past invocations performed; you cannot use them to send a new test event to the function.
+D=Logs Insights queries: they search and analyze log data after invocations; they do not trigger the function or store test events.
+T: To rerun and share a sample event against a deployed function without code, save it as a shareable test event in the Lambda console.

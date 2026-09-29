@@ -1,0 +1,367 @@
+# DOP-C02 detailed explanations e08 (explanation-only rewrites; letters are the published ones)
+
+@ Q001397 explain
+G: ## Two sides of an access decision
+An AWS request is allowed only if nothing in the chain denies it. AWS Organizations offers guardrails for both sides of that chain:
+- **Service control policies (SCPs)** cap what **principals** (IAM users and roles) in member accounts can do, no matter what their IAM policies say.
+- **Resource control policies (RCPs)** cap what can be done **to resources** in member accounts, no matter what the resource-based policy says. They cover a set of services that includes S3, STS, KMS, SQS and Secrets Manager.
+## Why RCPs close the gap
+An SCP never evaluates a principal from outside the organization, so it cannot stop a bucket owner from writing a bucket policy that grants access to account `111122223333`. An RCP attached to an OU can deny any access where `aws:PrincipalOrgID` is not your organization, so even a careless bucket or key policy cannot open data to outsiders.
+- RCPs only restrict; they never grant access by themselves.
+- Like SCPs, they do not apply to the management account.
+W: Resource control policies: they are the Organizations policy type that sets the maximum permissions on resources, so they can limit which external principals any resource-based policy in the OU is able to grant.
+X: A=Tag policies: they standardize tag keys and values and can block non-compliant tagging operations, but they say nothing about who may access a resource.
+B=Declarative policies: they enforce a baseline for service configuration settings such as EC2 and VPC options (for example blocking public AMI sharing), not the principals named in resource-based policies.
+D=SCPs on principals: SCPs only restrict principals inside the organization's member accounts, so an external account named in a bucket or key policy is outside their reach.
+T: SCPs limit what your principals can do; RCPs limit what anyone, including external principals, can do to your resources.
+
+@ Q001398 explain
+G: ## Layers of a DDoS attack
+- **Layer 3/4 (network/transport)** attacks such as SYN floods or UDP reflection try to saturate bandwidth or connection tables. AWS Shield Standard mitigates common ones automatically for all customers, and **Shield Advanced** adds tailored detection, access to the Shield Response Team and cost protection.
+- **Layer 7 (application)** attacks send valid-looking HTTP requests. Only something that inspects requests, such as **AWS WAF**, can separate them from real users.
+## Rate-based rules
+A WAF rate-based rule counts requests per aggregation key over a time window and blocks keys that exceed the limit. The default key is the source IP, but you can aggregate on other keys such as a header, a URI path or a combination, or count all requests that match a scope-down statement. That lets you catch a distributed flood where each IP stays low but the traffic pattern as a whole is abusive. Shield Advanced can also create WAF rules automatically for application-layer DDoS mitigation on protected resources.
+W: WAF plus Shield Advanced: WAF rate-based and scoped rules handle the HTTP flood at layer 7, while Shield Advanced covers large volumetric layer 3/4 events on CloudFront with expert support and cost protection for scaling during attacks.
+X: A=Shield Advanced alone: Shield Advanced relies on AWS WAF web ACLs for layer 7 mitigation, so it does not remove the need for request-inspection rules.
+C=WAF alone for all layers: WAF only sees HTTP(S) requests; it has no visibility into SYN or UDP floods at layers 3/4.
+D=Security groups: CloudFront edge locations sit in front of the origin, and security groups only allow or deny by IP, port and protocol, so they neither inspect HTTP nor absorb volumetric floods.
+T: Inspect and throttle HTTP with WAF rules; absorb network floods and get cost protection with Shield Advanced.
+
+@ Q001399 explain
+G: ## How network ACLs are evaluated
+A network ACL is a stateless filter on a subnet boundary. Its rules are numbered and evaluated **in ascending order**; the first rule whose protocol, port range and CIDR match the packet decides the outcome, and later rules are ignored.
+Example inbound NACL:
+- `90 DENY all 203.0.113.0/24`
+- `100 ALLOW TCP 443 0.0.0.0/0`
+- `* DENY all 0.0.0.0/0`
+A packet from `203.0.113.25` to port 443 matches rule 90 first and is dropped, even though rule 100 would also match.
+## Security groups and NACLs together
+Traffic must pass **both** layers. The NACL is checked at the subnet edge, and the security group at the instance's network interface. A security group allow cannot rescue traffic the NACL has already dropped. Because NACLs are stateless, return traffic also needs an outbound rule, usually for ephemeral ports `1024-65535`.
+W: Rule 90 matches first: NACL rules are evaluated from lowest number up and stop at the first match, so the DENY for `203.0.113.0/24` blocks the traffic before the ALLOW 443 rule is considered.
+X: A=Security groups override NACLs: neither layer overrides the other; traffic must be allowed by both, and the NACL decision happens first at the subnet boundary.
+C=Outbound only: NACLs have separate inbound and outbound rule sets and filter both directions.
+D=Most specific rule wins: NACLs do not use longest-prefix or specificity logic; the rule number alone sets the evaluation order.
+T: NACL rules are first-match by rule number, and both the NACL and the security group must allow a flow.
+
+@ Q001400 explain
+G: ## Centralized egress inspection
+In a hub-and-spoke design, spoke VPCs send all internet-bound traffic through **AWS Transit Gateway** to an inspection VPC. There, **AWS Network Firewall** endpoints inspect the traffic before it leaves through NAT gateways.
+## Domain-based filtering
+Network Firewall stateful rule groups can use a **domain list**: an allow list or deny list of names such as `.example.com` or `api.partner.com`.
+- For HTTPS, the firewall reads the SNI field of the TLS Client Hello; for HTTP, it reads the `Host` header.
+- With an allow list, HTTP and TLS traffic to any domain not on the list is dropped, so only approved FQDNs are reachable over the web.
+Because the firewall policy lives in one account and VPC, the security team edits one rule group and every spoke is covered. AWS Firewall Manager can manage those policies across the organization. Route 53 Resolver DNS Firewall is a complementary control that blocks name resolution, but it does not see traffic sent directly to an IP.
+W: Network Firewall with domain lists: stateful domain-list rules in the inspection VPC filter egress by FQDN for all spokes whose traffic Transit Gateway routes through it, with one centrally managed policy.
+X: A=Security groups with domain rules: security groups only accept CIDRs, prefix lists and security group references; they cannot match on domain names.
+B=Flow Logs plus Lambda: Flow Logs record IPs and ports after the fact, contain no domain names and cannot block a connection in real time.
+D=WAF on spoke ALBs: WAF inspects inbound HTTP requests to an ALB; it does not see outbound connections from instances to the internet.
+T: Egress FQDN filtering for many VPCs is Network Firewall domain-list rules in a central inspection VPC reached through Transit Gateway.
+
+@ Q001401 explain
+G: ## Control Tower control behaviors
+AWS Control Tower groups its controls (formerly called guardrails) by how they act:
+- **Preventive** controls stop an action before it happens. They are implemented as SCPs (and, for some controls, RCPs or declarative policies), so a denied API call such as `cloudtrail:StopLogging` simply fails.
+- **Detective** controls find resources that are already non-compliant. They are implemented as AWS Config rules, which evaluate recorded configuration and report compliance.
+- **Proactive** controls check resources before provisioning, using CloudFormation hooks.
+## Using both together
+Here, the SCP makes it impossible for member accounts to disable CloudTrail, and the Config rule flags any account where CloudTrail is still found disabled, for example an account enrolled before the control was applied. Preventive stops new problems; detective proves the state and catches what prevention missed.
+W: SCP preventive, Config detective: an SCP denies the API call up front, while a Config rule evaluates resources after the fact and reports non-compliance.
+X: A=Both preventive: a Config rule cannot block an API call; it only evaluates configuration after changes are recorded.
+C=Roles reversed: an SCP acts at request time and blocks the call, which is prevention, while a Config rule only reports, which is detection.
+D=Only detective supported: Control Tower offers preventive, detective and proactive controls.
+T: SCP-based controls prevent, Config-rule controls detect, and CloudFormation hooks check proactively.
+
+@ Q001402 explain
+G: ## Finding sensitive data in S3
+**Amazon Macie** inspects object contents in S3 using managed data identifiers (such as credit card numbers, bank account numbers and national IDs) and custom data identifiers you define with regular expressions.
+- **Sensitive data discovery jobs** can run once or on a daily, weekly or monthly schedule and can be scoped to buckets and prefixes.
+- Each match produces a sensitive data finding, for example `SensitiveData:S3Object/Financial`, with the bucket and object key.
+## Turning findings into action
+Macie publishes findings to Amazon EventBridge. An EventBridge rule matching Macie findings of the financial type can invoke a Lambda function that copies the object to a restricted quarantine bucket and deletes the original, or applies a tag that a bucket policy uses to deny access. The whole loop runs without people, and the finding stays in Macie as a record.
+W: Macie jobs with EventBridge and Lambda: Macie detects card numbers in object contents, and its EventBridge finding events trigger a Lambda function that quarantines the object automatically.
+X: A=Config encryption rule: Config checks bucket settings such as default encryption; it never reads object contents, so it cannot spot card numbers.
+C=Inspector: Inspector scans EC2 instances, container images and Lambda functions for vulnerabilities; it does not classify data stored in S3.
+D=GuardDuty S3 Protection: it analyzes S3 data events for suspicious access patterns, such as unusual API calls; it does not inspect what the files contain.
+T: Macie looks inside S3 objects for sensitive data; GuardDuty and Config watch access and configuration, not content.
+
+@ Q001403 explain
+G: ## KMS versus CloudHSM
+- **AWS KMS** is a managed service. Keys never leave its validated HSMs, but you use them only through KMS APIs such as `Encrypt`, `Decrypt` and `GenerateDataKey`. You never log in to the HSM or call it with standard crypto libraries.
+- **AWS CloudHSM** gives you a cluster of single-tenant HSMs in your VPC. You manage crypto users and keys yourself and call the HSM directly through the PKCS#11 library, the JCE provider or the Microsoft CNG/KSP provider. CloudHSM HSMs are FIPS-validated at Level 3 (the current hsm2m.medium type under FIPS 140-3; the older hsm1.medium type under FIPS 140-2).
+KMS HSMs are also FIPS 140-3 Level 3 validated, so the validation level alone does not decide between the two; the need for direct HSM access does.
+## Getting both
+A **KMS custom key store** backed by a CloudHSM cluster lets you create KMS keys whose key material lives in your own HSMs. Services that integrate with KMS, such as S3, EBS or RDS, can then use those keys through normal KMS calls, while the same cluster still serves direct PKCS#11 or JCE workloads. The cluster needs at least two active HSMs in different Availability Zones for this.
+W: CloudHSM with an optional custom key store: CloudHSM provides dedicated validated HSMs with direct PKCS#11, JCE and CNG access, and a custom key store lets KMS-integrated services use keys held in that cluster.
+X: B=SSE-C: with SSE-C the customer sends a key with each S3 request, but where that key is stored is left entirely to the customer, so it provides no HSM at all.
+C=Secrets Manager is identical: Secrets Manager stores secrets encrypted with KMS; it offers no direct HSM access and is not a replacement for CloudHSM.
+D=Standard KMS keys: KMS HSMs are validated too, but KMS keys are used only through KMS APIs, so the requirement for direct PKCS#11, JCE or CNG calls against the HSM is not met.
+T: Direct HSM control means CloudHSM; a custom key store connects that CloudHSM cluster to KMS-integrated services.
+
+@ Q001404 explain
+G: ## Shell access without inbound ports
+**AWS Systems Manager Session Manager** opens an interactive shell (or port forwarding) to an instance through the SSM Agent.
+- The agent makes an **outbound** HTTPS connection to the Systems Manager endpoints, so the security group needs no inbound rules at all.
+- Access is controlled with IAM, for example allowing `ssm:StartSession` only on instances tagged `Env=Dev`.
+- Sessions can be logged to CloudWatch Logs or S3, and every session start is recorded in CloudTrail.
+- Instances in private subnets without internet access can use VPC interface endpoints for `ssm`, `ssmmessages` and `ec2messages`.
+## Requirements
+The instance needs the SSM Agent (preinstalled on many AWS AMIs) and permissions such as the `AmazonSSMManagedInstanceCore` managed policy through its instance profile, or Default Host Management Configuration. After that, the port 22 rules can be deleted from every security group.
+W: Session Manager: it provides auditable shell access over an outbound agent connection, so all inbound SSH rules can be removed while engineers keep troubleshooting access.
+X: A=Bastion host with the same rules: the bastion itself still exposes SSH, and copying the 0.0.0.0/0 rule keeps the same exposure while adding a host to patch.
+B=Site-to-Site VPN for SSH: port 22 must still be open on the instances (from the VPN range), and the company takes on tunnels and key management just for admin access.
+D=Office IP range only: narrowing the source reduces exposure, but inbound SSH remains open and SSH keys still need to be managed.
+T: Session Manager replaces inbound SSH with IAM-controlled, logged sessions over an outbound connection.
+
+@ Q001405 explain
+G: ## What Shield Advanced cost protection covers
+A DDoS attack can make an application scale out: more EC2 instances, more load balancer capacity, more CloudFront data transfer. Those charges are real even though the traffic was malicious.
+**Shield Advanced cost protection** lets you request service credits for usage spikes caused by a DDoS attack on resources that Shield Advanced protects, such as CloudFront distributions, Route 53 hosted zones, Application Load Balancers, Classic Load Balancers, Elastic IP addresses (including those attached to Network Load Balancers) and Global Accelerator accelerators.
+## What is required
+- An active Shield Advanced subscription.
+- The affected resource must have been **added as a protected resource** before the attack; unprotected resources are not eligible.
+- You request the credit through AWS Support after the attack, and AWS reviews the event against its detection data.
+In this case, the ALB (or the CloudFront distribution in front of it) must be a Shield Advanced protected resource.
+W: Cost protection credits: Shield Advanced can credit scaling charges caused by a DDoS attack, provided the ALB was a protected resource and a credit request is filed with AWS Support.
+X: A=Reserved Instance discounts: Shield Advanced has nothing to do with Reserved Instance pricing; its benefit is credits for attack-related usage.
+C=Refunds for downtime on any resource: credits cover scaling charges, not downtime, and only for resources explicitly protected by Shield Advanced.
+D=Free usage of all services: there is no blanket free usage during attacks; only attack-driven charges on protected resources are eligible for credits.
+T: Shield Advanced cost protection credits DDoS-driven scaling charges, but only for resources you added as protected before the attack.
+
+@ Q001406 explain
+G: ## Agentless malware scanning
+**GuardDuty Malware Protection for EC2** scans the EBS volumes of an instance without installing any agent.
+- **GuardDuty-initiated scans**: when GuardDuty produces a finding that suggests malware on an instance (for example communication with a known command-and-control server), it automatically takes snapshots of the attached EBS volumes and scans copies of them in a GuardDuty service account.
+- **On-demand scans** can also be started for a chosen instance.
+- Detected malware produces findings such as `Execution:EC2/MaliciousFile`, which can be routed through EventBridge for response.
+Because scanning happens on snapshot copies, the running workload is not slowed down, and nothing has to be installed or updated on the host. You can choose whether to keep the snapshots when malware is found, to support forensics.
+W: Malware Protection for EC2: it is the GuardDuty feature that automatically scans an instance's EBS volumes from snapshots when a suspicious finding appears, with no agents on the host.
+X: A=Lambda Protection: it monitors network activity from Lambda function invocations; it does not scan EBS volumes.
+B=S3 Protection: it analyzes CloudTrail S3 data events for suspicious access to buckets; it does not look at EC2 disks.
+C=RDS Protection: it profiles login activity to Aurora and RDS databases to detect anomalous access; it has no malware scanning of EBS.
+T: GuardDuty-initiated, agentless EBS snapshot scanning is Malware Protection for EC2.
+
+@ Q001407 explain
+G: ## From finding to full story
+GuardDuty tells you that something looks wrong. **Amazon Detective** helps you work out what actually happened.
+- Detective automatically ingests CloudTrail management events, VPC Flow Logs, GuardDuty findings and, optionally, EKS audit logs and other security findings.
+- It builds a **behavior graph** that links entities: IAM roles and users, role sessions, EC2 instances, IP addresses and AWS accounts.
+- It keeps up to a year of aggregated history, so you can compare an entity's behavior now with its normal baseline.
+## Example investigation
+From a GuardDuty finding on instance `i-0abc`, you pivot in Detective to the instance profile role, see which sessions assumed it, which API calls those sessions made, and which external IPs the instance talked to, all on a timeline, without writing Athena queries across raw logs.
+W: Amazon Detective: it correlates CloudTrail, Flow Logs and GuardDuty data into a behavior graph with visual timelines, which is exactly the scoping work the team wants to avoid doing by hand.
+X: A=Trusted Advisor: it checks accounts against best practices for cost, security and limits; it has no incident investigation or log correlation.
+B=AWS Config: it records resource configuration changes over time, but not network traffic, and it does not correlate API calls with role sessions for an investigation.
+D=Amazon Macie: it discovers sensitive data in S3 objects; it does not analyze EC2 network activity or role assumptions.
+T: GuardDuty detects; Detective investigates by correlating logs into a behavior graph.
+
+@ Q001408 explain
+G: ## Web ACL scope
+Every AWS WAF web ACL has a **scope** that is fixed when you create it:
+- `CLOUDFRONT` scope protects CloudFront distributions. It is a global resource and is managed through the `us-east-1` endpoint.
+- `REGIONAL` scope protects Regional resources such as Application Load Balancers, API Gateway REST APIs, AppSync GraphQL APIs, Cognito user pools, App Runner services and Verified Access instances. The web ACL must be created in the **same Region** as the resource.
+## Why the Region does not help here
+Creating a web ACL in `us-east-1` does not make it Regional. A CloudFront-scoped web ACL can only be associated with CloudFront distributions, so an ALB in `us-east-1` still needs a separate `REGIONAL` web ACL in `us-east-1`. Scope cannot be changed on an existing web ACL, so the fix is to create a new one (rule groups can be reused if they are also Regional) and associate it with the ALB.
+W: Recreate with REGIONAL scope: ALBs only accept Regional web ACLs from their own Region, and scope cannot be changed after creation.
+X: A=Move the ALB: no Region lets an ALB use a CloudFront-scoped web ACL; that scope applies only to CloudFront distributions.
+C=Scope doesn't matter: scope decides which resource types a web ACL can protect, which is the whole problem here.
+D=Firewall Manager bridging: Firewall Manager deploys and manages WAF policies across accounts, but it creates web ACLs of the correct scope; it does not convert one scope into the other.
+T: CloudFront needs a CLOUDFRONT-scope web ACL; an ALB needs a REGIONAL web ACL in its own Region.
+
+@ Q001409 explain
+G: ## What KMS rotation does
+Rotating a KMS key creates new cryptographic key material while keeping the same key ID and ARN. New encryption uses the new material; older ciphertext is still decrypted with the old material, which KMS retains.
+## Which keys support automatic rotation
+- **Symmetric encryption keys with KMS-generated material**: yes. You enable it and choose a period (default 365 days).
+- **Imported key material**: automatic rotation is not available. You rotate it yourself: import new key material into the key and rotate on demand, or create a new key and move the alias to it.
+- **Asymmetric and HMAC keys**, and keys in custom key stores: no automatic rotation.
+- **Multi-Region keys**: rotation is configured on the **primary** key, and KMS propagates the new material to all related replica keys so they stay interoperable. You cannot set rotation on a replica independently.
+W: Imported material and multi-Region behavior: automatic rotation does not apply to keys with imported material, and multi-Region replicas receive rotated material from their primary key rather than rotating on their own.
+X: B=Asymmetric keys rotate too: automatic rotation is only for symmetric encryption keys; asymmetric keys must be rotated by creating a new key.
+C=Multi-Region never rotates: multi-Region symmetric keys support rotation, driven by the primary and shared with the replicas.
+D=Identical for all keys: key type and key origin change what is supported; imported material cannot use automatic rotation.
+T: Automatic rotation is for KMS-generated symmetric keys; imported material is excluded and multi-Region keys rotate through their primary.
+
+@ Q001410 explain
+G: ## Two separate proofs
+The auditor asks for two things, and each needs its own control.
+## Integrity: were the logs changed?
+With **CloudTrail log file validation** enabled, CloudTrail delivers a digest file every hour. Each digest holds SHA-256 hashes of the log files delivered in that hour and is signed with a private key; digests are also chained to the previous one. Running `aws cloudtrail validate-logs` recomputes the hashes and checks the signatures, proving whether any log file was modified or deleted after delivery.
+## Immutability: can anyone delete them?
+**S3 Object Lock** in **compliance mode** with a 7-year retention period stores each object version as write-once-read-many (WORM). During retention no user, including the root user, can delete or overwrite the protected version, and the retention cannot be shortened. Governance mode is weaker because users with special permission can bypass it.
+W: Log file validation plus Object Lock: validation proves the delivered files are unchanged, and Object Lock in compliance mode guarantees they cannot be deleted for the 7-year retention period.
+X: A=CloudTrail Lake plus deny policy: a bucket policy can be edited or removed by an administrator, so it is not proof that nobody can delete the logs.
+B=Insights plus Versioning: Insights detects unusual API activity, not tampering, and versioning allows versions to be permanently deleted by anyone with permission.
+C=Config history plus MFA Delete: Config history tracks resource configuration rather than log integrity, and MFA Delete only requires an MFA code to permanently delete versions; it does not enforce a 7-year retention.
+T: Validation digests prove integrity; Object Lock compliance mode proves the logs cannot be deleted.
+
+@ Q001411 explain
+G: ## Detect and fix automatically
+**AWS Config** records resource configurations and evaluates them with rules. A managed rule such as `s3-bucket-server-side-encryption-enabled` marks buckets NON_COMPLIANT when they do not meet the encryption requirement.
+**Auto remediation** attaches a Systems Manager Automation runbook to the rule, for example `AWS-EnableS3BucketEncryption`, with the bucket name passed as a parameter. When a bucket becomes non-compliant, Config runs the runbook with an IAM role you provide, then re-evaluates the bucket.
+## The audit trail
+- Config keeps the configuration timeline of the bucket, showing before and after.
+- Systems Manager keeps the Automation execution history.
+- CloudTrail records the `PutBucketEncryption` call made by the remediation role.
+Note that since January 2023 S3 applies SSE-S3 as the base level of encryption to every bucket and new object, and it cannot be turned off, so in practice this pattern is used to enforce a stricter standard such as SSE-KMS with a specific key.
+W: Config rule with SSM auto-remediation: Config detects the non-compliant bucket within minutes and runs an Automation runbook to enable encryption, while Config, SSM and CloudTrail record what changed and when.
+X: A=CloudWatch alarm emailing the team: it only notifies; a person still has to fix each bucket.
+B=Deny s3:PutObject: it may block some uploads but leaves the bucket setting unchanged, so the bucket stays non-compliant and nothing is remediated.
+C=Weekly manual script: it needs a person and can leave a bucket non-compliant for up to a week, which misses the "within minutes, without human intervention" requirement.
+T: Config rules detect and SSM Automation remediates, with a recorded history of every change.
+
+@ Q001412 explain
+G: ## Who can produce a REJECT in Flow Logs
+A VPC Flow Log record with `REJECT` means the traffic was blocked by a **security group or a network ACL**. The record does not say which one.
+## Why the NACL is the next suspect
+- **Security groups** are stateful: if inbound 3306 is allowed on the database, the reply is allowed automatically.
+- **Network ACLs** are stateless and apply per subnet. Traffic from the app subnet to the DB subnet must pass the app subnet's outbound NACL and the DB subnet's inbound NACL for port 3306, and the reply must pass the DB subnet's outbound NACL and the app subnet's inbound NACL for the **ephemeral port** range (for example `1024-65535`).
+A common mistake is a custom NACL that allows 3306 in but has no outbound rule for ephemeral ports, which produces REJECT entries even though both security groups are correct.
+W: Check the subnet NACLs: once the security groups are confirmed to allow the flow, the only other layer that can reject it is a network ACL, often a missing ephemeral-port rule for return traffic.
+X: A=CloudTrail of SG creation: CloudTrail shows who changed a security group, but it cannot explain packets being rejected by a rule currently in effect.
+C=pkt-srcaddr field: this field shows the original source IP behind an intermediate layer; adding it changes what is logged, not whether traffic is accepted.
+D=Suppressed GuardDuty finding: GuardDuty only reports threats; suppression rules hide findings and never block network traffic.
+T: Flow Log REJECTs come from security groups or NACLs; if security groups are fine, check the stateless NACL rules in both directions.
+
+@ Q001413 explain
+G: ## What drift detection compares
+CloudFormation drift detection compares the **actual** configuration of each supported resource with its **expected** configuration from the template. Its known limits:
+- Only resource types that support drift detection are checked.
+- Only **properties defined in the template** are compared; properties left to default are not checked.
+- Some list and complex properties are compared imperfectly, and some changes may not be reported.
+## Example with a security group
+If the template defines `AWS::EC2::SecurityGroup` without a `SecurityGroupIngress` property, and rules are managed elsewhere (for example as separate `AWS::EC2::SecurityGroupIngress` resources), a rule added in the console is not a change to any property CloudFormation is tracking. Drift detection reports the security group `IN_SYNC`, even though the live rules differ. AWS Config rules on security groups are a good second check.
+W: Known gaps for some properties: drift detection only checks properties it tracks for supported resources, so an ingress rule added outside a tracked property can go unreported.
+X: A=UPDATE_ROLLBACK_COMPLETE required: drift detection runs on stacks in several stable states, such as CREATE_COMPLETE and UPDATE_COMPLETE; it does not need a rollback state.
+B=Security groups unsupported: `AWS::EC2::SecurityGroup` supports drift detection; the gap is in which properties are compared.
+C=Runs every 24 hours: drift detection runs only when someone or something starts it; there is no built-in 24-hour schedule, and the stem says it did run.
+T: Drift detection checks only tracked properties of supported resources, so IN_SYNC is not proof that nothing changed.
+
+@ Q001414 explain
+G: ## From log events to an alarm
+When CloudTrail delivers events to a CloudWatch Logs log group, a **metric filter** can turn matching events into a CloudWatch metric.
+- Filter pattern: `{ $.errorCode = "AccessDenied" }` counts every access-denied event.
+- **Dimensions**: a metric filter can publish up to three dimensions taken from event fields, for example `Principal = $.userIdentity.arn`. Each principal then gets its own metric time series.
+- An **alarm** with a 5-minute period, statistic Sum and threshold greater than 10 fires when a principal crosses the limit, and it can notify an SNS topic that pages the on-call engineer.
+- A standard alarm watches one time series, meaning one principal. To cover whichever principal is highest, alarm on a CloudWatch Metrics Insights query over the per-principal metric instead of creating one alarm per principal.
+## Things to watch
+High-cardinality dimensions create many time series; CloudWatch can disable a metric filter that generates too many distinct dimension values in a short time, so choose dimensions carefully. A CloudWatch Contributor Insights rule on the log group is another way to rank principals by error count, and you can alarm on its top contributor value.
+W: Metric filter with a principal dimension: it counts AccessDenied events per IAM principal in near real time, and a CloudWatch alarm on that metric can page within the 5-minute window.
+X: A=Config rules scanning CloudTrail: Config evaluates resource configurations; it does not read or count CloudTrail log events.
+C=GuardDuty built-in threshold: GuardDuty findings come from its own detection models; you cannot set a custom "more than 10 AccessDenied in 5 minutes" threshold.
+D=Daily Athena query: it runs once a day over logs in S3, far outside the 5-minute alerting requirement.
+T: Custom counting and thresholds on CloudTrail logs means metric filters plus CloudWatch alarms.
+
+@ Q001415 explain
+G: ## Behavior versus configuration
+Two different kinds of problems need two different tools.
+- **Amazon GuardDuty** analyzes activity: CloudTrail events, VPC Flow Logs, DNS logs and more. It uses threat intelligence and anomaly detection to report things such as credentials used from an unusual location or reconnaissance-style API calls. Example findings are in the `UnauthorizedAccess:IAMUser/` and `Discovery:IAMUser/` families.
+- **AWS Config** records resource configuration and evaluates it with rules. A rule such as `s3-bucket-level-public-access-prohibited` marks a bucket NON_COMPLIANT as soon as its Block Public Access settings are turned off, and can trigger remediation.
+## Applying it to the scenario
+Stolen credentials making odd calls is a **behavior** problem: nothing about the resources changed yet. A disabled public access block is a **configuration** problem: the resource no longer matches the baseline.
+W: GuardDuty for behavior, Config for drift: GuardDuty detects anomalous use of credentials, and a Config rule detects the bucket setting that departed from the required baseline.
+X: A=Macie and GuardDuty: Macie discovers sensitive data in S3 and does not analyze IAM API behavior; GuardDuty is not a configuration compliance tool.
+B=GuardDuty for both: GuardDuty reports threats from activity; it does not evaluate resources against a configuration baseline.
+C=Config for both: Config evaluates resource configurations; it does not analyze API call patterns or geolocation for anomalies.
+T: GuardDuty finds suspicious activity; Config finds configuration that drifted from the baseline.
+
+@ Q001416 explain
+G: ## CloudTrail Insights
+CloudTrail Insights learns a baseline of normal management API activity for an account and writes an **Insights event** when activity departs from it. Two insight types exist:
+- **API call rate**: unusual volume of write management API calls, such as a sudden jump in `RunInstances`.
+- **API error rate**: unusual numbers of failed management API calls, such as many `AccessDenied` errors.
+Each Insights event includes the start and end of the unusual activity, the baseline compared with the observed value, and the top principals and user agents involved.
+## Using it
+You enable Insights on a trail or CloudTrail Lake event data store; it adds cost per events analyzed. Insights events are delivered with the trail logs and can be matched by EventBridge rules to alert or start a response, for example suspending a role that suddenly launches 20 times its usual number of instances.
+W: CloudTrail Insights: it automatically detects unusual API call volume against the account's baseline, without writing metric filters or thresholds.
+X: A=Log file integrity validation: it proves log files were not modified; it does not analyze what the events contain.
+C=S3 data events: they record object-level S3 operations and have nothing to do with EC2 `RunInstances` volumes.
+D=Config resource timeline: it shows configuration changes of individual resources, not API call rates compared with a baseline.
+T: For anomalies in management API call or error rates, turn on CloudTrail Insights instead of hand-tuned thresholds.
+
+@ Q001417 explain
+G: ## Management events versus data events
+CloudTrail separates API activity into two main categories:
+- **Management events** are control-plane operations on resources, such as `CreateBucket`, `PutBucketPolicy` or `PutBucketEncryption`. Trails log them by default.
+- **Data events** are operations on the data inside a resource, such as S3 `GetObject`, `PutObject` and `DeleteObject`. They are high volume, so they are **not logged** unless you enable them on a trail or a CloudTrail Lake event data store, and they are billed per event.
+## What this means here
+The investigation sees bucket-level calls because those are management events, but the downloads were `GetObject` data events that nobody enabled. Going forward, enable S3 data events, scoped with advanced event selectors to the sensitive buckets and to read events if cost matters. S3 server access logs are another, less detailed record of object requests.
+W: Data events not enabled: object-level S3 calls are data events, which a trail records only after they are explicitly turned on.
+X: A=Never logs S3 activity: CloudTrail logs bucket-level operations as management events and object operations as data events when configured.
+B=Only in VPC Flow Logs: Flow Logs record IPs, ports and bytes, never API names, object keys or IAM principals.
+C=Needs versioning: versioning keeps older object versions; it has no effect on whether CloudTrail records `GetObject`.
+T: S3 object reads are CloudTrail data events, which must be enabled on the trail before they can be investigated.
+
+@ Q001418 explain
+G: ## Streaming logs across accounts
+A **subscription filter** on a CloudWatch Logs log group sends matching log events, as they arrive, to a destination such as Kinesis Data Streams, Amazon Data Firehose or Lambda.
+## Cross-account setup
+- In the security account, create a Kinesis data stream and a **CloudWatch Logs destination** (a resource that points to the stream through an IAM role).
+- Attach a **destination policy** that allows the 30 member accounts, or the whole organization, to subscribe.
+- In each member account, create subscription filters on the application log groups that target the destination ARN. An account-level subscription filter policy can cover many log groups at once.
+- The SIEM consumes from the stream, or Firehose delivers onward to the SIEM or to S3.
+Log events reach the central stream within seconds, instead of waiting for a scheduled export.
+W: Cross-account subscription filters to Kinesis: subscription filters push log events continuously to a destination backed by a central Kinesis stream, giving near-real-time delivery to the SIEM.
+X: A=Daily CreateExportTask: export tasks are batch jobs to S3 that can take a long time to complete, so data arrives hours late instead of in near real time.
+B=VPC Flow Logs instead: Flow Logs contain network metadata only, so they do not replace the application logs the SIEM needs.
+D=Weekly manual CLI copy: it is manual, slow and error-prone, and data would be up to a week old.
+T: For near-real-time central log collection, use cross-account subscription filters to a Kinesis-backed destination, not batch exports.
+
+@ Q002034 explain
+G: ## CodeDeploy traffic shifting for Lambda
+CodeDeploy deploys Lambda functions by moving a function **alias** from the old version to the new one. The deployment configuration sets how traffic moves:
+- **Canary**, for example `LambdaCanary10Percent5Minutes`: 10% of traffic goes to the new version for 5 minutes, then the remaining 90% shifts at once.
+- **Linear**, for example `LambdaLinear10PercentEvery1Minute`: 10% more traffic every minute until 100%.
+- **All at once**: `LambdaAllAtOnce` shifts everything immediately.
+## Automatic rollback
+In the deployment group you add CloudWatch alarms, such as the function's error-rate alarm, and enable rollback when an alarm threshold is met. If the alarm goes into ALARM during the deployment, CodeDeploy stops and points the alias back to the previous version. `BeforeAllowTraffic` and `AfterAllowTraffic` hooks can add test functions on top of this.
+W: LambdaCanary10Percent5Minutes with alarm rollback: it sends exactly 10% for 5 minutes, then the rest, and the alarm on the deployment group triggers automatic rollback.
+X: A=Linear without alarms: linear shifting keeps adding 10% every minute instead of pausing 5 minutes, and with no alarms nothing can trigger rollback.
+B=AllAtOnce with a post-deployment test: all traffic moves immediately, so there is no 10% phase, and a test after the fact does not replace alarm-based rollback during the shift.
+D=Manual alias weight: weighted aliases can split traffic, but manual updates give neither timed shifting nor automatic rollback on the alarm.
+T: Timed 10% then 100% with alarm rollback is a CodeDeploy canary configuration plus alarms on the deployment group.
+
+@ Q002035 explain
+G: ## Cross-account CodePipeline deployments
+When a pipeline in a tools account deploys to a production account, two things must cross the account boundary: **permissions** and **encrypted artifacts**.
+## Permissions
+Create an IAM role in the production account whose trust policy allows the tools account (the pipeline's service role). The pipeline's CloudFormation deploy action specifies this role through its `RoleArn`, and the stack itself usually runs with a separate CloudFormation deployment role in production.
+## Artifacts
+The artifact bucket is in the tools account and encrypted with a KMS customer managed key. The production role must be able to:
+- read the objects, granted in the **bucket policy**, and
+- `kms:Decrypt` (and related calls) with the key, granted in the **key policy**.
+The AWS managed key `aws/s3` cannot be used here, because its key policy cannot be edited to grant another account access.
+W: A=Cross-account role: the deploy action assumes a production role that trusts the tools account, so CloudFormation calls run with production permissions.
+C=Key and bucket policies: the production role must be allowed to read the artifact objects and decrypt them with the customer managed key, otherwise the deploy action cannot read its input artifacts.
+X: B=Duplicate the pipeline: this abandons the central tools account model and duplicates pipelines instead of configuring cross-account access.
+D=VPC peering: CodePipeline, S3, KMS and CloudFormation are reached through AWS APIs with IAM credentials; network peering between VPCs plays no part.
+E=aws/s3 managed key: its key policy is controlled by AWS and cannot grant another account decrypt access, which is why a customer managed key is required.
+T: Cross-account pipelines need an assumable role in the target account and a customer managed KMS key plus bucket policy that let that role read artifacts.
+
+@ Q002036 explain
+G: ## What a package repository proxy does
+**AWS CodeArtifact** is a managed repository for package formats such as npm, Maven, PyPI and NuGet.
+- A repository with an **external connection** to `public:npmjs` fetches a package from the public registry the first time someone asks for it and **keeps a copy**. Later requests are served from CodeArtifact, so builds keep working if npmjs is briefly unavailable.
+- Developers and CodeBuild point npm at the CodeArtifact endpoint, using `aws codeartifact login --tool npm` to get a temporary token.
+- **Package origin controls** decide, per package, whether new versions may come from upstream and external connections or be published directly, which blocks dependency-confusion attacks.
+- To stop a specific version from being used, security can change its **package version status** (for example to Archived) or delete it, so the repository no longer serves it. Access is governed with IAM and repository policies.
+A common layout is a team repository whose upstream is a shared repository that holds the external connection, so every team shares one cache.
+W: CodeArtifact with an npmjs external connection: it caches public packages centrally, lets security control which packages and versions are used, and serves cached versions when the public registry is down.
+X: A=ECR with OCI artifacts: ECR stores container images and OCI artifacts, but npm cannot install from it and it has no pass-through cache for the npm registry.
+C=Manual S3 uploads: npm cannot use a bucket as a registry, and manual uploads give no automatic caching or version control.
+D=CodeBuild local cache: it only speeds up individual builds on the same host, is best effort and does nothing for developers or for blocking package versions.
+T: A central, controllable npm cache with upstream failover is CodeArtifact with an external connection.
+
+@ Q002037 explain
+G: ## CodeBuild caching
+Every CodeBuild build starts in a fresh environment, so by default Maven downloads every dependency again into `~/.m2/repository`. A **cache** keeps chosen files between builds.
+- **Amazon S3 cache**: listed paths are uploaded to a bucket after a build and downloaded at the start of the next one. It works on any build host.
+- **Local cache**: stored on the build host, with modes for source, Docker layers and custom paths. It is fast but only helps when the next build lands on the same host.
+## Example
+In the project, enable an S3 cache, and in `buildspec.yml` add:
+`cache:` with `paths:` set to `/root/.m2/**/*`
+Now only new or changed dependencies are downloaded; the rest come from the cache, which can remove most of the 8 minutes. Pulling dependencies from a CodeArtifact Maven repository in the same Region can also make the remaining downloads faster and more reliable.
+W: Cache the Maven repository: the time is spent re-downloading unchanged dependencies, and caching `~/.m2` between builds removes most of that download work.
+X: A=Larger EBS volume: disk size is not the bottleneck; the dependencies still have to be downloaded on every build.
+B=Largest compute type: more CPU and memory speed up compilation and tests, not network downloads of the same files.
+C=10 parallel pipelines: each parallel build would still download all the dependencies itself, multiplying cost without removing the repeated download.
+T: When builds keep downloading the same dependencies, cache them rather than scaling up compute.

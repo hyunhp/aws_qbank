@@ -1,0 +1,350 @@
+# DOP-C02 detailed explanations e11 (explanation-only rewrites; letters are the published ones)
+
+@ Q003466 explain
+G: ## What stack drift is
+A CloudFormation stack records the configuration each resource should have. **Drift** happens when someone changes a resource outside CloudFormation, for example editing a security group rule in the console. The template still says port 443 only, but the real group now also allows port 22.
+## How drift detection works
+- `DetectStackDrift` (or `DetectStackSetDrift` for StackSets) compares the live properties of supported resources with the template's expected values and marks each resource `IN_SYNC`, `MODIFIED` or `DELETED`.
+- Detection only runs when asked, so it must be scheduled. Common patterns are the AWS Config managed rule `cloudformation-stack-drift-detection-check`, which runs drift detection and marks drifted stacks noncompliant, or an EventBridge Scheduler job that calls a Lambda function.
+- Results are routed to owners with EventBridge and SNS, and Config rules can be deployed to every account with a conformance pack or StackSets.
+W: Scheduled drift detection with notifications: it checks every stack regularly, flags the exact resources and properties that changed out of band, and alerts the owners without touching running workloads.
+X: A=Delete and recreate monthly: recreating stacks causes downtime and can destroy data in databases or buckets, and it hides drift instead of telling anyone what was changed or by whom.
+B=Disable console access: removing all console access blocks legitimate operations work and still detects nothing, since changes can also be made through the CLI, SDKs or other tools.
+C=Manual yearly comparison: an annual manual review across many accounts is slow and error-prone, so drift can persist for months before anyone notices it.
+T: Drift is found by running CloudFormation drift detection on a schedule and alerting on drifted stacks, not by rebuilding stacks or restricting access.
+
+@ Q003467 explain
+G: ## Golden AMIs and Image Builder
+EC2 Image Builder runs a pipeline that builds, hardens and tests an AMI, then hands the result to a **distribution configuration**. The distribution settings decide where the finished image goes:
+- Copy the AMI to other Regions.
+- Grant **launch permissions** to specific account IDs, to an organization ARN, or to organizational unit ARNs, for example `arn:aws:organizations::111122223333:ou/o-abc123/ou-ab12-cdef3456`.
+- Optionally update launch templates in target accounts so new instances pick up the image.
+## Why sharing by organization or OU helps
+When permissions are granted to an OU, any account placed in that OU later can use the image with no extra step. AMIs encrypted with a customer managed KMS key also need a key policy that lets the target accounts use the key.
+W: Image Builder distribution with organization or OU sharing: every new pipeline run shares the approved AMI automatically with the accounts that need it, and the permission follows accounts as they join the OU.
+X: A=Make the AMIs public: a public AMI can be launched by anyone on the internet, exposing internal software and configuration, and it does not limit use to the organization.
+C=Manual copies to each account: copying after every build does not scale across many accounts and new builds, and a missed copy leaves teams on outdated images.
+D=Email the AMI IDs: an email grants no launch permission, so the recipients still cannot launch a private AMI from another account.
+T: Share golden AMIs through Image Builder distribution settings that target the organization or OUs, never by making images public or copying them by hand.
+
+@ Q003468 explain
+G: ## Rolling a new AMI into an Auto Scaling group
+An Auto Scaling group launches instances from a **launch template**. Changing the template version only affects instances launched later; existing instances keep running the old AMI.
+- EC2 Image Builder distribution settings can create a new launch template version that points to the new AMI and set it as the default.
+- An **instance refresh** (`StartInstanceRefresh`) then replaces instances in batches, keeping a minimum healthy percentage in service, and can skip instances that already match the template.
+## Automating the trigger
+Image Builder publishes an event when an image build completes. An EventBridge rule can invoke a Lambda function or Automation runbook that starts the instance refresh, so a new AMI release flows to the fleet with no human steps. Checkpoints and automatic rollback can stop a bad image from replacing the whole fleet.
+W: Launch template update plus instance refresh: the new AMI becomes the template default and the refresh replaces running instances gradually and safely, with no manual work.
+X: A=Wait for instances to fail: healthy instances may run the old AMI for months, leaving known vulnerabilities in place and a mixed fleet that is hard to support.
+B=Log in and patch each instance: manual changes do not scale and drift from the golden image, which defeats the purpose of building a tested AMI.
+D=New Auto Scaling group per AMI: creating groups by hand for every version is slow and error-prone, and traffic must be moved manually each time.
+T: Point the launch template at the new AMI and let an instance refresh replace the fleet; do not rely on failures or manual changes.
+
+@ Q003469 explain
+G: ## Catching problems before and during a stack update
+A CloudFormation deployment can fail or cause damage in two stages: when the template is written, and when it is applied.
+- **cfn-lint** checks a template against the resource specification: invalid property names, wrong types, bad references and deprecated runtimes.
+- **cfn-guard** evaluates templates against policy-as-code rules, for example "every S3 bucket must have encryption and block public access". Both run as pipeline steps and fail the build on violations.
+- A **change set** lists what an update will do before it runs: which resources are added, modified or removed, and whether a modification requires **replacement**. A reviewer can spot that renaming a database would replace it and lose data.
+Automatic rollback on failure is another safety net: if a resource fails, CloudFormation returns the stack to its last working state.
+W: D=Review change sets: they show every add, modify and replace action in advance, so destructive changes are caught before execution.
+E=cfn-lint and cfn-guard in the pipeline: they reject syntactically invalid or noncompliant templates automatically, before any deployment starts.
+X: A=Manual edits after deployment: editing resources outside CloudFormation creates drift, and the next stack update may overwrite or conflict with those edits.
+B=Disable rollback: a failed update then leaves resources in a partially updated state that someone must fix by hand, instead of returning to the last good configuration.
+C=Deploy to production without review: skipping review and testing lets errors and destructive replacements reach production unnoticed.
+T: Validate templates automatically with cfn-lint and cfn-guard, and review change sets before execution; manual edits and disabled rollback make stacks less safe.
+
+@ Q003470 explain
+G: ## Two layers of tag governance
+Consistent tags such as `CostCenter` or `Environment` drive cost allocation, access control and automation. Governance across accounts needs both a standard and a way to find violations.
+- **Tag policies** in AWS Organizations define the allowed tag keys, their capitalization and permitted values, and are attached to the root, OUs or accounts. With enforcement enabled for chosen resource types, tagging operations that use noncompliant values are rejected, and a compliance report lists resources that do not follow the policy.
+- **AWS Config rules** such as the managed rule `required-tags` evaluate resources continuously and mark any resource missing the required keys or values as noncompliant. An organization-wide rule or conformance pack plus an aggregator gives one central view.
+Tag policy enforcement rejects noncompliant values but does not stop a resource from being created with no tags at all, which is why a detective Config rule complements tag policies.
+W: A=Tag policies: they standardize tag keys and values across every account in the organization and can block noncompliant tag values.
+E=Config required-tags rules: they detect and report resources that are missing required tags, in every account, as noncompliant.
+X: B=Tag production only: leaving other environments untagged breaks cost allocation and automation there and does nothing to enforce consistency.
+C=Remove tags: removing tags loses ownership and cost attribution and makes tag-based access control and automation impossible.
+D=Wiki page: documentation is not enforced and cannot report which resources are missing tags.
+T: Use tag policies to standardize tags and Config rules to detect resources that break the standard; documentation alone enforces nothing.
+
+@ Q003471 explain
+G: ## Patch Manager and patch policies
+AWS Systems Manager Patch Manager patches managed nodes (Windows Server and many Linux distributions) using **patch baselines**: rules such as "approve Critical and Important security updates seven days after release".
+- A **patch policy**, created with **Quick Setup**, applies baselines, a scan schedule and an install schedule to targets across the accounts and Regions of an organization, run from the management account or a delegated administrator.
+- Nodes need the SSM Agent and an instance profile that allows Systems Manager.
+- Compliance results are collected centrally, so the Patch Manager dashboard shows which nodes are missing patches, and the data can be synced to S3 for reporting.
+For example, one policy can scan every node daily and install approved patches every Sunday at 02:00, with separate baselines for Windows and Amazon Linux.
+W: Patch policies with Quick Setup: one configuration applies consistent baselines and schedules to Windows and Linux nodes in every account and Region, and reports compliance centrally.
+X: A=Manual RDP and SSH patching: it is slow and inconsistent across hundreds of nodes and leaves no central compliance record.
+C=Yearly AMI replacement only: vulnerabilities published during the year stay unpatched for months, which violates any reasonable patching standard.
+D=Per-instance cron jobs: each team configures its own schedule and sources, so baselines differ and nothing reports compliance centrally.
+T: For consistent cross-account patching with central compliance, use Patch Manager patch policies through Quick Setup, not ad hoc scripts or manual sessions.
+
+@ Q003472 explain
+G: ## Why very large stacks hurt
+Every CloudFormation stack update evaluates the whole template and processes its resources as one unit. A stack with hundreds of resources (the default limit is 500 per stack) means a small change to one tier still waits on a large update, a failure rolls back everything, and one team's change blocks another's.
+## Splitting by lifecycle
+Resources that change at different rates belong in different stacks:
+- A **network** stack (VPC, subnets) that changes rarely.
+- A **data** stack (databases, buckets) that must be protected.
+- An **application** stack (services, functions) that changes daily.
+Stacks share values with **cross-stack references**: the producer declares an `Outputs` entry with `Export`, and the consumer reads it with `Fn::ImportValue`, for example the VPC ID. An export cannot be changed or deleted while another stack imports it. Nested stacks are an alternative when components are always deployed together.
+W: Split by lifecycle with cross-stack references: each smaller stack updates faster, has a smaller blast radius and can be owned by the team that changes it.
+X: A=Merge more resources: a larger stack makes every update slower and riskier and moves closer to the per-stack resource limit.
+C=Batch changes for months: fewer, larger updates put more change into each deployment, so failures are bigger and harder to diagnose, and the slowness remains.
+D=Remove dependencies: dependencies make resources create in a valid order; removing them causes failures, such as an instance created before its subnet exists.
+T: Break large stacks into smaller ones by lifecycle and connect them with exports and imports, rather than growing a single stack.
+
+@ Q003473 explain
+G: ## Scheduling work across a fleet
+Systems Manager separates when work may happen from how it is executed.
+- **Maintenance Windows** define a schedule (a cron or rate expression, such as every Sunday at 03:00), a duration and a cutoff, plus **targets**, which can be selected by tag, for example `Tag:PatchGroup=web`. Tasks registered to the window run only inside that period.
+- **Run Command** executes an SSM document on managed nodes, such as `AWS-RunShellScript` for Linux or `AWS-RunPowerShellScript` for Windows, with concurrency and error thresholds, and records output per instance.
+Registering a Run Command task in a maintenance window gives a script that runs on tagged instances only during the approved weekly period. Windows can also run Automation runbooks, Lambda functions or Step Functions state machines.
+W: C=Maintenance Windows: they restrict the task to the approved weekly schedule and select the target instances by tag.
+E=Run Command: it runs the actual script on the targeted instances, with rate control and per-instance output.
+X: A=Parameter Store: it stores configuration values and secrets for other tools to read; it does not schedule or execute scripts.
+B=Session Manager: it opens interactive shell sessions on one instance at a time for a person, not scheduled runs across tagged instances.
+D=OpsCenter: it collects and tracks operational issues as OpsItems; it does not define windows or execute commands.
+T: Maintenance Windows decide when and where; Run Command does the work. Parameter Store, Session Manager and OpsCenter serve other purposes.
+
+@ Q003474 explain
+G: ## Preventive versus detective controls
+A **preventive** control stops a noncompliant action before it happens; a **detective** control finds it afterwards. Service control policies (SCPs) in AWS Organizations are preventive: they set the maximum permissions for every principal in the accounts they apply to, regardless of what IAM policies grant.
+## Using condition keys
+Many services expose condition keys that describe encryption in the request:
+- `ec2:Encrypted` for EBS volumes, so a `Deny` on `ec2:CreateVolume` when it is `false` blocks unencrypted volumes.
+- `rds:StorageEncrypted` for `CreateDBInstance` and `CreateDBCluster`.
+- `s3:x-amz-server-side-encryption` for specific encryption headers on object uploads.
+SCPs do not apply to the management account, so workloads should not run there. Detective checks such as AWS Config rules are still useful for resources created before the policy.
+W: SCPs with encryption condition keys: a Deny statement attached at the root or an OU blocks unencrypted create requests in every member account, before any resource exists.
+X: B=CloudWatch dashboards: dashboards only display information after resources exist; they cannot stop a create request.
+C=Monthly security review: a review is detective and late, so unencrypted resources exist and may hold data for weeks before anyone acts.
+D=Wiki reminder: guidance relies on each team remembering it and enforces nothing.
+T: To block unencrypted resources organization-wide, deny the create actions with SCP condition keys; dashboards, reviews and documentation only detect or advise.
+
+@ Q003475 explain
+G: ## When is an EC2 instance "complete"?
+CloudFormation marks an `AWS::EC2::Instance` as `CREATE_COMPLETE` once EC2 reports the instance is launched, not when the software installed by user data is working. Stacks that depend on the application can then start too early.
+## CreationPolicy and cfn-signal
+- A **CreationPolicy** on the resource tells CloudFormation to wait for success signals, for example `ResourceSignal` with `Count: 1` and `Timeout: PT15M`.
+- At the end of the user data script, the instance runs the helper script **cfn-signal**, such as `cfn-signal -e $? --stack MyStack --resource WebServer --region us-east-1`, which sends success or failure based on the exit code.
+- If a failure signal arrives or the timeout expires, the resource fails and the stack rolls back.
+Auto Scaling groups use the same mechanism, with a count equal to the number of instances.
+W: CreationPolicy with cfn-signal: CloudFormation holds the resource in progress until the instance reports that configuration succeeded, so dependent resources only proceed once the application is ready.
+X: A=Stack output with the instance ID: outputs only publish values after resources exist; they add no waiting.
+B=Condition on instance type: conditions decide whether a resource is created at all, based on parameters; they have nothing to do with configuration progress.
+C=DependsOn: it only orders resource creation and waits for the instance's own completion, which happens before the application is configured.
+T: DependsOn orders creation; only a CreationPolicy (or wait condition) with cfn-signal waits for software on the instance to finish.
+
+@ Q003476 explain
+G: ## Collecting logs at fleet scale
+Logs from hundreds of hosts need an agent on each source and one shared configuration.
+- The **CloudWatch agent** tails log files (and collects metrics) on EC2 and on-premises servers. Its JSON configuration can be stored in Systems Manager Parameter Store, and Run Command or a State Manager association uses `AWS-ConfigureAWSPackage` to install the `AmazonCloudWatchAgent` package and `AmazonCloudWatch-ManageAgent` to apply the same configuration to every instance.
+- For containers on ECS, **FireLens** adds a Fluent Bit or Fluentd sidecar to the task through the `awsfirelens` log driver and routes container output to CloudWatch Logs or other destinations. On EKS, a Fluent Bit DaemonSet (for example through the CloudWatch Observability add-on) does the same.
+Changing the central configuration once then changes collection everywhere, and new instances pick it up automatically.
+W: CloudWatch agent or FireLens with central configuration: every instance and container ships logs to CloudWatch Logs the same way, and configuration is managed in one place.
+X: A=Email logs nightly: email is size-limited and unreliable, logs arrive a day late, and nothing is searchable or alarmed on in CloudWatch.
+B=Local files read over SSH: logs stay scattered on hosts and disappear when instances are replaced, and searching hundreds of hosts by hand is impractical.
+C=One shared EBS volume: an EBS volume lives in one Availability Zone and generally attaches to one instance (Multi-Attach is limited to io1 and io2 in the same AZ and needs a cluster-aware file system), so it cannot collect logs from a whole fleet and containers.
+T: Fleet-wide log collection means an agent (CloudWatch agent or FireLens/Fluent Bit) driven by centrally stored configuration.
+
+@ Q003477 explain
+G: ## Cross-account log streaming
+A **subscription filter** on a CloudWatch Logs log group sends matching events to a destination as they are ingested, so delivery is near real time.
+- In the central account you create a **logs destination** (`PutDestination`) that fronts a Kinesis Data Stream or Amazon Data Firehose stream, and a destination policy that allows the source accounts or the whole organization ID.
+- Each source account creates a subscription filter that points to the destination ARN; account-level subscription filter policies can cover all log groups in an account.
+- Firehose buffers and delivers the data to S3 for long-term storage and Athena, or to OpenSearch Service for search and dashboards.
+For example, application logs from 50 accounts all land in one S3 bucket partitioned by account and date within minutes of being written.
+W: Cross-account subscriptions to Kinesis or Firehose: events stream continuously from every account into central storage and analytics, without scripts or manual steps.
+X: B=Separate dashboards per account: there is no central copy, so no one can query or correlate logs across the 50 accounts.
+C=Daily FTP copy scripts: a once-a-day batch is not near real time, FTP is unencrypted by default, and 50 separate scripts are fragile to operate.
+D=Manual downloads: engineers logging in to each account is slow, does not scale and gives no continuous analysis.
+T: Near-real-time central logging uses cross-account subscription filters into Kinesis or Firehose, not scheduled copies or manual access.
+
+@ Q003478 explain
+G: ## Prometheus without the servers
+Prometheus scrapes metrics from applications and stores them as time series queried with **PromQL**. Self-managed Prometheus needs storage sizing, high availability and upgrades, which becomes heavy with many EKS clusters.
+**Amazon Managed Service for Prometheus** is a Prometheus-compatible, serverless metrics store:
+- You create a **workspace**, and metrics are sent with Prometheus `remote_write` from an AWS managed collector (an agentless scraper for EKS), the ADOT collector or a Prometheus agent.
+- It scales ingestion and storage automatically and replicates data across Availability Zones.
+- Queries use standard PromQL, so Amazon Managed Grafana or other Grafana setups can chart the data, and alerting rules can route to SNS.
+Existing dashboards and alerts written for Prometheus keep working.
+W: Amazon Managed Service for Prometheus: it stores and queries Prometheus metrics with PromQL while AWS runs the storage and query layer.
+X: A=Hand-managed Timestream tables: Timestream is a separate time series database, not a Prometheus remote-write and PromQL endpoint, so existing Prometheus tooling would need custom integration and upkeep. Its serverless LiveAnalytics engine has also been closed to new customers since June 2025.
+B=CloudWatch Logs Insights: it queries log events in log groups with its own query language; it is not a Prometheus metrics store.
+D=X-Ray service maps: X-Ray visualizes request traces between services; it does not ingest or query Prometheus metrics.
+T: If the requirement is managed storage and PromQL for Prometheus metrics, choose Amazon Managed Service for Prometheus.
+
+@ Q003479 explain
+G: ## OpenTelemetry and ADOT
+**OpenTelemetry** is an open, vendor-neutral standard (APIs, SDKs, the OTLP protocol and a collector) for generating and exporting traces, metrics and logs. Instrument once and choose backends later.
+**AWS Distro for OpenTelemetry (ADOT)** is an AWS-supported, tested distribution of the OpenTelemetry collector and language SDKs:
+- Applications send telemetry over OTLP to the ADOT collector running as a sidecar, a DaemonSet or on the host.
+- Exporters send traces to AWS X-Ray, metrics to CloudWatch (for example in Embedded Metric Format) or Amazon Managed Service for Prometheus, and logs to CloudWatch Logs.
+- The same collector can also export to supported third-party tools.
+One agent therefore replaces separate tracing, metrics and log shippers.
+W: ADOT collector: it gathers traces, metrics and logs with vendor-neutral OpenTelemetry and exports them to AWS services.
+X: A=CloudTrail organization trails: CloudTrail records AWS API calls made to the control plane, not application traces or custom metrics.
+C=Custom cron scripts: home-grown scripts are fragile, unstandardized and cannot trace requests across services.
+D=Config recorders: AWS Config records resource configuration changes, not application telemetry.
+T: Vendor-neutral traces, metrics and logs from applications point to OpenTelemetry, which on AWS means the ADOT collector.
+
+@ Q003480 explain
+G: ## Aggregating log messages
+**CloudWatch Logs Insights** runs queries over one or more log groups for a chosen time range, such as the last seven days. Its query language chains commands with pipes:
+- `filter` keeps matching events, `parse` extracts fields, `stats` aggregates, `sort` and `limit` shape the result.
+- A query such as `filter @message like /ERROR/ | stats count(*) as n by @message | sort n desc | limit 20` returns the 20 most frequent error messages.
+- The `pattern` command groups similar messages whose variable parts differ, such as request IDs, which helps when messages are not identical.
+Results can be added to a dashboard, and you pay per GB of data scanned.
+W: Logs Insights with stats count() by message: it aggregates last week's application log events and ranks the error messages by frequency in one query.
+X: A=Reachability Analyzer: it analyzes whether a network path exists between two resources; it never reads application logs.
+B=Config advanced queries: they query resource configuration with SQL, not log content.
+C=CloudTrail event history: it lists AWS API calls, such as who stopped an instance, not errors written by the application.
+T: For counting and ranking patterns inside application logs, use Logs Insights `stats`; Config and CloudTrail describe resources and API calls.
+
+@ Q003481 explain
+G: ## CloudTrail Lake
+CloudTrail delivers events to S3 through trails, but querying those files needs tables, partitions and a query engine. **CloudTrail Lake** is a managed alternative:
+- An **event data store** collects events directly, and an organization event data store created from the management account or a delegated administrator captures events from every member account.
+- Events are kept for the retention period you choose, which can span many years.
+- You run SQL `SELECT` queries in the console or with the `StartQuery` API, for example finding every `DeleteBucket` call in the last year grouped by account and user.
+No pipeline, crawler or table definition is needed; you pay for ingestion, retention and data scanned.
+Since May 31, 2026, CloudTrail Lake is closed to new customers; existing customers can keep using it, and AWS points new customers to Amazon CloudWatch for similar capabilities. The feature set described here is what the question tests.
+W: CloudTrail Lake event data store: it stores organization-wide CloudTrail events for the full year and answers SQL queries directly, without building a pipeline.
+X: A=Config aggregators: they aggregate resource configuration and compliance data from many accounts, not the API event history security needs.
+C=VPC Flow Logs in S3: flow logs capture network traffic metadata such as IPs and ports, not API calls, and would still need a query setup.
+D=Dashboards from API call counts: dashboards show aggregate numbers and cannot return individual events with SQL.
+T: SQL over a year of organization-wide CloudTrail events with no pipeline points to a CloudTrail Lake event data store.
+
+@ Q003482 explain
+G: ## Querying logs where they sit
+Access logs from ALB, CloudFront or S3 server access logging land in S3 as text files. **Amazon Athena** queries them in place with SQL:
+- A table in the **AWS Glue Data Catalog** describes the log format and S3 location, created with a `CREATE EXTERNAL TABLE` statement or a crawler.
+- Partitioning by date (or partition projection) limits each query to the needed prefixes, and converting logs to Parquet reduces the data scanned.
+- Athena is serverless and billed per TB scanned, so there is nothing to load or run.
+For example, a query can count requests by status code per hour for the last day. Amazon QuickSight or Managed Grafana can use Athena as a data source for dashboards.
+W: Athena with a Glue Data Catalog table: it gives interactive SQL over the logs directly in S3, and dashboard tools can use it as a data source.
+X: B=SQS messages per log line: SQS is a message queue for decoupling applications; it has no SQL query capability and messages disappear once consumed.
+C=RDS with weekly imports: loading logs by hand into a database is slow and stale, and the instance must be sized and paid for continuously.
+D=Batch jobs printing to stdout: printing logs is not analysis and gives no SQL querying or dashboards.
+T: For SQL analysis of logs stored in S3, define a Glue catalog table and query it with Athena instead of moving the data.
+
+@ Q003483 explain
+G: ## Finding the slow hop in a distributed request
+One user request may pass through an API, several microservices and a database. Averaged metrics per service do not show which call made a specific request slow; **distributed tracing** does.
+- **AWS X-Ray** records a trace for each sampled request, split into segments and subsegments with timings for every service and downstream call. The service map (trace map) shows the services, their connections and latency and error rates on each edge.
+- **CloudWatch Application Signals** auto-instruments applications (using OpenTelemetry-based instrumentation) and builds service dashboards with latency, error and request volume per service and operation, plus dependency views and service level objectives, linked to the related traces.
+For example, a p99 spike on the checkout API can be traced to the inventory service's database call.
+W: C=CloudWatch Application Signals: it shows latency per service and operation and its dependencies, pointing to the service that is slow.
+E=X-Ray traces and service map: they break each request into per-service timings, so the slow segment is visible directly.
+X: A=Config rule evaluations: they report whether resource configurations comply with rules, not request latency.
+B=Budgets forecasts: they project spend against a budget and say nothing about performance.
+D=Access Analyzer findings: they identify external or unused access in policies, which is unrelated to latency.
+T: Latency across microservices is diagnosed with tracing and service-level views (X-Ray, Application Signals), not with compliance, cost or permission tools.
+
+@ Q003484 explain
+G: ## Closing the loop from alarm to fix
+A CloudWatch alarm changes state when a metric crosses a threshold, for example when a process-count metric published by the CloudWatch agent (`procstat`) for the service drops to 0.
+- Every alarm state change is sent to Amazon EventBridge as a `CloudWatch Alarm State Change` event.
+- An EventBridge rule matching `"state": {"value": ["ALARM"]}` for that alarm targets a **Systems Manager Automation runbook**.
+- The runbook uses a step such as `aws:runCommand` to run `systemctl restart myservice` (or the Windows equivalent) on the affected instance, then can verify the service and notify the team.
+The fix runs within seconds of detection, is logged and can be reused across instances.
+W: Alarm to EventBridge to Automation runbook: the failure is detected and the service is restarted automatically, only when it actually fails, with an audit trail.
+X: A=Cron restart every minute: restarting a healthy service every minute interrupts users continuously and still ignores what CloudWatch detects.
+C=SNS email to the team: a person must read the message and act, so recovery depends on human response time instead of being automatic.
+D=Hourly dashboard review: a failure can go unnoticed for up to an hour and still needs a manual restart.
+T: Automated remediation connects an alarm to EventBridge and a Systems Manager Automation runbook; emails and dashboards still need a human.
+
+@ Q003485 explain
+G: ## Thresholds that follow the pattern
+Latency often has a normal rhythm: low at night, high during business hours, different at weekends. A fixed threshold such as 500 ms is either too loose at night or too noisy at peak.
+**CloudWatch anomaly detection** trains a model on the metric's history (up to two weeks), learning hourly, daily and weekly seasonality and trend. It produces an **expected band**:
+- The band width is set in standard deviations, for example `ANOMALY_DETECTION_BAND(m1, 2)`.
+- An alarm fires when the metric goes outside the band, above it or below it depending on the chosen comparison.
+- The model keeps updating, and periods such as deployments can be excluded from training.
+So 300 ms at 03:00 on a Sunday can alarm while 450 ms on Monday morning does not.
+W: Anomaly detection alarms: the band adapts to the learned weekly pattern, so the alarm fires on deviation from normal instead of a fixed value.
+X: A=Synthetics blueprints: they create canaries that test endpoints from outside; they do not learn a metric's normal pattern.
+B=Static threshold alarms: a fixed value ignores daily and weekly patterns, which is exactly what the requirement rules out.
+C=Logs retention settings: retention controls how long log events are kept and has nothing to do with alerting.
+T: Alerting on deviation from a seasonal pattern without fixed thresholds is CloudWatch anomaly detection.
+
+@ Q003486 explain
+G: ## Combining alarms to cut noise
+A single high error rate may be a brief blip, and occasional latency spikes may be harmless. Paging only when both happen together gives fewer, more meaningful alerts.
+A **composite alarm** watches the states of other alarms and evaluates a rule expression:
+- `ALARM("HighErrorRate") AND ALARM("HighLatency")` goes to ALARM only when both child alarms are in ALARM.
+- Operators include `AND`, `OR`, `NOT`, and functions such as `ALARM`, `OK` and `INSUFFICIENT_DATA`.
+- The child alarms are usually configured without notification actions, so only the composite alarm pages the team. Actions suppression can also mute alerts while a known condition, such as a deployment, is active.
+W: Composite alarm: it notifies only when the error-rate alarm and the latency alarm are in ALARM at the same time, removing single-signal noise.
+X: A=Log subscription: it streams log events to Kinesis Data Streams, Firehose or Lambda; it does not evaluate alarm states.
+B=Contributor Insights rule: it ranks top contributors in log data, such as busiest IPs; it cannot combine alarm conditions.
+D=Metric filter: it turns matching log events into a metric; alarms can then use that metric, but the filter cannot require two alarms at once.
+T: To alert only when several alarms are firing together, use a composite alarm with an `AND` rule.
+
+@ Q003487 explain
+G: ## Top-N analysis on log data
+Questions like "which clients cause the most errors" are top-N problems. **CloudWatch Contributor Insights** answers them continuously:
+- A rule reads structured log events (JSON or common log format) in CloudWatch Logs, defines **keys** to group by, such as the client IP, and **filters**, such as status code 500 to 599.
+- It reports the top contributors over time as a graph, and the results can be added to dashboards or used in alarms.
+Contributor Insights reads only CloudWatch Logs, while ALB delivers access logs to S3 as space-delimited files. The logs must first be sent into a CloudWatch Logs log group, for example by a Lambda function that is triggered by new log objects and writes each entry as a JSON event. After that, a rule keyed on the client IP and filtered on 5XX codes shows which addresses cause the most errors hour by hour.
+W: Contributor Insights rules: they rank the IP addresses behind the most 5XX responses and show how those top contributors change over time.
+X: B=Config conformance packs: they bundle compliance rules for resource configuration and never analyze traffic or log fields.
+C=Trusted Advisor checks: they give account-level best-practice recommendations on cost, security and limits, not per-client error analysis.
+D=Composite alarms only: they combine alarm states into one signal but cannot identify which IP addresses cause errors.
+T: Top talkers or top error sources in log data point to Contributor Insights; alarms and compliance tools cannot rank contributors.
+
+@ Q003488 explain
+G: ## Tiering log storage
+Different ages of logs have different needs: recent logs must be searchable quickly, old logs only need cheap, durable storage for compliance.
+- **CloudWatch Logs** is ideal for recent data (Logs Insights, metric filters, alarms). Each log group has a **retention setting**, from one day to many years, or never expire. Storage there is billed per GB-month.
+- Older logs are moved to **S3**, either continuously with a subscription filter to Amazon Data Firehose or in batches with export tasks (`CreateExportTask`).
+- An **S3 Lifecycle** rule transitions objects to S3 Glacier Flexible Retrieval or Glacier Deep Archive after, for example, 90 days, and expires them after seven years. S3 Object Lock can make them immutable if required.
+For example, keep 30 days in CloudWatch and keep the full seven years in S3 at archive prices.
+W: Short CloudWatch retention plus S3 export with lifecycle to Glacier: recent logs stay searchable, and the seven-year archive sits in the cheapest storage class.
+X: A=Delete after 30 days: this breaks the seven-year retention requirement, and database backups do not contain application logs.
+C=EBS volumes on the servers: EBS is priced for block storage, logs are tied to individual instances, and they can be lost when instances are replaced.
+D=CloudWatch forever with no retention: all seven years stay at CloudWatch storage prices, which cost far more than archive storage in S3.
+T: Keep recent logs in CloudWatch with a short retention and archive older ones to S3 with lifecycle transitions to Glacier.
+
+@ Q003489 explain
+G: ## Testing from the outside
+Metrics collected by the application only show requests that actually arrive. To know whether users can reach an API, you need **synthetic monitoring**: scripted requests sent on a schedule.
+**CloudWatch Synthetics canaries** are scripts (Node.js or Python, with Puppeteer, Playwright or Selenium runtimes) that:
+- Run on a schedule as often as once per minute.
+- Call endpoints, check status codes and response content, and can take screenshots of UI flows.
+- Publish metrics such as `SuccessPercent` and `Duration`, which alarms can use.
+Blueprints such as the API canary and heartbeat monitor give a starting script. A canary runs in the Region where it is created, so checking from several geographic locations means deploying canaries in several Regions.
+W: Synthetics canaries: they call the API every minute from the Regions where they are deployed and alarm when availability or latency degrades.
+X: B=Logs Insights: it queries logs after the fact and sends no requests to the API, so it cannot test availability from other locations.
+C=Config rules: they evaluate resource configuration compliance, not whether an endpoint responds.
+D=CloudTrail trails: they record AWS API calls made in the account, not the health of the company's own API.
+T: Proactive, scheduled availability checks from multiple locations are CloudWatch Synthetics canaries, deployed in each Region you want to test from.
+
+@ Q003490 explain
+G: ## Monitoring as code
+Alarms and dashboards are resources like any other. Defining them in a CloudFormation template (`AWS::CloudWatch::Alarm`, `AWS::CloudWatch::Dashboard`) means they are reviewed, versioned and identical wherever they are deployed.
+**CloudFormation StackSets** deploy one template to many accounts and Regions:
+- With service-managed permissions, a StackSet targets OUs in AWS Organizations.
+- **Automatic deployment** adds the stack to accounts that join the target OU later and can remove it when they leave.
+- Updating the template once updates every account.
+For example, a baseline set of alarms for API 5XX rates and database CPU, plus a standard dashboard, lands in every new workload account on day one. CloudWatch cross-account observability can add a central view from a monitoring account.
+W: CloudFormation with StackSets: the same alarms and dashboards are created in every account automatically and kept consistent through template updates.
+X: A=Rely on default alarms: CloudWatch publishes many service metrics automatically, but it does not create alarms for your workloads, so nothing would alert.
+B=Create alarms manually after problems: the result is reactive and inconsistent, and monitoring is missing exactly when the first incident happens.
+D=One account's unshared dashboard: without cross-account sharing or observability, a dashboard cannot show other accounts' metrics, and it creates no alarms there.
+T: Consistent alarms and dashboards in every account come from infrastructure as code deployed with StackSets.
+
+@ Q003491 explain
+G: ## Why high cardinality gets expensive
+In CloudWatch, every unique combination of metric name and dimension values is a separate custom metric, billed per metric per month. A `TenantId` dimension with 10,000 tenants creates 10,000 metrics; adding `RequestId` creates a new metric for almost every request.
+## Embedded Metric Format (EMF)
+EMF is a JSON log structure. A Lambda function simply writes a log line containing an `_aws` metadata block that names the namespace, metrics and dimensions, for example latency with only `Service` and `Operation` as dimensions. CloudWatch Logs extracts those metrics automatically, with no `PutMetricData` calls, and Powertools for AWS Lambda can produce the format.
+- Fields such as `tenantId` or `requestId` are kept in the same log event as plain properties, not dimensions.
+- Logs Insights can then query them, such as average latency by tenant for the last hour.
+W: EMF for key metrics plus Logs Insights for detail: only low-cardinality dimensions become billed metrics, while per-tenant and per-request detail stays queryable in logs.
+X: A=Disable metrics: waiting for customer complaints removes monitoring entirely and finds problems late.
+B=DynamoDB scanned every minute: full scans of a growing table consume read capacity, get slower over time and require building a custom dashboard system.
+C=Metric per tenant and request ID: every unique dimension combination is a separate billed custom metric, so request IDs cause metric counts and cost to explode.
+T: Put a few low-cardinality dimensions into metrics with EMF, and keep high-cardinality fields such as tenant and request IDs in logs for Logs Insights.

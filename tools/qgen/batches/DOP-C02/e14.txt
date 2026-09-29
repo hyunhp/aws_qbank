@@ -1,0 +1,221 @@
+# DOP-C02 detailed explanations, chunk e14 (explanation-only rewrites; letters are the published ones)
+
+@ Q003544 explain
+G: ## Active-passive failover with Route 53
+Route 53 can answer DNS queries differently depending on endpoint health. An active-passive design needs two pieces working together:
+- **Health checks** decide whether the primary is healthy. A health check can probe an endpoint over HTTP/HTTPS (optionally matching a string in the response body, such as a `/health` page that tests the database), or it can follow the state of a CloudWatch alarm, or combine other checks (calculated health check).
+- **Failover routing records** decide what to return. You create a `PRIMARY` record for the main Region and a `SECONDARY` record for the standby, both with the same name. Route 53 returns the primary while its health check passes and returns the secondary only when the primary is unhealthy.
+## Example
+`api.example.com` has a primary alias to the ALB in `us-east-1` with a health check on `/health`, and a secondary alias to the ALB in `us-west-2`. If `/health` starts failing, new DNS answers point to `us-west-2`; clients follow once cached answers expire (TTL).
+W: B=Health checks on application endpoints or alarms: they give Route 53 an application-level signal of whether the primary really works, which is what triggers the failover.
+E=Failover routing records: the primary/secondary record pair is the routing policy that sends traffic to the standby only when the primary is marked unhealthy, and back when it recovers.
+X: A=Weighted 50/50 without health checks: this sends half of all traffic to the standby at all times, and without health checks Route 53 keeps answering with an unhealthy Region.
+C=Simple routing with low TTL: simple routing cannot attach health checks to choose between Regions, so a low TTL only makes clients re-query faster for the same unconditional answer.
+D=One Region with more AZs: this protects against an AZ failure but provides no standby Region at all, so there is nothing to fail over to during a Regional problem.
+T: Route 53 active-passive failover = failover routing records (primary/secondary) plus health checks that reflect real application health; weights or simple records alone do not react to failures.
+
+@ Q003545 explain
+G: ## Where Amazon SQS stores messages
+Amazon SQS is a **regional** managed service. When you send a message, SQS stores copies redundantly across multiple Availability Zones in that Region, so the loss of one AZ does not lose the queue or its messages. You do not choose an AZ for a queue, and there is nothing to configure for AZ resilience on the queue itself.
+## What can still fail
+The weak point is usually the **consumers**. If every worker runs in one AZ and that AZ fails, messages stay safely in the queue but nobody processes them, and the backlog grows.
+- Run consumers in an Auto Scaling group (or ECS/EKS service) whose subnets span two or more AZs.
+- If an AZ is lost, the remaining consumers keep polling; messages being processed by a failed worker reappear after the visibility timeout and are picked up by healthy workers.
+W: D=Consumers spread across AZs: SQS already survives an AZ failure, so the only thing to add is consumer capacity in more than one AZ so that processing continues when one AZ goes down.
+X: A=One large instance in the "most reliable" AZ: no AZ is guaranteed never to fail, and a single instance in one AZ is exactly the single point of failure the requirement rules out.
+B=A separate queue per AZ: SQS queues are not tied to an AZ, and splitting the work into several queues adds routing complexity without improving the durability the service already provides.
+C=Cross-Region queue replication: SQS has no built-in cross-Region replication, and a Region-level copy addresses Regional disasters, not the AZ failure the question asks about.
+T: SQS is regional and already multi-AZ; AZ resilience for a queue-based system comes from spreading the consumers across AZs.
+
+@ Q003546 explain
+G: ## Why reactive scaling is too late here
+Normal dynamic scaling (target tracking or step scaling) reacts after a metric rises. If new instances need 10 minutes to boot and warm up, users suffer for those 10 minutes every morning. Two families of features help:
+- **Launch capacity before the spike.** A *scheduled action* sets the desired capacity at a fixed time, for example `07:45` every weekday. *Predictive scaling* learns the daily pattern from the load history and launches instances ahead of the forecast demand, with a configurable buffer time.
+- **Make new capacity ready faster.** An EC2 Auto Scaling **warm pool** keeps pre-initialized instances in a `Stopped`, `Running` or `Hibernated` state. They have already run their slow setup (lifecycle hooks, user data), so a scale-out moves them into service in much less time than launching from scratch.
+## Example
+A scheduled action raises the minimum to 20 at 07:45, and a warm pool of 10 stopped instances covers any extra growth after 08:00.
+W: C=Warm pool of pre-initialized instances: it removes most of the 10-minute initialization from the critical path, so capacity added during the spike becomes ready quickly.
+E=Scheduled or predictive scaling before 08:00: both add capacity ahead of a known, recurring spike instead of waiting for metrics to rise.
+X: A=Longer ALB idle timeout: this only keeps idle connections open longer; it adds no capacity and does not shorten instance start-up.
+B=Termination protection: it stops specific instances from being terminated but does not launch new instances or speed up readiness.
+D=Higher alarm threshold for scale-out: a higher threshold makes the group scale out even later, which worsens the problem.
+T: For a predictable spike with slow-starting instances, add capacity ahead of time (scheduled or predictive scaling) and keep pre-initialized instances ready (warm pool); reactive tweaks come too late.
+
+@ Q003547 explain
+G: ## Scaling queue workers on backlog per task
+The raw `ApproximateNumberOfMessagesVisible` metric is a poor scaling target by itself: 1,000 messages may be a lot for 2 tasks but trivial for 50. AWS recommends a **backlog per task** (or per instance) metric instead:
+- `backlog per task = ApproximateNumberOfMessagesVisible / number of running tasks`
+- The acceptable backlog is derived from the processing time and the latency you allow. If a task processes a message in 0.1 s and a message may wait at most 10 s, each task can hold a backlog of 100.
+You publish the calculated value as a custom CloudWatch metric (for example from a small Lambda function on a schedule, or with metric math) and configure **Application Auto Scaling target tracking** for the ECS service's `DesiredCount` with a target value of 100. The service then adds tasks when the backlog per task rises above the target and removes them when it drops.
+W: A=Target tracking on backlog per task: it scales the ECS service in proportion to the actual work waiting in the queue and keeps the per-task backlog at a level that meets the latency goal.
+X: B=Doubling capacity every hour: a schedule ignores the queue, so it overprovisions when the queue is empty and can still fall behind on a sudden burst.
+C=Manual desired count each morning: this cannot follow changes in queue depth during the day and depends on a person remembering to act.
+D=Scaling on cluster EBS usage: disk usage has no relationship to how many messages are waiting, so the service would scale on the wrong signal.
+T: Scale queue consumers on backlog per task (queue depth divided by running tasks) with target tracking, not on schedules, manual counts or unrelated resource metrics.
+
+@ Q003548 explain
+G: ## How Lambda concurrency limits work
+Concurrency is the number of function invocations running at the same moment. Each AWS account has a **Regional concurrency quota** shared by all functions (1,000 by default, although newly created accounts can start with a lower quota). When the total in-flight invocations hit that quota, further synchronous calls are throttled with `429 TooManyRequestsException`.
+- **Raising the quota:** the account concurrency limit is a soft quota. You can request an increase through Service Quotas so the whole account has more headroom during spikes.
+- **Reserved concurrency:** setting `ReservedConcurrentExecutions` on a function sets aside part of the pool exclusively for it (and also caps it at that value). A noisy, less important function can no longer consume the capacity a critical API function needs.
+## Example
+With a 1,000 quota, a batch job bursting to 1,000 invocations starves the API. Reserving 300 for the API function guarantees it 300 concurrent executions no matter what the batch job does.
+W: D=Request a higher account concurrency quota: more total concurrency directly reduces throttling when the combined load exceeds the current account limit.
+E=Reserve concurrency for critical functions: it guarantees the critical API a protected slice of the pool so other functions' spikes cannot throttle it.
+X: A=Reduce memory to 128 MB: memory size changes CPU and cost per invocation, not the concurrency quota; lower CPU can even make invocations run longer and use more concurrency.
+B=Delete old versions and aliases: versions consume code storage, not concurrency, so removing them frees nothing that throttling depends on.
+C=Increase each function's timeout: longer timeouts let slow invocations hold a concurrency slot longer, which increases throttling instead of reducing it.
+T: Lambda throttling from the account limit is fixed by raising the Regional concurrency quota and protecting important functions with reserved concurrency, not by tuning memory, timeouts or versions.
+
+@ Q003549 explain
+G: ## Provisioned versus on-demand capacity in DynamoDB
+- **Provisioned mode:** you set read and write capacity units (RCU/WCU), optionally with auto scaling. Auto scaling adjusts based on CloudWatch metrics over several minutes, so a sudden, unpredictable spike can exceed provisioned capacity and cause `ProvisionedThroughputExceededException` throttles before capacity catches up.
+- **On-demand mode:** there is no capacity to plan. You pay per read and write request, and the table adapts to traffic automatically. It can instantly handle up to double the previous traffic peak, and it keeps growing as the higher level of traffic persists.
+You can switch an existing table between modes (with limits on how often), without downtime or data migration.
+## When to choose on-demand
+Unknown or spiky workloads, new applications without traffic history, and teams that prefer paying per request to managing capacity. Steady, predictable traffic is often cheaper in provisioned mode.
+W: A=Switch to on-demand capacity mode: it removes RCU/WCU planning entirely and absorbs unpredictable spikes by scaling with the request rate.
+X: B=Longer TTL duration: TTL only controls when expired items are deleted; it has no effect on read or write throughput.
+C=Point-in-time recovery: PITR provides continuous backups for restoring to a past second, which protects data but does nothing for throttling.
+D=Add a local secondary index: an LSI can only be created with the table, and it shares the table's capacity, so it adds writes rather than capacity.
+T: For unpredictable DynamoDB traffic without capacity planning, use on-demand mode; TTL, PITR and indexes do not change throughput.
+
+@ Q003550 explain
+G: ## Two kinds of EC2 status checks
+- **System status checks** detect problems with the underlying AWS host: loss of network connectivity or power, or host hardware and software issues. You cannot fix these from inside the instance.
+- **Instance status checks** detect problems inside the guest, such as a failed boot or exhausted memory, which usually need a reboot or a configuration fix.
+## The recover action
+You can create a CloudWatch alarm on `StatusCheckFailed_System` with the EC2 **recover** action. When the alarm fires, EC2 moves the instance to healthy hardware and keeps its **identity**: the same instance ID, private IP addresses, Elastic IP addresses and instance metadata, and its EBS volumes stay attached. Many current instance types also support simplified automatic recovery, which is on by default; the CloudWatch alarm is the explicit, configurable option and can also notify an SNS topic.
+Recovery applies to supported instance types with EBS-backed storage; instances using instance store volumes cannot be recovered this way.
+W: B=CloudWatch alarm with the EC2 recover action: it reacts automatically to a failed system status check and restores the same instance, with the same IDs and IPs, on healthy hardware.
+X: A=Monthly AMI rebuild: rebuilding images is a patching routine; it does not detect a host failure and would produce new instances with new identities.
+C=Hourly reboot cron job: a reboot runs on the same failed host and cannot fix a hardware problem, and a cron job inside an unreachable instance may not run at all.
+D=SNS email to on-call: it only notifies a person, so recovery is manual and delayed rather than automatic.
+T: A failed system status check is a host problem; the CloudWatch alarm recover action moves the instance to new hardware while preserving its ID, IPs and volumes.
+
+@ Q003551 explain
+G: ## What AWS Elastic Disaster Recovery does
+AWS Elastic Disaster Recovery (AWS DRS) protects physical, virtual and cloud servers, including on-premises machines and EC2 instances in another Region.
+- An agent on each source server performs **continuous block-level replication** of its disks to a low-cost staging area in the target Region. Because changes stream continuously, the recovery point is typically seconds old.
+- The staging area uses small replication servers and cheap storage, so you do not pay for full-size standby servers.
+- On a drill or a real failover, DRS launches recovery instances from the latest (or an earlier point-in-time) state, usually within minutes, giving an RTO of minutes. Failback to the original site is also supported.
+## Compare with backups
+A daily backup plan gives an RPO of up to 24 hours and a restore that can take much longer; that is far from "seconds and minutes".
+W: C=AWS Elastic Disaster Recovery: continuous block-level replication of on-premises and EC2 servers into another Region delivers an RPO of seconds and launches recovery instances within minutes.
+X: A=AWS Backup daily plans: backups taken once a day mean up to a day of lost data, and restoring full servers is not a minutes-level recovery.
+B=Local EBS snapshots: snapshots are point-in-time and, kept in the same Region, do not survive a Regional outage; they also do not cover on-premises servers.
+D=S3 Cross-Region Replication: CRR replicates objects in S3 buckets, not the disks of running servers, so there is nothing to boot the application from.
+T: Seconds-level RPO and minutes-level RTO for whole servers (on-premises or EC2) across Regions is the job of Elastic Disaster Recovery's continuous replication, not periodic backups.
+
+@ Q003552 explain
+G: ## Chaos engineering with AWS Fault Injection Service
+AWS Fault Injection Service (FIS) runs controlled fault-injection experiments against your AWS workloads so you can prove that recovery really works.
+- An **experiment template** lists the **actions** (for example `aws:ec2:terminate-instances`, `aws:ec2:stop-instances`, CPU stress through SSM, or network disruption), the **targets** (such as instances with the tag `env=staging`, or a percentage of an Auto Scaling group) and **stop conditions**.
+- Stop conditions are CloudWatch alarms. If an alarm such as "error rate above 5%" fires, FIS halts the experiment to limit the impact.
+## Example
+Terminate 30% of the instances in the web tier and watch whether the Auto Scaling group replaces them and the ALB keeps serving requests without errors.
+W: B=AWS Fault Injection Service: it can terminate EC2 instances on purpose in a controlled experiment, with targeting and alarm-based stop conditions, to verify automatic recovery.
+X: A=AWS Artifact: it is a portal for downloading AWS compliance reports and agreements; it cannot act on your resources.
+C=Trusted Advisor checks: they review configuration for best practices (cost, security, fault tolerance) but never inject failures or test recovery behavior.
+D=Amazon Inspector: it scans EC2, container images and Lambda for software vulnerabilities and network exposure, which is unrelated to resilience testing.
+T: To prove automatic recovery, inject real faults with AWS Fault Injection Service; advisory and scanning services only report, they never test.
+
+@ Q003553 explain
+G: ## Verifying backups with AWS Backup restore testing
+A backup you have never restored is only an assumption. **AWS Backup restore testing** turns restore verification into a scheduled, automated job:
+- A **restore testing plan** sets the schedule (for example weekly) and which recovery points to use, such as the latest one or a random one from a time window.
+- **Resource selections** pick the protected resources to test (EBS, EC2, RDS, Aurora, DynamoDB, EFS, S3 and others), with optional overrides for restore parameters.
+- AWS Backup restores into your account, records the restore job's result and timing, and deletes the restored resources after the retention period you set.
+- For deeper checks, an EventBridge rule can trigger a Lambda function that tests the restored data and reports back with `PutRestoreValidationResult`.
+## Why it matters
+It gives evidence for audits and shows how long a real restore takes, which you can compare with your RTO.
+W: D=AWS Backup restore testing: it restores recovery points on a schedule, validates them, and cleans up afterwards, which is exactly automated backup verification.
+X: A=S3 Inventory reports: they list objects and their metadata (such as encryption and replication status) but never restore or test anything.
+B=CloudTrail Insights: it detects unusual API call volume or error rates in CloudTrail events, which says nothing about whether a backup can be restored.
+C=Config conformance packs: they evaluate resource configurations against rules, for example that a backup plan exists, but do not perform restores.
+T: Checking that backups exist is configuration compliance; proving they restore needs AWS Backup restore testing on a schedule.
+
+@ Q003554 explain
+G: ## The four disaster recovery strategies
+From cheapest and slowest to most expensive and fastest:
+- **Backup and restore:** copy backups to another Region and rebuild everything after a disaster. RTO is hours or more, and RPO equals the backup interval.
+- **Pilot light:** data is replicated continuously, core infrastructure exists but compute is off or minimal, so it must be started and scaled up during recovery. RTO is tens of minutes to hours.
+- **Warm standby:** a complete, working copy of the stack runs in the second Region at reduced size, with data replicated. During a disaster you scale it up and shift traffic, often in minutes.
+- **Multi-site active-active:** full capacity in two or more Regions serving traffic all the time, for near-zero RTO at roughly double the cost.
+## Matching the requirement
+An RTO of 30 minutes at moderate cost points to warm standby: it is already running and tested, so recovery is a scale-up and a DNS or routing switch, but you pay only for scaled-down capacity.
+W: C=Warm standby in a second Region: a replicated, scaled-down but fully functional stack can be scaled up and receive traffic within 30 minutes, without paying for full duplicate capacity.
+X: A=One Region with extra AZs: multiple AZs protect against data center failures, but a Regional outage takes down every AZ in that Region, so there is no recovery site.
+B=Multi-site active-active: it meets the RTO but runs full capacity twice, which exceeds the moderate cost the company wants.
+D=Weekly backups copied to another Region: rebuilding from backups takes hours, and weekly backups risk up to a week of lost data, missing the 30-minute RTO.
+T: Warm standby sits between backup-and-restore and active-active: a running, scaled-down copy that recovers in minutes at moderate cost.
+
+@ Q003555 explain
+G: ## Aurora replicas and Aurora Auto Scaling
+An Aurora cluster has one writer instance and up to 15 **Aurora Replicas** that share the same cluster storage volume. Replicas serve reads through the cluster's reader endpoint, which spreads connections across them.
+**Aurora Auto Scaling** is an Application Auto Scaling policy for the cluster's replica count:
+- You choose a metric, such as average CPU utilization of the replicas or the average number of connections, and a target value (for example 60% CPU).
+- You set a minimum and maximum number of replicas.
+- When load rises above the target, Aurora adds replicas; when it falls, it removes the ones it added. New replicas join the reader endpoint automatically.
+## Example
+Minimum 1, maximum 8, target 60% CPU: during the busy afternoon the cluster grows to 6 readers, and at night it shrinks back to 1.
+W: A=Aurora Auto Scaling for replicas: it adds and removes Aurora Replicas automatically based on a target metric, matching reader capacity to read load that changes during the day.
+X: B=Aurora Serverless v1 pausing: pausing stops the whole cluster when there is no activity, rather than adding read replicas, and Aurora Serverless v1 has reached end of support.
+C=Aurora cloning: a clone is a separate copy-on-write cluster for testing or analysis; it does not add readers to the existing cluster's reader endpoint.
+D=Aurora Backtrack: backtrack rewinds a MySQL-compatible cluster to an earlier point in time; it has nothing to do with read capacity.
+T: To follow variable read load, let Aurora Auto Scaling change the number of replicas behind the reader endpoint; cloning, backtracking and pausing solve other problems.
+
+@ Q003556 explain
+G: ## Zonal NAT gateways
+A NAT gateway lets instances in private subnets reach the internet or other AWS services. A standard (zonal) NAT gateway is highly available **within its own Availability Zone**, but it lives in a single AZ.
+If a VPC has one NAT gateway in AZ-a and the private subnets in AZ-a, AZ-b and AZ-c all route `0.0.0.0/0` to it, then:
+- an outage in AZ-a cuts outbound access for all three AZs, even though AZ-b and AZ-c are healthy, and
+- traffic from AZ-b and AZ-c crosses AZ boundaries, which adds data transfer charges.
+## The resilient pattern
+Create one NAT gateway in a public subnet of each AZ and give each AZ's private subnets their own route table whose `0.0.0.0/0` route points to the NAT gateway **in the same AZ**. A failure in one AZ then affects only that AZ.
+W: B=One NAT gateway per AZ with AZ-specific routes: each AZ has its own egress path, so losing one AZ no longer breaks outbound traffic for the others.
+X: A=Larger NAT instance in the same AZ: it is still one instance in one AZ, and a self-managed NAT instance needs its own failover scripting, so the single point of failure remains.
+C=Second internet gateway: a VPC can have only one internet gateway attached, and the internet gateway is not the weak point; the zonal NAT gateway is.
+D=Public IPs on all private instances: this turns private instances into internet-reachable ones, defeating the private subnet design instead of making NAT resilient.
+T: A zonal NAT gateway lives in one AZ, so use one per AZ and route each AZ's private subnets to its local NAT gateway.
+
+@ Q003557 explain
+G: ## Surviving node and AZ failures on Amazon EKS
+Resilience in Kubernetes comes from two layers:
+- **Where pods can run:** managed node groups (or Karpenter node pools) should use subnets in several AZs. **Topology spread constraints** then tell the scheduler to spread a Deployment's pods evenly, for example with `topologyKey: topology.kubernetes.io/zone` and `maxSkew: 1`, so one AZ never holds all the replicas.
+- **How many pods stay up:** a Deployment needs **multiple replicas** so that losing one pod or node leaves others serving. A **PodDisruptionBudget** such as `minAvailable: 2` stops voluntary disruptions, like node drains during upgrades or scale-in, from evicting too many pods at once.
+## Example
+A checkout Deployment with 6 replicas across 3 AZs (2 per AZ) and a PDB of `minAvailable: 4` keeps at least 4 pods running during upgrades and still has 4 left if an entire AZ goes down.
+W: A=Multi-AZ node groups with topology spread constraints: nodes exist in several AZs and the scheduler spreads replicas across them, so an AZ outage removes only part of the capacity.
+E=Pod disruption budgets and multiple replicas: several replicas tolerate node failures, and the PDB keeps a minimum number running during drains and upgrades.
+X: B=Single node for all pods: one node is a single point of failure; if it fails, every pod stops at the same time.
+C=Pinning pods to one AZ: this saves some cross-AZ data transfer but guarantees a full outage when that AZ has a problem.
+D=One replica per deployment: a single pod goes down with its node, and any drain or restart causes downtime.
+T: EKS resilience = multi-AZ nodes plus spread constraints for placement, and multiple replicas plus PDBs for availability; single nodes, single AZs or single replicas are points of failure.
+
+@ Q003558 explain
+G: ## Stateless application tiers
+If each web server keeps user sessions in its own memory, the session belongs to that instance. When Auto Scaling terminates the instance during scale-in, or the instance fails, those users lose their session and are logged out. This forces teams to avoid scale-in and blocks elastic scaling.
+The fix is to make the web tier **stateless** by storing session data in a shared external store:
+- **Amazon ElastiCache** (Redis OSS or Valkey, or Memcached): in-memory, sub-millisecond reads, commonly used for session caches.
+- **Amazon DynamoDB**: a fully managed key-value table; the `session_id` is the partition key and a TTL attribute removes expired sessions automatically.
+Any instance can then serve any request, so the Auto Scaling group can add or remove instances freely and the load balancer no longer needs sticky sessions.
+W: C=Externalize sessions to ElastiCache or DynamoDB: sessions survive instance termination because they live outside the instances, so scale-in no longer logs users out.
+X: A=Long sticky sessions: stickiness keeps a user on the same instance, but the session is still lost when that instance is terminated, and long durations also unbalance the load.
+B=Disable scale-in: it avoids logouts by never removing instances, which means paying for peak capacity all the time instead of scaling elastically.
+D=One large instance: scaling up instead of out removes elasticity entirely and creates a single point of failure where one failure logs out everyone.
+T: Elastic scaling requires stateless instances; move session state to ElastiCache or DynamoDB rather than relying on stickiness or blocking scale-in.
+
+@ Q003559 explain
+G: ## Policy as code with CloudFormation Guard
+AWS CloudFormation Guard (`cfn-guard`) is an open-source policy-as-code tool. You write rules in a simple domain-specific language and validate structured files, such as CloudFormation templates in JSON or YAML, against them **before** anything is deployed.
+- A rule can require that every `AWS::S3::Bucket` has encryption enabled, or that resources carry `Tags` with keys such as `CostCenter` and `Owner`.
+- In a pipeline you run a command like `cfn-guard validate -d template.yaml -r rules.guard` in a CodeBuild step; any failed rule returns a non-zero exit code and stops the pipeline.
+- Guard rules can also be enforced at deployment time through CloudFormation Hooks, but the core idea is the same: check the template, not the deployed stack.
+## Why before deployment
+Catching a missing tag in the pipeline is cheap. Finding it after the stack is created means remediation, cleanup and possibly non-compliant resources running in the meantime.
+W: D=CloudFormation Guard rules in the pipeline: they evaluate templates against organizational rules, such as required tags, and fail the pipeline before a non-compliant stack is deployed.
+X: A=Stack outputs for each tag: outputs only export values from a stack that already exists; they do not check anything or block a deployment.
+B=StackSets for each account: StackSets deploy the same stack to many accounts and Regions, which spreads a template rather than validating it.
+C=Drift detection after deploy: drift detection compares deployed resources with their template after deployment, so it cannot stop a non-compliant template from being deployed.
+T: Validate templates before deployment with CloudFormation Guard; outputs, StackSets and drift detection act on stacks that already exist.

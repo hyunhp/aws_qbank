@@ -1,0 +1,361 @@
+# DOP-C02 detailed explanations e06 (explanation-only rewrites; letters are the published ones)
+
+@ Q001345 explain
+G: ## Streaming versus querying stored logs
+There are two very different ways to get numbers out of log events:
+- **Streaming** with Kinesis Data Streams: producers write records into shards and a consumer application (for example a Kinesis Client Library app or a Managed Service for Apache Flink job) reads them within moments of arrival. The consumer can keep state in memory, such as a 60-second sliding window of `errors / requests`, and update it on every record.
+- **Querying** with CloudWatch Logs Insights: logs are first ingested into a log group, then a query scans a time range and returns a result. Each query is a separate, on-demand job that takes seconds or longer and has to be started again to get a fresh number.
+## Why it matters for automated scaling
+A scaling decision driven by a rolling error rate needs a value that is always current. A continuous consumer can emit that value (for example as a custom metric or a direct API call) every few hundred milliseconds. Scheduling Logs Insights queries in a loop only gives snapshots, adds query latency and ingestion delay, and charges per GB scanned on every run.
+W: Continuous versus on-demand: Kinesis delivers each record to the consumer as it arrives, so a stateful consumer can maintain a sub-second rolling aggregate, while Logs Insights only answers when a query is run against logs already stored.
+X: A=Logs Insights triggers scaling: Logs Insights returns query results; it has no built-in action that changes Auto Scaling capacity, so it cannot replace the streaming path.
+C=Cannot query numbers: Logs Insights can parse fields and run `stats` functions such as `count`, `avg` and `sum`, so it can compute an error rate. The problem is latency, not arithmetic.
+D=Always cheaper: cost depends on shard hours or on-demand throughput versus GB scanned, so neither is cheaper for every pattern, and cost is not what the latency requirement hinges on.
+T: For a continuously updated, sub-second aggregate you need a stream with a stateful consumer; Logs Insights is an on-demand query tool over stored logs.
+
+@ Q001346 explain
+G: ## Management events versus data events
+CloudTrail separates API activity into categories:
+- **Management events** are control-plane operations, such as `CreateBucket`, `PutBucketPolicy` or `RunInstances`. The console **Event history** shows the last 90 days of these for free, and a new trail logs them by default.
+- **Data events** are operations on or inside a resource, such as S3 `GetObject`, `PutObject` and `DeleteObject`, or Lambda `Invoke`. They are high volume, so they are **not** logged unless you turn them on for a trail or a CloudTrail Lake event data store, and they are billed per event.
+## What this means for the investigation
+Reading an object is `GetObject`, a data event. Event history never shows data events, so the absence of the record says nothing about whether the read happened. If no trail had S3 data events enabled last week, the principal who read the object cannot be recovered from CloudTrail.
+- Going forward, enable S3 data events (you can scope them with advanced event selectors to the sensitive bucket or prefix and to read events only, to control cost).
+- Each logged `GetObject` then records `userIdentity`, source IP, time and the object key.
+W: Data events are off by default: trails log management events unless configured otherwise, and object reads are data events, so S3 data events must be enabled to capture who called `GetObject`.
+X: A=24-hour retention: Event history keeps management events for 90 days, and trails deliver to S3 where retention is whatever you set. The event is missing because it was never a management event.
+B=Never records S3: CloudTrail records S3 bucket-level operations as management events and object-level operations as data events once enabled. VPC Flow Logs show IPs and ports, never the IAM principal or object key.
+D=Versioning: versioning keeps older object versions; it has no effect on whether CloudTrail logs API calls against the object.
+T: Object-level S3 access is a CloudTrail data event that must be switched on; management-event history alone can never answer who read an object.
+
+@ Q001347 explain
+G: ## Two ways to react to new S3 objects
+- **S3 Event Notifications** send an event straight from the bucket to a Lambda function, SQS queue or SNS topic. Each notification configuration names one destination, and S3 rejects configurations whose prefix/suffix filters overlap for the same event type, so the same `incoming/` event cannot go to two destinations directly. Every new target means editing the bucket's notification configuration.
+- **Amazon EventBridge integration**: turn on "Send notifications to Amazon EventBridge" for the bucket once. S3 then sends every event (for example detail-type `Object Created`) to the default event bus, and you write **rules** that match on bucket name and key prefix.
+## Why EventBridge fits the requirement
+One rule can have up to five targets, and you can add more rules for the same event, all without touching the bucket. Example pattern: `source: aws.s3`, `detail-type: Object Created`, `detail.object.key` with `prefix: incoming/`. Targets can include Lambda, SNS, SQS and Step Functions state machines, and each target can have its own retry policy and dead-letter queue.
+W: S3 to EventBridge with rules: the bucket is configured once, and new consumers such as an SNS topic or a Step Functions workflow are added as rule targets without changing the bucket configuration.
+X: A=Another notification per target: overlapping prefix filters for the same event type are rejected, and even non-overlapping ones require editing the bucket each time a target is added, which is what the team wants to avoid.
+B=Config rule: AWS Config records resource configuration such as bucket settings; it does not track individual object uploads, so it cannot trigger on each new object.
+C=Polling every minute: adds up to a minute of delay, costs a list operation per run, needs state to know what is new, and still needs custom code to fan out to other targets.
+T: Configure S3 once to publish to EventBridge and fan out with rules; direct S3 notifications tie each destination to the bucket configuration.
+
+@ Q001348 explain
+G: ## What a composite alarm is
+A **composite alarm** does not watch a metric. It watches the states of other alarms and evaluates a rule expression, for example:
+`ALARM("HighCPU") AND (ALARM("HighMemory") OR ALARM("High5xx"))`
+- The underlying metric alarms keep evaluating as usual, but you remove their notification actions.
+- Only the composite alarm has an SNS action, so one incident produces one page.
+- Functions such as `ALARM`, `OK` and `INSUFFICIENT_DATA` combine with `AND`, `OR` and `NOT`.
+## Why it reduces noise
+Three symptoms of one root cause (CPU, memory, errors) all fire at roughly the same time. With a composite alarm, the on-call engineer is paged once when the combined condition is met, and the child alarms remain visible in the console for context. Composite alarms also support **action suppression**, where a chosen alarm (such as a maintenance-window alarm) mutes the composite's actions while it is in ALARM.
+W: Composite alarm: it evaluates a Boolean rule over the three alarms' states and sends a single notification, which is exactly the de-duplication the team wants.
+X: A=Anomaly detection on all three: an anomaly detection alarm uses a learned band on one metric (or metric math expression); it changes how thresholds are set, not how many alarms and pages you get.
+B=SNS deduplication: standard SNS topics deliver every published message to every subscription; they do not merge three different alarm messages into one.
+D=One metric filter: metric filters turn log lines into metrics; they cannot merge existing CPU and memory metrics, and Logs Insights queries are not an alarm mechanism.
+T: To turn several related alarms into one page, combine their states with a composite alarm rule and notify only from the composite.
+
+@ Q001349 explain
+G: ## RDS Storage Auto Scaling
+Allocated storage on RDS is normally a fixed number you pick, such as 200 GiB. When free space runs out, writes fail. **Storage Auto Scaling** lets RDS grow the volume for you:
+- You set a **maximum storage threshold**, for example 1,000 GiB.
+- RDS increases storage when free space is low (roughly under 10 percent of allocated), the low-storage condition has lasted at least 5 minutes, and at least 6 hours have passed since the last storage change.
+- Each increase is the larger of 10 GiB, 10 percent of current storage, or the predicted growth, and it happens online without downtime.
+## How it caps cost
+Growth never goes past the maximum threshold, so the largest possible storage bill is known in advance. Storage can grow but not shrink automatically, so choosing a sensible ceiling is the cost control. A `FreeStorageSpace` alarm is still a good companion to warn you when the database approaches the ceiling.
+W: Storage Auto Scaling with a maximum: RDS grows storage automatically when it runs low, so nobody resizes manually, and the maximum storage threshold puts a hard cap on how large (and costly) it can get.
+X: A=Alarm plus ticket: detects the problem but leaves a person to resize, which is the manual work the team wants to remove, and a sudden jump may fill the disk before someone acts.
+B=Performance Insights: it analyzes database load, wait events and top SQL; it does not move or reallocate storage between tables.
+C=Multi-AZ: provides a synchronous standby for failover; the standby has the same storage size as the primary, and failover never adds capacity.
+T: Automatic storage growth with a cost ceiling is Storage Auto Scaling plus its maximum storage threshold, not alarms or availability features.
+
+@ Q001350 explain
+G: ## Two DynamoDB capacity modes
+- **Provisioned with auto scaling**: you set read and write capacity units, and Application Auto Scaling adjusts them with a target tracking policy (for example 70 percent utilization). It reacts to CloudWatch metrics, so it needs a few minutes of sustained high use before raising capacity. A spike that arrives within seconds can be throttled before the increase lands; burst capacity only absorbs short excesses.
+- **On-demand**: there is no capacity to set. You pay per request, and the table accommodates traffic up to double its previous peak instantly. If traffic grows past that, DynamoDB keeps adapting, though extremely sharp jumps far above any previous peak can still see brief throttling, and you can set a maximum throughput per table to cap cost.
+## Choosing for spiky traffic
+With 10x jumps in seconds, reactive scaling is the weak spot of provisioned mode. On-demand removes forecasting and handles spikes much better, at the price of less predictable cost, which the team said is secondary.
+W: On-demand handles spikes immediately: capacity is available per request without waiting for an alarm-driven adjustment, while auto scaling reacts over minutes and can throttle during sudden bursts.
+X: A=Always cheaper: for steady, predictable load, well-utilized provisioned capacity (especially with reserved capacity) is usually cheaper than paying per request.
+C=Auto scaling reacts faster: auto scaling depends on CloudWatch metrics and target tracking, so it lags a sharp spike; on-demand has no such reaction delay for traffic within its current headroom.
+D=On-demand needs alarms: on-demand mode has no capacity settings and no scaling alarms; DynamoDB manages throughput itself.
+T: For unpredictable, sharp spikes pick on-demand, because provisioned auto scaling only reacts after the metrics show the spike.
+
+@ Q001351 explain
+G: ## How ECS service auto scaling works
+ECS uses **Application Auto Scaling**. You register a scalable target for the service's `DesiredCount` with a **minimum** and **maximum** capacity, then attach policies:
+- A **target tracking** policy on `ECSServiceAverageCPUUtilization` (for example target 60) creates CloudWatch alarms and raises or lowers the desired count to keep the metric near the target.
+- Every change is clamped to the scalable target's bounds: if the maximum is 4 and the service already runs 4 tasks, the policy can alarm but will not add a fifth.
+## What to check when scaling stalls
+- The scalable target's `MaxCapacity` compared with the current desired count (a very common cause).
+- Scaling activities from `describe-scaling-activities`, which state why an action did not happen.
+- Whether dynamic scale-out is suspended on the scalable target (`SuspendedState`), and whether tasks can actually be placed (capacity or subnet IP limits show up as pending tasks, not as a missing scaling action).
+W: Already at maximum capacity: target tracking never scales beyond the registered `MaxCapacity`, so a service sitting at its maximum stays put however high CPU goes.
+X: A=Logs subscription filter: target tracking uses CloudWatch metrics and alarms that ECS already publishes; CloudWatch Logs subscriptions play no part.
+B=Fargate cannot use target tracking: Application Auto Scaling works for ECS services on both Fargate and EC2 launch types.
+D=Memory only: ECS provides predefined metrics for both average CPU and average memory utilization, plus ALB request count per target.
+T: When a correctly registered target tracking policy does not scale out despite a breached target, first compare the desired count with the scalable target's maximum.
+
+@ Q001352 explain
+G: ## Alarm actions and fan-out
+A CloudWatch alarm can send its state change to an **SNS topic**. SNS then delivers the same message to every subscription, so one alarm can reach people and code at once:
+- An **email or SMS/chat** subscription notifies the on-call engineer.
+- A **Lambda** subscription receives the alarm JSON, including the alarm name and the metric dimensions, such as `InstanceId`.
+## Running the cleanup on the right instance
+The Lambda function reads the instance ID from the alarm's dimensions and calls Systems Manager `SendCommand` with a document such as `AWS-RunShellScript` targeting that instance. Run Command executes the cleanup script through the SSM Agent, without SSH, and records the output.
+- The instance needs the SSM Agent and an instance profile that allows Systems Manager.
+- An alternative with the same idea is an EventBridge rule on the alarm state change that starts an SSM Automation runbook; both keep notification and remediation tied to the same alarm.
+W: SNS to the engineer and a Lambda: one alarm action fans out to a human notification and to a function that runs the cleanup script on the specific instance through Run Command.
+X: B=Nightly reboot: a scheduled action runs on a clock, not when the alarm fires, reboots rather than cleans up, and does nothing to notify the engineer.
+C=Metric filter runs the script: metric filters only convert log events into metric values; they cannot execute scripts on an instance.
+D=Config runs the script from the alarm: AWS Config remediation is triggered by a noncompliant Config rule evaluation, not by a CloudWatch alarm, and it does not notify the on-call engineer.
+T: Use alarm to SNS to fan out: people get the page, and a Lambda (or SSM Automation) carries out the targeted fix.
+
+@ Q001353 explain
+G: ## Config rules plus remediation
+An AWS Config rule decides whether each resource is COMPLIANT or NON_COMPLIANT. For example, a custom rule or a managed rule that checks installed applications (using Systems Manager inventory data) can flag instances that lack the CloudWatch agent.
+A **remediation action** attached to the rule runs a Systems Manager **Automation document** against each noncompliant resource:
+- The resource ID (the instance ID) is passed as a parameter.
+- **Automatic remediation** runs without a person, with a configurable retry count.
+- The runbook can call Run Command, for example `AWS-ConfigureAWSPackage` to install `AmazonCloudWatchAgent`, then configure and start the agent.
+## Why this closes the loop
+Detection (Config) and repair (SSM Automation) are linked, so an instance that drifts out of compliance is fixed and then re-evaluated as compliant, with an audit trail in both services.
+W: Config remediation with SSM Automation: the rule detects the missing agent and automatically runs an Automation runbook that installs and starts it on each noncompliant instance.
+X: B=Inventory: Systems Manager Inventory collects metadata about installed software; it reports the gap but never installs anything.
+C=Alarm and email: notifies people who then install by hand, which is the manual operator action the requirement rules out.
+D=Config installs directly: Config has no ability to install software itself; its remediation works by running Systems Manager Automation documents.
+T: Config finds noncompliant resources; SSM Automation fixes them. Automatic remediation joins the two with no human step.
+
+@ Q001354 explain
+G: ## How ALB health checks decide a target is unhealthy
+Each target group health check has a few settings:
+- `HealthCheckIntervalSeconds`: how often a check is sent (5 to 300 seconds).
+- `HealthCheckTimeoutSeconds`: how long to wait for a response before counting a failure.
+- `UnhealthyThresholdCount`: consecutive failures before the target is marked unhealthy (2 to 10).
+- `HealthyThresholdCount`: consecutive successes before it returns to service.
+## A worked example
+With a 10-second interval, 5-second timeout and threshold of 2, a target that stalls for about 20 seconds is removed from rotation. With a 30-second interval, 10-second timeout and threshold of 5, it has to fail for about two and a half minutes before removal, so a brief CPU spike no longer causes flapping, and users stop hitting the reduced pool. The trade-off is slower detection of a truly dead target, so tune to the length of the transient behavior you want to tolerate.
+W: Raise the unhealthy threshold and/or interval and timeout: tolerating a few slow or failed checks over a longer window lets targets ride out brief slowness while still catching real failures.
+X: B=Remove the health check: for instance and IP targets, ALB target group health checks are always enabled and cannot be turned off, and ignoring health would keep sending traffic to truly broken instances.
+C=TCP health checks: an ALB target group's health check uses HTTP or HTTPS, not TCP, and a TCP check would only prove the port is open, hiding real application failures.
+D=Shorter interval: checks more often, so the consecutive-failure threshold is reached faster during a short spike, making flapping worse.
+T: To stop flapping on brief slowness, make the health check more tolerant (higher threshold, longer interval or timeout), never weaker or faster.
+
+@ Q001355 explain
+G: ## EventBridge rules versus EventBridge Scheduler
+Scheduled **EventBridge rules** (cron or rate expressions on an event bus) were the original way to run jobs on a timer. They share the per-bus rule quota with event-pattern rules (a default of 300 rules per event bus, adjustable), run in UTC only, and have no native one-time schedule.
+**EventBridge Scheduler** is a separate service built only for scheduling:
+- A default quota of one million schedules per account per Region (adjustable).
+- Cron, rate and **one-time** (`at(...)`) schedules, with a **time zone** per schedule and correct daylight saving handling.
+- **At-least-once** delivery with a retry policy and a dead-letter queue per schedule.
+- Flexible time windows to spread load, schedule groups, and templated or universal targets that can call many AWS APIs directly.
+Example: `cron(0 9 * * ? *)` in `Asia/Seoul` runs at 09:00 local time all year.
+W: EventBridge Scheduler: it is purpose-built for very large numbers of schedules and adds time zones, one-time schedules, retries and dead-letter queues that scheduled rules lack.
+X: B=Config scheduled rules: periodic Config rules evaluate resource compliance at fixed frequencies (1 to 24 hours); they are not a general job scheduler for Lambda.
+C=Inspector scheduled scans: Amazon Inspector scans workloads for vulnerabilities; it has no feature to invoke arbitrary Lambda functions on a schedule.
+D=Logs scheduled queries: running Logs Insights queries on a schedule is about analyzing log data, not about invoking thousands of independent jobs with delivery guarantees.
+T: For thousands of timed jobs with time zones and one-time runs, move from scheduled EventBridge rules to EventBridge Scheduler.
+
+@ Q001356 explain
+G: ## Automatic versus manual remediation in AWS Config
+A remediation action on a Config rule runs an SSM Automation document against noncompliant resources. It can be set up two ways:
+- **Manual**: Config shows the noncompliant resource and an operator chooses "Remediate", so a human confirms each action.
+- **Automatic**: Config runs the document as soon as the resource is evaluated NON_COMPLIANT, with retries.
+## Why the action matters
+Automatic remediation is attractive for safe, reversible fixes, such as enabling bucket encryption. Terminating an instance is **destructive and irreversible**: if the rule is misconfigured, a tag or exception is missing, or a legitimate production instance is flagged, automation destroys it with no chance to intervene.
+- A safer pattern is automatic containment (stop, snapshot, isolate or tag) and manual or approval-gated termination.
+- Test rules in a non-production account and limit scope before enabling destructive automation.
+W: Misfire destroys production: automatic termination acts on every NON_COMPLIANT evaluation, so a false positive terminates a real workload, while manual remediation adds a human check before an irreversible action.
+X: A=Already terminated: remediation acts on running, noncompliant instances; terminating them is the action itself, so the risk is very real.
+B=No manual option: Config supports both manual and automatic remediation for the same remediation action, so the comparison is valid.
+D=No EBS remediation: remediation runs any SSM Automation document, including ones that act on EC2 or EBS, so the rule's subject is not a barrier.
+T: Automate reversible fixes freely, but put a human check in front of destructive actions like termination, because a false positive cannot be undone.
+
+@ Q001357 explain
+G: ## AWS Health events across an organization
+AWS Health publishes events about your own resources: scheduled maintenance, service issues affecting your account, and abuse or security notifications. By default each account sees only its own events.
+- **Organizational view** (enabled from the management account, optionally with a delegated administrator such as a security account) aggregates Health events from all member accounts, including accounts that join later. It is available through the Health console and the Health API.
+- Health events also appear in **EventBridge** with source `aws.health`. With organizational view on, the management account or delegated administrator receives a single feed of Health events from all accounts in its own EventBridge, so a rule such as `{"source": ["aws.health"]}` (optionally filtered by `eventTypeCategory` or service) there can route them to an SNS topic, a Lambda function or a ticketing integration.
+## Why this has the least per-account work
+The organization-wide view is turned on once in the organization, not configured in each of the 20 accounts, and one EventBridge rule in the central account sends the events to one SNS topic the security team subscribes to. A hand-built rule in every account works too, but each new account needs the same setup and it can drift.
+W: Organizational view plus EventBridge to SNS: Health events from every member account are aggregated centrally with one-time setup, and a rule on `aws.health` routes them to a single topic.
+X: A=Rule in each member account: technically workable, but every current and future account needs its own rule and cross-account permissions, which is the per-account setup the requirement tries to avoid.
+B=Config aggregator: aggregators collect Config resource configurations and compliance data; they never receive AWS Health events.
+D=RSS feed per account: the public status RSS feeds are not per-account, and subscribing email per account gives fragmented notifications with nothing to automate on.
+T: Centralize Health events with the organizational view and route `aws.health` events with EventBridge instead of wiring each account separately.
+
+@ Q001358 explain
+G: ## How CloudTrail events reach EventBridge
+EventBridge receives CloudTrail-recorded API calls as events with detail-type `AWS API Call via CloudTrail`. A rule such as `source: aws.s3`, `detail.eventName: DeleteObject` matches them, but only if CloudTrail actually records the call.
+- **Management events**, such as `PutBucketPolicy`, are recorded by default, which is why that part of the rule works.
+- **Data events**, such as `GetObject`, `PutObject` and `DeleteObject`, are recorded only when a trail (or event data store) has S3 data events enabled for the bucket.
+## Fixing the rule
+Enable S3 data events for the bucket on a trail, ideally scoped with advanced event selectors to `DeleteObject` on that bucket or prefix to limit cost. Another option is to enable the bucket's EventBridge integration and match the native `Object Deleted` event, which does not need CloudTrail at all.
+W: Enable S3 data events: object-level calls like `DeleteObject` are data events that CloudTrail does not record by default, so no event exists for the rule to match until they are enabled.
+X: A=Missing s3:GetObject: the function's permissions only matter once it is invoked; the rule never fires at all, and deleting objects would not involve GetObject anyway.
+B=Only to CloudWatch Logs: CloudTrail-recorded API calls do reach EventBridge, which is proven by the rule working for bucket policy changes.
+D=EventBridge cannot match S3 calls: EventBridge matches S3 API calls recorded by CloudTrail, including object-level calls once data events are on, and can also receive native S3 events.
+T: When an S3 API rule fires for bucket changes but not for object operations, the missing piece is CloudTrail S3 data events.
+
+@ Q001359 explain
+G: ## Two different detection needs
+**Known, specific action.** `CreateAccessKey` is an IAM management event. An EventBridge rule on `source: aws.iam`, `detail-type: AWS API Call via CloudTrail`, `detail.eventName: CreateAccessKey` fires within moments of each call and can notify SNS or start remediation. IAM is a global service, so these events are delivered in US East (N. Virginia), where the rule should live.
+**Unknown, unusual behavior.** **CloudTrail Insights** is enabled on a trail or event data store. It learns a baseline of normal management API call volume and API error rates per API, then logs an Insights event when activity deviates significantly, such as a sudden jump in `CreateUser` or `AttachRolePolicy` calls or a burst of `AccessDenied` errors. No thresholds or API names need to be chosen.
+- Insights events can also be sent to EventBridge for alerting.
+W: EventBridge plus CloudTrail Insights: the rule gives near-real-time alerts on the exact `CreateAccessKey` call, and Insights detects abnormal call volume or error rates on its own baseline.
+X: B=Periodic Config rules: Config evaluates resource configuration on change or on a schedule; it does not alert on individual API calls in real time or learn API volume baselines.
+C=One metric filter with threshold: a fixed threshold must be chosen by the team and counts all IAM calls together, so it neither isolates CreateAccessKey precisely nor adapts to normal patterns.
+D=GuardDuty alone: GuardDuty findings target threats such as credential misuse; they do not alert on every CreateAccessKey call, and GuardDuty is not a general anomaly detector for API volume and error rates.
+T: Match specific API calls with EventBridge rules; find unexpected changes in API volume or errors with CloudTrail Insights.
+
+@ Q001360 explain
+G: ## Push versus buffered processing
+When an EventBridge rule targets Lambda directly, EventBridge invokes the function asynchronously. If the function is throttled, EventBridge retries with backoff for up to its retry policy (by default 24 hours and 185 attempts, often reduced), then drops the event unless a target dead-letter queue is set.
+Putting **Amazon SQS** between them changes the model:
+- EventBridge writes each finding to the queue; the write succeeds even when consumers are busy.
+- Messages wait in the queue (up to 14 days retention) until Lambda has capacity.
+- The Lambda event source mapping polls the queue with a chosen **batch size** and **maximum concurrency**, so bursts are processed at a controlled pace.
+- Failed messages return to the queue and, after `maxReceiveCount`, move to a dead-letter queue.
+## Why ordering does not matter here
+Findings are independent, so a standard queue (unordered, very high throughput) is a good fit.
+W: SQS target with controlled polling: the queue absorbs the burst durably, and Lambda drains it at a set batch size and concurrency, so findings are not lost when the function is saturated.
+X: B=Step Functions Express: Express workflows have their own start-rate and service quotas, and any Lambda step inside still hits the same concurrency limit; nothing buffers events that cannot start.
+C=Very high reserved concurrency: reserved concurrency is capped by the account's concurrency quota, can still be exhausted by a large storm, and pushes the burst onto downstream systems.
+D=Zero retries: discards any event that fails the first time, which increases loss rather than preventing it.
+T: When a push-based target can be overwhelmed, put a queue in front of it and let consumers pull at a controlled rate.
+
+@ Q001361 explain
+G: ## What the requirement asks for
+- **Sustained high throughput**: over 50,000 records per second.
+- **Retention and replay**: several independent consumers read the same data, each at its own pace.
+- **Order per device**.
+## How Kinesis Data Streams fits
+A stream is made of **shards**. Each shard accepts up to 1,000 records or 1 MB per second of writes, so at least 50 shards (or on-demand mode) handle the load. The **partition key** decides the shard: using the device ID sends all of a device's records to the same shard, where they are stored in order with increasing sequence numbers.
+- Records are retained for 24 hours by default, extendable up to 365 days, and consumers can re-read from any position.
+- Multiple consumers read the same shards independently; **enhanced fan-out** gives each consumer its own 2 MB per second per shard.
+So the anomaly detector reads in real time while the archiver reads in batches.
+W: Kinesis with device ID as partition key: it scales by shards to the required throughput, keeps per-device order, retains data for replay, and lets multiple consumers read the same records independently.
+X: A=EventBridge bus: EventBridge routes events to targets once per rule; it has no shard-based ordering per key, consumers cannot read the stream at their own position, and PutEvents throughput quotas are set per Region.
+C=SQS FIFO: gives ordering, but each message is deleted once a consumer processes it, so two independent consumers cannot both read and replay the same data.
+D=SNS fan-out: SNS pushes messages to subscribers; standard topics neither guarantee order nor retain messages, and even FIFO topics (with optional archive and replay) do not give consumers a sharded log to read at their own position the way a stream does.
+T: High-volume, ordered-per-key data that several consumers must read and replay calls for a stream (Kinesis), not a queue, bus or topic.
+
+@ Q001362 explain
+G: ## The callback (task token) pattern
+AWS Step Functions **Standard** workflows can run for up to a year and keep their state between steps. A task that uses the `.waitForTaskToken` integration pattern:
+- Passes a unique **task token** to a service, for example publishing it in an SNS email with approve and reject links (typically via API Gateway and a small Lambda).
+- Pauses the execution, without paying for compute, until someone calls `SendTaskSuccess` or `SendTaskFailure` with that token.
+- Can have a `TimeoutSeconds` or `HeartbeatSeconds` so it fails if nobody answers.
+## The incident workflow
+- An EventBridge rule on high-severity Security Hub findings starts the state machine.
+- A task isolates the instance by swapping its security group.
+- A `Wait` state pauses 30 minutes, then a check runs.
+- If still unresolved, an SNS approval request is sent and the workflow waits for the token; on approval, it terminates the instance.
+W: Step Functions with waitForTaskToken and SNS: it orchestrates the multi-step, long-running flow and pauses at the approval step until a human returns the token.
+X: A=Scheduler polling every 5 minutes: adds a separate polling loop and state storage to fake a workflow, instead of reacting to the finding and holding state in one orchestrator.
+B=Lambda with sleep: Lambda has a 15-minute maximum timeout, so a 30-minute sleep is impossible, and it would pay for idle time while waiting.
+C=SSM Automation with no approval: as described it has only automatic steps, so it cannot provide the required human approval gate (Automation does offer an `aws:approve` action, but this option explicitly excludes it).
+T: For long-running automation with a human decision in the middle, use Step Functions and the wait-for-task-token callback pattern.
+
+@ Q001363 explain
+G: ## EventBridge Pipes
+**EventBridge Pipes** connect one **source** to one **target** in a point-to-point flow, with optional steps in between:
+- **Source**: pollable services such as SQS queues, Kinesis and DynamoDB streams, Amazon MQ, Amazon MSK or self-managed Kafka. The pipe does the polling for you.
+- **Filtering**: event patterns drop messages you do not want, and you are not charged for filtered-out events.
+- **Enrichment**: a Lambda function, Step Functions Express workflow, API Gateway endpoint or **API destination** (an external HTTP API) adds context to each event.
+- **Transformation**: an input transformer reshapes the payload before delivery.
+- **Target**: many AWS services, including an event bus, Step Functions or another queue.
+## Example
+SQS `orders-queue` feeds a pipe that filters for `status = NEW`, calls a partner API through an API destination to add customer tier, then delivers the enriched event to a Step Functions workflow, all without writing a plumbing Lambda.
+W: EventBridge Pipes: it reads from SQS directly and adds built-in filtering, external-API enrichment and transformation before delivering to one target, which is the point-to-point flow described.
+X: B=Archive and Replay: stores events sent to an event bus so they can be replayed later; it does not read from SQS, filter, enrich or transform.
+C=Schema Registry: discovers and stores event schemas and generates code bindings; it does not move or change events.
+D=Chained rule: rules only match events that are put on an event bus; they cannot poll an SQS queue or call an external API for enrichment on their own.
+T: Use rules to fan out events on a bus; use Pipes for a source-to-target flow with filter, enrich and transform steps.
+
+@ Q001365 explain
+G: ## Handling the result of asynchronous invocations
+When EventBridge invokes Lambda, the invocation is **asynchronous**: Lambda queues the event, runs the function, and retries failures up to 2 times by default. The caller never sees the response. Two features deal with the outcome:
+- **Destinations**: configured per function (or alias/version) for **on success** and **on failure**. Lambda sends an invocation record to the destination, which can be an SQS queue, SNS topic, another Lambda function or an EventBridge event bus (and, for failures, also an S3 bucket). The record contains the original request payload plus the **response payload** on success, or the error details after retries are exhausted on failure.
+- **Dead-letter queue**: an older feature for **failures only**. It receives the original event with only basic error attributes (such as the error code and message), and never any success records.
+## Example
+On success to an EventBridge bus that feeds the analytics pipeline; on failure to an SQS queue a reprocessing job reads from.
+W: Lambda destinations: on-success and on-failure destinations capture the event with the function's response or error details, with no publishing code inside the function.
+X: A=try/catch with SNS: this is the custom in-function code the team wants to avoid, and it cannot see failures that happen outside the handler, such as timeouts or out-of-memory crashes.
+C=Dead-letter queue only: a DLQ receives only failed events after retries and never includes the function's response for successful invocations.
+D=X-Ray: X-Ray records traces, timing and segments for troubleshooting; it does not store full request and response payloads in S3.
+T: For asynchronous Lambda, destinations capture both success results and final failures; a DLQ covers failures only.
+
+@ Q001366 explain
+G: ## Cross-account event forwarding
+To send GuardDuty findings from a member account to a central account with EventBridge, two pieces must line up:
+- **In the member account**: a rule on the default bus matching `source: aws.guardduty` whose target is the central bus ARN, for example `arn:aws:events:us-east-1:111122223333:event-bus/security-bus`, and an IAM role that the rule uses to call `events:PutEvents` on that bus. The Region matters too: findings stay in the Region where GuardDuty produced them.
+- **In the central account**: the custom bus's **resource-based policy** must allow the member account (or the whole organization via `aws:PrincipalOrgID`) to call `events:PutEvents`.
+## Troubleshooting one missing account
+If nine accounts work, the central rule is fine. Look at what is unique to the tenth: a typo in the bus ARN or wrong Region, a missing or wrong IAM role on its rule, or a bus policy statement that lists nine account IDs instead of ten. The member rule's `FailedInvocations` metric shows whether delivery is being attempted and failing.
+W: Target ARN and bus policy: a wrong target bus ARN in the tenth account, or a bus policy that does not allow that account's PutEvents, stops only its events while the others arrive.
+X: A=AWS Config in the member account: Config is not involved in GuardDuty or EventBridge event delivery; findings are forwarded without it.
+B=GuardDuty in the central account: findings are generated in the member account and forwarded by EventBridge; the other nine accounts already arrive, so the central GuardDuty setting is not the difference.
+D=AdministratorAccess on an IAM user: cross-account event delivery is authorized by the bus policy and the sender's rule role, not by the permissions of a human IAM user in the central account.
+T: When one account's cross-account events are missing, check that account's rule target ARN and role, and that the central bus policy allows it to PutEvents.
+
+@ Q001367 explain
+G: ## Where account-specific AWS events come from
+AWS publishes two kinds of status information:
+- The **public service health dashboard** shows general Regional service status. It is not tied to your resources.
+- **AWS Health** (the account-specific view of the AWS Health Dashboard, formerly the Personal Health Dashboard) shows events that affect **your** resources, such as scheduled maintenance on a specific EC2 instance ID, instance retirement, or an issue affecting your account, with affected entities listed.
+## Automating across 20 accounts
+- **Organizational view** aggregates Health events from all member accounts for the management account or a delegated administrator, including a single organization-wide feed in that account's EventBridge.
+- Health events are also emitted to **EventBridge** with source `aws.health`, for example `eventTypeCode` `AWS_EC2_INSTANCE_RETIREMENT_SCHEDULED` or `AWS_EC2_PERSISTENT_INSTANCE_RETIREMENT_SCHEDULED`.
+- A rule on those events can start a Lambda function or an SSM Automation runbook that, for example, stops and starts the instance to move it to healthy hardware before the maintenance window.
+W: Health organizational view with EventBridge rules: Health reports the events that affect your own instances, organizational view covers all 20 accounts, and EventBridge rules turn those events into automated remediation.
+X: A=CloudTrail Insights: detects unusual volumes or error rates in your own API calls; it does not know about AWS-side issues or scheduled maintenance.
+C=Polling the public health page: the public page shows general service status, not which of your instances are affected, and scraping it is fragile and slow.
+D=Trusted Advisor weekly email: Trusted Advisor checks best practices such as cost, security and limits; it does not deliver AWS maintenance events, and a weekly email cannot drive timely automation.
+T: Events about your own resources come from AWS Health; route `aws.health` events through EventBridge to automate the response.
+
+@ Q001368 explain
+G: ## Simplest way to run a function on a timer
+**EventBridge Scheduler** invokes a target on a rate or cron schedule. A schedule such as `rate(15 minutes)` with a Lambda function as its target is the whole setup:
+- No servers, no workflow definition, no extra runbook.
+- A built-in retry policy and optional dead-letter queue per schedule.
+- An execution role that allows `lambda:InvokeFunction`.
+The function itself finds instances with the cleanup tag and calls `TerminateInstances`.
+## When the other tools make sense
+- **Step Functions** earns its place when there are multiple steps, branching, retries across services or state to keep. A looping state machine with a wait state adds definitions and state transitions to pay for, for nothing here.
+- **SSM Automation** is good for runbooks acting on instances, but wrapping a single Lambda call in a runbook adds a layer.
+- **AWS Config** periodic rules evaluate compliance at 1, 3, 6, 12 or 24 hours, never 15 minutes.
+W: EventBridge Scheduler invoking Lambda: one schedule calls the function every 15 minutes directly, which is the least infrastructure for a single stateless job.
+X: A=Automation runbook on a rate rule: works, but adds a runbook and its execution role between the schedule and the logic, which is extra overhead for no orchestration benefit.
+B=Step Functions wait loop: a continuously running loop of wait states adds a state machine to build, monitor and pay for, although the job has no steps or state to manage.
+D=Config periodic rule as remediation: Config periodic triggers cannot run every 15 minutes, and Config rules evaluate compliance rather than serve as a job scheduler.
+T: A single recurring stateless job needs only a schedule targeting the function; add orchestration services only when there are real workflow steps.
+
+@ Q001369 explain
+G: ## Conformance packs
+A **conformance pack** is a collection of AWS Config rules and remediation actions defined in one YAML template and deployed and updated as a single unit. Sample templates exist for frameworks such as CIS or operational best practices, and you can write your own.
+- **Organization conformance packs** are deployed from the management account or a Config **delegated administrator** (for example an audit account) with `PutOrganizationConformancePack`. They are applied to all member accounts, and to accounts that join the organization later.
+- Updating the template updates every account, so the rule set stays versioned and identical.
+- Config reports a **compliance score** per conformance pack per account: the percentage of rule and resource combinations that are compliant.
+## Example
+A 30-rule "Baseline-v3" pack deployed to 50 accounts shows scores like 96 percent for one account and 71 percent for another, and a new account gets the same pack automatically.
+W: Organization conformance pack from the delegated administrator: it deploys the same versioned set of rules and remediations to all current and future accounts and gives a native compliance score per account for that pack.
+X: B=StackSets plus a spreadsheet: deploys rules, but they are not tracked as one package, and computing scores by hand adds work and has no native per-pack score.
+C=Firewall Manager security group policies: these manage and audit security groups across accounts; they do not deploy arbitrary Config rules with remediation or produce a pack compliance score.
+D=Config aggregator pushing rules: aggregators only collect configuration and compliance data from source accounts; they cannot deploy rules.
+T: Deploy a versioned rule set organization-wide with an organization conformance pack; aggregators only view data, they never push rules.
+
+@ Q001370 explain
+G: ## Auto Scaling lifecycle hooks
+A **launch lifecycle hook** pauses each new instance in the `Pending:Wait` state before it enters `InService` (and before it is registered with the load balancer target group).
+- The hook sends a notification, for example the EventBridge event `EC2 Instance-launch Lifecycle Action`, with the instance ID, hook name and token.
+- The instance waits until something calls `CompleteLifecycleAction` with `CONTINUE` or `ABANDON`, or until the heartbeat timeout (default 3,600 seconds) passes and the default result is applied.
+## The setup
+- Create the hook on the Auto Scaling group.
+- An EventBridge rule matches the launch lifecycle event and starts an SSM Automation runbook.
+- The runbook installs the agent, registers with monitoring, runs the validation script with Run Command, then calls `CompleteLifecycleAction`: `CONTINUE` on success, `ABANDON` on failure so the instance is terminated and replaced.
+W: Launch lifecycle hook with EventBridge and an SSM runbook: the instance is held in Pending:Wait while the runbook configures and validates it, and it only goes InService, receiving traffic, after CompleteLifecycleAction.
+X: A=Config rule after InService: by the time the instance is InService it already receives traffic, so evaluating it afterward is too late to gate anything.
+B=Health check grace period: it only delays when failed health checks count against the instance; it runs no configuration and does not keep the instance out of the load balancer.
+D=Synchronous user data only: the Auto Scaling group moves the instance to InService once it is running, whether or not the script has finished or succeeded, so user data alone does not hold traffic back.
+T: To keep new instances out of service until setup succeeds, use a launch lifecycle hook and complete it from the automation.

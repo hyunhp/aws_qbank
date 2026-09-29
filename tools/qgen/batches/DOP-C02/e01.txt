@@ -4,7 +4,7 @@
 G: ## How CodePipeline moves artifacts
 Every action in a pipeline reads and writes **artifacts**: zip files kept in an S3 bucket called the **artifact store**. The store is encrypted with a KMS key, either the AWS managed `aws/s3` key or a customer managed key.
 ## Cross-Region actions
-A deploy action in another Region cannot read a bucket through its own Regional endpoint in the pipeline's Region. So a cross-Region pipeline defines one artifact store per Region (the `artifactStores` map in the pipeline structure, one entry per Region with its bucket and key). CodePipeline copies the artifact into the target Region's bucket before that action runs.
+CodePipeline requires an artifact store in every Region where the pipeline runs actions. So a cross-Region pipeline defines one artifact store per Region (the `artifactStores` map in the pipeline structure, one entry per Region with its bucket and key). CodePipeline copies the artifact into the target Region's bucket before that action runs.
 - A standard KMS key lives in a single Region, so the target Region needs its own key.
 - That key's policy must allow `kms:Decrypt` (and the S3 permissions must allow `s3:GetObject`) for the roles that read the artifact, such as the CodeDeploy or CloudFormation action role.
 Example: pipeline in `us-east-1`, deploy in `eu-west-1` → a bucket and key in `eu-west-1`, with the deploy role in the key policy.
@@ -65,9 +65,9 @@ CodePipeline has a built-in **Manual approval** action. When the pipeline reache
 - **Notification**: the action can publish to an SNS topic, which emails or chats the approvers.
 - **Review URL and comments**: you can set a URL (such as the staging site) and instructions that appear in the notification and in the console.
 - **Who may approve**: approving calls `codepipeline:PutApprovalResult`. Grant that action, scoped to the pipeline's ARN, only to the release-manager group's IAM role or policy.
-- **Timeout**: an approval that nobody acts on fails after 7 days. For a shorter expiry, such as 3 days, add small automation, for example a scheduled Lambda function that rejects approvals older than 3 days with `PutApprovalResult`.
+- **Timeout**: by default an approval that nobody acts on fails after 7 days. The approval action's declaration can set a shorter timeout (`timeoutInMinutes`, which applies only to manual approval actions), such as 3 days; alternatively, a small scheduled automation can reject stale approvals with `PutApprovalResult`.
 Example: stage `Approve` sits between `DeployStaging` and `DeployProd`, and SNS sends the staging URL to the release managers.
-W: Manual approval with SNS and IAM-scoped approvers: it is the native pause point in CodePipeline, shows the reviewer the staging URL, restricts approval through IAM, and has a built-in expiry that can be tightened to 3 days with a small reject automation.
+W: Manual approval with SNS and IAM-scoped approvers: it is the native pause point in CodePipeline, shows the reviewer the staging URL, restricts approval through IAM, and has a built-in expiry that can be set to 3 days.
 X: A=Lambda sleeping until a DynamoDB flag: a Lambda invocation runs for at most 15 minutes, so it cannot wait days, and you would rebuild notifications, permissions and expiry yourself.
 B=CodeBuild polling a ticket: it pays for build compute while waiting, needs custom ticket integration, and approval rights would live in the ticket system instead of IAM.
 C=Step Functions wait with no timeout: it adds a state machine and custom action for something built in, and "no timeout" directly contradicts the requirement that approvals expire.
@@ -79,12 +79,12 @@ When a CodeBuild project is configured with a VPC, subnets and security groups, 
 ## Counting addresses in a /28
 A `/28` holds 16 addresses. AWS reserves 5 in every subnet (network address, VPC router, DNS, one reserved for future use, broadcast), leaving **11 usable**. Other resources in the subnet use some of those too.
 - 5 concurrent builds → probably fine.
-- 15 concurrent builds → some builds cannot get an ENI and fail or time out while CodeBuild tries to set up networking.
+- 15 concurrent builds → more ENIs than the subnet has free addresses, so some builds cannot get network access and fail.
 The pattern "worked before, fails intermittently only after raising concurrency" points to a per-build resource that runs out.
 ## Fixing it
 Use larger subnets (for example `/24`) and spread the project across several subnets in different Availability Zones.
 W: ENIs exhausting the /28 subnet: each concurrent build consumes a private IP, only 11 are usable in a `/28`, and failures appear only when concurrency grows, which matches the symptom.
-X: B=RDS connection limit: the stem gives no sign the database reached its connection limit, and hitting that limit returns "too many connections" errors from MySQL rather than network timeouts tied to how many builds run.
+X: B=RDS connection limit: a few extra test builds are unlikely to exhaust an RDS instance's connection limit, and hitting that limit returns an immediate "too many connections" error from MySQL rather than a connection timeout.
 C=No VPC support for concurrent builds: CodeBuild supports VPC connectivity for concurrent builds of the same project; the only limit is the IP space and ENIs available in the chosen subnets.
 D=Security group rule missing: a missing inbound rule would block every build, including single builds that previously worked, not only some builds after concurrency was increased.
 T: VPC-connected builds each consume a subnet IP; if failures scale with concurrency, check subnet size before blaming the database.
@@ -179,7 +179,7 @@ G: ## Two ways a source action detects changes
 - **Start latency**: a push waits for the next check before the pipeline starts.
 - **More API calls**: the service keeps asking the repository even when nothing changed, and the calls add up across many pipelines.
 - **Less precise**: several quick pushes may be seen as one change.
-Polling is still valid as a temporary setting, but AWS recommends event-based change detection and has moved pipelines off polling.
+Polling is still valid as a temporary setting, but AWS recommends event-based change detection.
 Example: with events, a push at 10:00:00 starts the pipeline within seconds; with polling it starts only when the next check runs.
 W: Polling adds latency and more API calls: the pipeline waits for the next check instead of reacting immediately, and it keeps calling the repository whether or not anything changed.
 X: A=No tradeoff: polling and events differ in start latency, API usage and precision, which is why AWS recommends event-based detection.
@@ -226,7 +226,8 @@ G: ## SAST as a pipeline gate
 ## How a build fails
 In CodeBuild, any command in a buildspec phase that exits with a **non-zero code** fails that phase and the build. A failed build fails its CodePipeline action, so later stages (publishing the artifact, deploying) never run.
 Most SAST tools let you set a threshold so the exit code reflects severity, for example a flag that exits with code 1 when any high-severity finding exists.
-Example: `build: commands: - sast-scan --fail-on high .` runs before the step that pushes the artifact, so a high finding stops the pipeline.
+Example: the `build` phase runs the scanner with its tool-specific fail-on-high option, and the artifact is published only by a later step that runs after a successful build, so a high finding stops the pipeline.
+Note that CodeBuild still runs `post_build` after a failed `build` phase, so do not publish from `post_build` unconditionally (check `CODEBUILD_BUILD_SUCCEEDING` or publish in a later stage).
 ## Shift left
 Scanning before publishing is cheaper than finding the same flaw after release.
 W: SAST in the build phase with a non-zero exit: the scan runs before publishing, and a high-severity finding fails the build automatically, which blocks the artifact from reaching the repository.
@@ -285,7 +286,7 @@ T: Custom gates in CodePipeline → a Lambda invoke (or custom) action that repo
 @ Q001233 explain
 G: ## Build environments in CodeBuild
 Every build runs in a container from a **build image**:
-- **AWS managed images** contain common runtimes and tools, and AWS updates them over time, so exact tool versions can change.
+- **AWS managed images** contain common runtimes and tools (including some browsers), and AWS updates them over time, so exact tool versions can change and cannot be pinned.
 - **Custom images** are Docker images you build and store, usually in Amazon ECR. You install exactly what you need, pinned to specific versions.
 ## UI tests with Selenium
 Selenium drives a real browser through a matching driver, for example Chrome with a ChromeDriver of the same major version. In a container the browser runs **headless**, with no display.
@@ -362,7 +363,7 @@ A **canary** is a script (Node.js or Python, for example with Puppeteer or Selen
 - Canaries publish metrics such as `SuccessPercent` and `Duration`, plus screenshots and logs.
 - By default they run outside your VPC, so they test the public path users take.
 ## Connecting to rollback
-Create a CloudWatch alarm, for example `Duration > 2000 ms` or `SuccessPercent < 100`, and add it to the CodeDeploy **deployment group** with automatic rollback when an alarm is triggered. CodeDeploy watches the alarm while a deployment is in progress, so use a bake or wait period (for example in a blue/green deployment) that covers the first canary runs.
+Create a CloudWatch alarm, for example `Duration > 2000 ms` or `SuccessPercent < 100`, and add it to the CodeDeploy **deployment group** with automatic rollback when an alarm is triggered. CodeDeploy evaluates the alarm only while a deployment is in progress, so the deployment must last long enough to cover the first canary runs, for example through gradual traffic shifting or a wait period before the original environment is terminated.
 W: Synthetics canary alarm on the deployment group: the canary produces real end-to-end checkout transactions from outside on a schedule, and its alarm tells CodeDeploy to roll back when latency exceeds 2 seconds.
 X: A=ALB health check with a 2-second timeout: health checks call one path from the load balancer, inside the network, and only mark targets unhealthy; they do not run a checkout flow or roll back a deployment.
 B=X-Ray sampling rules: X-Ray records real requests; it does not generate synthetic traffic, and sampling rules only decide how many requests are traced.
@@ -371,11 +372,11 @@ T: Scheduled synthetic user journeys → Synthetics canaries; attach their alarm
 
 @ Q001239 explain
 G: ## Amazon CodeGuru Reviewer
-CodeGuru Reviewer uses automated reasoning and machine learning to comment on code quality and security, for example resource leaks, concurrency problems or unsafe handling of input. It supports Java and Python.
+CodeGuru Reviewer uses automated reasoning and machine learning to comment on code quality and security, for example resource leaks, concurrency problems or unsafe handling of input. It supports Java and Python. AWS has stopped accepting new repository associations for CodeGuru Reviewer and points new users to Amazon Q Developer code reviews, but the integration pattern below is what the exam tests.
 - **Associate a repository** (such as a CodeCommit repository) with CodeGuru Reviewer.
 - When a pull request is opened or updated, it runs an incremental review and posts recommendations as comments on the PR.
 ## Blocking merges
-Recommendations by themselves do not block a merge. To enforce a rule, add a check: for example, a CodeBuild job run on each PR that fails when unresolved critical findings exist, combined with a CodeCommit approval rule that requires that check's approval before merging.
+Recommendations by themselves do not block a merge. To enforce a rule, add a check: for example, a CodeBuild job run on each PR that fails when unresolved critical findings exist, combined with a CodeCommit approval rule whose approval pool includes the role that approves the PR only when that check passes.
 ## Related but different
 **CodeGuru Profiler** examines running applications for CPU and latency hotspots; it does not review source code.
 W: Associate with CodeGuru Reviewer and fail builds on critical findings: the association gives automatic PR recommendations in CodeCommit, and a build gate turns critical findings into a merge blocker.

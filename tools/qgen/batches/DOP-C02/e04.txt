@@ -1,0 +1,361 @@
+# DOP-C02 detailed explanations, batch e04 (explanation-only rewrites; letters are the published ones)
+
+@ Q001293 explain
+G: ## Why AWS APIs throttle
+Every AWS service limits how many API requests an account can make per second, per Region and often per API action. When a caller goes over that rate, the service rejects the call with an error such as `ThrottlingException` or "Rate exceeded". The limit is on the service side, so it applies no matter which client sends the request: SDK, CLI, console or a third-party tool.
+## How clients are expected to react
+- **Retry with exponential backoff**: wait a short time, retry, and double the wait after each failure (for example 100 ms, 200 ms, 400 ms...).
+- **Add jitter**: randomize each wait so hundreds of parallel workers do not all retry at the same instant and cause a new spike.
+- **Limit concurrency**: fewer calls in flight at once keeps the request rate under the limit in the first place.
+The AWS SDKs have this built in through retry modes: `standard` retries throttling errors with backoff and jitter, and `adaptive` also slows the client down on its own when it sees throttling. You can raise the maximum attempts, and put a worker pool or semaphore around the parallel batch so only, say, 10 accounts are processed at a time.
+W: Backoff, jitter and less concurrency: throttling is a transient, rate-based error, so retrying later with randomized, growing delays succeeds without losing work, and capping parallel calls stops the script from hitting the limit so often.
+X: A=Switch to the AWS CLI: the CLI calls the same service APIs and is throttled exactly like the SDK; it even uses the same kind of retry logic underneath, so changing tools does not change the rate limit.
+B=Raise Lambda concurrency: the errors come from the CloudFormation and EC2 APIs, not from Lambda. More Lambda concurrency would, if anything, send even more parallel calls and make the throttling worse.
+D=Stop and log for manual retry: this gives up on a transient error that an automatic retry would usually clear within seconds, turning a resilient batch job into one that needs a human after every spike.
+T: Throttling is solved by slowing down and retrying (backoff, jitter, fewer parallel calls), not by changing tools or raising limits on an unrelated service.
+
+@ Q001294 explain
+G: ## Knowing what software is on each instance
+**Systems Manager Inventory** runs on managed nodes (instances with the SSM Agent and an instance profile) and collects metadata on a schedule: installed applications and their versions, Windows updates, network settings, files and more. You set it up once with an Inventory association, for example "collect every 30 minutes on all managed instances".
+## Turning inventory into compliance
+AWS Config can record this inventory as a resource type (`AWS::SSM::ManagedInstanceInventory`), so every change in installed software becomes a configuration item Config can evaluate.
+- A Config rule checks whether each instance has the security agent at an approved version, for example `SecurityAgent` version `>= 7.2`. AWS also offers managed rules for required or blocked applications (such as `ec2-managedinstance-applications-required`), or you can write a custom rule for more specific version logic.
+- Config marks each instance COMPLIANT or NON_COMPLIANT, keeps the history, and gives you a compliance report you can export or aggregate across accounts for auditors.
+W: SSM Inventory with a Config rule: Inventory gathers the installed agent version from each instance with no custom agent, and Config continuously evaluates it and keeps a compliance history and report, which is exactly what the audit needs.
+X: A=Inspector network reachability: that feature analyzes network paths and open ports to find what can be reached from the internet; it does not report which version of a third-party agent is installed on an instance.
+B=CloudTrail with Athena: CloudTrail records AWS API calls such as `RunInstances`, not what software is installed inside the operating system, so no query over it can show the agent version.
+C=Trusted Advisor: Trusted Advisor checks account-level best practices (cost, security, limits, fault tolerance); it has no view into the packages installed on individual instances.
+T: "What software version is on my instances, and is it compliant?" means SSM Inventory to collect and AWS Config to evaluate and report; API logs and account checks cannot see inside the OS.
+
+@ Q001295 explain
+G: ## Reacting to an API call in near real time
+When someone calls an AWS API, such as `ec2:AuthorizeSecurityGroupIngress`, CloudTrail records a management event. With CloudTrail recording those events, they also flow to Amazon EventBridge with the detail type "AWS API Call via CloudTrail", usually within seconds.
+An EventBridge rule can match on fields in that event, for example `eventName` = `AuthorizeSecurityGroupIngress`, and start a target.
+## Why Step Functions as the target
+The response has several steps: evaluate the rule (is it port 22 from `0.0.0.0/0`?), post to Slack, revoke the rule if it is disallowed, and maybe record the result. A Step Functions state machine runs these as separate states:
+- `Choice` states hold the "does it match the disallowed pattern?" logic.
+- Task states call Lambda, an HTTP endpoint or the EC2 API directly (for example `RevokeSecurityGroupIngress`).
+- Each execution keeps a visual history of every step's input, output and error, which is the troubleshooting visibility the team asked for.
+W: EventBridge starting Step Functions: the CloudTrail event reaches EventBridge within seconds of the API call, and a state machine performs the notify and revoke steps while recording each execution step by step for later troubleshooting.
+X: B=Hourly Lambda scanning CloudTrail logs: an open SSH rule could stay in place for up to an hour, and CloudTrail log files are delivered to S3 in batches, so this can never meet a "within seconds" goal.
+C=Config custom rule doing everything: a change-triggered Config rule depends on the configuration recorder noticing the change, which is typically slower than the EventBridge event, and one Lambda that evaluates, messages Slack and remediates gives no per-step execution history.
+D=Config periodic rule every 24 hours: a daily evaluation leaves the port open for up to a day, far outside the seconds-level response required.
+T: For seconds-level reaction to a specific API call, trigger on the CloudTrail event in EventBridge and orchestrate the steps in Step Functions; periodic scans and Config schedules are far slower.
+
+@ Q001296 explain
+G: ## What a State Manager association does
+A State Manager association applies an SSM document (for example `AWS-RunShellScript` or `AWS-ApplyAnsiblePlaybooks`) to a set of targets, such as all instances with tag `Env=prod`, either once or on a schedule, and keeps them in that state.
+## Rate controls
+With 2,000 targets, you rarely want everything to run at the same moment. Associations have two rate-control settings:
+- `MaxConcurrency`: how many targets run at once, as a number or a percentage, for example `50` or `10%`. The rest wait until slots free up, so the change rolls out in waves.
+- `MaxErrors`: how many failures are allowed before State Manager stops sending the association to new targets, for example `5%`. A broken configuration is caught after a few instances instead of all 2,000.
+Run Command and Automation use the same two settings for fleet-wide actions.
+W: MaxConcurrency and MaxErrors: `MaxConcurrency` staggers the rollout so only a controlled number of instances run the update at once, and `MaxErrors` halts it early if the change starts failing.
+X: A=Use Maintenance Windows instead: associations do support rate controls themselves. Maintenance Windows are about when work is allowed to run, and they would add scheduling overhead without being needed for concurrency control.
+B=CloudWatch alarm pause: an alarm can be attached to an association as a stop condition, but it only reacts after load has already spiked; it does not limit how many of the 2,000 instances start at the same time.
+D=MaxErrors only: `MaxErrors` limits how many failures are tolerated but does nothing about how many instances run at once; `MaxConcurrency` is the setting that prevents the simultaneous rollout.
+T: To roll a change across a large fleet safely, set `MaxConcurrency` to stagger it and `MaxErrors` to stop it early; alarms and schedules are not concurrency controls.
+
+@ Q001297 explain
+G: ## The state of AWS OpsWorks
+AWS OpsWorks (Stacks, and OpsWorks for Chef Automate and Puppet Enterprise) ran configuration management with Chef or Puppet, often needing a Chef or Puppet server or OpsWorks-managed agents. AWS has ended support for all OpsWorks offerings (OpsWorks Stacks reached end of life in May 2024), so continued investment there is a dead end.
+## What Systems Manager offers instead
+Systems Manager is agent-based through the SSM Agent, which is already installed on many AWS-provided AMIs, and needs no separate configuration server:
+- **State Manager** keeps instances in a desired configuration on a schedule.
+- **Run Command** runs ad hoc commands across a fleet.
+- **Automation** runs multi-step runbooks.
+It manages EC2 and, through hybrid activations, on-premises servers and VMs. SSM documents can even run existing Ansible playbooks or Chef recipes (for example `AWS-ApplyChefRecipes`), which makes a gradual move away from OpsWorks easier.
+W: Systems Manager, no Chef or Puppet server; plan migration: SSM is native to AWS, needs no configuration server, and OpsWorks is no longer supported, so the decision should be driven by a planned move of the cookbooks' logic into SSM documents and associations.
+X: A=OpsWorks is the recommended default: OpsWorks has reached end of life, so it is not recommended for any new configuration management work.
+C=SSM cannot manage on-premises servers: Systems Manager manages hybrid and on-premises machines through hybrid activations, so this is not a reason to stay on OpsWorks.
+D=Cookbooks run unmodified in Automation: Automation runbooks are SSM documents with their own schema; Chef recipes can be run through a dedicated SSM document, but OpsWorks-specific stack and lifecycle behavior does not carry over, so the two are not equivalent.
+T: OpsWorks is end of life; Systems Manager (State Manager, Run Command, Automation) is the native, server-less replacement, including for hybrid fleets.
+
+@ Q001298 explain
+G: ## Error handling in Step Functions
+When a Task state fails, the whole execution fails unless the state says otherwise. Task, Parallel and Map states have two fields for this:
+- **Retry**: a list of retriers. Each one matches errors (`ErrorEquals`, such as `Lambda.TooManyRequestsException` or `States.TaskFailed`) and sets `IntervalSeconds`, `MaxAttempts` and `BackoffRate`. With interval 2, backoff 2 and 3 attempts, the waits are 2 s, 4 s and 8 s. `JitterStrategy: FULL` adds randomness.
+- **Catch**: runs after retries are used up. It matches errors and sends the execution to another state with `Next`, for example a `Cleanup` state that tidies up and publishes an SNS notification. `ResultPath` can keep the error details for that path.
+## Example
+A Task with `Retry: [{ErrorEquals: ["States.TaskFailed"], IntervalSeconds: 2, MaxAttempts: 3, BackoffRate: 2}]` and `Catch: [{ErrorEquals: ["States.ALL"], Next: "NotifyAndCleanup"}]` retries the throttled call three times, then routes to the cleanup path instead of failing the execution.
+W: Retry with backoff plus Catch: Retry handles the transient throttling with growing delays, and Catch routes to the cleanup and notification path only after the retries are exhausted.
+X: A=Parallel state retries automatically: a Parallel state runs branches concurrently; it retries nothing unless you add a Retry field to it, and a retry there would rerun every branch rather than the one step.
+B=Wait state before the Task: a fixed pause does not stop a downstream API from throttling under load, and it gives no retry or failure routing when the call still fails.
+D=Tasks retry by default: Step Functions does not retry a Task unless a Retry field is defined; without one, the first error fails the execution, which is exactly the behavior described.
+T: In Step Functions, transient failures need an explicit Retry with backoff, and failures that remain need a Catch to a recovery path; nothing is retried by default.
+
+@ Q001299 explain
+G: ## Running Automation across accounts and Regions
+Systems Manager Automation runbooks (for example `AWS-CreateTags` or your own tagging runbook) can be started once from a central account and run in many accounts and Regions.
+## How it works
+- In the central (administrator) account, a role such as `AWS-SystemsManager-AutomationAdministrationRole` lets Automation assume roles in other accounts.
+- In each target account, a role such as `AWS-SystemsManager-AutomationExecutionRole` trusts the central account and has permissions for the runbook's actions. These roles can be rolled out to all member accounts with CloudFormation StackSets.
+- When you start the automation, you give `TargetLocations`: a list of account IDs or organizational units, the Regions, and concurrency and error limits.
+The central account then shows one parent execution with a child execution per account and Region, so the team can monitor all 120 (30 x 4) runs in one place.
+W: Multi-account, multi-Region Automation: one execution from the management account fans out into every listed account and Region by assuming the execution role there, and all results are tracked centrally.
+X: A=Run Command only: Automation itself supports multi-account and multi-Region execution; Run Command runs commands on managed nodes and is not the cross-account runbook feature here.
+B=Config aggregators run runbooks: an aggregator only collects configuration and compliance data from many accounts into one view; it cannot start Automation in those accounts.
+C=Copy and run in each console: this is exactly the per-account manual work the team wants to avoid, and 120 separate runs give no central monitoring.
+T: To run one runbook across many accounts and Regions from a single place, use Automation's multi-account, multi-Region execution with an execution role in each target account.
+
+@ Q001300 explain
+G: ## How RDS Multi-AZ failover works
+An RDS Multi-AZ DB instance has a primary in one Availability Zone and a synchronous standby in another. Applications connect to a DNS name such as `mydb.abc123.us-east-1.rds.amazonaws.com`, never to an IP address.
+On failover, RDS promotes the standby and updates that DNS record to point to the standby's IP. The record has a short TTL, so clients that look up the name again reach the new primary within a minute or two.
+## Where it goes wrong
+The DNS change only helps clients that actually re-resolve the name:
+- Some runtimes cache DNS results much longer than the TTL. The JVM, for example, can cache lookups indefinitely when a security manager is installed, and otherwise uses its own cache setting (`networkaddress.cache.ttl`).
+- Connection pools keep old connections open and may keep dialing the cached IP.
+The fix is to respect the TTL (for example, set the JVM cache to a few seconds), make the pool drop and recreate connections on errors, and use retry logic.
+W: The app caches the IP past its TTL: RDS already moved the DNS name to the new primary, so the outage came from clients still using the old IP; re-resolving DNS and recycling connections fixes it.
+X: A=Multi-AZ does not update DNS: RDS updates the endpoint's DNS record automatically on failover, so a Lambda function to change a Route 53 record is unnecessary.
+B=Only Aurora fails over DNS: RDS Multi-AZ DB instances (and DB clusters) also keep the same endpoint name and repoint it on failover; Aurora is not required.
+C=Security groups block the new primary: the security groups belong to the DB instance, and the standby carries the same configuration, so after failover the new primary accepts the same traffic.
+T: Multi-AZ failover keeps the name and changes the IP; applications must re-resolve DNS instead of caching the old address.
+
+@ Q001301 explain
+G: ## Multi-Region writes
+Many databases replicate across Regions, but most allow writes in only one Region at a time. For a global session store, every Region needs to both read and write locally with low latency.
+## DynamoDB global tables
+A DynamoDB global table is one logical table with a replica in each chosen Region, for example `us-east-1`, `eu-west-1` and `ap-northeast-1`.
+- Every replica accepts reads and writes (active-active).
+- Changes replicate to the other Regions asynchronously, typically within about a second.
+- If two Regions update the same item at nearly the same time, the default mode keeps the last write (last-writer-wins) on every replica.
+It is fully managed and serverless: add a replica Region and DynamoDB handles replication and conflict resolution.
+W: DynamoDB global tables: they give local, low-latency writes in every Region with built-in last-writer-wins conflict resolution and no servers or replication to manage.
+X: A=Aurora Global Database: it has one primary Region that takes writes; the other Regions are read-only (write forwarding still sends writes to the primary Region), so it is not active-active with local writes.
+C=ElastiCache cross-Region replication: ElastiCache Global Datastore has one primary cluster for writes, and secondary Regions are read-only, so active-active writes are not available.
+D=RDS MySQL cross-Region read replicas: the replicas serve reads only; every write must go to the single source Region, which adds latency for users far away.
+T: Active-active writes in several Regions with last-writer-wins and little operational effort points to DynamoDB global tables; Aurora, ElastiCache and RDS replicas have one writer Region.
+
+@ Q001302 explain
+G: ## Origin failover in CloudFront
+A CloudFront distribution fetches content from an origin, such as an S3 bucket, when the object is not already cached. An **origin group** contains two origins: a primary and a secondary.
+- You choose which HTTP status codes count as failure, for example `500`, `502`, `503`, `504`, `403` or `404`.
+- If the primary returns one of those codes or times out, CloudFront automatically retries that same request against the secondary origin.
+- Failover applies to `GET`, `HEAD` and `OPTIONS` requests, which fits static assets.
+## Pairing with S3 replication
+S3 Cross-Region Replication copies objects from the primary bucket, say in `us-east-1`, to a replica bucket in `us-west-2`. Using the two buckets as primary and secondary in an origin group means a Regional S3 problem is absorbed per request, with no DNS change or human action.
+W: Origin group with the replica bucket as failover: CloudFront itself detects the error status from the primary bucket and serves the request from the replica in the other Region, automatically and immediately.
+X: A=Separate distributions with Route 53 weighted routing: weighted routing splits traffic by fixed weights and does not by itself react to S3 errors; switching would need health checks or manual weight changes plus DNS caching delays.
+B=Lambda@Edge redirect on 5xx: this is custom code to maintain and it sends a redirect to the client instead of transparently retrying, when CloudFront already has built-in origin failover.
+D=S3 Transfer Acceleration: it speeds up uploads and downloads to a single bucket over edge locations; it provides no second Region and no failover.
+T: For automatic per-request failover between a primary and replica bucket, use a CloudFront origin group; DNS tricks and custom code are slower and more fragile.
+
+@ Q001303 explain
+G: ## How an ALB spreads traffic across zones
+An Application Load Balancer has a node in each enabled Availability Zone. DNS answers clients with the node IPs, so incoming requests are split roughly evenly between the nodes: here about 50% to the AZ a node and 50% to the AZ b node.
+## Cross-zone on versus off
+- **Cross-zone enabled** (the ALB default): each node can send requests to any healthy target in any zone. All 10 targets share the load, so each gets about 10%.
+- **Cross-zone disabled**: each node sends requests only to targets in its own zone. The AZ a node's 50% is split between its 2 targets (about 25% each), while the AZ b node's 50% is split among 8 targets (about 6.25% each).
+On an ALB, cross-zone load balancing is always on at the load balancer level, but you can turn it off per target group.
+W: About 10% each, or about 25% for AZ a targets: with cross-zone on every target shares equally across 10 targets, and with it off each zone gets half the traffic, so the 2 targets in AZ a carry about 25% each.
+X: B=50% per AZ when enabled, 10% when disabled: this reverses the behaviors; 50% per zone is what happens with cross-zone off, and an even 10% per target is the cross-zone on result.
+C=Cannot be disabled on an ALB: although it is on at the load balancer level, ALB lets you turn off cross-zone load balancing for individual target groups.
+D=80% to AZ b, and traffic stops to AZ a when disabled: with cross-zone on, AZ b's 8 targets get 80% in total, but disabling cross-zone does not cut off AZ a; its node still sends its half of the traffic to the 2 local targets.
+T: Cross-zone on balances per target; cross-zone off balances per zone, so uneven target counts across zones overload the smaller zone's targets.
+
+@ Q001304 explain
+G: ## Durability versus protection from mistakes
+S3 Standard is designed for 99.999999999% ("11 nines") durability. That means S3 stores copies across multiple Availability Zones and repairs lost copies, so the chance of losing an object to disk, server or facility failure is extremely small.
+Durability says nothing about what you ask S3 to do. If a user, a buggy script or an attacker issues `DeleteObject` or overwrites a key, S3 carries that out durably too.
+## What protects against deletes and overwrites
+- **Versioning** keeps earlier versions; a delete adds a delete marker you can remove, and an overwrite leaves the old version recoverable.
+- **Object Lock** (WORM) prevents versions from being deleted or changed for a retention period.
+- **MFA Delete**, replication to another account, and **AWS Backup** add further safety against mistakes, ransomware or a compromised account.
+Also note that availability (whether you can reach the data right now) is a separate figure: S3 Standard is designed for 99.99%.
+W: Durability guards against hardware loss, not deletes: 11 nines protects against losing data to infrastructure failure, while accidental or malicious deletes and overwrites still need Versioning, Object Lock or backups.
+X: A=11 nines also protects against deletes: S3 faithfully executes a valid delete request; without Versioning or backups, a deleted object is gone.
+C=Only in Regions with three or more AZs: the number of AZs affects resilience to hardware and facility failures, not whether a user can delete or overwrite data.
+D=11 nines is availability: 11 nines is the durability design target; S3 Standard's availability design is 99.99%, and deletes remain a risk either way.
+T: Durability protects data from infrastructure failure; only Versioning, Object Lock and backups protect it from your own deletes and overwrites.
+
+@ Q001305 explain
+G: ## How global tables handle conflicting writes
+In the default mode of DynamoDB global tables (multi-Region eventual consistency), each Region's replica accepts writes and replicates them to the others asynchronously. There is no global lock and no single global order of writes.
+If users in `us-east-1` and `eu-west-1` update the same item's `status` within milliseconds, each Region first applies its own write. When replication catches up, DynamoDB resolves the conflict with **last-writer-wins**, based on internal timestamps, so all replicas end up with the same value, but not necessarily the one a human would call "first".
+## Options when that is unacceptable
+- Route all writes for a given item or attribute to one "home" Region.
+- Use conditional writes (for example a version-number check) so a write only succeeds if the item is in the expected state. This works within the Region handling the write, so it pairs best with a home-Region design.
+- DynamoDB also offers a multi-Region strong consistency mode for global tables, but it has higher write latency and requires three Regions from the same geographic Region set, so a US plus Europe pair like this one cannot use it.
+W: Last-writer-wins; use conditional writes or avoid multi-Region writes: the result is expected behavior of asynchronous multi-active replication, and the fix is to control where and how that attribute is written.
+X: A=A bug, since strict global order is guaranteed: the default global tables mode does not order writes globally; converging on the last writer is the documented behavior, not a defect.
+B=Enable Streams for strict consistency: DynamoDB Streams only publishes a log of item changes for consumers to read; it does not coordinate writes between Regions or change conflict resolution.
+C=Transactions are conflict-free across Regions: transactions give ACID guarantees only in the Region where they run; a concurrent write in another Region can still conflict during replication.
+T: Default global tables are multi-active with last-writer-wins; if an attribute needs a single authority, route its writes to one Region or guard them with conditions.
+
+@ Q001306 explain
+G: ## The problem with toggling health checks
+In an active-passive setup, each service might have its own Route 53 failover record and health check. Failing over service by service by editing health checks is easy to get wrong: some records move to the standby Region and others stay, so calls bounce between Regions and latency rises.
+## Route 53 Application Recovery Controller (ARC)
+ARC adds **routing controls**: simple on/off switches, hosted on a highly available cluster of Regional endpoints, that are attached to Route 53 records through special health checks.
+- A **control panel** groups the routing controls for all services of an application, for example `us-east-1-on` and `us-west-2-on`.
+- You flip several controls in one API call or console action, so all services move to the new Region together.
+- **Safety rules** block unsafe states: an assertion rule can require that at least one Region stays on, and a gating rule can require a master switch before any control changes.
+Each change is an API action logged in CloudTrail, which gives the audit trail.
+W: ARC routing controls with safety rules: they switch all interdependent records to the other Region as one coordinated, auditable action, and safety rules prevent partial or both-off states.
+X: A=Config conformance packs: they deploy groups of Config rules to check compliance; they do not change DNS or move traffic between Regions.
+B=Separate SSM Automation per service: running one runbook per service reproduces the same piecemeal failover, with no built-in rule stopping an inconsistent mix of Regions.
+D=Longer health check interval: this only makes failure detection slower; it does nothing to coordinate multiple services or prevent partial failover.
+T: For coordinated, safe Regional failover of many services at once, use ARC routing controls and safety rules instead of toggling individual health checks.
+
+@ Q001307 explain
+G: ## The Elastic Load Balancing types
+- **Application Load Balancer (ALB)**, Layer 7: routes HTTP/HTTPS by path, host or headers; terminates the client connection and opens its own to targets. It supports gRPC and can balance individual requests.
+- **Network Load Balancer (NLB)**, Layer 4: forwards TCP, UDP and TLS flows with very low added latency, handles millions of requests per second, and gives each zone a static IP (or an Elastic IP).
+- **Gateway Load Balancer (GWLB)**: sends traffic through third-party virtual appliances such as firewalls using GENEVE.
+- **Classic Load Balancer**: previous generation, kept for older workloads.
+## Why Layer 4 here
+The services need full-duplex, long-lived TCP connections, the lowest latency, and no content-based routing. An NLB passes each TCP connection straight to a target and keeps it there for its lifetime, adding very little latency. Keep in mind that it balances connections, not individual gRPC calls, so clients should use several connections if even load across targets matters.
+W: Network Load Balancer: it forwards long-lived TCP connections at Layer 4 with the lowest latency and static IPs, and the team explicitly does not need Layer 7 routing.
+X: A=Classic Load Balancer: it is the previous-generation load balancer, lacks newer features, and AWS recommends ALB or NLB for new designs.
+B=Gateway Load Balancer: it is built to insert inspection appliances into the traffic path, not to balance application traffic to microservices.
+C=Application Load Balancer: it does support gRPC, but it proxies at Layer 7 and adds processing the team said it does not need, whereas the requirement is the lowest-latency Layer 4 option.
+T: Long-lived TCP with the lowest latency and no content-based routing points to NLB; choose ALB when you need Layer 7 routing features.
+
+@ Q001308 explain
+G: ## Two kinds of RDS Multi-AZ
+- **Multi-AZ DB instance**: one primary plus one standby in another Availability Zone, with synchronous replication. The standby cannot serve traffic; it exists only for failover. Read scaling needs separate read replicas.
+- **Multi-AZ DB cluster**: one writer plus two readable standbys in three different Availability Zones, available for RDS for MySQL and RDS for PostgreSQL. It provides a writer (cluster) endpoint and a reader endpoint that spreads reads across the two standbys. Failover is typically faster, often under 35 seconds.
+## Example
+A MySQL app points writes at the cluster endpoint and reporting queries at the reader endpoint. It gets high availability and read offloading without creating any read replicas.
+W: Clusters have two readable standbys and a reader endpoint: that is exactly the combination of HA and read offloading the workload needs, while the DB instance deployment's standby cannot serve reads.
+X: B=Both allow reads from standbys: the standby in a Multi-AZ DB instance deployment is not accessible for reads; only the DB cluster deployment has readable standbys.
+C=DB instance deployments always fail over faster: Multi-AZ DB clusters typically fail over faster, not slower, than Multi-AZ DB instances.
+D=DB clusters are Aurora-only: Multi-AZ DB clusters are an RDS feature for MySQL and PostgreSQL; Aurora has its own, separate cluster architecture.
+T: For HA plus readable standbys in RDS MySQL or PostgreSQL, choose a Multi-AZ DB cluster; a Multi-AZ DB instance's standby is for failover only.
+
+@ Q001309 explain
+G: ## Availability of components in series
+When a request must pass through every component, the whole chain works only when all of them work. The overall availability is roughly the product of each component's availability:
+- `0.9995 x 0.9999 x 0.995` is about `0.9944`, or 99.44%.
+- 99.44% availability is roughly 49 hours of possible downtime a year, while 99.95% alone would be about 4.4 hours.
+Each added dependency lowers the total, and the weakest component has the biggest effect.
+## Where to spend effort
+Improve the weakest link first. The single-AZ RDS instance at about 99.5% dominates the loss. Enabling Multi-AZ adds a standby in another Availability Zone with automatic failover, which removes the single-AZ failure point and raises the database's availability much closer to the other tiers. Components in parallel (redundant copies) work the other way: they raise availability.
+W: Serial availability is roughly the product; enable Multi-AZ on RDS: multiplying three figures gives a total below any single one, and the single-AZ database is by far the largest contributor, so fixing it first gives the biggest gain.
+X: A=SLAs are additive: availability percentages are not summed (that would exceed 100%); for components in series they multiply.
+B=Only the least reliable component matters: the weakest component dominates, but every component in the chain lowers the total, which is why the end-to-end figure is below even the database's 99.5%.
+D=Serverless tiers are excluded: API Gateway and Lambda are in the request path and have their own availability commitments, so they are part of the calculation like any other tier.
+T: In a serial chain, availabilities multiply, so every dependency lowers the total and the weakest link, here a single-AZ database, is the first thing to fix.
+
+@ Q001310 explain
+G: ## Scaling on a leading metric
+CPU rises only after tasks are already busy. Request count rises as soon as clients send more traffic, so it is a leading indicator of load.
+The ALB publishes `RequestCountPerTarget`, and Application Auto Scaling offers it as the predefined metric `ALBRequestCountPerTarget` for ECS services.
+## Target tracking
+A target tracking policy holds a metric at a value you choose, like a thermostat. For example, target 500 requests per target per minute:
+- Traffic grows to 20,000 requests per minute across 20 tasks (1,000 per task): the policy adds tasks until the ratio is back near 500.
+- Traffic falls: it removes tasks gradually.
+Because it scales in proportion to incoming requests, new tasks start earlier in a surge than with a CPU policy, which leaves more time for them to pass health checks.
+W: Target tracking on ALBRequestCountPerTarget: it scales the ECS service in proportion to incoming request volume, reacting to load as it arrives instead of waiting for CPU to saturate.
+X: A=Scheduled scaling on historical peaks: it adds tasks at fixed times, so any surge that does not match the schedule is missed entirely.
+B=Manual desired-count changes: a human reacting to a latency alarm is slower than CPU-based scaling, not faster, and does not scale.
+C=Step scaling on CPU with one large step: it still waits for CPU to be high, which is the reactive behavior the team wants to avoid, and one big step overshoots or undershoots.
+T: For request-driven services behind an ALB, target tracking on requests per target scales with load as it arrives; CPU-based policies react only after tasks are already saturated.
+
+@ Q001311 explain
+G: ## Two node autoscalers for EKS
+- **Cluster Autoscaler** watches for pods that cannot be scheduled and increases the desired size of an existing EC2 Auto Scaling group (node group). Each group usually has one instance type or a narrow set of similar types, so diversity means many node groups, and scaling goes through the Auto Scaling group.
+- **Karpenter** is an open-source node provisioner. It reads the requirements of pending pods (CPU, memory, architecture, zone, Spot or On-Demand) and launches instances directly through EC2, choosing from a wide list of instance types to pack the pods efficiently. It also consolidates by replacing under-used nodes with fewer or cheaper ones.
+## Example
+Twenty pending pods needing about 60 vCPU in total: Karpenter can pick one or two right-sized Spot instances that fit them, instead of adding many nodes of a fixed size to a node group. EKS Auto Mode builds on Karpenter for this reason.
+W: Karpenter provisions flexible nodes from pending pods: it picks from many instance types, including Spot, directly from pod requirements, which gives faster, better-packed scaling for spiky and diverse workloads.
+X: A=Only Cluster Autoscaler supports Spot: Karpenter supports Spot and On-Demand capacity natively and can choose between them per pod requirement.
+B=Karpenter runs only outside EKS: Karpenter runs inside the EKS cluster as a controller and is widely used with the managed control plane.
+C=Functionally identical, licensing only: both are open source and free; they differ in how they provision nodes (node groups versus direct, flexible EC2 launches).
+T: For fast, right-sized, multi-instance-type and Spot node provisioning on EKS, Karpenter beats Cluster Autoscaler's fixed node-group model.
+
+@ Q001312 explain
+G: ## Where HTTP 429 comes from
+`429 Too Many Requests` is the throttling response. In an API Gateway plus Lambda setup, if Lambda concurrency is fine, the throttle is almost always in API Gateway itself.
+## API Gateway throttling layers
+API Gateway applies a token-bucket limit with a steady **rate** (requests per second) and a **burst** (how many can arrive at once):
+- Account level, per Region: by default 10,000 requests per second with a burst of 5,000 in most Regions (some newer Regions start lower), shared by all APIs in the account and Region.
+- Stage and method level: limits you set on a stage or on individual routes.
+- Usage plans: per API key limits for specific clients.
+When any applicable limit is exceeded, API Gateway returns 429 without calling Lambda, so Lambda metrics look calm. Check the `4XXError` metric and the throttling settings, then raise stage limits, request a quota increase, or add caching.
+W: API Gateway rate or burst throttling: the 429s are produced by API Gateway before the request reaches Lambda, which is why Lambda concurrency stays well under its limit.
+X: A=DLQ is full: a dead-letter queue only receives failed asynchronous invocations; API Gateway calls Lambda synchronously, and a DLQ has nothing to do with 429 responses to clients.
+B=Usage plan is mandatory: usage plans are optional and are used for per-client quotas with API keys; a missing plan does not cause throttling.
+D=Reserved concurrency set too high: a high reserved concurrency gives the function more guaranteed capacity; if anything, a too-low value would cause throttling, and that would show in Lambda's throttle metrics.
+T: A 429 with healthy Lambda concurrency means API Gateway throttling (account, stage, method or usage plan limits).
+
+@ Q001313 explain
+G: ## Cold starts
+When Lambda has no ready execution environment, it creates one: downloads the code, starts the runtime and runs your initialization code. This "cold start" can add hundreds of milliseconds or more. It happens after a new deployment and when traffic jumps faster than warm environments exist.
+## Reserved versus provisioned concurrency
+- **Reserved concurrency** sets aside part of the account's concurrency for one function and also caps it at that number. It does not create or warm any environments.
+- **Provisioned concurrency** keeps a chosen number of environments initialized and ready. Requests up to that number never see a cold start. It is billed while configured and can be scaled on a schedule or with Application Auto Scaling, which suits a predictable workload.
+Example: with provisioned concurrency of 50 on the alias `live`, the first 50 concurrent requests after a deploy hit warm environments.
+W: Provisioned concurrency; reserved only caps: provisioned concurrency keeps environments initialized so bursts and new deployments do not pay the cold start, while reserved concurrency only guarantees and limits capacity.
+X: A=Reserved concurrency pre-initializes: reserved concurrency is a quota setting; it does not warm any execution environments, so cold starts continue.
+B=Memory and concurrency are the same: memory sets the CPU and RAM per invocation; it can shorten initialization a little but is a separate setting from concurrency and does not keep environments warm.
+C=SnapStart for every runtime, replacing both settings: SnapStart supports only certain runtimes (such as Java, Python and .NET), cannot be combined with provisioned concurrency on the same version, and does not replace reserved concurrency.
+T: Provisioned concurrency pre-warms environments to remove cold starts; reserved concurrency only reserves and caps how many can run.
+
+@ Q001314 explain
+G: ## Two places to cache an API
+- **API Gateway stage cache** (REST APIs): a dedicated cache in the API's Region, sized from 0.5 GB up. Responses are cached per method and cache keys, with a TTL from 0 to 3600 seconds (default 300). Cached responses skip the backend (Lambda, HTTP service), which cuts backend load and cost, but users still travel to the Region.
+- **CloudFront** in front of the API: caches responses at edge locations near users, so repeat requests are answered close to the user without reaching API Gateway at all. Cache behavior, TTLs and cache keys are set in the distribution.
+## Layering them
+For a public, read-heavy endpoint you can use both: CloudFront absorbs most traffic at the edge, and requests that miss there (from other edge locations or after edge expiry) can still hit the stage cache instead of the backend.
+W: Stage caching cuts backend load, CloudFront caches at the edge, and they can be layered: the decision turns on where you want the cache (Regional in front of the backend versus near users), and combining them is valid.
+X: B=Mutually exclusive: nothing prevents a CloudFront distribution from caching an API Gateway origin that also has stage caching enabled.
+C=CloudFront cannot cache API Gateway: API Gateway serves HTTPS, and it is a common CloudFront origin; edge-optimized endpoints even use CloudFront for routing.
+D=API Gateway always uses 300 seconds: 300 seconds is only the default; the stage cache TTL can be set from 0 to 3600 seconds and overridden per method.
+T: API Gateway caching protects the backend in the Region, CloudFront caching serves users from the edge, and the two complement each other.
+
+@ Q001315 explain
+G: ## Dynamic versus predictive scaling
+**Dynamic scaling** (target tracking, step scaling) reacts to metrics as they change. When traffic rises at 9:00, instances launch after the metric crosses the target, so there is a lag while they boot.
+**Predictive scaling** looks at up to 14 days of CloudWatch history, learns daily and weekly patterns, and forecasts capacity for the next 48 hours. In "forecast and scale" mode it schedules capacity changes ahead of the forecast, for example launching instances at 8:45 for the 9:00 rise. A pre-launch buffer setting controls how early.
+## Using them together
+Predictive scaling sets the baseline for the expected pattern, and a dynamic policy handles surprises on top. The group's minimum and maximum still apply; predictive scaling only raises capacity above the maximum if you explicitly allow it. You can start in "forecast only" mode to review forecasts before letting it act.
+W: Forecasts load and schedules capacity ahead of demand: for a recurring daily pattern, capacity is already in service when traffic arrives, instead of being added after the metrics rise.
+X: A=Replaces min and max capacity: the group's minimum and maximum still bound capacity; predictive scaling works within them unless you explicitly let it exceed the maximum.
+B=Spot only: predictive scaling is a policy on the Auto Scaling group and works with On-Demand, Spot or mixed-instances groups.
+D=Pre-launches every instance type: it launches only the capacity the forecast needs, using the group's normal launch template or mixed-instances policy, not every instance type in advance.
+T: Dynamic scaling reacts after demand rises; predictive scaling learns recurring patterns and adds capacity before it arrives, and the two work best together.
+
+@ Q001316 explain
+G: ## Sticky sessions and where state lives
+With sticky sessions, the ALB sets a cookie (for example `AWSALB`) so each user keeps going to the same target. This is needed when the application keeps session data, such as login state or a shopping cart, in the memory of one instance.
+The weakness: when that instance goes away, through scale-in, a failed health check or a deployment, its in-memory sessions go with it. The ALB sends the user to another instance that knows nothing about them, so they are logged out and the cart looks wrong.
+## Stateless instances
+The long-term fix is to move session data out of the instances into a shared store:
+- **ElastiCache** (Redis OSS or Valkey, or Memcached) for very fast session reads and writes.
+- **DynamoDB** with a TTL attribute to expire old sessions automatically.
+Every instance reads the session by its ID from the store, so any instance can serve any user, scale-in loses nothing, and stickiness becomes optional.
+W: Externalize session state: storing sessions in ElastiCache or DynamoDB makes instances stateless, so terminating any of them during scale-in no longer loses logins or carts.
+X: A=Never terminate instances with active sticky sessions: there is no such ALB-aware termination setting, and busy instances almost always have some session, so this would effectively block scale-in.
+B=7-day cookie duration: the cookie only decides which instance a user is sent to; when that instance is terminated, the in-memory session is lost no matter how long the cookie lasts.
+C=Disable Auto Scaling: this gives up elasticity and cost savings, and instances can still fail or be replaced, losing sessions anyway.
+T: Sticky sessions only hide in-memory state; putting sessions in a shared store makes instances disposable and scaling safe.
+
+@ Q001317 explain
+G: ## Step scaling versus target tracking
+- **Step scaling**: you create CloudWatch alarms and define steps yourself, for example "CPU 60-80%: add 2 instances; above 80%: add 4". You tune thresholds, step sizes and alarms, and must write matching scale-in steps.
+- **Target tracking**: you pick a metric and a value, such as average CPU at 50% or `ALBRequestCountPerTarget` at 1,000. Auto Scaling creates and manages the alarms and calculates how much to scale out or in to keep the metric near that value.
+## When to use which
+When capacity rises roughly in proportion to load, such as twice the traffic needing about twice the instances, target tracking is the recommended default: less to configure and it adjusts proportionally in both directions. It supports predefined metrics, custom metrics and metric math. Step scaling fits cases that need precise, custom responses at specific thresholds.
+W: Target tracking: with a well-understood, stable relationship between load and capacity, holding a metric at a target value keeps capacity matched automatically with far less tuning.
+X: A=Step scaling always reacts faster: speed depends on the alarms, metrics and warm-up settings; step scaling is not inherently faster and needs more manual tuning.
+B=Target tracking cannot use custom metrics: target tracking supports custom CloudWatch metrics and metric math, not only the predefined ones.
+C=Only scheduled scaling: schedules follow the clock, not actual load, so any change in traffic outside the schedule is missed.
+T: When load and capacity scale proportionally, target tracking is the recommended, low-maintenance choice; step scaling is for custom threshold responses.
+
+@ Q001318 explain
+G: ## Why scale-out can be slow
+When an Auto Scaling group launches a new instance, it must boot, install updates and agents, and warm up the application before it can take work. If that takes several minutes, capacity arrives late for sudden spikes.
+## Warm pools
+A **warm pool** is a set of instances that have already gone through launch and initialization and then wait next to the group:
+- They can wait in the `Stopped` state (you pay only for storage such as EBS volumes), `Hibernated`, or `Running`.
+- On scale-out, the group moves instances from the warm pool into service, which only requires starting or resuming an already configured instance.
+- Lifecycle hooks can run the lengthy setup while the instance enters the warm pool, before it is ever needed.
+Example: a warm pool of 10 stopped instances lets the fleet add 10 ready workers in about the time it takes to start them, instead of waiting through the full setup.
+W: EC2 Auto Scaling warm pools: they keep pre-initialized instances in a low-cost state (typically stopped) so scale-out skips the slow OS update, agent and warm-up steps.
+X: B=Longer cooldown: a cooldown pauses further scaling actions after one completes; making it longer delays scaling even more and does nothing about initialization time.
+C=Termination lifecycle hooks: these run actions when instances are being removed, such as draining or copying logs; they do not speed up adding new instances.
+D=Larger instance types: bigger instances may boot slightly faster, but they still run the full update, install and warm-up sequence at launch, and they cost more.
+T: For slow-to-initialize instances, warm pools keep configured capacity ready at low cost; cooldowns and termination hooks do not shorten scale-out.

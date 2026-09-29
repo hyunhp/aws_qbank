@@ -1,0 +1,361 @@
+# DOP-C02 detailed explanations, chunk e13 (explanation-only rewrites; letters are the published ones)
+
+@ Q003518 explain
+G: ## What IAM Access Analyzer unused access finds
+IAM Access Analyzer offers several analyzer types. External access analyzers report resources shared outside your zone of trust. **Unused access analyzers** look at IAM roles and IAM users and report access that nobody is using.
+- **Unused roles**: roles with no activity within the tracking period you choose (for example 90 days).
+- **Unused credentials**: IAM user access keys and console passwords that have not been used.
+- **Unused permissions**: services and actions a role or user is allowed but never calls.
+## Making it continuous
+Create the analyzer at the organization level from the management account or a delegated administrator, so every member account is covered. Findings are refreshed automatically and are published to Amazon EventBridge and AWS Security Hub. A rule can then open a ticket, notify the owner, or start a Lambda or Step Functions workflow that reviews and removes the role or trims the policy.
+Example: a role `legacy-batch-role` unused for 120 days produces a finding; the workflow tags it, waits for owner confirmation, then deletes it.
+W: Access Analyzer unused access with automated review: it continuously detects unused roles, keys, passwords and permissions across the organization, and the findings can drive an event-based cleanup workflow instead of relying on people.
+X: A=Broad permissions: granting more access makes the problem worse. Every unused permission is still attack surface if the role is compromised, and least privilege is the goal, not something to give up on.
+B=Annual survey: a once-a-year self-report depends on memory and goodwill, misses roles nobody owns, and leaves unused access in place for up to a year. It is neither continuous nor evidence-based.
+C=Delete roles older than 30 days: role age says nothing about use. Many production roles are years old and active every minute, so this would break running workloads while unused new roles survive.
+T: Remove unused access based on measured usage (Access Analyzer unused access findings plus automation), not on age, surveys or by widening permissions.
+
+@ Q003519 explain
+G: ## Workforce access to many accounts
+AWS IAM Identity Center is the recommended way to give employees access to many AWS accounts in an organization.
+- Users come from the Identity Center directory or from an external identity provider such as Microsoft Entra ID or Okta through SAML and SCIM.
+- A **permission set** is a template of policies, for example `ReadOnlyAccess` or a custom `DevOpsDeploy` set. When you assign a user or group a permission set in an account, Identity Center creates a matching IAM role there.
+- Users sign in once to the AWS access portal, pick an account and role, and get temporary credentials for the console or CLI (`aws sso login`).
+- MFA can be required at sign-in, either by Identity Center or by the external IdP.
+Example: the group `platform-admins` gets the `AdministratorAccess` permission set in 40 production accounts with one assignment, and removing a person from the group revokes all of it at once.
+W: IAM Identity Center with permission sets and MFA: it centralizes identities, permissions and MFA for every account and issues short-lived role credentials, so there are no per-account users to manage.
+X: B=Shared administrator user: a shared login makes CloudTrail show one identity for everyone, so actions cannot be attributed to a person, and the password must be changed whenever anyone leaves.
+C=Cognito user pools: Cognito authenticates customers of your own web and mobile applications. It does not provide sign-in to the AWS Management Console or manage permissions across AWS accounts.
+D=IAM users in every account: dozens of users per person, each with its own password, MFA device and policies, is hard to audit and to deprovision, and uses long-term credentials that Identity Center avoids.
+T: Workforce access to many accounts means Identity Center permission sets with MFA; Cognito is for application end users and IAM users do not scale.
+
+@ Q003520 explain
+G: ## Policy as code for templates
+Instead of reviewing CloudFormation templates by eye, you write rules that a tool checks automatically.
+- **AWS CloudFormation Guard** (`cfn-guard`) is an open-source tool where you write rules in a small DSL, for example that every `AWS::S3::Bucket` must set `BucketEncryption` or every `AWS::RDS::DBInstance` must have `StorageEncrypted: true`. `cfn-guard validate` returns a non-zero exit code on violations.
+- **cfn-nag** is an open-source linter with built-in rules for insecure patterns such as unencrypted storage or security groups open to `0.0.0.0/0`.
+## Where it runs
+Add a CodeBuild action to the pipeline right after source (and after `cdk synth`, if you use the CDK). When the tool exits non-zero, the build fails, the pipeline stops, and nothing is deployed. Because it runs on every commit, violations are caught minutes after they are written. CloudFormation Hooks can add a second, deploy-time check inside CloudFormation itself.
+W: cfn-guard or cfn-nag in a failing CodeBuild stage: every template is checked automatically before deployment, and a violation blocks the release instead of reaching an account.
+X: B=Remove encryption requirements: this makes the scan pass by deleting the policy it is supposed to enforce, which leaves unencrypted storage in production and fails the stated requirement.
+C=Manual quarterly scans: templates change many times a day, so a quarterly human review lets noncompliant infrastructure run for months and does not fail the pipeline at all.
+D=Deploy first, rely on Config: AWS Config is a useful detective control, but it only reports after the resource exists. Unencrypted data may already be written, and the requirement is to fail the pipeline before deployment.
+T: Shift security left: run policy-as-code checks (cfn-guard, cfn-nag) in the pipeline so violations fail the build, and keep Config as the after-the-fact safety net.
+
+@ Q003521 explain
+G: ## Preventive and detective controls for AMIs
+Two layers work together.
+- **Preventive**: deny the launch before it happens. An SCP or IAM policy can deny `ec2:RunInstances` on the image resource (`arn:aws:ec2:*::image/*`) unless the AMI matches an approved list, using condition keys such as `ec2:ImageID` or `ec2:Owner` (for example only AMIs owned by your central image account). EC2 also has an account-level **Allowed AMIs** setting that limits, by criteria such as the AMI owner, which AMIs can be discovered and launched; it can be applied across an organization with declarative policies.
+- **Detective**: find what slipped through or existed before. AWS Config managed rules `approved-amis-by-id` and `approved-amis-by-tag` mark instances launched from other AMIs as noncompliant, and can trigger notifications or remediation.
+Example: an SCP denies launches unless `ec2:Owner` equals the golden-image account; Config flags an older instance still running from a public AMI.
+W: C=SCPs or IAM conditions on RunInstances: they block launches from unapproved AMIs in every account before an instance exists, which is the preventive half.
+E=Config rules for unapproved AMIs: they continuously evaluate running instances and report any from unapproved AMIs, covering existing instances and gaps in the preventive policy.
+X: A=Disable CloudTrail: turning off auditing enforces nothing and removes the evidence you would need to see who launched what. It makes compliance worse.
+B=Email after launch: a notification after the fact relies on people remembering to send it and does not stop an unapproved AMI from running.
+D=Tag with AMI name after launch: a tag only records information; it does not stop anything, and a user who launches from an unapproved AMI can set any tag they like.
+T: Enforce approved AMIs with a preventive deny on `ec2:RunInstances` plus a detective Config rule; logging, tags and emails alone enforce nothing.
+
+@ Q003522 explain
+G: ## Layered S3 baseline across accounts
+- **Account-level Block Public Access**: four settings that override any bucket ACL or policy that would make data public. Set on each account, they protect every existing and future bucket there. New buckets also get Block Public Access and SSE-S3 default encryption automatically, but settings can be changed later.
+- **Default encryption**: each bucket's default encryption (SSE-S3 or SSE-KMS with a chosen key) encrypts every new object.
+- **SCPs**: deny actions such as `s3:PutAccountPublicAccessBlock` and `s3:PutBucketPublicAccessBlock` for everyone except a security role, so teams cannot switch the protections off.
+- **AWS Config with remediation**: rules like `s3-account-level-public-access-blocks-periodic` and `s3-bucket-server-side-encryption-enabled` detect drift, and automatic remediation (Systems Manager Automation documents) fixes it.
+Deploy the baseline through the organization (for example CloudFormation StackSets or Control Tower) so new accounts get it automatically.
+W: Account BPA, default encryption, SCPs and Config remediation: each layer covers the others' gaps, applies in every account, and works without anyone remembering to do it.
+X: A=Wiki page: documentation helps people who read it, but it does not stop a misconfigured bucket from being created or detect one that exists.
+B=Delete misconfigured buckets without warning: deletion destroys data that may be critical, gives the owning team no chance to fix the setting, and is far more drastic than simply correcting the configuration.
+C=Monthly script in one account: it sees only that one account, runs once a month so exposure can last weeks, and only emails owners instead of enforcing anything.
+T: Enforce S3 protections with layers that apply everywhere automatically (account BPA, default encryption, SCP guardrails, Config remediation), not with docs, scripts or deletion.
+
+@ Q003523 explain
+G: ## How CodeBuild reads secrets
+A buildspec can reference secrets by name instead of containing them:
+- `env: parameter-store: DB_PASSWORD: /prod/db/password` reads a SecureString from Systems Manager Parameter Store.
+- `env: secrets-manager: API_TOKEN: prod/api:token` reads the `token` key of a Secrets Manager secret.
+At build time, CodeBuild fetches the values with the project's service role and exposes them as environment variables inside the build container. The repository holds only the reference, access is controlled by IAM (`secretsmanager:GetSecretValue`, `ssm:GetParameters`, plus `kms:Decrypt` for customer managed keys), and rotation happens in the secret store without editing code.
+Environment variables in the project configuration can also be set with the types `PARAMETER_STORE` or `SECRETS_MANAGER`, which store a reference rather than the value.
+Build scripts should still avoid echoing these variables or turning on shell tracing (`set -x`) that prints them.
+W: Secrets Manager or Parameter Store references in the buildspec: the secret value never lives in the repository or project definition, and it is fetched at run time under IAM control.
+X: A=Print secrets in logs: build logs go to CloudWatch Logs or S3 and are readable by many people, so printing a secret leaks it exactly where the requirement forbids.
+C=Plaintext project environment variables: plaintext variables are stored in the project configuration and are visible to anyone who can view the project in the console or call `BatchGetProjects`; AWS recommends the Parameter Store or Secrets Manager types for sensitive values.
+D=Hard-coded in the buildspec: the secret is committed to Git history, copied to every clone and fork, and stays there even after it is removed from the latest version.
+T: Keep only secret references in build configuration and fetch values from Secrets Manager or Parameter Store at build time.
+
+@ Q003524 explain
+G: ## Two rotation strategies in Secrets Manager
+Secrets Manager rotates database secrets with a Lambda function (or managed rotation) in four steps: create a new version labeled `AWSPENDING`, set it in the database, test it, then move the `AWSCURRENT` label to it.
+- **Single user**: the password of one database user is changed. Between setting the new password and moving the label, clients holding the old value can fail to connect, so there is a short risk window.
+- **Alternating users**: the secret holds two users, for example `app_user` and `app_user_clone`. Each rotation updates the password of the user that is not currently in use, then switches `AWSCURRENT` to it. The previous user and password (`AWSPREVIOUS`) keep working, so connections opened with the old value do not break. It needs a separate admin secret with permission to change the other user's password.
+Applications should read the secret at connect time (or cache it with a short TTL) and retry once on authentication failure.
+W: Alternating users rotation: one valid credential is always available while the other is rotated, so rotation is automatic and does not interrupt running connections.
+X: A=Disable rotation: long-lived passwords increase the damage from any leak and fail the requirement for automatic rotation. Avoiding change is not the same as avoiding downtime.
+B=Manual change and restart: manual steps are error-prone and restarting every application is the downtime the requirement wants to avoid.
+C=Environment variables, yearly rotation: the password is copied into many places, a year is far too long between changes, and updating it still requires redeploying or restarting applications.
+T: For zero-downtime credential rotation, use Secrets Manager with the alternating users strategy so one valid login always exists.
+
+@ Q003525 explain
+G: ## Central security posture view
+AWS Security Hub collects findings from AWS security services and partner tools into one place, in a common format (AWS Security Finding Format).
+- Sources include GuardDuty, Inspector, Macie, IAM Access Analyzer, Firewall Manager and AWS Config.
+- Its **security standards** (such as AWS Foundational Security Best Practices, CIS AWS Foundations Benchmark, PCI DSS and NIST SP 800-53) run automated checks built on Config rules and show a **security score** per standard.
+- Naming: in 2025 AWS renamed these posture-management capabilities (standards, controls, security scores) **AWS Security Hub CSPM** and introduced a new AWS Security Hub that correlates findings from GuardDuty, Inspector, Macie and Security Hub CSPM. Questions like this one use "Security Hub" for the service as a whole.
+## Organization-wide setup
+In AWS Organizations, the management account designates a **delegated administrator** account for Security Hub. That account enables Security Hub in member accounts, sees all their findings, and with cross-Region aggregation can view every Region from one home Region. Automation rules and EventBridge can route findings to ticketing or remediation.
+W: Security Hub with a delegated administrator: it aggregates GuardDuty, Inspector, Macie and Config findings from all accounts and Regions into one view and computes compliance scores against security standards.
+X: B=Trusted Advisor in the management account: Trusted Advisor gives best-practice checks across cost, performance, security and limits. It does not ingest GuardDuty, Inspector or Macie findings or score security standards.
+C=Detective in each member account: Detective helps investigate a finding by graphing related activity. It is not a finding aggregator, and a per-account deployment would not give a central view.
+D=CloudWatch dashboards per account: dashboards show metrics and logs you wire into them, one account at a time, and have no built-in finding aggregation or compliance scoring.
+T: For one organization-wide view of security findings and standard scores, use Security Hub with a delegated administrator; Detective investigates and Trusted Advisor advises.
+
+@ Q003526 explain
+G: ## What Amazon Detective does
+Amazon Detective automatically builds a **behavior graph** from data it ingests: CloudTrail management events, VPC Flow Logs, GuardDuty findings, and optionally EKS audit logs and Security Hub findings.
+- Entities include IAM roles and users, EC2 instances, IP addresses, S3 buckets and Kubernetes pods.
+- For each entity it shows activity over time, such as which API calls a role made, from which IPs, and how that compares with its usual baseline.
+- It keeps up to a year of graph data, so you can look back before the finding was raised.
+## Typical workflow
+GuardDuty raises `UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration`. From the finding you choose to investigate in Detective, which opens the role's profile: the unusual source IP, the new API calls it made, other resources it touched, and related findings grouped together. You use that to decide scope and containment.
+W: Amazon Detective: it is built for investigating findings, visualizing related API calls, IP addresses and resources over time from its behavior graph.
+X: A=Amazon Inspector: Inspector scans EC2 instances, container images in ECR and Lambda functions for software vulnerabilities and network exposure. It does not investigate GuardDuty findings.
+B=AWS Shield Advanced: Shield Advanced protects against DDoS attacks on internet-facing resources and gives access to the Shield Response Team. It has no investigation graph of API activity.
+D=AWS Firewall Manager: Firewall Manager centrally deploys WAF, security group, Network Firewall and similar policies across accounts. It enforces rules, it does not analyze incidents.
+T: GuardDuty detects, Detective investigates by graphing related entities and activity over time; Inspector, Shield and Firewall Manager solve other problems.
+
+@ Q003527 explain
+G: ## What Amazon Security Lake is
+Amazon Security Lake builds a security data lake in S3 buckets in your own account.
+- It collects AWS sources automatically: CloudTrail, VPC Flow Logs, Route 53 Resolver query logs, Security Hub findings, EKS audit logs and AWS WAF logs.
+- It accepts **custom sources**, such as third-party firewalls or endpoint tools, which write data in the same schema.
+- All data is normalized into the **Open Cybersecurity Schema Framework (OCSF)** and stored as Apache Parquet, so one query works across sources.
+- Data from many accounts and Regions can roll up to a central Region, with lifecycle and retention settings.
+- **Subscribers** (for example a SIEM, Athena or OpenSearch) get data access or query access.
+Example: an analyst runs one Athena query joining CloudTrail and a partner firewall's logs by IP address, because both use OCSF fields.
+W: Amazon Security Lake: it centralizes AWS and third-party security logs in S3 in the standard OCSF format and makes them available for analytics tools.
+X: A=Storage Gateway: it connects on-premises applications to cloud storage through file, volume or tape interfaces. It does not collect or normalize security logs.
+C=ElastiCache: an in-memory cache (Redis OSS, Valkey or Memcached) for low-latency reads. It is not durable log storage and has no security schema.
+D=Lightsail: a simplified service for virtual servers, containers and small databases. It has nothing to do with collecting security data.
+T: Centralize AWS and third-party security logs in a normalized OCSF format with Security Lake.
+
+@ Q003528 explain
+G: ## How CloudTrail log file integrity validation works
+When validation is enabled on a trail, CloudTrail creates a **digest file** every hour alongside the log files.
+- The digest file lists every log file delivered in that hour with its SHA-256 hash.
+- Each digest is signed with a private key held by CloudTrail (SHA-256 with RSA) and contains the signature of the previous digest, forming a chain.
+- You check it with `aws cloudtrail validate-logs --trail-arn ... --start-time ...`, which verifies the signatures and recomputes the hashes.
+If a log file was changed, the hash will not match; if one was deleted, it will be missing from S3 while still listed in the digest; if a digest was removed, the chain breaks. That gives an auditor evidence that files are unchanged since delivery. For stronger protection, combine it with S3 Object Lock and a restrictive bucket policy.
+W: Log file integrity validation: signed hourly digest files with hashes of each log file prove whether any log was modified or deleted after CloudTrail delivered it.
+X: A=CloudWatch Logs metric filters: they count matching events and drive alarms. They say nothing about whether the log files in S3 were altered.
+B=CloudTrail Insights: Insights detects unusual API call volume or error rates. It analyzes activity, not the integrity of stored log files.
+C=S3 Transfer Acceleration: it speeds up uploads over long distances using edge locations. It offers no hashing, signing or tamper evidence.
+T: To prove CloudTrail logs are unaltered, enable log file integrity validation and verify the signed digest chain.
+
+@ Q003529 explain
+G: ## CIS benchmarks and Security Hub
+The **CIS AWS Foundations Benchmark** is a set of security recommendations from the Center for Internet Security, such as MFA on the root user, CloudTrail enabled in all Regions, and no security groups allowing `0.0.0.0/0` to port 22.
+AWS Security Hub offers this benchmark as a **security standard** (several versions are available); since 2025 this standards and scoring capability carries the name **AWS Security Hub CSPM**. When enabled:
+- Security Hub runs automated controls, most built on AWS Config rules, so AWS Config must be recording in the account.
+- Each control shows passed or failed resources, and the standard shows an overall **security score**.
+- With a delegated administrator and cross-Region aggregation, the scores cover every account and Region.
+- Failed controls become findings that EventBridge can route to notifications or remediation.
+W: Security Hub with the CIS AWS Foundations standard: it checks accounts against CIS controls continuously and reports compliance as scores and findings.
+X: A=AWS Budgets: Budgets tracks spending and usage against thresholds. It has no security checks and knows nothing about CIS controls.
+C=AWS DataSync: DataSync copies data between on-premises storage and AWS storage services on a schedule. It does not evaluate account configuration.
+D=CloudFront geo restrictions: they block viewers from certain countries for content delivery. That is a single access setting, not a compliance assessment.
+T: Continuous CIS compliance checks and reports come from Security Hub's CIS AWS Foundations standard, backed by Config.
+
+@ Q003530 explain
+G: ## Protecting the pipeline itself
+A pipeline has production permissions, so an attacker who can change it can deploy anything. Two areas matter most.
+- **Who can change the pipeline and what each stage can do**: only a small group should have `codepipeline:UpdatePipeline` or rights to change the pipeline's CloudFormation stack. Each stage (build, deploy) should use its own role with only the permissions it needs, and production deploy roles should trust only the pipeline.
+- **Artifacts in transit between stages**: CodePipeline stores artifacts in an S3 artifact bucket. Encrypt it with a customer managed KMS key, limit `kms:Decrypt` and bucket access to the pipeline and stage roles, and block public access. Otherwise someone could replace a built artifact between the build and deploy stages.
+Add CloudTrail monitoring on pipeline and bucket changes, and signed artifacts or images where possible.
+W: A=Least-privilege stage roles and restricted edit rights: they stop people and compromised stages from changing what the pipeline does or deploys.
+E=KMS-encrypted, restricted artifact store: it prevents artifacts from being read or swapped between stages by anyone other than the pipeline.
+X: B=Disable CloudTrail for CodePipeline: it saves little and removes the audit trail that would show who changed the pipeline, so tampering goes unnoticed.
+C=Any developer can edit production deploy actions: anyone could add a step that deploys unreviewed code, which is exactly the tampering to prevent.
+D=Deployment credentials in the repository: anyone with read access, and every clone, gets production credentials, and they stay in Git history even after removal.
+T: Secure a pipeline by limiting who can change it and what each stage can do, and by encrypting and locking down its artifact store.
+
+@ Q003531 explain
+G: ## Giving pods their own IAM role
+By default, pods can use the worker node's instance role through the instance metadata service, so every pod on a node gets the same permissions. EKS offers two ways to map an IAM role to a Kubernetes service account instead:
+- **EKS Pod Identity**: install the Pod Identity Agent add-on, create a role that trusts `pods.eks.amazonaws.com`, and create a pod identity association linking the role to a namespace and service account. No OIDC provider setup is needed and the same role can be reused across clusters.
+- **IRSA (IAM roles for service accounts)**: register the cluster's OIDC provider in IAM, create a role whose trust policy allows `sts:AssumeRoleWithWebIdentity` for `system:serviceaccount:<namespace>:<name>`, and annotate the service account with `eks.amazonaws.com/role-arn`.
+In both cases the AWS SDK in the pod gets temporary credentials for that role only. Restricting pod access to IMDS (for example a hop limit of 1) keeps pods from falling back to the node role.
+W: EKS Pod Identity or IRSA: each service account gets its own least-privilege IAM role with temporary credentials, independent of the node's role.
+X: A=One broad node role: every pod on every node gets the union of all permissions, so a compromise of any pod exposes everything; it is the opposite of per-service-account permissions.
+B=Cluster creator's credentials in pods: those are a person's highly privileged credentials; putting them in pods removes accountability and gives every app admin-level access.
+D=IAM user keys in Kubernetes secrets: these are long-term keys that must be rotated manually, and Kubernetes secrets are only base64-encoded unless encryption is configured, so a leak lasts until someone notices.
+T: For per-pod AWS permissions on EKS use Pod Identity or IRSA, never shared node roles or stored access keys.
+
+@ Q003532 explain
+G: ## Config conformance packs
+A **conformance pack** is a collection of AWS Config rules (and optional remediation actions) defined in one YAML template and deployed as a single unit.
+- For encryption, the pack could include `encrypted-volumes` or `ec2-ebs-encryption-by-default`, `rds-storage-encrypted`, and `s3-bucket-server-side-encryption-enabled`.
+- An **organization conformance pack** is deployed from the management account or a Config delegated administrator to every member account, and to new accounts as they join.
+- Each resource is reported compliant or noncompliant, and the pack shows a compliance score.
+- With a Config aggregator, results from all accounts and Regions appear in one view for auditors.
+AWS also provides sample conformance pack templates for common frameworks that you can customize.
+W: Organization-wide Config conformance pack: it deploys the encryption rules to every account in one step and reports noncompliant EBS volumes, RDS instances and S3 buckets.
+X: B=Route 53 health checks: they test whether endpoints respond over HTTP, HTTPS or TCP. They cannot see whether storage behind the endpoint is encrypted.
+C=CloudWatch alarm on new resource count: counting resources says nothing about their encryption settings, and it would not identify which resource is noncompliant.
+D=IAM policy in the management account: an IAM policy controls what principals in that account can do. It does not inspect resources in member accounts or produce a compliance report.
+T: To check and report a set of rules across every account, deploy a Config conformance pack across the organization.
+
+@ Q003533 explain
+G: ## Event-driven remediation
+Every API call that changes a security group is recorded by CloudTrail and delivered to Amazon EventBridge as an `AWS API Call via CloudTrail` event in near real time (delivery is best effort, usually well before the event appears in the trail's log files in S3).
+An EventBridge rule can match exactly the risky change:
+- `source`: `aws.ec2`
+- `detail.eventName`: `AuthorizeSecurityGroupIngress`
+The target Lambda function reads the request parameters from the event, checks whether the rule opens port 22 to `0.0.0.0/0` (or `::/0`), calls `RevokeSecurityGroupIngress` to remove it, and publishes a message to an SNS topic for the team. In an organization, events from member accounts can be forwarded to a central event bus, or the rule can be deployed in every account with StackSets.
+A Config rule such as `restricted-ssh` with auto-remediation is a slower but useful backup that also catches existing rules.
+W: EventBridge rule plus Lambda: the change event triggers automatic revocation and notification shortly after the API call, with no human in the loop; it is the only choice that reacts per change rather than on a schedule.
+X: A=Monthly penetration test: an open SSH port could stay exposed for up to a month, and a test only reports, it does not remove the rule.
+C=Weekly Trusted Advisor review: weekly checks and manual fixes leave days of exposure and depend on someone acting; the requirement is minutes and automatic removal.
+D=Block all security group changes: it stops every legitimate change as well, breaking deployments and operations, when only one kind of change needs to be reversed.
+T: For fast automatic correction of a risky API change, match the CloudTrail event in EventBridge and remediate with Lambda, not with periodic reviews or blanket bans.
+
+@ Q003534 explain
+G: ## Break-glass access
+Break-glass access is an emergency path used only when normal access fails, for example if the identity provider is down or an incident needs rights that normal roles lack.
+A sound design:
+- A **dedicated IAM role** (for example `BreakGlassAdmin`) in each production account, assumable only by a few named identities, with a trust policy condition `aws:MultiFactorAuthPresent` set to true.
+- Credentials for the identities that can use it are stored securely, with retrieval itself logged.
+- **Alerting on every use**: an EventBridge rule on `AssumeRole` of that role (or console sign-in) notifies the security team immediately, and CloudTrail keeps the full record of actions.
+- Regular tests to make sure it works, and a review after every use.
+With AWS Organizations, centralized root access management lets the management account or a delegated administrator remove root credentials from member accounts and perform the few root-only tasks through short-lived root sessions, so a shared root password is not the emergency path.
+W: Dedicated break-glass role with MFA and alerts: access exists when needed, is limited to few people, requires MFA, and every use is visible and auditable.
+X: A=Permanent admin for every engineer: standing admin access is used day to day, so it is neither rare nor emergency-only, and it greatly increases the risk from any stolen credential.
+B=Disable monitoring: removing alerts makes emergency actions invisible, which defeats the auditing requirement and hides misuse.
+C=Shared root credentials: root cannot be restricted by IAM policies (only by SCPs in member accounts), and a shared login shows one identity in CloudTrail, so no individual is accountable.
+T: Break-glass means a dedicated, MFA-protected, tightly scoped role with an alert on every use, not shared root or standing admin rights.
+
+@ Q003535 explain
+G: ## Why secrets must not be baked into images
+A container image is made of layers. A file copied in one layer stays in the image even if a later step deletes it, and anyone who can pull the image can extract it (for example by exporting the layers or reading `docker history` for build arguments). Images are also copied to caches, registries and many hosts.
+Two practices keep secrets out:
+- **Scan in the pipeline**: run secret scanners on the source repository and on built images (tools such as `git-secrets` or open-source image scanners), and fail the build when a key, token or password is found.
+- **Inject at runtime**: store the secret in Secrets Manager or Parameter Store and let the platform provide it when the container starts. In ECS the task definition's `secrets` field uses `valueFrom` with the secret ARN; on EKS you can use the Secrets Store CSI Driver. If a build step truly needs a credential, use BuildKit secret mounts (`RUN --mount=type=secret`), which do not persist in layers.
+W: C=Secret scanning in the pipeline: it detects credentials in code or images before they are pushed and deployed.
+E=Runtime injection from a secret store: the image never contains the secret; the running task fetches it under IAM control and rotation needs no rebuild.
+X: A=SSH private keys in the image: every copy of the image carries the key, which cannot be revoked per host and gives shell access to anyone who pulls the image.
+B=Copying .env files into the image: the credentials become part of a layer that persists and can be extracted, even if a later step deletes the file.
+D=Public registry: it exposes the image and anything inside it to the whole internet, which spreads secrets rather than preventing them.
+T: Keep secrets out of images by scanning for them in the pipeline and injecting them at runtime from Secrets Manager or Parameter Store.
+
+@ Q003536 explain
+G: ## What Amazon Macie does
+Amazon Macie discovers sensitive data in Amazon S3.
+- It keeps an inventory of buckets and evaluates their security, such as public access, encryption and sharing with other accounts.
+- It inspects object contents with **managed data identifiers** (names, addresses, credit card numbers, passport numbers, credentials and more) and **custom data identifiers** based on regular expressions.
+- **Automated sensitive data discovery** samples objects across your buckets continuously; **sensitive data discovery jobs** scan chosen buckets in depth.
+- Findings go to the Macie console, EventBridge and Security Hub.
+## Multi-account
+With AWS Organizations, the management account designates a Macie **delegated administrator**, which enables Macie in member accounts and sees their buckets and findings centrally.
+W: Amazon Macie with a delegated administrator: it scans S3 object contents for PII across all member accounts from one administrator account.
+X: B=Config managed rules: Config evaluates resource configuration, such as whether a bucket is encrypted or public. It never reads the objects, so it cannot find PII inside them.
+C=AWS Shield: Shield protects internet-facing resources against DDoS attacks and has no data classification features.
+D=Inspector EC2 scanning: Inspector looks for software vulnerabilities and network exposure on instances, container images and Lambda functions. It does not classify data stored in S3.
+T: Finding PII in S3 across accounts is Macie's job; Config checks settings, Inspector checks vulnerabilities.
+
+@ Q003537 explain
+G: ## Inspecting web requests centrally
+**AWS WAF** is a web application firewall that inspects HTTP(S) requests at Layer 7 before they reach CloudFront, Application Load Balancers, API Gateway REST APIs, AppSync and other supported resources. **Managed rule groups**, such as the Core rule set, Known bad inputs and SQL database rules, block common exploits like SQL injection and cross-site scripting and are updated by AWS.
+**AWS Firewall Manager** applies security policies across an AWS Organization.
+- It requires Organizations, a Firewall Manager administrator account, and AWS Config enabled in member accounts.
+- A WAF policy defines which rule groups to apply and which resource types or tags are in scope.
+- Firewall Manager automatically attaches the web ACL to matching resources in every account, including new ones, and reports noncompliant resources.
+W: AWS WAF managed rules through Firewall Manager: WAF inspects every request for exploits, and Firewall Manager keeps the same rules enforced on all public applications in all accounts.
+X: A=Security groups for ports 80 and 443: security groups filter by protocol, port and source address. They cannot look inside an HTTP request for SQL injection or other exploits.
+B=CloudWatch dashboard: counting requests shows traffic volume but does not inspect or block anything.
+C=NACLs allowing all internet traffic: NACLs are stateless Layer 3/4 filters on subnets, and allowing everything removes even that filtering; they never examine request contents.
+T: Layer 7 exploit inspection is AWS WAF, and consistent rules across accounts come from deploying it with Firewall Manager.
+
+@ Q003538 explain
+G: ## OIDC federation from GitHub Actions
+GitHub Actions can issue a short-lived **OpenID Connect (OIDC) token** for each workflow run, signed by `token.actions.githubusercontent.com`.
+Setup in AWS:
+- Create an IAM OIDC identity provider for `https://token.actions.githubusercontent.com` with audience `sts.amazonaws.com`.
+- Create a role whose trust policy allows `sts:AssumeRoleWithWebIdentity` from that provider, with conditions on the token claims, for example `token.actions.githubusercontent.com:sub` equal to `repo:my-org/my-app:ref:refs/heads/main` or `repo:my-org/my-app:environment:prod`.
+- In the workflow, grant `id-token: write` and use the `aws-actions/configure-aws-credentials` action with the role ARN.
+The workflow exchanges its token for temporary credentials that expire after the job, and only the named repository (and branch or environment) can assume the role. No access keys exist to leak or rotate.
+W: OIDC federation to a repository-scoped role: GitHub gets short-lived credentials per run, and the trust policy limits which repository and branch can deploy, with no stored keys.
+X: A=Shared IAM user for all repositories: it still needs long-term keys, and every repository gets the same broad rights, so one compromised repository can deploy anywhere.
+C=Root user access keys: root keys have unrestricted access that IAM policies cannot limit; AWS strongly recommends having no root access keys at all.
+D=IAM user keys rotated yearly: encryption at rest in GitHub does not change that these are long-term keys; a leaked key stays valid for up to a year, which is what the requirement forbids.
+T: CI outside AWS should use OIDC federation to a narrowly trusted IAM role, so there are no long-term keys to store.
+
+@ Q003539 explain
+G: ## How AWS Config records history
+AWS Config works per account and per Region.
+- A **configuration recorder** captures the configuration of supported resources and records a new **configuration item** each time something changes, such as a security group rule being added. You can choose continuous or periodic (daily) recording.
+- A **delivery channel** sends configuration history and snapshots to an S3 bucket, where they can be retained as long as audits require.
+- Recorders must run in every account and every Region you use; otherwise changes there are invisible.
+## Centralizing
+An **aggregator** in a central account (for example an organization aggregator in the Config delegated administrator account) collects configuration and compliance data from all accounts and Regions. Auditors can then query it in one place, for example with advanced queries that use SQL-like syntax.
+Deploy recorders with Control Tower or CloudFormation StackSets so new accounts are covered automatically.
+W: Config recorders everywhere with an aggregator: every resource change is recorded with a timestamped history, and the aggregator gives auditors one organization-wide view.
+X: A=30-day CloudWatch Logs in one account: it covers only one account, keeps data briefly, and CloudWatch Logs does not record resource configuration unless you build that yourself.
+B=Quarterly screenshots: they capture a single moment, miss all changes between captures, cannot scale to many resources, and are easy to get wrong.
+D=Trusted Advisor reports: Trusted Advisor gives the current results of best-practice checks. It does not keep a history of how each resource was configured over time.
+T: Configuration history for audits comes from AWS Config recorders in every account and Region, centralized with an aggregator.
+
+@ Q003540 explain
+G: ## Manual approvals in CodePipeline
+CodePipeline has a **Manual approval** action. When the pipeline reaches it, execution pauses and can notify approvers through an SNS topic, with a link and optional review URL.
+- An approver approves or rejects, with a comment. This calls `codepipeline:PutApprovalResult`.
+- IAM decides who can approve: grant `PutApprovalResult` on that approval action only to an approver group, and not to the developers who author changes.
+- If nobody responds within seven days, the action fails.
+## Evidence
+- The **pipeline execution history** shows the approval action's result, the approver and the comment.
+- **CloudTrail** records the `PutApprovalResult` API call with the approver's identity, time and source IP, and can be kept long term in S3.
+Together these show who approved which release and when.
+W: A=Restricted manual approval action: the pipeline cannot reach production until a member of the approver group, a second person, approves.
+E=CloudTrail and pipeline history: they record the approval event with identity and time, which is the required evidence.
+X: B=Remove approvals for urgent releases: it bypasses the control exactly when mistakes are most likely; urgent paths should still require a (faster) approval.
+C=Approval by chat without a pipeline record: the pipeline does not wait for the chat, and messages can be edited, lost or hard to link to a release, so there is no enforcement and no reliable evidence.
+D=Author approves own deployment: self-approval means only one person was involved, which defeats separation of duties and the second-person rule.
+T: Enforce two-person releases with a manual approval restricted to an approver group, and rely on pipeline history and CloudTrail as the record.
+
+@ Q003541 explain
+G: ## Surviving the loss of an Availability Zone
+An Availability Zone is one or more data centers with independent power and networking. To survive losing one, capacity must already exist in others and be managed automatically.
+- An **Auto Scaling group** with subnets in three AZs spreads instances across them. If an AZ becomes unavailable, the group launches replacements in the remaining AZs to keep the desired capacity.
+- **ELB health checks** (health check type `ELB`) make the group replace instances that fail the load balancer's checks, not just instances that stop running.
+- The **Application Load Balancer** has nodes in each enabled AZ and sends traffic only to healthy targets, so users are routed away from the failed AZ.
+Because the tier is stateless (sessions in ElastiCache or DynamoDB, not on the instance), any instance can serve any request. Size for losing one AZ: with three AZs, the other two must carry the full load.
+W: Auto Scaling across three AZs behind an ALB with ELB health checks: traffic shifts and capacity is replaced automatically when an AZ fails.
+X: A=Instance pair in one AZ with an Elastic IP: both instances share the same AZ, so an AZ failure takes both down, and moving the Elastic IP is a manual or scripted step.
+C=Manual registration in two AZs: the spread across AZs helps, but lost capacity is not replaced and new instances must be registered by hand, which fails the no-manual-action requirement.
+D=Single large instance with recover alarm: EC2 auto recovery moves the instance to new hardware in the same AZ, so it cannot help when the whole AZ is lost; it is still a single point of failure.
+T: AZ resilience without manual steps means a multi-AZ Auto Scaling group behind a load balancer with ELB health checks.
+
+@ Q003542 explain
+G: ## Aurora Global Database
+Aurora Global Database spans multiple AWS Regions with one **primary Region** that accepts writes and **secondary Regions** that are read-only.
+- Replication is done by the Aurora storage layer over dedicated infrastructure, not by the database engine, so it adds little load and typically lags less than one second.
+- **Switchover** (planned) moves the primary to another Region without data loss, for example for a Region rotation drill; the replicas must be in sync first.
+- **Managed failover** (unplanned) promotes a secondary Region when the primary Region is impaired; data not yet replicated can be lost, so recovery point depends on replication lag (usually seconds) and recovery time is typically minutes.
+- Secondary clusters also serve low-latency local reads, and write forwarding, when enabled, lets a secondary cluster forward writes to the primary.
+Example: the primary in `us-east-1` fails; you start a managed failover to `eu-west-1`, which becomes the new writer, and applications reconnect to its endpoint.
+W: Aurora Global Database with managed cross-Region failover: storage-level replication keeps lag typically under a second, and a secondary Region can become the writer within minutes.
+X: A=Self-managed database with scripts: custom replication and failover scripts are hard to make reliable, and meeting sub-second lag and minute-level failover is on you to build, test and operate.
+B=Nightly snapshot copies: up to a day of data can be lost, and restoring a snapshot in another Region can take a long time for large databases.
+C=RDS Multi-AZ in one Region: Multi-AZ protects against instance or AZ failure within a Region only; if the Region fails, there is no copy elsewhere.
+T: For cross-Region relational DR with sub-second lag and minute-level failover, choose Aurora Global Database; Multi-AZ stays in one Region and snapshots lose data.
+
+@ Q003543 explain
+G: ## DynamoDB global tables
+A **global table** is a set of DynamoDB tables (replicas) in several Regions that DynamoDB keeps in sync automatically.
+- Every replica accepts **reads and writes** (multi-active). By default replication is asynchronous and usually completes within about a second; conflicting writes to the same item are resolved with last writer wins.
+- A global table can instead be created with multi-Region strong consistency for applications that must always read the latest write; it has its own Region and feature restrictions, and eventual consistency remains the default mode.
+- Applications in each Region use their local replica. If one Region fails, applications in other Regions keep reading and writing, and traffic can be shifted with Route 53 or application logic.
+- You add a Region to an existing table as a replica; DynamoDB copies existing data and then streams changes.
+Example: an `Orders` table with replicas in `us-east-1` and `us-west-2`; when `us-east-1` has an outage, the application in `us-west-2` keeps accepting orders.
+W: DynamoDB global tables: fully managed multi-Region, multi-active replication lets the application keep serving reads and writes from another Region when one fails.
+X: A=TTL settings: TTL deletes items after a timestamp to save storage. It has no role in copying data to another Region.
+B=DynamoDB Accelerator: DAX is an in-memory read cache in front of a table in one Region. It does not replicate across Regions or accept writes when the Region is down.
+D=Streams only: DynamoDB Streams records item changes for 24 hours for consumers to process. Building cross-Region replication on it yourself is possible but is not a managed multi-Region solution; global tables already do this for you.
+T: Multi-Region read and write availability for DynamoDB comes from global tables; TTL, DAX and Streams alone do not provide it.

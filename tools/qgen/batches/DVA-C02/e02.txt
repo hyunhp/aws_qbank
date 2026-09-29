@@ -1,0 +1,359 @@
+# DVA-C02 detailed explanations, chunk e02 (explanation-only rewrites; letters are the published ones)
+
+@ Q000612 explain
+G: ## What DynamoDB Streams records
+When you enable a stream on a table, DynamoDB writes a record for every insert, update and delete, and keeps each record for 24 hours. The stream view type decides what a record holds: `KEYS_ONLY`, `NEW_IMAGE`, `OLD_IMAGE` or `NEW_AND_OLD_IMAGES`.
+- Records are grouped into shards, and the changes to a given item appear in the order they happened.
+- Each change appears exactly once in the stream.
+## How Lambda reads it
+An **event source mapping** is a poller that Lambda runs for you. It reads each shard, sends batches of records to your function, and moves on only after a batch succeeds, so processing stays in order within a shard.
+Example: a `PutItem` followed by an `UpdateItem` on order `o-17` arrives as an `INSERT` record and then a `MODIFY` record, with the old and new images if you asked for them.
+W: Streams with an event source mapping: every item-level change is captured as it happens and delivered to the function within seconds, in order for each item, without any polling code of your own.
+X: A=Consumed-capacity alarm: the alarm watches a usage metric such as consumed write units. It says that writes happened, not which items changed or what their new values are, so there is nothing to process.
+B=Scan every minute: a full-table Scan each minute reads and pays for every item, adds up to a minute of delay, and cannot see an item that was changed twice or deleted between two scans.
+D=Notifications on backups: DynamoDB backups are not files in a customer S3 bucket, and even an export to S3 is a periodic snapshot, not a feed of each individual change.
+T: To react to each item change in near real time, attach Lambda to DynamoDB Streams; polling, metrics or snapshots miss the individual changes.
+
+@ Q000613 explain
+G: ## The Lambda execution environment lifecycle
+On a cold start Lambda creates a new execution environment, downloads your code and runs the **init phase**: everything at module level, outside the handler. Then it calls the handler for the event.
+After the invocation the environment is frozen and kept for a while. The next request routed to it skips init and calls only the handler, so anything created during init is reused.
+- Good to put in init: SDK clients, database connection setup, configuration and static reference data.
+- Keep in the handler: work that depends on the event or must be fresh on every call.
+Example in Python: `s3 = boto3.client("s3")` and `rates = load_rates()` at the top of the file, then the handler just uses `s3` and `rates`.
+For remaining cold-start cost, provisioned concurrency or SnapStart (for supported runtimes) can run init ahead of time.
+W: Initialize outside the handler: the expensive client creation and data load then run once per execution environment instead of on every invocation, and warm invocations reuse them for free.
+X: A=Disable the execution role: the role only supplies permissions and cannot be switched off during init. Without it the function could not call the services it needs, and it would not make initialization faster.
+C=Longer timeout: a larger timeout only lets a slow invocation finish instead of failing. The same slow work still runs every time, so latency and billed duration stay high.
+D=Less memory: Lambda allocates CPU in proportion to memory, so less memory usually makes initialization slower, not faster.
+T: Do one-time setup at module level so warm invocations reuse it; timeouts and smaller memory settings do not remove repeated work.
+
+@ Q000614 explain
+G: ## Kinesis Data Streams in short
+A Kinesis data stream is an ordered, durable log split into **shards**. Producers write records with a partition key; records with the same key go to the same shard and stay in order.
+- Records stay in the stream for the retention period: 24 hours by default, extendable up to 365 days. Consumers can re-read from any position within that window.
+- Several consumers can read the same data independently, for example one for alerts and one for archiving.
+## Lambda as a consumer
+A Lambda event source mapping polls each shard and invokes the function with batches of records, usually within about a second of arrival. Settings such as batch size, batching window and parallelization factor tune throughput.
+Example: sensors write readings keyed by `deviceId`; the function flags readings outside the normal range, and with 7-day retention a fixed version of the detector can replay the week's data.
+W: Kinesis with extended retention and Lambda: the stream gives second-level delivery to the anomaly function, and a 7-day retention period keeps the raw records available for replay.
+X: B=Nightly Glue job: a batch ETL job that runs once a night produces results hours after the data arrives, far from the seconds the anomaly detection needs.
+C=S3 Glacier: Glacier storage classes are for long-term archive at low cost. They do not trigger processing, and some classes need minutes to hours to retrieve data, so nothing happens in real time.
+D=SNS only: SNS pushes messages to subscribers and is not meant as a storage layer. A standard topic keeps no copy after delivery, so there is no stream of raw records to reprocess days later.
+T: Real-time processing plus replay points to a retained stream (Kinesis Data Streams) with a Lambda consumer, not batch jobs, archives or push-only messaging.
+
+@ Q000615 explain
+G: ## How DynamoDB spreads data
+DynamoDB hashes the **partition key** to decide which physical partition stores an item. Each partition can serve about 3,000 read units and 1,000 write units per second, no matter how much capacity the table has overall.
+If most traffic uses one key value, it all lands on one partition. That partition throttles with `ProvisionedThroughputExceededException` while the others sit idle, which is called a **hot partition**. Adaptive capacity helps uneven traffic, but it cannot push one key past the per-partition limit.
+## Fixing a hot key
+- Choose a high-cardinality partition key, such as `transactionId` or `accountId`.
+- Or use write sharding: append a suffix such as `2026-09-15#7` (a random or calculated number from 0 to 9), and query all suffixes when reading a day.
+W: One hot partition key: with the date as the key, every write for the day goes to the single value `2026-09-15`, so one partition hits its limit while the table as a whole still has unused capacity.
+X: A=Regional capacity: DynamoDB does not run out of capacity for a Region in this way. Throttling while the table has headroom points to how the traffic is distributed across keys.
+B=Streams not enabled: Streams only records item changes for consumers. It plays no part in where items are stored or how writes are spread across partitions.
+C=Missing sort key: placement is decided by the partition key alone. A sort key orders items inside a partition key value, so adding one would not spread a single date's writes.
+T: Throttling with spare table capacity means a hot partition key; use a high-cardinality key or write sharding.
+
+@ Q000616 explain
+G: ## Two read consistency modes
+DynamoDB keeps several copies of each item. A write is acknowledged once it is durable, and the other copies catch up, usually within a second.
+- **Eventually consistent** read (the default): may be served by a copy that has not caught up yet, so it can return the old value right after a write.
+- **Strongly consistent** read (`ConsistentRead=true`): returns the most recent successfully written value.
+## What it costs
+One read unit covers one strongly consistent read of up to 4 KB per second, or two eventually consistent reads of that size. So a 3 KB item costs 0.5 read units eventually consistent and 1 read unit strongly consistent.
+Strong reads are available on the base table and local secondary indexes, for `GetItem`, `Query`, `Scan` and `BatchGetItem`, but not on global secondary indexes.
+Example: `GetItem` with `Key={"cartId": ...}` and `ConsistentRead=True` right after the write returns the new total.
+W: ConsistentRead at double the cost: setting the flag makes `GetItem` return the latest committed value, and each read consumes twice the read capacity of an eventually consistent read.
+X: A=GSI is strongly consistent: global secondary indexes are updated asynchronously and support only eventually consistent reads, so they can be even more stale than the base table.
+C=Enable Streams: a stream records changes for other consumers. It does not change how `GetItem` reads are served, so reads can still be stale.
+D=Scan returns newest: a Scan is also eventually consistent unless you set `ConsistentRead`, and it reads the whole table to find one item, which costs far more.
+T: Read-after-write needs `ConsistentRead=true` on the base table, at twice the read-unit cost; GSIs cannot give it.
+
+@ Q000617 explain
+G: ## Picking a read mode for balances
+DynamoDB stores each item on several replicas. After a write, an **eventually consistent** read might hit a replica that has not received the change yet, and return the previous balance for a short time.
+A **strongly consistent** read, requested with `ConsistentRead=true`, returns a result that reflects every write that succeeded before the read.
+- Cost: one read unit per 4 KB instead of half a unit.
+- Availability: supported on the base table and local secondary indexes, not on global secondary indexes.
+- In global tables, strong reads apply within one Region's replica by default; cross-Region strong consistency needs the multi-Region strong consistency mode.
+Example: after `UpdateItem` sets `balance = 950`, a `GetItem` with `ConsistentRead=true` on `accountId=A1` is guaranteed to return 950, not the earlier 1000.
+W: Strongly consistent read: `ConsistentRead=true` guarantees the latest committed balance right after the update, and the stated tolerance for the higher read cost covers the extra read units.
+X: A=Eventually consistent base-table read: this is the default mode and can return the old balance for a short time after the update, which the requirement rules out.
+B=Any GSI read: global secondary indexes are maintained asynchronously from the table and allow only eventually consistent reads, so they cannot promise the latest value.
+D=Scan with filter: the filter is applied after every item has been read and charged, and without `ConsistentRead` the Scan is eventually consistent too, so it is costly and still not guaranteed fresh.
+T: When the latest value is mandatory, use a strongly consistent read on the table and accept the doubled read cost.
+
+@ Q000618 explain
+G: ## How a GSI is maintained
+A global secondary index is stored separately from its table, with its own partitions and its own partition key. When you write to the table, DynamoDB copies the change to each affected GSI **asynchronously**, usually within a fraction of a second, but not as part of the table write itself.
+Because the index can lag slightly behind the table, DynamoDB offers only eventually consistent reads on a GSI. A `Query` on a GSI with `ConsistentRead=true` is rejected with a validation error.
+## Where strong reads are possible
+- Base table: `GetItem`, `Query`, `Scan`, `BatchGetItem` with `ConsistentRead=true`.
+- Local secondary index: yes, because it shares the table's partition key and is updated together with the table.
+If you need a strongly consistent result, read the base table (for example, `GetItem` with the key found through the GSI).
+W: Asynchronous GSI updates: the index is updated after the table write, so DynamoDB cannot guarantee it reflects the latest write and supports only eventually consistent reads on it.
+X: A=Required for cost reasons: the limit is not a pricing choice. Strong reads are simply not offered on a GSI because of how it is replicated, whatever you are willing to pay.
+B=LSIs replaced GSI consistency: LSIs and GSIs are different tools. An LSI must share the table's partition key and be created with the table, so it cannot stand in for a GSI with a different key.
+D=Strong reads deprecated: strongly consistent reads are fully supported on base tables and local secondary indexes today.
+T: GSIs are asynchronously maintained, so they are eventually consistent only; go to the base table or an LSI for strong reads.
+
+@ Q000619 explain
+G: ## Why Query needs a partition key
+A `Query` must name exactly one partition key value with `=`, and can then narrow by a sort key range. That lets DynamoDB go straight to one group of items. The table here is keyed by `customerId`, so "all customers, one month" is not a single key value, and the only way to answer it on the table is a Scan.
+## Build a key for the access pattern
+A global secondary index can use any attribute as its keys. Store an extra attribute such as `orderMonth = "2026-08"` on each order and create a GSI with partition key `orderMonth` and sort key `orderDate`.
+- Report: `Query` the GSI with `orderMonth = "2026-08"`, optionally `orderDate BETWEEN ...`, and read only that month's items.
+- The GSI can project only the attributes the report needs, making it smaller.
+- If one month receives very heavy write traffic, shard the key (for example `2026-08#3`) and query each suffix.
+W: GSI keyed on month: it turns the report into a Query over one partition key value and a sort key range, so each hourly run reads only last month's orders instead of the whole table.
+X: A=Strongly consistent Scan: this reads every item exactly as before and charges twice as much per item, so the report gets more expensive, not cheaper.
+B=Query with only an orderDate filter: a Query requires an equality condition on the partition key; without a `customerId` value it cannot run, and a filter never replaces the key condition.
+C=Parallel Scan with a filter: more segments finish sooner, but every item is still read and charged, and the filter is applied only after the read.
+T: Recurring access patterns belong in key design; add a GSI with the right partition key and Query it instead of Scanning.
+
+@ Q000620 explain
+G: ## What a FilterExpression really does
+A `Scan` reads items from the table page by page, up to 1 MB of data per page. **After** the items are read, DynamoDB applies the `FilterExpression` and removes the ones that do not match before returning the page.
+- Read capacity is charged on the data read, not on the data returned.
+- The 1 MB page limit applies before the filter too, so a page can come back with few or zero items and a `LastEvaluatedKey` to continue.
+Example: scanning 2 GB of data to find 50 items with `status = "FLAGGED"` charges for all 2 GB, even though only 50 items come back.
+## Reading only what you need
+Make the searched attribute part of a key: `Query` the table if it is already the partition key, or create a global secondary index keyed on it and `Query` that index. Then DynamoDB reads only matching items.
+W: Filters apply after reads: the Scan pays for every item it reads and discards non-matches afterwards; a Query on the table key or a GSI reads only the matching items.
+X: B=Invalid filter syntax: an invalid expression makes the request fail with a validation error; it does not silently fall back to a full scan. The high cost comes from how Scan works.
+C=More write capacity: the problem is read consumption. Write capacity is used only by writes and has no effect on what a Scan costs.
+D=Scan does not support filters: Scan does accept `FilterExpression`, which is exactly why the request succeeds while still charging for every item read.
+T: A filter trims the response, not the bill; move the lookup onto a key (Query or a GSI) to reduce reads.
+
+@ Q000621 explain
+G: ## Query with a key condition
+A `Query` selects one partition key value and, optionally, a range of sort key values. Items with the same partition key are stored sorted by the sort key, so DynamoDB reads just that slice, already in order.
+Sort key conditions include `=`, `<`, `<=`, `>`, `>=`, `BETWEEN` and `begins_with`.
+Example key condition: `CustomerId = :c AND OrderDate BETWEEN :from AND :to` with `:from = "2026-08-30"` and `:to = "2026-09-29"`.
+- Results come back in ascending sort key order; set `ScanIndexForward=false` for newest first.
+- Only items that match are read and charged, and large results are paged with `LastEvaluatedKey`.
+W: Query with BETWEEN: one request reads only this customer's orders in the 30-day range, and they come back sorted by `OrderDate` automatically.
+X: B=BatchGetItem with partition key only: `BatchGetItem` needs the full primary key of each item, partition key and sort key, so it cannot fetch "all orders in a date range".
+C=Scan with filters: a Scan reads every item in the table and charges for all of them before the filter removes the other customers' orders, and the results are not sorted by date.
+D=GetItem per date: `GetItem` needs the exact primary key. You would need 30 or more calls, each only matching an order whose `OrderDate` value is exactly that string, and orders with times in the value would be missed.
+T: For one partition key and a sort key range, use Query with a key condition; Get and BatchGet need exact keys and Scan reads everything.
+
+@ Q000622 explain
+G: ## Two kinds of secondary index
+**Global secondary index (GSI)**
+- Partition key and sort key can be any attributes, so it can regroup the data completely.
+- Can be created or deleted at any time on an existing table.
+- Has its own read and write capacity in provisioned mode.
+- Reads are eventually consistent only.
+**Local secondary index (LSI)**
+- Uses the same partition key as the table with a different sort key, so it only reorders items within each partition key value.
+- Must be defined when the table is created (up to 5 per table), and cannot be added later.
+- Uses the table's capacity.
+- Supports strongly consistent reads, and limits each partition key value's item collection to 10 GB.
+Example: table key `customerId` + `orderDate`; an LSI on `customerId` + `total` sorts one customer's orders by amount, while a GSI on `status` + `orderDate` works across all customers.
+W: GSI any key, LSI same partition key: a GSI can use any attributes as keys and be added any time, while an LSI keeps the table's partition key and must be created together with the table.
+X: A=Consistency swapped: it is the other way round. LSIs support strongly consistent reads, and GSIs support only eventually consistent reads.
+B=Throughput swapped: also reversed. A GSI has its own provisioned throughput, and an LSI consumes the base table's capacity.
+C=Same feature: they differ in key schema, when they can be created, capacity and consistency, so choosing the wrong one has real consequences.
+T: GSI means new keys, any time, own capacity, eventual reads; LSI means same partition key, created with the table, shared capacity, strong reads possible.
+
+@ Q000623 explain
+G: ## Design keys for the query you run
+In DynamoDB the **partition key** groups items that you read together, and the **sort key** orders items inside that group. The pair must be unique for each item.
+For chat, the natural group is a room and the natural order is time:
+- Partition key `roomId`, sort key `timestamp` (for example an ISO string such as `2026-09-29T10:15:03.120Z`, with a message id appended if two messages could share a timestamp).
+- Query: `roomId = :room`, `ScanIndexForward=false` (newest first), `Limit=20`.
+DynamoDB reads only the 20 most recent items of that room, whatever the table's size. The next page uses `ExclusiveStartKey` from `LastEvaluatedKey`.
+W: roomId partition, timestamp sort: a Query in descending order with a limit of 20 reads exactly the newest 20 messages of one room, already sorted.
+X: A=messageId key and Scan: no key groups messages by room, so every request reads and pays for the entire table and then sorts it in code.
+C=roomId as the only key: the primary key must be unique, so each room could hold only one item, and there is no sort key to order messages by time.
+D=timestamp partition, roomId sort: each timestamp becomes its own partition key value, so finding one room's recent messages means scanning; the room is not a group you can Query.
+T: Put the grouping attribute in the partition key and the ordering attribute in the sort key, then Query descending with a Limit.
+
+@ Q000624 explain
+G: ## Sparse indexes
+DynamoDB writes an item into a global secondary index only if the item has the index's key attributes. Items without them are simply left out, so the index can be much smaller than the table: a **sparse index**.
+To use this for returned orders, set the index key attribute only on those orders, for example `Status = "RETURNED"` (or a dedicated `ReturnedAt` attribute) and remove it or omit it on other orders. A GSI keyed on that attribute then holds only the returned orders.
+- A `Query` (or even a `Scan`) on the index reads only that small set.
+- The index is kept up to date automatically when an order becomes returned.
+- If the returned set grows large, add a sort key such as `ReturnedAt` for range queries.
+W: Sparse GSI on Status: only the small percentage of orders carrying the key attribute appear in the index, so reading returned orders touches that subset instead of millions of items.
+X: A=Separate S3 bucket: moving part of the data to S3 splits one record set across two stores that must be kept in sync, and S3 cannot answer key-based queries like DynamoDB.
+C=Status as table sort key: a table's primary key cannot be changed after creation, and a sort key only orders items within one partition key value, so it would not collect returned orders from across the table.
+D=Scheduled Scan with filter: the Scan still reads and pays for every order each time, and the filter only removes non-matches after they are read.
+T: To find a small subset quickly, index only the items that carry an attribute (a sparse GSI) instead of scanning everything.
+
+@ Q000625 explain
+G: ## Low-level API vs higher-level clients
+The DynamoDB low-level API represents every value as an **AttributeValue** with a type descriptor: `{"S": "Ana"}`, `{"N": "42"}`, `{"BOOL": true}`, `{"M": {...}}`. Numbers are sent as strings so no precision is lost, which is why hand-written conversion code often has bugs.
+The AWS SDKs offer higher-level layers that do this marshalling for you:
+- JavaScript v3: `DynamoDBDocumentClient` from `@aws-sdk/lib-dynamodb` accepts plain objects.
+- Java v2: the DynamoDB Enhanced Client maps annotated classes to items.
+- .NET: the object persistence model (`DynamoDBContext`); Python: the boto3 `Table` resource.
+Example: `put({TableName, Item: {id: "u1", age: 42}})` instead of `{"id": {"S": "u1"}, "age": {"N": "42"}}`.
+W: Document client or object mapper: it converts native language types to and from AttributeValues automatically, removing the type-descriptor boilerplate and the number conversion bugs.
+X: B=Store everything as strings: numbers stored as `S` sort as text (so "10" comes before "9") and cannot be used in numeric update expressions such as `ADD`, which causes new bugs.
+C=BatchWriteItem everywhere: it groups up to 25 puts or deletes into one call but uses the same typed AttributeValue format, so the boilerplate stays the same.
+D=Switch to PartiQL: the low-level `ExecuteStatement` API still takes parameters and returns items as typed AttributeValues; PartiQL changes the query syntax, not the value format.
+T: Let the SDK's document client or mapper handle DynamoDB types; changing storage types or APIs does not remove the marshalling work.
+
+@ Q000626 explain
+G: ## DynamoDB attribute value format
+In the low-level API (and in raw JSON such as CLI input files) every value is an object with one key, the **type descriptor**, and the value:
+- `S` string: `{"S": "hello"}`
+- `N` number: `{"N": "42"}`, the number written as a string
+- `B` binary (base64), `BOOL` boolean, `NULL`
+- `M` map, `L` list, and the sets `SS`, `NS`, `BS`
+Numbers are passed as strings so that DynamoDB can store up to 38 digits of precision without the rounding that a JSON floating-point number would cause. DynamoDB still treats them as numbers: they sort numerically and work in arithmetic update expressions.
+Example: `"quantity": {"N": "3"}` then `UpdateExpression: "SET quantity = quantity + :one"` with `":one": {"N": "1"}`.
+W: The N descriptor with a string: `{"N": "42"}` marks the attribute as a number and passes the value as a string, which is the required low-level representation.
+X: A=Bare JSON number: the low-level API requires a type descriptor around every value; a plain `42` is not a valid AttributeValue and causes a validation error.
+B=S descriptor: `{"S": "42"}` is accepted, but it stores a string, so the value sorts as text and cannot be used in numeric expressions.
+D=Number key: `Number` is not one of DynamoDB's type descriptors, and the value must be a string even with the correct `N` descriptor.
+T: Low-level DynamoDB numbers are `{"N": "value"}`: a type descriptor plus the number as a string.
+
+@ Q000627 explain
+G: ## How Time to Live works
+TTL lets DynamoDB delete expired items for you. You pick an attribute name, for example `expiresAt`, enable TTL on the table, and store in each item a **Number** holding the expiry time in Unix epoch seconds.
+Example: a session created at `1790000000` gets `expiresAt = 1790086400` (24 hours later).
+- A background process finds expired items and deletes them, typically within a few days of the expiry time, not at the exact second.
+- TTL deletions consume no write capacity and cost nothing.
+- Until they are deleted, expired items can still be returned, so filter on `expiresAt > now` if that matters.
+- Each TTL deletion appears in DynamoDB Streams marked as a system delete, so you can archive or react to expirations.
+W: TTL attribute: DynamoDB removes each session item after its stored expiry time with a background process that uses no write capacity and needs no scheduler or cleanup code.
+X: B=Switch to on-demand: billing mode only changes how capacity is paid for; it deletes nothing, and manual deletes would still be charged as writes.
+C=Scheduled Lambda cleanup: this is exactly the scheduled job the requirement excludes, and every Scan read and `DeleteItem` it performs consumes capacity.
+D=Streams only: a stream records changes that already happened; enabling it does not remove any items.
+T: For automatic, free expiry of items, set a TTL epoch attribute; scheduled deleters and billing changes cost capacity or do nothing.
+
+@ Q000628 explain
+G: ## Point-in-time recovery (PITR)
+When PITR is enabled, DynamoDB continuously backs up the table. You can restore to any second within the recovery period, which is up to 35 days (the period is configurable), up to about five minutes before the current time.
+- A restore always creates a **new table**; you then point the application to it or copy the good data back.
+- It protects against accidental writes and deletes, such as a bug that corrupted items at 14:05 yesterday: restore to 14:04.
+- Enabling it does not affect table performance.
+## Other backup features
+**On-demand backups** are full snapshots taken when you ask (or on a schedule with AWS Backup). They let you return only to the moments you captured.
+W: Point-in-time recovery: continuous backups allow a restore to any second within the last 35 days, which is exactly the required recovery window.
+X: B=Global tables: they replicate every write to other Regions within seconds, including corrupting writes, so they give no copy of the earlier good data.
+C=DynamoDB Streams: a stream keeps change records for only 24 hours and is not a restore mechanism; rebuilding data from it would be custom work.
+D=Monthly on-demand backups: you could return only to the day a backup was taken, losing up to a month of changes, instead of any chosen moment.
+T: Restore to any second in the last 35 days means PITR; replication and change streams copy mistakes rather than undo them.
+
+@ Q000629 explain
+G: ## Cache-aside (lazy loading)
+In the cache-aside pattern the application talks to the cache first:
+- Read: look up the key in the cache. On a hit, return it. On a miss, read DynamoDB, store the result in the cache with a TTL (for example 5 minutes), then return it.
+- Write: update DynamoDB, then delete or update the cached key so the next read gets fresh data.
+**Amazon ElastiCache** (Valkey, Redis OSS or Memcached) is a general-purpose in-memory store with sub-millisecond reads. Because the application controls it, it can cache DynamoDB items, computed results or data from other sources.
+Example: `product:123` is served from memory thousands of times per second, while DynamoDB is read roughly once per TTL per product.
+DAX is the DynamoDB-specific alternative, an API-compatible cache in front of DynamoDB only.
+W: ElastiCache cache-aside: repeated catalog reads are answered from memory, so DynamoDB sees far fewer reads and response times drop, with no change to the table's schema.
+X: A=Provisioned capacity with auto scaling: it adjusts capacity to demand but every repeated read still goes to DynamoDB and is still paid for, so neither cost per read nor latency improves.
+B=Enable Streams: a stream publishes item changes for consumers; it does not serve any reads, so read volume and latency stay the same.
+D=More write capacity: the workload is read-heavy; extra write capacity costs more and does nothing for reads.
+T: For the same data requested over and over, put an in-memory cache in front; capacity tuning still pays for every read.
+
+@ Q000630 explain
+G: ## Why DynamoDB is not a search engine
+DynamoDB finds items by key. It has no text index, so `contains()` is only a case-sensitive substring check applied after reading items. It has no typo tolerance, no relevance ranking and no counts per category.
+## Pairing DynamoDB with OpenSearch
+**Amazon OpenSearch Service** builds an inverted index of words and supports:
+- Full-text and **fuzzy** queries ("laptp" still matches "laptop").
+- Relevance scoring, so the best matches come first.
+- Aggregations, which give **facets** such as "Brand: A (120), B (85)".
+Keep DynamoDB as the system of record and copy changes into OpenSearch, either with DynamoDB Streams and a Lambda function, or with the managed zero-ETL integration based on OpenSearch Ingestion. The app searches OpenSearch to get product ids, then reads details from DynamoDB if needed.
+W: Stream into OpenSearch: OpenSearch provides fuzzy full-text search, relevance ranking and faceted aggregations, while streaming keeps the index in sync with the DynamoDB catalog.
+X: A=S3 with Athena per request: each Athena query scans files in S3 and typically takes seconds, which is too slow and costly for interactive search, and it offers no relevance ranking.
+B=Scan with contains(): every search reads the whole table, and substring matching gives no typo tolerance and no ranking.
+C=GSI per word: index keys are attributes, not words inside text, and a table allows only a limited number of GSIs, so this cannot index a vocabulary or rank results.
+T: Keep DynamoDB for key access and add OpenSearch, fed by streams or zero-ETL, for full-text, fuzzy and faceted search.
+
+@ Q000631 explain
+G: ## Search needs a different index
+DynamoDB indexes items only by their keys. A search for words anywhere in a description, with typos, ranked by relevance, needs an **inverted index**: a map from each word (and its variants) to the documents that contain it.
+Amazon OpenSearch Service provides this:
+- Text analysis (lowercasing, stemming) so "Running Shoes" matches "run shoe".
+- Fuzzy queries that tolerate typos by allowing a small edit distance.
+- Relevance scoring (BM25 by default) to sort the best matches first.
+## The common pattern
+DynamoDB stays the source of truth. Changes flow into OpenSearch through DynamoDB Streams with a Lambda function, or through the zero-ETL integration. Users search in OpenSearch and the app loads full items from DynamoDB by key.
+W: Stream changes into OpenSearch: a dedicated search index adds typo-tolerant full-text search and relevance ranking, while the stream keeps it synchronized with DynamoDB.
+X: A=Replace DynamoDB with S3: S3 stores objects by key and has no full-text search or ranking of its own, so the capability is still missing and the application loses its fast item access.
+B=Scan with contains(): every request reads millions of items, and a substring match gives no typo tolerance or relevance order.
+C=More read capacity: capacity only raises how many reads per second are allowed; it adds no new query features, so full-text search is still impossible.
+T: DynamoDB plus OpenSearch: keep the database for key lookups and sync to OpenSearch for full-text search.
+
+@ Q000632 explain
+G: ## Shards, replicas and cluster health
+An OpenSearch index is split into **primary shards**, and each primary can have **replica shards** on other nodes. A replica is never placed on the same node as its primary.
+- **Green**: all primary and replica shards are assigned.
+- **Yellow**: all primaries are assigned, but at least one replica is not, often because there are too few nodes or the nodes are low on disk.
+- **Red**: at least one primary is unassigned.
+## Scaling for growing logs
+- Add data nodes (or larger ones) so replicas can be placed and load is spread.
+- Size shards sensibly; AWS guidance is roughly 30 to 50 GiB per shard for log workloads.
+- Use time-based indices (daily or by size) with rollover and Index State Management to delete or move old data.
+Example: a 2-node domain with daily indices of 5 primaries and 1 replica each, whose disks are filling, will leave some replicas unassigned and turn yellow.
+W: More nodes and better sharding: extra data nodes give room for unassigned replicas and more CPU, memory and disk, and right-sized shards spread the growing ingestion and queries evenly.
+X: A=Single primary shard: one shard lives on one node, so each index's queries and indexing can use only that node, and large indices produce oversized shards that are slow to search and recover.
+B=Disable replicas: removing replicas hides the yellow status but leaves no copy if a node fails and removes the replica copies that also serve searches, so performance and resilience get worse.
+C=One index, no rotation: a single ever-growing index keeps adding data to the same shards, and old logs cannot be dropped cheaply by deleting whole indices.
+T: A yellow, slowing log cluster needs capacity plus a shard and index strategy, not fewer shards or replicas.
+
+@ Q000633 explain
+G: ## User pools and identity pools
+Amazon Cognito has two parts that are often confused:
+- A **user pool** is a user directory for your app. It handles sign-up and sign-in with username and password, MFA (such as TOTP authenticator apps or SMS), password reset, and federation with social providers like Google or SAML/OIDC providers. After sign-in it issues JWTs: an ID token, an access token and a refresh token.
+- An **identity pool** exchanges an identity (for example a user pool token) for temporary **AWS credentials** so the app can call AWS services directly.
+## Using the tokens with an API
+API Gateway can validate user pool tokens with a Cognito authorizer, or your backend can verify the JWT signature using the user pool's public keys.
+Example: the user signs in with Google through the user pool's managed login, the app receives an access token, and sends `Authorization: Bearer <token>` to the API.
+W: User pool with Google and MFA: a user pool gives the password sign-up, MFA and Google federation in one managed directory and issues the JWTs the API needs.
+X: A=Identity pool alone: it issues temporary AWS credentials, not a username and password directory or JWTs for your own API, so sign-up and MFA would be missing.
+C=IAM Identity Center: it manages workforce access to AWS accounts and business applications, not self-service sign-up for a public web app's customers.
+D=IAM user per customer: IAM users are for access to AWS itself, are limited in number per account, and do not offer app sign-up, Google login or JWTs for an API.
+T: Customer sign-in, MFA, social login and JWTs mean a Cognito user pool; identity pools are for getting AWS credentials.
+
+@ Q000634 explain
+G: ## From sign-in to AWS credentials
+A user pool proves who the user is and issues JWTs, but JWTs cannot sign S3 requests. An **identity pool** bridges that gap:
+- Configure the user pool as an authentication provider of the identity pool.
+- The app sends the user pool ID token to the identity pool, which returns temporary AWS credentials for an **authenticated IAM role**.
+- The credentials expire automatically and are refreshed with a new token.
+## Scoping access per user
+Each user gets a stable identity ID, available as the policy variable `${cognito-identity.amazonaws.com:sub}`. The role's policy can allow `s3:PutObject` only on `arn:aws:s3:::photos-bucket/private/${cognito-identity.amazonaws.com:sub}/*`, so each user can write only to their own prefix.
+The app then uploads straight to S3 with the SDK, without passing the file through a server.
+W: Identity pool with an IAM role: it exchanges user pool tokens for short-lived credentials from a role whose policy uses the identity ID variable to limit each user to their own S3 prefix.
+X: B=Embedded access key: long-lived keys in an app can be extracted by anyone, never expire, and give every user the same access, so there is no per-user scoping.
+C=Lambda authorizer on S3: Lambda authorizers are an API Gateway feature; S3 bucket policies cannot call a Lambda function to authorize requests.
+D=IAM user per app user: IAM users have long-term credentials, a per-account quota, and must be created and managed for every sign-up, which does not fit app end users.
+T: To give app users scoped, temporary AWS credentials, connect the user pool to an identity pool and map it to an IAM role.
+
+@ Q000635 explain
+G: ## Federation instead of IAM users
+Federation lets people sign in with an identity provider (IdP) you already trust, then assume an IAM role and receive **temporary credentials** from AWS STS. No IAM user is created for them.
+- **SAML 2.0**: add the corporate IdP (for example Microsoft Entra ID or AD FS) as a SAML provider in IAM. The IdP issues a signed assertion, and `AssumeRoleWithSAML` returns credentials for a role.
+- **OIDC / web identity**: add an IAM OIDC identity provider (the issuer URL and audience), and the app calls `AssumeRoleWithWebIdentity` with the provider's token. Amazon Cognito identity pools offer the same outcome with extra features such as guest access and mapping users to roles.
+The role's trust policy decides which IdP, and which users or claims, can assume it; the role's permissions decide what they can do.
+W: C=OIDC web identity federation: an IAM OIDC provider or a Cognito identity pool exchanges the OIDC token for temporary role credentials, so public OIDC users call AWS directly.
+E=SAML 2.0 federation: an IAM SAML provider trusts the corporate IdP's signed assertions and `AssumeRoleWithSAML` returns temporary credentials without IAM users.
+X: A=Anonymous bucket policy: it only opens one S3 bucket to everyone, authenticates no one, and gives no credentials for any other AWS API.
+B=Mirror IAM users: creating one IAM user per person is exactly what the requirement forbids, and it brings long-term credentials that must be rotated and removed by hand.
+D=Share root credentials: the root user has unrestricted access to the whole account and must never be shared; it is not a federation mechanism.
+T: External SAML and OIDC identities get AWS access through IAM identity providers or Cognito identity pools that issue temporary role credentials.
+
+@ Q000636 explain
+G: ## What "bearer" means
+A **bearer token** works like cash: whoever presents it in `Authorization: Bearer <token>` is accepted. Nothing ties it to a device, IP address or password. Cognito access and ID tokens are JWTs that are **signed**, not encrypted, so anyone can also read their claims.
+## Limiting the damage of a leak
+- Keep access tokens short-lived. Cognito lets you set access and ID token validity from 5 minutes to 1 day, so a leaked token stops working soon.
+- Revoke the refresh token (`RevokeToken`) or sign the user out everywhere (`GlobalSignOut`) so no new tokens can be issued from it.
+- An API that validates JWTs itself only checks the signature and expiry, so a revoked access token can still work there until it expires; short validity is what bounds this window.
+- Never log `Authorization` headers; redact tokens in application and access logs.
+W: Usable by anyone; shorten and revoke: possession alone grants access, so the right response is to revoke the session's refresh token and keep token lifetimes short enough that leaked tokens expire quickly.
+X: A=Safe because of KMS: JWTs are signed to prevent tampering, not encrypted to prevent use, and even an encrypted token would still be accepted when presented.
+C=Bound to the client IP: standard bearer tokens carry no binding to an IP or client; sender-constrained tokens are a separate mechanism that this API does not use.
+D=Needs the password: the password is only used to obtain the token; afterwards the token itself is the credential and is accepted on its own.
+T: A leaked bearer token is a working credential until it expires, so revoke it and keep lifetimes short.

@@ -1,0 +1,370 @@
+# DOP-C02 detailed explanations e05 (explanation-only rewrites; letters are the published ones)
+
+@ Q001319 explain
+G: ## Two ElastiCache engine families
+Amazon ElastiCache offers two kinds of engines, and they are built for different jobs.
+- **Redis OSS / Valkey** keeps rich data types in memory: strings, hashes, lists, sets and **sorted sets** (for example a leaderboard `ZADD scores 950 user42`, then `ZREVRANGE scores 0 9` for the top 10). A replication group has one primary node and up to five read replicas, and with **Multi-AZ** enabled a replica in another Availability Zone is promoted automatically when the primary fails.
+- **Memcached** is a simple, multi-threaded key-value cache. Nodes are independent: there is no replication, so a failed node loses its data and the application has to repopulate it.
+## Picking for a dashboard cache
+A reporting dashboard in front of Aurora benefits from sorted sets (top-N reports, time-ordered keys) and must keep serving cached results if one node or AZ fails. Both needs point to the same engine family.
+W: ElastiCache for Redis (or Valkey): it provides sorted sets and other data structures, and its replication groups support Multi-AZ with automatic failover, so both stated requirements are met by one engine.
+X: A=Memcached for throughput: multi-threading can raise throughput per node, but throughput was not the requirement. Memcached has no replicas and no automatic failover, and it only stores simple key-value data.
+B=Either engine: the engines are not equivalent. Memcached lacks replication, Multi-AZ failover and data types such as sorted sets, so it fails both requirements.
+C=Memcached: plain Memcached still has no replication or failover and only supports opaque key-value items, so it cannot provide sorted-set operations or survive a node or AZ loss.
+T: Need replication, automatic Multi-AZ failover or rich data types → Redis OSS/Valkey; Memcached is only a simple, non-replicated key-value cache.
+
+@ Q001320 explain
+G: ## What a Lambda cold start is
+When no idle execution environment is available, Lambda creates a new one: it downloads the code, starts the runtime and runs your initialization code outside the handler. CloudWatch Logs shows this as `Init Duration` in the `REPORT` line. It happens after a new version is deployed (all old environments are discarded) and when traffic suddenly bursts above the number of warm environments.
+## Tools that remove cold starts
+- **Provisioned concurrency** keeps a set number of environments initialized on a published version or alias. With **Application Auto Scaling** you can use target tracking on `LambdaProvisionedConcurrencyUtilization`, or scheduled scaling, so the warm pool grows before busy periods and shrinks when it is quiet.
+- **SnapStart** (for supported runtimes such as Java, Python and .NET) snapshots an initialized environment when a version is published and resumes new environments from that snapshot, cutting init time without keeping environments running (Java has no extra SnapStart charge; Python and .NET add caching and restore charges). It cannot be combined with provisioned concurrency on the same version, so choose one per function.
+W: Auto-scaled provisioned concurrency, or SnapStart: provisioned concurrency keeps environments warm and target tracking scales them with demand instead of paying for peak all day; SnapStart is an alternative that shortens the init phase itself for supported runtimes.
+X: A=Switch to x86_64: every architecture has an init phase. Changing instruction set does not keep environments warm, and arm64 (Graviton) is usually as fast or faster and cheaper.
+B=Reserved concurrency at the account limit: reserved concurrency only reserves and caps capacity; it does not pre-initialize any environment. Lambda also keeps part of the account concurrency unreserved, so it cannot all be given to one function.
+C=Maximum timeout: the timeout limits how long one invocation may run. It does nothing to the time spent creating a new environment, so the INIT spikes stay the same.
+T: Cold-start latency is fixed by pre-warmed environments (provisioned concurrency with auto scaling) or faster init (SnapStart); reserved concurrency and timeouts only control limits.
+
+@ Q001321 explain
+G: ## How RDS Multi-AZ failover works
+In a Multi-AZ DB instance deployment, RDS keeps a synchronous standby in another Availability Zone. Applications connect to the DB endpoint, a DNS name such as `mydb.abc123.us-east-1.rds.amazonaws.com`. When the primary fails, RDS promotes the standby and points that DNS name at it; failover usually completes in one to two minutes.
+## Testing it on purpose
+RDS offers a built-in way to trigger that exact process:
+- Console: **Reboot** and select **Reboot with failover**.
+- CLI: `aws rds reboot-db-instance --db-instance-identifier mydb --force-failover`.
+The primary and standby swap roles, the endpoint moves, and existing connections drop. This lets the team measure real recovery time and confirm the application retries, re-resolves DNS (no long DNS caching) and reconnects. (For Aurora or Multi-AZ DB clusters the equivalent is `failover-db-cluster`.)
+W: Reboot with failover: it runs the real, supported Multi-AZ failover path, including standby promotion and the endpoint DNS update, so the test shows how the application actually behaves during a failover.
+X: A=Block the security group: this makes the database unreachable but does not make RDS fail over, because RDS health monitoring does not depend on your security groups. You would only test an outage, not recovery.
+B=Edit the DNS CNAME manually: the RDS endpoint name is managed by AWS in its own DNS zone and cannot be edited by customers. Failover is supposed to be done by RDS itself, which is what needs testing.
+D=Delete the standby: in a Multi-AZ instance deployment the standby is not a separate instance you can see or delete. Removing redundancy would also destroy the very mechanism being tested.
+T: To prove Multi-AZ failover, trigger it the supported way (reboot with failover), not by breaking networking or DNS.
+
+@ Q001322 explain
+G: ## The four AWS disaster recovery strategies
+AWS describes DR strategies on a scale where cost rises as recovery time objective (RTO) and recovery point objective (RPO) shrink:
+- **Backup and restore**: data is backed up (for example with AWS Backup or snapshots copied to another Region); infrastructure is rebuilt from code after a disaster. Cheapest, but RTO is typically hours.
+- **Pilot light**: data is continuously replicated to the recovery Region and core pieces (for example a database replica) are running, while servers are off or not yet created. On failover you start or scale them up; recovery takes tens of minutes.
+- **Warm standby**: a scaled-down but fully working copy runs all the time; recovery takes minutes.
+- **Multi-site active/active**: full capacity in several Regions; near-zero RTO and the highest cost.
+## Example
+A monthly report tool that can be down for a day fits backup and restore. An ordering system that must be back within 30 minutes is a better fit for pilot light.
+W: Cheapest-slowest versus costlier-faster: backup and restore only pays for stored backups but must rebuild everything, while pilot light pays for always-on replication and core services to recover much faster.
+X: A=Not a recognized strategy: backup and restore is the first of the four strategies in AWS's own DR guidance.
+C=Pilot light costs more than active-active: active-active runs full production capacity in more than one Region, so it is the most expensive option; pilot light keeps only a minimal core running.
+D=Identical RTOs: the strategies differ in what is already running when disaster strikes. Rebuilding from backups takes far longer than scaling up a replicated pilot light, whatever backup tool is used.
+T: DR strategies trade cost for speed: backup and restore is cheapest and slowest, pilot light costs more for faster recovery, and active-active is the most expensive.
+
+@ Q001323 explain
+G: ## Amazon Application Recovery Controller (ARC)
+ARC (formerly Route 53 Application Recovery Controller) helps you fail over multi-Region or multi-AZ applications safely. Two of its features work together:
+- **Readiness checks** continuously compare the resources in each replica of your application. You define a recovery group made of cells (for example one per Region) and resource sets such as Auto Scaling groups, DynamoDB tables, Aurora clusters or Route 53 health checks. ARC reports whether the standby matches the primary in capacity, configuration and AWS service quotas, and flags drift as "not ready".
+- **Routing controls** are highly available on/off switches tied to Route 53 health checks, used to move traffic between cells during a failover.
+Availability note: AWS closed the readiness check feature to new customers on April 30, 2026 (existing users keep it) and points new customers to ARC Region switch, whose plan evaluation regularly checks that a recovery plan is ready to run. Exam questions still use readiness checks as the answer for continuous failover-readiness verification.
+## Example
+If the primary Region's Auto Scaling group grows to 20 instances but the standby's maximum is still 10, or its account quota is lower, the readiness check turns not ready long before anyone needs to fail over.
+W: ARC readiness checks: they run continuously, compare the standby's resources, capacity and quotas against the primary, and plug into the same Route 53-based failover model, which is exactly the "ready at any moment" check the company wants.
+X: A=Quarterly manual script: a check every three months leaves long gaps in which drift goes unnoticed, and it depends on people remembering to run and maintain it.
+B=Billing alarms: billing alarms watch estimated charges. Spending tells you nothing about whether the database, capacity and DNS in the secondary Region are ready to take traffic.
+C=Trusted Advisor cost checks: these look for savings such as idle resources; they do not compare two Regions or test failover readiness.
+T: Continuous proof that the standby can take over → ARC readiness checks; cost and billing tools only look at money.
+
+@ Q001324 explain
+G: ## AWS Systems Manager Incident Manager
+Incident Manager turns an alert into a managed incident using a **response plan**. A response plan defines, in advance:
+- **Triggers**: a CloudWatch alarm entering ALARM (for example 5XX error rate above 5%) or an EventBridge event opens the incident automatically.
+- **Engagements**: which contacts, on-call schedules and escalation plans are paged, with the incident context attached.
+- **Runbooks**: a Systems Manager Automation document that runs remediation steps, such as restarting a service or rolling back a deployment.
+- **Chat channel** and an incident timeline, so every action is recorded and auditable, and post-incident analysis afterwards.
+Availability note: Incident Manager stopped accepting new customers on November 7, 2025; accounts that already use it continue as before. For new accounts AWS points to Systems Manager OpsCenter and AWS Partner paging tools, but the exam still treats response plans as the detection-to-response answer.
+## Example
+A response plan "checkout-high-errors" is linked to the checkout error alarm; when it fires, the on-call engineer is paged and an Automation runbook collects diagnostics and restarts the unhealthy service.
+W: Incident Manager response plans: they connect detection (alarms or events) to a predefined response of paging, runbooks and chat, with a recorded timeline, which is the standardized, auditable detection-to-response workflow described.
+X: A=Trusted Advisor checks: Trusted Advisor periodically reviews accounts against best practices (cost, security, limits). It does not watch application error rates or run incident runbooks.
+B=Inspector findings: Inspector scans EC2, containers and Lambda for software vulnerabilities and network exposure. Its findings are about security weaknesses, not live operational incidents like high error rates.
+C=Config rules with drift notifications: Config evaluates resource configuration compliance. A misconfigured resource is not the same as a running application returning errors, and Config has no paging or incident timeline.
+T: Alarm → page people → run a runbook → keep a timeline is Incident Manager; Trusted Advisor, Inspector and Config assess configuration and security, not incidents.
+
+@ Q001325 explain
+G: ## Shallow versus deep health checks
+An ALB health check calls one path, such as `/health`, and expects a success code. If that handler only returns `200 OK` without touching the worker threads, queues or database calls the real requests use, a deadlocked task still looks healthy. This is a **shallow** health check.
+A reliable design measures what the task really does:
+- The application (or a sidecar) publishes a custom CloudWatch metric such as `RequestsProcessed` or `QueueAgeSeconds` per task, or exposes a deep health endpoint that exercises the real code path.
+- A CloudWatch alarm fires when, for example, `RequestsProcessed = 0` for 3 minutes while traffic is arriving.
+- The alarm triggers automation (EventBridge plus a Lambda function or an SSM Automation runbook) that stops the stuck task; the ECS service scheduler then starts a replacement to keep the desired count.
+W: True-health metric with alarm-driven replacement: it detects the deadlock from real work done, not from a shallow endpoint, and replaces the stuck task automatically before customers report the problem.
+X: B=ECS health checks detect deadlocks automatically: ECS container health checks only run the command you define. If that command does not exercise the deadlocked code path, it passes just like the ALB check.
+C=Longer health check interval: a longer interval makes checks less frequent, so detection gets slower, and the check would still pass because it does not test the deadlocked path.
+D=Disable health checks: this removes all automated detection, so even crashed tasks would keep receiving traffic. It makes the problem worse.
+T: A health check is only useful if it tests real work; when shallow checks pass during deadlocks, alarm on a true-health signal and replace the task automatically.
+
+@ Q001326 explain
+G: ## AWS Fault Injection Service (FIS)
+FIS runs controlled chaos-engineering experiments against your AWS resources. You create an **experiment template** that lists:
+- **Actions**, for example `aws:ec2:terminate-instances`, `aws:ec2:stop-instances`, `aws:network:disrupt-connectivity`, CPU or latency stress through SSM documents, or pre-built scenarios such as an AZ power interruption.
+- **Targets**, chosen by tags, resource IDs or filters, with selection modes such as `PERCENT(30)` to hit only part of a fleet.
+- **Stop conditions**: CloudWatch alarms that halt the experiment immediately if, for example, customer-facing errors exceed a limit.
+- An IAM role that limits what the experiment is allowed to touch.
+## Why it fits
+Teams can run the same template repeatedly in a test environment (and later in production) to prove that Auto Scaling, Multi-AZ failover and alarms behave as documented.
+W: FIS experiments with stop conditions: FIS is the managed service built to inject faults such as instance termination, network disruption and AZ impairment, with guardrails that stop the experiment if it goes too far.
+X: A=Inspector terminating instances: Inspector finds software vulnerabilities and network exposure. It does not terminate resources or simulate failures, and vulnerability status has nothing to do with resilience testing.
+B=CloudTrail replay: CloudTrail records API activity for auditing. It cannot replay calls, and replaying old API calls would not recreate hardware, network or AZ failures anyway.
+D=Config rules that terminate resources: Config evaluates compliance; remediation actions fix non-compliant settings. Deleting non-compliant resources is not a controlled, reversible experiment with stop conditions.
+T: Safely prove recovery works by injecting real failures with guardrails → AWS FIS; audit, compliance and vulnerability tools do not inject faults.
+
+@ Q001327 explain
+G: ## Metric resolution in CloudWatch
+- **Standard resolution** custom metrics keep data at 1-minute granularity, so the shortest alarm period is 60 seconds.
+- **High resolution** custom metrics (`StorageResolution = 1`) keep data at 1-second granularity. Alarms on them can use periods of 10, 20 or 30 seconds (or any multiple of 60).
+- Metrics created by CloudWatch Logs **metric filters** are standard resolution (1-minute), so they cannot drive sub-minute alarms.
+## Getting high-resolution data from instances
+The CloudWatch agent can act as a **StatsD** server (default UDP port 8125). The application sends values such as the gauge `sessions:42|g` to localhost, and the agent publishes them to CloudWatch. Setting the StatsD collection and aggregation intervals below 60 seconds makes the agent publish them as high-resolution metrics, with no custom API code in the application.
+## Example
+Session counts emitted every 10 seconds, stored at 1-second resolution, with an alarm using a 10-second period and 3 datapoints, can react within 30 seconds.
+W: Agent StatsD metrics at high resolution: the agent collects the application's StatsD values and publishes them as high-resolution custom metrics, which allow 10-second alarm periods and meet the 30-second reaction target.
+X: A=Standard resolution with 60-second alarms: a 60-second period cannot even finish one evaluation within 30 seconds, so the reaction requirement is impossible.
+C=EC2 detailed monitoring: detailed monitoring only sends the built-in EC2 metrics (CPU, network, disk operations) every minute. It does not see application session counts and is not sub-minute.
+D=Log the counts and use a metric filter: metric filters publish standard-resolution (1-minute) metrics, so no 10-second alarm period is possible, and log delivery adds further delay before the metric exists.
+T: Sub-minute alarms need high-resolution custom metrics; the CloudWatch agent's StatsD support is an easy way to publish them from instances.
+
+@ Q001328 explain
+G: ## Metric filters turn log lines into metrics
+A **metric filter** on a CloudWatch Logs log group matches incoming log events against a pattern and publishes a CloudWatch metric for every match. No application change is needed because it works on logs already being written.
+For JSON logs the pattern can test a field directly:
+- Pattern: `{ $.level = "ERROR" }`
+- Metric: namespace `App`, name `ErrorCount`, metric value `1` (each match adds 1).
+## Alarm on the metric
+Create a CloudWatch alarm on `ErrorCount` with statistic `Sum`, period 300 seconds, and threshold "greater than 50". Every 5 minutes the alarm compares the number of ERROR lines with 50 and can notify SNS, trigger Auto Scaling or run automation.
+W: Metric filter plus alarm: the filter counts ERROR entries as they arrive and the alarm on the resulting metric fires when the 5-minute sum exceeds 50, without touching the application.
+X: A=Scheduled Logs Insights query with EventBridge only: Logs Insights scheduled queries can send results to EventBridge, but you still have to build rules or code that read the count, compare it with 50 and notify, and there is no CloudWatch metric or alarm state to track. A metric filter with an alarm is the simpler, built-in path.
+B=S3 event notification on exports: log exports to S3 are batch jobs that can take hours, and a notification that files arrived says nothing about how many ERROR lines they contain.
+D=Anomaly detection on IncomingBytes: IncomingBytes measures log volume, not content. Error lines could rise while total volume stays normal, and normal traffic spikes would cause false alarms.
+T: To alarm on how often a pattern appears in logs, use a metric filter to create a metric and alarm on its Sum; volume metrics and exports cannot see log content.
+
+@ Q001329 explain
+G: ## Streaming logs out of CloudWatch Logs
+A **subscription filter** sends matching log events from a log group to a destination in near real time: Kinesis Data Streams, Amazon Data Firehose or Lambda (the console's OpenSearch Service option uses a Lambda function). For many accounts, each source account sends to a cross-account **destination** in a central account.
+## A typical central search design
+- Subscription filters on the log groups send events to a Kinesis data stream in the logging account.
+- Amazon Data Firehose (or a consumer) delivers events to **Amazon OpenSearch Service**, where they are indexed for full-text search and visualized in OpenSearch Dashboards within seconds.
+- A Firehose delivery (or backup) to **S3** keeps the raw, compressed logs cheaply. Later, Amazon Athena can run SQL over them without any servers.
+W: Subscription filters to Kinesis, OpenSearch and S3: one streaming pipeline gives near-real-time full-text search and dashboards in OpenSearch, and the S3 copy supports cheap, long-term ad hoc SQL queries.
+X: A=Logs Insights on every log group: Logs Insights is a query tool you run on demand against log groups; it is not a central full-text search index with rich dashboards for many teams, and keeping everything in CloudWatch Logs long term costs more than S3.
+B=Metric streams to Redshift: metric streams export CloudWatch metrics only, not log events, so no log text ever reaches the destination.
+C=Nightly CreateExportTask: exports run as batch jobs, one active export task at a time per account, and data is only available the next day. That is not near real time.
+T: Near-real-time log search across many groups → subscription filters feeding OpenSearch, with raw copies in S3 for later SQL; exports are batch and metric streams carry no logs.
+
+@ Q001330 explain
+G: ## Encrypting a log group with your own KMS key
+CloudWatch Logs can encrypt a log group with a customer managed AWS KMS key (`associate-kms-key` or `kmsKeyId` at creation). The encryption is done by the **CloudWatch Logs service**, not by the caller: when your role calls `PutLogEvents`, the service itself calls KMS to encrypt the data.
+That means the **key policy** must allow the Regional service principal, for example `logs.us-east-1.amazonaws.com`, to use the key:
+- Actions such as `kms:Encrypt*`, `kms:Decrypt*`, `kms:ReEncrypt*`, `kms:GenerateDataKey*` and `kms:Describe*`.
+- Ideally a condition on `kms:EncryptionContext:aws:logs:arn` that limits use to the specific log group ARN.
+If the service principal is missing or the condition names the wrong ARN, the service cannot use the key and writes to the log group fail with access errors, even though the caller's IAM policy is fine.
+W: Key policy missing the CloudWatch Logs service principal: the service needs permission in the key policy to use the key on the log group's behalf, so without it PutLogEvents fails right after the key is associated.
+X: A=Only AWS managed keys allowed: CloudWatch Logs encryption uses customer managed KMS keys; that is the documented way to encrypt a log group with KMS.
+B=Caller needs kms:Decrypt that roles cannot get: IAM roles can be granted KMS permissions normally, and for writing logs the encryption is performed by the CloudWatch Logs service, not by the caller.
+D=Retention must be Never expire: retention and encryption are independent settings; any retention period works with a KMS key.
+T: An encrypted log group works only if the KMS key policy lets the CloudWatch Logs service principal use the key; the writer's IAM policy alone is not enough.
+
+@ Q001331 explain
+G: ## Where logs should live for long retention
+CloudWatch Logs storage is priced for logs you actively search, and log groups default to **Never expire**, so costs keep growing. Amazon S3 storage classes are far cheaper for data you rarely read:
+- **S3 Glacier Deep Archive** is the lowest-cost class, with retrieval in hours, which suits compliance archives.
+## A typical design
+- Set a short retention in CloudWatch Logs, for example 30 or 90 days, for troubleshooting and Logs Insights queries.
+- Copy logs to S3 with export tasks (`CreateExportTask`) or continuously with a subscription filter to Amazon Data Firehose.
+- Add an S3 Lifecycle rule: transition objects to Deep Archive after a few days and expire them after 7 years (about 2,557 days). Deep Archive has a 180-day minimum storage charge, which is irrelevant for 7-year data.
+W: Short CloudWatch retention, S3 export, Deep Archive with 7-year expiry: recent logs stay searchable, the compliance copy sits in the cheapest storage class, and lifecycle expiry deletes it automatically when the 7 years end.
+X: A=Recreate log groups every 30 days: deleting a log group deletes its logs, so the 7-year requirement is broken, and subscriptions, alarms and metric filters on it are lost each time.
+B=Intelligent-Tiering on the log group: S3 storage classes apply to S3 objects, not to CloudWatch Logs log groups. Seven-year retention inside CloudWatch Logs would stay at CloudWatch storage prices.
+D=Never expire with a built-in archival tier: CloudWatch Logs has no automatic cheaper archive tier for old data. The Infrequent Access log class lowers ingestion price, not a storage archive, so Never expire keeps growing the bill.
+T: Keep only the searchable window in CloudWatch Logs; move long-term compliance copies to S3 with lifecycle rules to Deep Archive and expiry.
+
+@ Q001332 explain
+G: ## CloudWatch metric streams
+A **metric stream** continuously sends CloudWatch metrics out of an account with low latency (typically a few minutes), without polling APIs. You choose:
+- **What to send**: all metrics in the account, or include/exclude filters by namespace (and metric name). Metrics that appear later in included namespaces are streamed automatically, with no per-metric setup.
+- **Format**: JSON or OpenTelemetry.
+- **Destination**: an Amazon Data Firehose delivery stream, which can deliver to S3 or to HTTP endpoints of third-party observability partners.
+## Example
+A stream for all namespaces delivers through Firehose to a partner's HTTPS endpoint. When a new service starts publishing metrics next month, they flow to the partner with no change.
+W: Metric streams through Firehose: a managed, push-based export of all or filtered metrics in near real time to third-party endpoints, scaling automatically as new metrics appear and needing no custom code.
+X: B=Scheduled Lambda with GetMetricData: you must list and track every metric yourself, pay for API calls, handle throttling and pagination, and accept delays and gaps. That is the custom code the team wants to avoid.
+C=Log subscription filters: subscription filters stream log events, not metrics, so CloudWatch metrics from services such as EC2 or RDS never pass through them.
+D=Shared dashboards: sharing a dashboard gives people a view of graphs. It does not export metric data for another platform to ingest.
+T: Continuous, automatic export of CloudWatch metrics to another tool → metric streams via Firehose; polling APIs, log subscriptions and dashboards are not export pipelines.
+
+@ Q001333 explain
+G: ## Namespaces, metric names and dimensions
+A CloudWatch custom metric is identified by namespace, metric name and **dimensions** (name/value pairs). `ApiLatency` with `TenantId=acme` and `ApiLatency` with `TenantId=globex` are two time series of one metric name.
+- CloudWatch does not create a combined series for custom metric dimensions on its own.
+- Totals across a dimension are computed at query time: a **Metrics Insights** query such as `SELECT AVG(ApiLatency) FROM SCHEMA("SaaS/Api", TenantId)` aggregates all tenant series, and `GROUP BY TenantId` splits them again. Metric math with `SEARCH` plus `SUM` or `AVG` works too.
+## Why this beats other layouts
+Each data point is published once, per-tenant graphs and alarms stay simple, and new tenants appear automatically in the aggregated query.
+W: One metric with a TenantId dimension, aggregated at query time: per-tenant drill-down comes from the dimension, and the all-tenant "rollup" is produced by aggregating across that dimension in Metrics Insights or metric math (CloudWatch does not precompute it), with no duplicate publishing.
+X: B=Publish every data point twice: this does give an aggregate series, but it is exactly the duplicate metric data the requirement forbids, and it doubles PutMetricData calls and data points.
+C=Logs only with Logs Insights: without metrics there are no fast graphs or CloudWatch alarms on latency, and each aggregate query scans log data again, which is slower and costs more.
+D=Separate metric name per tenant: every tenant becomes a different metric, so an aggregate needs a hand-maintained list of names, and dimension-based grouping and queries no longer work.
+T: Model per-entity data as a dimension of one metric and aggregate across the dimension at query time instead of publishing duplicates or one metric name per entity.
+
+@ Q001334 explain
+G: ## CloudWatch Logs Insights basics
+Logs Insights runs piped queries over a log group for a chosen time range (for example the last 24 hours). For JSON log events it discovers fields automatically, so `durationMs` can be used directly.
+Common commands:
+- `fields` picks which fields to show.
+- `filter` keeps matching events, for example `filter durationMs > 1000`.
+- `stats` aggregates, for example `stats avg(durationMs) by bin(5m)`.
+- `sort` orders results, `asc` or `desc`.
+- `limit` caps the number of rows.
+## Top-N pattern
+To find the N largest values of a field, sort descending on it and limit to N:
+`fields @timestamp, durationMs, @message | sort durationMs desc | limit 10`
+W: Sort by durationMs descending with limit 10: it returns the ten individual requests with the highest durations, showing each one's timestamp and full message for investigation.
+X: A=stats avg(durationMs): an average collapses all requests into a single number, so it cannot show which requests were the slowest.
+B=parse with display and limit: the parse has no capture pattern that extracts a value, and with no sort the limit just returns 10 arbitrary events, not the slowest ones.
+D=stats count() by durationMs: this groups requests by duration value and counts how many had each value. It returns a frequency table, not the ten slowest requests.
+T: Top-N queries in Logs Insights are "sort field desc | limit N"; averages and counts summarize, they do not rank individual events.
+
+@ Q001335 explain
+G: ## CloudWatch embedded metric format (EMF)
+EMF is a JSON log structure that tells CloudWatch Logs to extract metrics from a log event. A Lambda function simply prints a line such as:
+`{"_aws":{"Timestamp":1735689600000,"CloudWatchMetrics":[{"Namespace":"Shop","Dimensions":[["Service"]],"Metrics":[{"Name":"OrderValue","Unit":"None"}]}]},"Service":"checkout","OrderValue":129.5,"orderId":"o-981"}`
+- Lambda sends stdout to CloudWatch Logs as usual.
+- CloudWatch Logs creates the `OrderValue` metric asynchronously, outside the request path.
+- The same line is a searchable structured log, so metrics and context (like `orderId`) stay linked.
+Libraries such as Powertools for AWS Lambda (Metrics utility) or the `aws-embedded-metrics` client produce EMF for you.
+W: Embedded metric format: metrics are written as part of normal log output, so the handler makes no PutMetricData calls, adds no API latency or throttling risk, and still gets structured logs alongside the metrics.
+X: B=Synchronous PutMetricData per order: each call adds network latency to the request and counts against API request quotas, which is precisely the risk the team wants to avoid.
+C=Container Insights: Container Insights collects metrics for ECS, EKS and Kubernetes workloads. It does not apply to Lambda functions and does not emit custom business values like order value (Lambda Insights is the separate Lambda feature, and it covers system metrics).
+D=X-Ray annotations: annotations index traces so you can filter them. They are sampled trace data, not CloudWatch metrics, so business values would be incomplete and not directly graphable or alarmable.
+T: Custom metrics from Lambda without API calls → write EMF to logs and let CloudWatch extract them asynchronously.
+
+@ Q001336 explain
+G: ## Cross-account log delivery with subscription destinations
+CloudWatch Logs can send log events from one account to another without anyone polling:
+- In the central (security) account you create a Kinesis data stream or Amazon Data Firehose stream and a **CloudWatch Logs destination** (`PutDestination`) that points to it. A **destination policy** lists which source accounts or which organization may subscribe.
+- In each of the 40 source accounts, the team adds a **subscription filter** on its own log groups (or an account-level subscription policy) that targets the destination ARN.
+- CloudWatch Logs pushes matching events continuously. The only role involved is the one in the central account that lets CloudWatch Logs write to the stream; source accounts do not assume roles per delivery.
+## Result
+Each account still owns its log groups, retention and filters, while the security account receives a near-real-time copy of everything.
+W: Subscription filters to a destination in the security account: logs are pushed continuously to the central Kinesis stream, source accounts keep managing their own log groups, and no cross-account role assumption is needed for each delivery.
+X: A=Assume roles and poll FilterLogEvents: this is exactly the per-delivery cross-account role assumption the company wants to avoid, and polling adds lag, API throttling risk and custom code to maintain.
+C=Consolidated billing: consolidated billing combines invoices in AWS Organizations. It does not move or copy any log data.
+D=Nightly S3 exports and email summaries: exports are batch jobs that arrive the next day, and an email summary is not a central, queryable copy of the logs for analysis.
+T: Centralize logs from many accounts by pushing them with subscription filters to a cross-account destination, not by polling or nightly exports.
+
+@ Q001337 explain
+G: ## How the CloudWatch agent publishes metrics
+The unified CloudWatch agent collects system metrics that EC2 does not provide by default, such as memory and disk usage, and publishes them under the `CWAgent` namespace by calling the CloudWatch `PutMetricData` API. It uses the credentials of the instance profile role.
+If the role lacks permission, the agent runs and its configuration is valid, but every publish attempt is rejected and nothing appears in CloudWatch. The agent log (`/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log` on Linux) shows AccessDenied errors.
+## Required permissions
+- `cloudwatch:PutMetricData` to publish metrics (plus CloudWatch Logs actions if it also ships logs).
+- `ssm:GetParameter` if the agent loads its configuration from Parameter Store.
+The AWS managed policy `CloudWatchAgentServerPolicy` includes these; attach it to the instance role.
+W: Role allows PutMetricData (and ssm:GetParameter): with a running agent and a valid config, missing IAM permission for the publish call is the most common reason no data reaches CloudWatch, so check the instance role first.
+X: A=CloudTrail enabled: CloudTrail records API activity for auditing. Metrics are published whether or not a trail exists.
+B=Auto Scaling group membership: the agent works the same on standalone instances; being in an Auto Scaling group has nothing to do with whether metrics can be published.
+C=Public IP address: the agent only needs a network path to the CloudWatch endpoint, which a NAT gateway or a VPC interface endpoint provides without a public IP. Network problems would also show as connection errors, not a silent permission failure.
+T: Agent running, config valid, but no CWAgent metrics → check the instance role for cloudwatch:PutMetricData (and ssm:GetParameter) first.
+
+@ Q001338 explain
+G: ## Why CloudWatch Logs bills keep growing
+New log groups default to **Never expire**. With flat daily ingestion, stored data still grows every day, so the storage part of the bill rises steadily month after month. The fix is to separate the two needs:
+- **Query window (30 days)**: set the log group retention to 30 days, for example `aws logs put-retention-policy --log-group-name app --retention-in-days 30`. CloudWatch deletes older events automatically.
+- **Audit copy (1 year)**: send logs to S3 continuously with a subscription filter to Amazon Data Firehose, or with export tasks, and use an S3 Lifecycle rule to move objects to a colder class (for example Glacier Flexible Retrieval) and expire them after 365 days.
+## Example
+30 days in CloudWatch plus 12 months in S3 Glacier costs a fraction of 12 months in CloudWatch Logs storage, while Logs Insights still covers the period people actually query.
+W: 30-day retention plus an S3 archive: the searchable 30 days stay in CloudWatch Logs, the one-year audit copy sits in cheaper S3 storage with lifecycle expiry, and the unbounded growth stops.
+X: B=Keep Never expire with free compression: CloudWatch Logs bills stored (compressed) data, and Never expire is the reason storage keeps growing. There is no free treatment of old data.
+C=1-year retention on every log group: this meets the audit rule and stops unbounded growth, but it keeps eleven months of rarely read logs at CloudWatch Logs storage prices, which is not the cheapest way.
+D=Delete and recreate log groups monthly: deleting a log group deletes its data, breaking the one-year audit requirement, and also removes metric filters and subscriptions on it.
+T: Set a retention period matched to the query window and archive long-term audit copies to S3; Never expire and long CloudWatch retention both cost more.
+
+@ Q001339 explain
+G: ## Standard versus high resolution metrics
+- **Standard resolution**: data stored at 1-minute granularity; alarms use periods of 60 seconds or multiples of 60.
+- **High resolution** (`StorageResolution = 1` in `PutMetricData`): data stored at 1-second granularity; alarms can use 10, 20 or 30-second periods, so a spike can trigger an alarm within tens of seconds.
+## Where the extra cost comes from
+- **Alarms** with 10, 20 or 30-second periods are high-resolution alarms and are billed at a higher rate than standard alarms (roughly three times as much per alarm metric; check current pricing).
+- Publishing every few seconds means many more `PutMetricData` requests, and API requests are billed.
+- High-resolution data points are kept at 1-second detail only for 3 hours before being rolled up, so they are for fast detection, not long-term fine detail.
+## Example
+A spike detector with a 10-second period and 3 datapoints reacts within about 30 seconds but costs more than a 1-minute alarm on a standard metric.
+W: High resolution enables 10-second alarms at higher cost: only high-resolution metrics allow sub-minute alarm periods to meet the 30-second target, and the team pays more for high-resolution alarms and extra API calls.
+X: B=Standard metrics support 10-second alarms: standard-resolution data has one point per minute, and alarm periods on it must be at least 60 seconds.
+C=High resolution is always cheaper: smaller data points do not reduce cost; more frequent publishing and high-resolution alarms raise it.
+D=Resolution only affects dashboards: resolution decides which alarm periods are allowed, so it directly affects how fast an alarm can react, not just how graphs look.
+T: Sub-minute detection needs high-resolution metrics and alarms, which cost more; choose standard resolution when a 1-minute reaction is enough.
+
+@ Q001340 explain
+G: ## CloudWatch anomaly detection
+Anomaly detection trains a machine learning model on a metric's history (up to two weeks) and learns its normal hourly, daily and weekly pattern. It produces an **expected band** for every point in time.
+- An **anomaly detection alarm** compares the metric with that band instead of a fixed number, for example `ANOMALY_DETECTION_BAND(m1, 2)`, where `2` sets the band width in standard deviations.
+- You choose to alarm when the value is above the band, below the band, or outside it in either direction.
+- The model keeps updating, so gradual growth is absorbed and you can exclude known events (such as a sale day) from training.
+## Example
+Request count at 3 a.m. Sunday is normally 200, and at 1 p.m. Monday 20,000. A static threshold of 15,000 misses a Sunday-night spike to 8,000 and fires every weekday lunch; the anomaly band catches the first and ignores the second.
+W: Anomaly detection alarm: it learns the time-of-day and day-of-week pattern and alerts only when traffic leaves the expected band for that specific time, which is what a single static threshold cannot do.
+X: A=Scheduled query with a fixed filter: a fixed number is still a static threshold, just checked on a schedule; it ignores the time-of-day pattern.
+B=Config custom rule: Config evaluates resource configurations for compliance, not metric values, and an hourly check would be both slow and still need hand-made thresholds.
+D=Static alarm at last month's peak: it only fires above the highest value seen, so abnormal drops and off-peak spikes that stay below the peak are never detected.
+T: Metrics with daily and weekly seasonality → anomaly detection alarms with a learned band, not fixed thresholds.
+
+@ Q001341 explain
+G: ## Querying CloudTrail logs in S3 with Athena
+CloudTrail delivers log files as gzip-compressed JSON to an S3 bucket, organized by account, Region and date. **Amazon Athena** is a serverless SQL engine that reads data where it sits in S3; you pay per data scanned and manage no servers.
+- Create a table over the CloudTrail prefix, either from the CloudTrail console ("Create Athena table") or with a `CREATE EXTERNAL TABLE` statement using the CloudTrail SerDe.
+- Use **partition projection** on Region and date so queries only scan the days you ask for.
+## Example query
+`SELECT eventtime, useridentity.arn, sourceipaddress FROM cloudtrail_logs WHERE eventname = 'ConsoleLogin' AND sourceipaddress LIKE '203.0.113.%'`
+This finds console sign-ins from that range across the whole year without moving any data.
+W: Athena table over the CloudTrail S3 location: Athena runs standard SQL directly on the compressed JSON files in S3, serverless and pay-per-query, which fits ad hoc investigation of a year of logs.
+X: A=Re-upload into a log group for Logs Insights: moving a year of data back into CloudWatch Logs costs ingestion and storage fees and takes effort, while the data can already be queried in place in S3.
+B=Config custom rule: Config rules evaluate the current configuration of resources for compliance. They do not search historical sign-in events or run ad hoc SQL.
+D=Import into RDS: this needs a database server to provision and manage, a schema for nested JSON and a large import job, which is the opposite of the serverless requirement.
+T: Ad hoc SQL over logs already in S3, with no servers → Athena (with partition projection), not moving the data into another store.
+
+@ Q001342 explain
+G: ## Operational dashboards versus business dashboards
+- **CloudWatch dashboards** are built for operations teams: near-real-time graphs of metrics, alarms and log query results. They can be shared with people outside the account, but they are not a BI tool and have no per-user row-level data filtering.
+- **Amazon QuickSight** is AWS's business intelligence service (since late 2025 it is named Amazon Quick Sight and is part of Amazon Quick; exam questions still say QuickSight). It connects to data sources such as S3 (via Athena), Redshift or databases fed by exported metrics and logs, and builds interactive, polished dashboards with filters, drill-downs and calculated KPIs.
+## Features executives need
+- **Embedding**: QuickSight dashboards can be embedded in an internal web portal using the embedding APIs.
+- **Row-level security (RLS)**: a rules dataset restricts which rows each user or group sees, for example a regional manager only sees their region.
+- Access control through users, groups and IAM Identity Center integration.
+W: QuickSight dashboards with embedding and row-level security: QuickSight is designed for interactive business-facing analytics and supports embedding in portals and per-user data restrictions, which native CloudWatch dashboards do not provide.
+X: A=CloudWatch dashboard with embedding and RLS: CloudWatch dashboards are operational views; they do not offer row-level security or BI-style embedding, so the claim in this choice is not accurate.
+C=Config aggregator dashboards: a Config aggregator collects resource configuration and compliance data across accounts. It shows compliance status, not business trends from metrics and KPIs.
+D=Inspector reports as BI dashboards: Inspector reports list software vulnerabilities and exposure findings. They contain no operational metrics or business KPIs and are not a dashboarding tool.
+T: Engineers watching systems → CloudWatch dashboards; executives needing polished, embeddable, access-controlled analytics → QuickSight.
+
+@ Q001343 explain
+G: ## How X-Ray sampling works
+X-Ray does not record every request. **Sampling rules** decide which requests are traced. The default rule records the first request each second (the **reservoir**) and 5% of additional requests (the **fixed rate**).
+A custom rule matches requests by attributes and has a priority:
+- Match on service name, HTTP method, URL path, host, service type or resource ARN.
+- Set `ReservoirSize` (guaranteed traces per second) and `FixedRate` (percentage after that).
+- Lower priority numbers are evaluated first; the default rule is the fallback.
+## Example
+- Rule `health-and-static`, priority 10, URL path `/health*`, reservoir 0, fixed rate 0.001.
+- Rule `payments`, priority 20, URL path `/pay*`, reservoir 5, fixed rate 0.2.
+Noise routes are almost never traced, payment calls are traced heavily, and everything else still uses the default rule, so the service map and latency picture stay complete.
+W: Custom sampling rules per route: lowering the rate for high-volume, low-value paths cuts trace volume and cost, while higher rates on critical paths and the default rule keep visibility into overall behavior.
+X: B=Use CloudTrail data events: CloudTrail records AWS API calls such as S3 object access. It does not trace requests through your application, so it cannot replace X-Ray.
+C=Sample 100%: recording every request raises trace volume and cost further, the opposite of the goal.
+D=Disable X-Ray: metrics show that latency or errors changed, but not where in the call chain; turning tracing off loses the visibility the team wants to keep.
+T: Control X-Ray cost with targeted sampling rules (low rates for noisy routes, higher for critical ones) instead of all-or-nothing tracing.
+
+@ Q001344 explain
+G: ## CloudTrail Insights
+CloudTrail records API calls; **CloudTrail Insights** watches those calls for unusual activity. Once enabled on a trail (or event data store), it builds a baseline of normal behavior and generates an **Insights event** when activity departs from it.
+- Insights can analyze management events and, since late 2025, data events too; the management-event analysis is what catches control-plane spikes like the one in this question.
+- **API call rate insights** fire on unusual volumes of write management API calls, for example `CreateRole` jumping from a few per day to hundreds in an hour.
+- **API error rate insights** fire on unusual numbers of failed calls, such as a burst of `AccessDenied` errors.
+- Insights events show start and end times, the API involved and the baseline versus actual values, and can trigger EventBridge rules or CloudWatch alarms for response. Insights is billed per events analyzed.
+W: CloudTrail Insights: it automatically learns normal API call volume and flags abnormal spikes such as mass IAM role creation, with no custom anomaly-detection logic to build.
+X: B=Event history flags anomalies: event history is a 90-day searchable record of management events. It lets you look up calls but does not analyze volumes or raise anomalies.
+C=Config resource timeline: the timeline shows how one resource's configuration changed over time. It does not measure API call rates across the account.
+D=Log file integrity validation: validation uses signed digest files to prove log files were not altered or deleted. It detects tampering with logs, not unusual API activity.
+T: Automatic detection of unusual API call or error rates → CloudTrail Insights; event history, Config timelines and integrity validation do not detect anomalies.

@@ -1,0 +1,345 @@
+# DVA-C02 detailed explanations, chunk e03 (explanation-only rewrites; letters are the published ones)
+
+@ Q000637 explain
+G: ## How a Lambda authorizer gets the token
+An API Gateway Lambda authorizer runs before your integration and decides whether a request may proceed.
+- A **TOKEN** authorizer reads one header named as the identity source, usually `method.request.header.Authorization`. You can also set a token validation regex, such as `^Bearer [-0-9a-zA-Z._]*$`.
+- If that header is missing, or its value does not match the regex, API Gateway returns `401 Unauthorized` without even calling your function.
+- If the function runs, it typically strips the `Bearer ` prefix, verifies the JWT signature, issuer, audience and expiry, and returns an IAM policy, or throws `Unauthorized` to produce a 401.
+## Example
+A client sends `Authorization: eyJhbGci...` without `Bearer `, or puts the token in `X-Auth-Token`. The token is valid and unexpired, but the authorizer never sees it in the expected shape, so every call gets 401.
+W: Wrong token format or header: a 401 with a still-valid token points to the token not reaching the authorizer as configured, either a missing `Bearer ` prefix (failing the regex or the function's parsing) or a header other than the identity source.
+X: A=No custom domain: a stage works on its default `execute-api` URL without a custom domain. A missing custom domain would cause DNS or 403/404-type errors for that host name, not token rejection.
+B=Reserved concurrency set too high: more reserved concurrency only guarantees more capacity. Concurrency problems show up as throttling (429) or authorizer errors (500), never as a 401 for a valid token.
+D=Versioned deployment bucket: S3 versioning of the code bucket only keeps old copies of the package. It has no effect on how a running authorizer parses headers.
+T: A 401 for an unexpired token usually means the token arrived in the wrong header or format; check the identity source and the `Bearer ` prefix before suspecting infrastructure.
+
+@ Q000638 explain
+G: ## CLI named profiles
+The AWS CLI reads settings from two files in `~/.aws/`: `credentials` (keys) and `config` (Region, output, role settings). Each file can hold several named sections, called profiles.
+- `[default]` is used when you pass nothing.
+- `[profile prod]` in `config` can hold its own keys, an `sso_session`, or a `role_arn` plus `source_profile` to assume a role in another account.
+- You pick one per command with `--profile prod`, or for a whole shell with `export AWS_PROFILE=prod`.
+## Example
+`aws s3 ls --profile dev` lists buckets in the dev account, and `aws s3 ls --profile prod` lists them in the prod account, from the same installation and without retyping anything. With IAM Identity Center, `aws sso login --profile prod` refreshes short-lived credentials for that profile.
+W: Named profiles with --profile: each profile keeps its own credentials or role/SSO settings for one account, and the flag or `AWS_PROFILE` switches between them instantly.
+X: A=One shared IAM user: an IAM user belongs to exactly one account, so it cannot sign in to both. Sharing one user's keys also removes individual accountability.
+C=Bearer token in an environment variable: the CLI signs requests with SigV4 using an access key pair and optional session token (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`), not a bearer token, and one set of variables covers only one account at a time.
+D=Two CLI installations: both installations would read the same `~/.aws` files, so this adds nothing. Profiles already let one installation work with many accounts.
+T: One CLI, many accounts: define a named profile per account (keys, role or SSO) and choose it with `--profile` or `AWS_PROFILE`.
+
+@ Q000639 explain
+G: ## AssumeRole needs permission on both sides
+Assuming a role across accounts is a two-way handshake:
+- **Caller side**: the identity-based policy of the caller (here the Lambda execution role) must allow `sts:AssumeRole` on the target role ARN.
+- **Target side**: the target role's **trust policy** (a resource-based policy on the role) must name the caller as a principal, for example `"Principal": {"AWS": "arn:aws:iam::111122223333:role/order-fn-role"}` with `"Action": "sts:AssumeRole"`. It may also require conditions such as an `sts:ExternalId`.
+If either side is missing, STS returns `AccessDenied`. Cross-account access always needs both accounts to agree.
+## Example
+Account A's function is allowed to call AssumeRole on `arn:aws:iam::222233334444:role/reporting`, but that role trusts only `lambda.amazonaws.com` in account B. The call fails until the trust policy adds account A's execution role (or account A as a whole).
+W: Trust policy must trust the caller: the caller already has its half of the permission, so the missing half is the target role's trust policy allowing the execution role's ARN (or its account) to call `sts:AssumeRole`.
+X: A=Reserved concurrency: concurrency controls how many copies of the function can run at once. It plays no part in STS authorization decisions.
+C=AWSLambdaBasicExecutionRole on the target: that managed policy only lets a function write CloudWatch Logs. Adding it to the target role changes what the role can do after assumption, not who may assume it.
+D=Deployment bucket encryption: encryption of the S3 bucket holding the code package affects deployment storage only, not runtime calls to STS.
+T: Cross-account AssumeRole needs the caller's policy to allow it and the target role's trust policy to trust the caller; AccessDenied with the first in place means fix the trust policy.
+
+@ Q000640 explain
+G: ## Replacing access keys with federation
+An IAM user's access keys are long-term: they stay valid until someone rotates or deletes them, so a leaked key works for months. An IAM role has no long-term keys; STS issues temporary credentials that expire (for example after one hour).
+Most CI/CD systems (GitHub Actions, GitLab, many others) can issue a signed **OpenID Connect (OIDC) token** for each job.
+- In AWS you create an IAM OIDC identity provider for that issuer.
+- You create a role whose trust policy allows `sts:AssumeRoleWithWebIdentity` from that provider, with conditions on claims such as `aud` and `sub` (for example one repository and branch).
+- Each build exchanges its OIDC token for short-lived role credentials. Nothing secret is stored on the build server.
+W: OIDC federation to an IAM role: the external build system proves its identity with a per-job token and receives temporary credentials, so there are no long-term AWS keys to store, rotate or leak.
+X: A=Weekly key rotation: rotation shortens how long a leaked key is useful, but the credentials are still long-term keys, which is exactly what security wants to eliminate.
+B=A second IAM user: this doubles the number of long-term keys to protect instead of removing them.
+C=Keys in Secrets Manager: storing the keys more safely does not change their nature; they remain long-term access keys, and the build server now also needs credentials to read the secret.
+T: "No long-term credentials" for an outside system means federation (OIDC or SAML) into an IAM role with temporary credentials, not better storage or rotation of user keys.
+
+@ Q000641 explain
+G: ## What a permissions boundary does
+A permissions boundary is a managed policy attached to an IAM user or role that sets the **maximum** permissions that identity can ever have. Effective permissions are the intersection: an action must be allowed by the identity's policies **and** by the boundary.
+## Safe delegation pattern
+- Developers get `iam:CreateRole` and `iam:PutRolePolicy`/`iam:AttachRolePolicy`, but only with a condition like `"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/DevBoundary"`.
+- Every role they create must carry that boundary, and developers are denied permission to change or delete it.
+## Example
+A developer attaches `AdministratorAccess` to a new role. The boundary allows only S3, DynamoDB and CloudWatch Logs, so the role can still use only those services.
+W: Permissions boundaries: they cap each created role at a fixed maximum regardless of attached policies, and IAM conditions can force developers to apply the boundary to every role they create.
+X: A=IAM groups: groups only bundle policies for IAM users. A role cannot be a group member, and groups do not limit what policies someone attaches to a role.
+B=Resource-based policies: these are attached to resources such as buckets or queues and grant access to them. They do not put a ceiling on what a newly created role can do across all services.
+C=SCP at the root only: an SCP limits whole accounts in an organization, so it would restrict everyone equally, not provide a per-role cap tied to developer-created roles, and it does not apply to the management account.
+T: To let people create roles but never exceed a set of permissions, require a permissions boundary on those roles; groups and resource policies grant, they do not cap.
+
+@ Q000642 explain
+G: ## Fine-grained access control in DynamoDB
+IAM policies for DynamoDB can restrict access below the table level with condition keys:
+- `dynamodb:LeadingKeys` limits which **partition key values** a request may touch.
+- `dynamodb:Attributes` limits which attributes can be read or written.
+## With Cognito Identity Pools
+An identity pool exchanges a user's login for temporary credentials of an IAM role. The role's policy can use policy variables, so one policy serves every user:
+- `${cognito-identity.amazonaws.com:sub}` for per-user isolation, or
+- `${aws:PrincipalTag/tenant}` when the pool maps a `tenant` claim to a session tag (attributes for access control).
+## Example
+A condition `"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["${aws:PrincipalTag/tenant}"]}` lets a user in tenant `acme` query items whose partition key is `acme`, and DynamoDB rejects any request for `globex` items with AccessDenied.
+W: LeadingKeys condition per tenant: IAM evaluates the partition key of every request against the caller's tenant, so isolation is enforced by AWS itself, not by application code.
+X: B=Point-in-time recovery: PITR provides continuous backups for restoring the table to an earlier second. It controls nothing about who can read which items.
+C=Bearer token checked only in application code: this enforces isolation in the app, not at the AWS level. The user's temporary credentials could still call DynamoDB directly and read any tenant's items.
+D=DynamoDB Streams: streams publish item-level change records for consumers such as Lambda. They are change capture, not access control.
+T: Row-level tenant isolation in a shared DynamoDB table is done with an IAM `dynamodb:LeadingKeys` condition tied to the caller's identity, not with backups, streams or app-only checks.
+
+@ Q000643 explain
+G: ## API Gateway authorization options
+- **IAM authorization**: callers sign requests with SigV4 using AWS credentials.
+- **Cognito user pool authorizer**: validates JWTs issued by a Cognito user pool.
+- **Lambda authorizer**: your own function decides, so it can check any scheme, including a custom HMAC signature.
+## Request-type Lambda authorizers and caching
+A **REQUEST** authorizer receives headers, query strings, path and context variables, which is what an HMAC check needs (signature header plus the signed request parts). It returns an IAM policy.
+If you set identity sources (for example the signature and partner-ID headers) and a TTL of `300` seconds, API Gateway caches the policy for that combination, so repeat calls within 5 minutes skip the function and add little latency.
+W: Request-type Lambda authorizer with caching: custom code can verify the partner's proprietary HMAC header, and the authorizer result cache with a 300-second TTL reuses decisions for 5 minutes.
+X: A=API key with usage plan: API keys identify callers for throttling and quotas. They are a shared value, not a signature check, and AWS advises against using them for authorization.
+B=IAM authorization with SigV4: this accepts only AWS SigV4 signatures made with AWS credentials. It cannot validate a partner's own HMAC format.
+C=Cognito user pool authorizer: it only validates tokens issued by a Cognito user pool, so a proprietary HMAC header would be rejected.
+T: Any authentication scheme API Gateway does not know natively (custom HMAC, legacy tokens) goes in a Lambda authorizer, with result caching to cut latency.
+
+@ Q000644 explain
+G: ## Service-to-service calls with IAM
+When API Gateway uses **IAM authorization** (`AWS_IAM`) on a method, every request must be signed with AWS Signature Version 4. API Gateway checks the signature and then whether the signer's IAM policy allows `execute-api:Invoke` on that method's ARN.
+On Amazon ECS, a **task role** gives the containers temporary credentials that the AWS SDK picks up automatically and refreshes before they expire.
+## Example
+Service A's task role has a policy allowing `execute-api:Invoke` on `arn:aws:execute-api:us-east-1:111122223333:abc123/prod/GET/orders`. Service A signs its HTTPS call with SigV4 (for example using the SDK's signer). Service B's API accepts it; unsigned or wrongly signed calls get 403.
+W: Task role + IAM auth + SigV4: Service A gets a real AWS identity with short-lived credentials, signs each request, and the API admits only principals allowed to invoke that method.
+X: A=Share IAM user keys in the image: baking long-term keys into a container image spreads them to every registry and host that pulls it, and they never expire.
+C=Disable authorization: this lets anyone who can reach the API call it, which is the opposite of the requirement.
+D=Cognito unauthenticated role: an unauthenticated (guest) identity is meant for anonymous app users, not for proving that the caller is Service A.
+T: For SigV4-authenticated microservice calls, give the caller an IAM role (ECS task role) and set the API method to IAM authorization.
+
+@ Q000645 explain
+G: ## Two ways for services to prove who they are
+- **mTLS**: both sides present X.509 certificates during the TLS handshake, so authentication happens at the transport layer. A service mesh (for example Istio or Linkerd) can inject sidecars that do this automatically, but you need a certificate authority, issuance, distribution and rotation for every workload.
+- **IAM with SigV4**: on EKS, **IAM roles for service accounts (IRSA)**, or the newer EKS Pod Identity, map a Kubernetes service account to an IAM role. Pods get temporary AWS credentials and sign requests with SigV4; the receiver (for example API Gateway with IAM auth or a Lambda function URL) checks IAM policies.
+## The tradeoff
+mTLS works for any TCP protocol and does not depend on AWS, but adds PKI operations. IAM/SigV4 reuses IAM policies and CloudTrail and needs no certificates, but only works where the receiver can verify AWS signatures.
+W: mTLS at transport level vs IAM/SigV4: this correctly states that mTLS authenticates in the TLS layer and brings CA and certificate overhead, while IRSA-based SigV4 relies on IAM identities and policies.
+X: A=IRSA cannot be used with EKS: IRSA was built specifically for EKS; it uses the cluster's OIDC provider to let pods assume IAM roles.
+B=Identical and interchangeable: they operate at different layers and have different requirements, so they are not interchangeable (for example SigV4 does nothing for a raw gRPC call to a peer that cannot verify AWS signatures).
+D=mTLS removes certificate management: mTLS is certificate-based by definition. Every service needs its own certificate and a trusted CA, which is exactly the overhead.
+T: mTLS = certificates at the transport layer (PKI to run); IRSA/SigV4 = IAM identities and policies (no certificates, but AWS-aware receivers).
+
+@ Q000646 explain
+G: ## How IAM decides
+IAM evaluates every request against all applicable policies:
+- If any policy explicitly denies the action, it is denied.
+- Otherwise, if some policy explicitly allows the action **on that resource**, it is allowed.
+- Otherwise it is denied. This is the **implicit deny**: the default for anything not allowed.
+Actions are matched exactly. `dynamodb:GetItem` does not cover `dynamodb:Query`, and a resource of `arn:aws:dynamodb:us-east-1:111122223333:table/Orders` does not cover `table/Audit`.
+## Example
+The role's policy is `Allow dynamodb:GetItem on table/Orders`. `GetItem` on `Orders` succeeds; `Query` on `Orders` returns AccessDeniedException; `PutItem` on `Audit` returns AccessDeniedException.
+W: Only GetItem on Orders succeeds: it is the only action and resource pair with an explicit allow; Query and PutItem fall to the implicit deny.
+X: A=No explicit Deny means allowed: IAM starts from deny. The absence of a Deny statement does not grant anything; only Allow statements do.
+B=All actions on Orders: permissions are per action. Allowing `GetItem` says nothing about `Query`, `Scan` or writes on the same table.
+D=A Deny is required first: Allow statements work on their own. Deny statements only remove permissions; they are never a prerequisite for an allow.
+T: IAM is deny-by-default: each action on each resource needs its own explicit Allow, and anything not listed fails.
+
+@ Q000647 explain
+G: ## Combining policies from several sources
+A user's effective permissions come from every policy that applies: policies attached to the user, policies of **all** groups the user belongs to, plus boundaries, SCPs and resource policies. IAM merges them into one evaluation; there is no priority or ordering between groups.
+The rule is simple:
+- An **explicit Deny** in any applicable policy wins over any number of Allows.
+- Only if nothing denies does an Allow take effect.
+## Example
+Group `Developers` allows `s3:DeleteObject` on `arn:aws:s3:::reports/*`; group `Auditors` denies the same action. A user in both groups who calls DeleteObject gets `AccessDenied`. Removing the user from `Auditors` is the only way the Allow can apply.
+W: Denied, explicit Deny wins: the deny statement from one group overrides the allow from the other, because an explicit Deny anywhere in the evaluation cannot be overridden by an Allow.
+X: B=Depends on group creation order: IAM has no concept of policy precedence by creation date or group order. All policies are evaluated together.
+C=Allowed because one policy grants it: an Allow only takes effect when no applicable policy explicitly denies the action, and here one does.
+D=Groups evaluated independently: IAM does not evaluate each group separately and pick a winner; it combines all policies of the principal into a single decision.
+T: When policies conflict, an explicit Deny from any source always beats an Allow.
+
+@ Q000648 explain
+G: ## In transit vs at rest
+S3 endpoints accept both HTTP and HTTPS. Encryption settings on the bucket (SSE-S3, SSE-KMS) protect objects **at rest** on disk; they do nothing about whether the request itself travels in clear text.
+## The SecureTransport condition
+Every request carries the global condition key `aws:SecureTransport`, which is `true` for HTTPS and `false` for plain HTTP. A bucket policy statement like:
+- `"Effect": "Deny"`, `"Principal": "*"`, `"Action": "s3:*"`
+- `"Resource": ["arn:aws:s3:::my-bucket", "arn:aws:s3:::my-bucket/*"]`
+- `"Condition": {"Bool": {"aws:SecureTransport": "false"}}`
+rejects every HTTP request, from any principal, even ones whose IAM policies allow access, because an explicit Deny wins.
+W: Deny when aws:SecureTransport is false: a bucket policy deny on this key blocks all non-HTTPS requests to the bucket, which is the standard way to enforce encryption in transit for S3.
+X: A=Transfer Acceleration: it routes uploads and downloads through CloudFront edge locations for speed. It does not stop clients from using the regular endpoint over HTTP.
+B=Default SSE-S3 encryption: this encrypts objects at rest after S3 receives them. An HTTP request still sends data unencrypted over the network.
+C=Versioning: versioning keeps previous object versions to protect against overwrites and deletes. It has no effect on the transport protocol.
+T: Encryption at rest does not enforce HTTPS; to block plain HTTP on S3, deny requests where `aws:SecureTransport` is `false` in the bucket policy.
+
+@ Q000649 explain
+G: ## TLS on RDS for MySQL
+RDS for MySQL instances have a server certificate, so clients can connect with TLS. By default, though, the server also accepts unencrypted connections; TLS is used only if the client asks for it.
+To force it, set the DB parameter `require_secure_transport` to `1` (ON) in a **custom DB parameter group** attached to the instance. The server then rejects any connection that does not use TLS.
+- You can also require it per user with `ALTER USER 'app'@'%' REQUIRE SSL;`.
+- Clients should verify the server with the RDS CA bundle (for example `--ssl-mode=VERIFY_IDENTITY`).
+## Example
+Before the change, `mysql -h db... --ssl-mode=DISABLED` connects. After setting `require_secure_transport=1`, the same command fails with an error saying insecure transport is prohibited.
+W: require_secure_transport in the parameter group: it makes the database server itself refuse any non-TLS connection, closing the gap left by clients that do not request TLS.
+X: B=Storage encryption: this encrypts data, logs, backups and snapshots at rest with KMS. It does not change whether client connections are encrypted.
+C=Rotate the master password: rotation limits the damage of a leaked password but has nothing to do with the connection being encrypted.
+D=Multi-AZ: Multi-AZ adds a standby for failover and availability. The standby uses the same settings, so plaintext connections would still be accepted.
+T: Encryption at rest and credentials do not force TLS; on RDS for MySQL, set `require_secure_transport` in the parameter group.
+
+@ Q000650 explain
+G: ## Certificates for internal mTLS
+Mutual TLS needs a certificate on every service, issued by a CA that the other services trust. For internal-only traffic you want:
+- A CA that only your company trusts, not a public one.
+- Automated issuance through APIs, and short validity so compromised certificates expire quickly.
+**AWS Private CA** runs a private certificate hierarchy for you. You can issue certificates for internal names such as `orders.svc.internal` with the `IssueCertificate` API or through ACM, and it has a **short-lived certificate** CA mode (validity up to 7 days) at a lower price for frequently rotated workload certificates. Tools such as cert-manager and service meshes can request certificates from it automatically.
+W: AWS Private CA with short-lived certificates: it issues privately trusted certificates for internal services through APIs, supports short-lived certificates for frequent rotation, and keeps the CA key protected by AWS.
+X: A=KMS asymmetric keys as certificates: KMS stores key pairs, but a key is not an X.509 certificate. Nothing signs a certificate chain for mTLS peers to validate.
+C=ACM public certificates: public certificates are for publicly resolvable domains validated by DNS or email, and ACM public certificates cannot be exported for use inside your own containers.
+D=Self-signed certificates in S3: each service would have its own untrusted root, so peers must trust every certificate individually, with no central revocation or automated rotation, and storing private keys in S3 adds risk.
+T: Internal-only mTLS with automated, frequently rotated certificates calls for a private CA (AWS Private CA), not public ACM certificates or KMS keys.
+
+@ Q000651 explain
+G: ## Public vs private certificates
+- **Public ACM certificates** are issued by Amazon's public CA for domain names you prove you own. Browsers trust them, and they are deployed on integrated services such as ALB, CloudFront and API Gateway.
+- **AWS Private CA** (formerly ACM Private Certificate Authority) lets you run your own root and subordinate CAs. You decide the hierarchy, naming, validity and extensions, and certificates can be issued for any internal name, including client certificates for mTLS.
+## When to choose private
+Hundreds of internal endpoints that never face the internet, talking over mTLS, need certificates that only your organization trusts and a hierarchy you control, for example a root CA kept offline in use, with a subordinate CA per environment issuing workload certificates.
+W: ACM Private CA: it creates and manages a private CA hierarchy under your control and issues certificates for internal endpoints and mTLS clients, at the scale of hundreds of services.
+X: A=Amazon Cognito: Cognito authenticates application users and issues JWTs. It does not issue X.509 certificates for services.
+B=Public ACM certificates: public issuance requires publicly validated domain names and gives no control over the CA hierarchy, which does not fit internal-only endpoints and mTLS.
+D=AWS Secrets Manager: it stores and rotates secrets such as passwords and API keys. It can hold a certificate someone else issued, but it cannot issue one.
+T: Internal endpoints plus control of the certificate hierarchy means a private CA; public ACM is for internet-facing names.
+
+@ Q000652 explain
+G: ## Sharing one private CA across accounts
+Running a separate CA in every account costs money (each private CA is billed monthly) and fragments trust. AWS Private CA supports cross-account use through **AWS Resource Access Manager (RAM)**:
+- The shared services account creates a RAM resource share with the CA and chooses a managed permission (for example one that allows issuing end-entity certificates).
+- Member accounts, or a whole OU in AWS Organizations, accept or automatically receive the share.
+- In those accounts, teams request private certificates from the shared CA, for example through ACM, without ever touching the CA's key.
+A resource-based policy on the CA is another way to grant cross-account access; RAM is the Organizations-friendly option.
+W: RAM sharing of the private CA: RAM makes the central CA available to other accounts or OUs, so teams issue certificates from the same trusted hierarchy without creating their own CAs.
+X: B=Copying the CA private key: AWS Private CA keeps CA private keys in AWS-managed HSMs and never exports them. Copying a CA key would also destroy the security of the whole hierarchy.
+C=Service control policies: SCPs only set the maximum permissions for accounts; they never grant access and cannot share a resource with another account.
+D=Cross-account bucket policies: a bucket policy controls access to an S3 bucket. It has nothing to do with issuing certificates from a CA.
+T: To let other accounts use one AWS Private CA, share it with AWS RAM (or a CA resource policy); SCPs restrict, they do not share.
+
+@ Q000653 explain
+G: ## Who sees the plaintext?
+S3 offers several encryption models, and they differ in where encryption happens and who holds the key:
+- **SSE-S3**: S3 encrypts with keys it manages. S3 sees plaintext on every write and read.
+- **SSE-KMS**: S3 encrypts with a data key protected by your KMS key. S3 still receives and returns plaintext for authorized requests.
+- **SSE-C**: you send your own key with each request over HTTPS. S3 does not store the key, but it uses it and the plaintext in memory to encrypt or decrypt.
+- **Client-side encryption**: your application encrypts before upload (for example with the Amazon S3 Encryption Client) and decrypts after download. S3 only ever stores and returns ciphertext.
+## Example
+The company encrypts each file with AES-256-GCM using a key from its own on-premises HSM, then uploads the ciphertext. Even with full access to S3, AWS holds nothing it can decrypt.
+W: Client-side encryption with company-held keys: data is encrypted before it reaches AWS and the key never leaves the company, so AWS never has access to plaintext.
+X: A=SSE-C: the key and plaintext data both travel to S3 on each request, and S3 performs the encryption, so AWS systems do handle plaintext, even if only briefly.
+B=SSE-S3: AWS generates, holds and uses the keys, and S3 encrypts the plaintext you upload.
+D=SSE-KMS with a customer managed key: you control the key policy, but S3 and KMS decrypt data for authorized requests, so the plaintext passes through AWS.
+T: Only client-side encryption with keys that never leave you keeps plaintext out of AWS; every SSE option has S3 handle plaintext.
+
+@ Q000654 explain
+G: ## Encrypting before data leaves the server
+With **server-side encryption**, the application uploads plaintext over TLS and S3 encrypts it on arrival. That protects stored data, but AWS handles the plaintext and the keys.
+With **client-side encryption**, the application encrypts first, then uploads ciphertext:
+- Generate or load a data key locally (for example from an on-premises HSM or a local key store).
+- Encrypt the object in the application, for example with AES-256-GCM, often via the Amazon S3 Encryption Client with a raw key you supply.
+- Upload the ciphertext; download and decrypt locally when needed.
+## Why "local key" matters
+If the key were a KMS key, KMS would hold the key material. Using a key held only by the company satisfies both requirements: encrypted before leaving the servers, and AWS never has the key or the plaintext.
+W: Client-side encryption with a local key: the application encrypts before upload with a key that never goes to AWS, so S3 stores only ciphertext and AWS has neither plaintext nor key.
+X: A=Default bucket encryption with an AWS owned key: this is server-side (SSE-S3). S3 receives plaintext and uses keys that AWS owns.
+C=SSE-KMS with an AWS managed key: S3 encrypts after receiving plaintext, and the key lives in KMS under AWS management.
+D=SSE-S3: S3 encrypts on arrival with S3-managed keys, so data leaves the application servers unencrypted (apart from TLS) and AWS holds the keys.
+T: "Encrypted before it leaves our servers and AWS never has the key" means client-side encryption with a key you hold; all SSE options encrypt inside AWS.
+
+@ Q000655 explain
+G: ## Envelope encryption with KMS
+The KMS `Encrypt` API accepts at most **4 KB** of plaintext, and every call goes over the network, so it is meant for small secrets, not files. Envelope encryption solves this:
+- Call `GenerateDataKey` with your KMS key. KMS returns a data key twice: in **plaintext** and **encrypted** under the KMS key.
+- Encrypt the file locally with the plaintext data key (for example AES-256-GCM), then erase the plaintext key from memory.
+- Store the encrypted data key next to the ciphertext, for example as object metadata.
+- To read: call `Decrypt` on the small encrypted data key, then decrypt the file locally.
+## Example
+A 2 GB video is encrypted on the client with a fresh data key; only the 256-bit key goes to KMS for decryption later. The AWS Encryption SDK and the S3 Encryption Client implement this pattern for you.
+W: Envelope encryption with GenerateDataKey: the file is encrypted locally with a data key, and KMS only protects that small key, so the 4 KB limit never applies to the file.
+X: A=Encrypt the whole file with KMS: calls with plaintext over 4 KB fail, and sending large files to KMS would be slow and costly even if it were possible.
+B=Disable key rotation: rotation only controls whether new key material is created each period. It has no effect on the maximum request size.
+C=Key material on the client: KMS keys never leave KMS unencrypted; you cannot download a KMS key's material to the client.
+T: Large data + KMS = envelope encryption: KMS protects a data key, and the data key encrypts the file locally.
+
+@ Q000656 explain
+G: ## Kinds of KMS keys
+- **AWS managed keys** (aliases like `aws/s3`, `aws/ebs`) are created by AWS services in your account. You can view them and audit their use, but you cannot change their policy or rotation. AWS rotates their key material automatically every year.
+- **Customer managed keys** are created and fully controlled by you. Automatic rotation is **off by default**; when you enable it, you can choose a period between 90 and 2560 days (365 by default), and you can also trigger on-demand rotation.
+## What rotation does
+Rotation creates new key material for new encryptions and keeps old material so existing ciphertext still decrypts. The key ID, ARN and aliases stay the same, so applications need no changes. Keys with imported material or in custom key stores cannot use automatic rotation; for those you rotate manually by switching an alias to a new key.
+W: AWS managed rotate automatically, customer managed optional: AWS rotates its managed keys yearly without your involvement, while rotation of customer managed keys is your choice to enable and configure.
+X: A=Identical schedules set by the customer: customers cannot configure rotation for AWS managed keys at all, and the two key types behave differently.
+C=AWS managed keys never rotate: they are rotated automatically every year.
+D=Customer managed keys cannot rotate: symmetric customer managed keys support automatic rotation (when enabled) and on-demand rotation; other key types can be rotated manually.
+T: AWS managed keys rotate automatically on AWS's schedule; customer managed keys rotate only if you enable it, on a period you choose.
+
+@ Q000657 explain
+G: ## How EC2 key pairs work
+An EC2 key pair is a public/private key pair (RSA or ED25519) used for SSH login on Linux instances.
+- You create or import the key pair in EC2. AWS stores only the **public** key; if EC2 generates it, you download the private key file (`.pem`) once.
+- At launch you choose the key pair by name. On first boot the instance places the public key in the default user's `~/.ssh/authorized_keys`.
+- You connect with the private key: `ssh -i my-key.pem ec2-user@203.0.113.10`.
+## Keeping the private key safe
+The private key must stay with the user, with restrictive file permissions (`chmod 400`). Alternatives such as EC2 Instance Connect or Session Manager avoid long-lived keys, but the key pair method is the classic answer.
+W: Key pair at launch, SSH with its private key: the public key is installed on the instance at boot, and only the holder of the matching private key can log in, with no password involved.
+X: A=Root user password: the account root user signs in to the AWS console; it is not an operating-system account and has no SSH access to instances.
+B=Private key in a public S3 bucket: anyone on the internet could download it and log in to the instance, which defeats key-based authentication.
+D=KMS key pair in user data: user data is readable from the instance metadata service and by anyone with permission to describe the instance attribute, so putting a private key there exposes it; it is also the wrong place, as SSH needs the private key on the client.
+T: SSH to EC2: attach a key pair at launch and keep the private key only on your machine; never publish or embed it.
+
+@ Q000658 explain
+G: ## Encryption in transit to DynamoDB
+DynamoDB is reached only through its HTTPS API. The AWS SDK a Lambda function uses sends every request over TLS and signs it with SigV4, so data between Lambda and DynamoDB is encrypted in transit by default. Table encryption at rest (AWS owned, AWS managed or customer managed key) is a separate topic.
+## Keeping traffic off the internet
+- A Lambda function **not** attached to a VPC reaches the public DynamoDB endpoint from AWS-managed networking; traffic stays on the AWS network and is TLS-encrypted.
+- A function **attached** to a VPC needs a route to DynamoDB. Without an endpoint, that means a NAT gateway and the public endpoint. A **gateway VPC endpoint** for DynamoDB adds a route in the subnet route tables (prefix list) so traffic goes privately to DynamoDB with no NAT and no internet gateway. Interface endpoints (PrivateLink) for DynamoDB are also available.
+W: TLS by default, gateway endpoint for a private path: all DynamoDB API calls use TLS, and a DynamoDB gateway endpoint lets a VPC-attached function reach the table without an internet or NAT path.
+X: A=Protected only outside a VPC: TLS applies wherever the function runs. Attaching the function to a VPC changes the network path, not the encryption.
+C=Only with a customer managed key: the key choice affects encryption at rest in the table, not the TLS protection of API calls.
+D=Plaintext unless the client enables TLS: DynamoDB endpoints use HTTPS, and the SDK uses TLS by default, so there is no plaintext mode to opt out of.
+T: Lambda-to-DynamoDB traffic is always TLS-encrypted; to keep a VPC function's traffic private, add a DynamoDB VPC endpoint (usually the gateway type).
+
+@ Q000659 explain
+G: ## How clients trust a certificate
+During a TLS handshake the server sends its certificate and chain. The client accepts it only if the chain leads to a root CA in the client's **trust store** (the OS, JVM or container CA bundle).
+Public CAs are preinstalled in those stores. A root created in **AWS Private CA** is not, so every client must have that root (and any needed intermediates) added explicitly.
+## Why maintenance can break this
+A maintenance window often rebuilds hosts, patches the OS or updates container base images. That can replace a customized CA bundle with the default one, or a new subordinate CA may be in use whose chain is not deployed. The server certificate is still valid, but clients report "unable to get local issuer certificate" or "untrusted certificate".
+Fix: redistribute the private root to all clients, for example in the base image or via configuration management.
+W: Clients don't trust the private CA chain: an unexpired certificate rejected as untrusted means the client cannot build a chain to a trusted root, which for a private CA means the root was missing or removed from the client trust store.
+X: A=EC2 key pair instead of a certificate: key pairs are for SSH logins; an HTTPS service presents an X.509 certificate, and clients are already getting a certificate that they reject for trust reasons.
+C=Private CA certificate rotated automatically: AWS Private CA does not rotate a CA certificate on its own; replacing or renewing a CA certificate is a customer action.
+D=Public trust anchor by default: AWS Private CA never issues publicly trusted certificates; its hierarchy is private, which is exactly why clients need the root installed.
+T: "Untrusted" with an unexpired private certificate means the client trust store lacks the private CA root; distribute the root to every client.
+
+@ Q000660 explain
+G: ## EBS encryption and key choice
+EBS encryption uses KMS: volumes and every snapshot taken from them are encrypted with the chosen key, transparently to the instance. You can enable **encryption by default** per Region and set a default customer managed key.
+## Sharing encrypted snapshots
+- A snapshot encrypted with the AWS managed key `aws/ebs` **cannot be shared** with another account, because you cannot change that key's policy.
+- A snapshot encrypted with a **customer managed key** can be shared: modify the snapshot's permissions to add the DR account, and allow that account in the key policy (for example `kms:Decrypt`, `kms:DescribeKey`, `kms:CreateGrant`, `kms:ReEncrypt*`).
+- In the DR account you usually copy the snapshot and re-encrypt it with a DR-owned key, so restores do not depend on the source account's key.
+W: Customer managed key, share snapshot and key: CMK encryption covers the volumes and snapshots, and granting the DR account both snapshot access and key use lets it restore.
+X: A=S3 default encryption on a snapshot bucket: EBS snapshots are stored by AWS in S3-backed storage you cannot access as a bucket, so bucket settings do not apply and cannot encrypt them.
+B=AWS managed aws/ebs key: its key policy cannot be changed, so snapshots encrypted with it cannot be shared cross-account, and it is not a customer managed key as required.
+C=OS-level encryption, unencrypted volumes: the requirement is volume encryption with a CMK; the volumes and snapshots themselves would remain unencrypted at the EBS level.
+T: Cross-account restores of encrypted EBS snapshots need a customer managed key shared with the other account; `aws/ebs` snapshots cannot be shared.
+
+@ Q000661 explain
+G: ## What counts as personal data
+Personal data (often called PII) is any information that identifies a person directly or can identify them when combined with other data.
+- **Direct identifiers**: full name, email address, phone number, government ID number.
+- **Quasi-identifiers**: home address, date of birth, precise location. Alone they may not name someone, but combined (name + address, or ZIP code + birth date) they often point to one person.
+Technical metadata about systems, such as version numbers, Region names or format strings, describes software, not people.
+## Protecting it on AWS
+- Encrypt at rest and in transit (KMS, TLS) and restrict access with IAM.
+- Mask or tokenize fields in logs and analytics.
+- Discover PII in S3 with Amazon Macie.
+W: Name with home address: together they identify and locate a specific person, so this is personal data that needs controls such as encryption, masking and access limits.
+X: A=API version number: a value like `v2` describes the software interface and is the same for every user, so it identifies no one.
+C=Timestamp format string: a pattern like `yyyy-MM-dd'T'HH:mm:ss` describes how dates are written, not any person or event about a person.
+D=AWS Region name: a value like `eu-west-1` identifies infrastructure location and is shared by many customers, not an individual.
+T: Personal data is anything that identifies a person alone or in combination (name + address); system metadata is not.

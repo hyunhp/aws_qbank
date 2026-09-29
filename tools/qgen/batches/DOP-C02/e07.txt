@@ -1,0 +1,382 @@
+# DOP-C02 detailed explanations, e07 (explanation-only rewrites; letters are the published ones)
+
+@ Q001371 explain
+G: ## Two ways to fix a Config finding
+AWS Config rules only evaluate resources. To fix what they find you either attach a **remediation action** to the rule or react to the compliance event yourself.
+- **Built-in remediation**: you attach an SSM Automation document (for example an AWS-managed runbook) to the rule and choose manual or automatic. Config starts the runbook for each non-compliant resource, passes the resource ID as a parameter, and records each attempt.
+- **Custom path**: an EventBridge rule matches the `Config Rules Compliance Change` event and invokes a Lambda function that you write.
+## What the managed path gives you
+Automatic remediation has settings for **maximum automatic attempts** and **retry interval**, and SSM execution controls such as concurrency and error-percentage limits so a bad runbook does not hit hundreds of resources at once. Every run shows up as a remediation status in Config and as an Automation execution in Systems Manager. With a Lambda function, retries, throttling, idempotency and logging are all code you must build and maintain.
+The limit: the remediation can only do what the chosen runbook does.
+W: Managed retries, rate limits and audit trail: built-in remediation brings retry settings, execution controls and a per-resource execution history out of the box; the tradeoff is that the logic is bounded by the SSM document you attach.
+X: A=Lambda always cheaper: Lambda is not free (it bills per request and per GB-second), and cost is not the operational tradeoff being compared; the difference is how much retry and audit plumbing you have to build.
+B=Cannot use SSM documents: the opposite is true. Config remediation actions are defined as SSM Automation documents; that is the standard way they work.
+D=Lambda has better audit trail: a custom function only logs what you code it to log. Config remediation already records each remediation attempt and its result, and the Automation execution history keeps step-level detail.
+T: Pick Config's built-in SSM remediation when a runbook fits, because retries, rate limiting and auditing come for free; write a Lambda function only when you need custom logic.
+
+@ Q001372 explain
+G: ## Why slow boot hurts scale-out
+When an Auto Scaling group scales out, it launches brand-new instances. If the application needs 15 minutes to warm caches, the capacity arrives 15 minutes after the spike started.
+## What a warm pool is
+A **warm pool** is a set of instances that sit beside the Auto Scaling group, already launched and initialized, but not in service.
+- You choose their state: `Stopped` (you pay only for EBS volumes and attached Elastic IPs), `Hibernated`, or `Running`.
+- On scale-out, the group moves instances from the warm pool into service instead of launching from scratch. A stopped instance only needs to start, so it can serve traffic in seconds to a couple of minutes.
+- Lifecycle hooks can run the long initialization when an instance first enters the warm pool, so the heavy work happens ahead of time.
+- On scale-in you can have instances return to the warm pool rather than terminate.
+Example: a group with desired 4, warm pool min size 6 in `Stopped` state; a spike moves 6 prepared instances into service almost immediately.
+W: Auto Scaling warm pools: they keep pre-initialized instances outside the live pool, cheaply stopped or hibernated, and hand them to the group on scale-out, which removes the 15-minute warm-up from the critical path.
+X: A=Longer health check grace period: this only stops the group from marking a new instance unhealthy while it boots; the instance still takes 15 minutes before it can serve, so the spike is not met.
+B=Launch lifecycle hook with long wait: a hook holds each new instance in `Pending:Wait` while it initializes, which makes the delay explicit but does not remove it; every scale-out still waits the full warm-up.
+C=Scheduled scaling hours ahead: this works only for predictable demand and runs the extra instances fully in service (and billed) for hours; unexpected spikes are still slow.
+T: A lifecycle hook or grace period only waits out a slow boot; a warm pool does the boot ahead of time and keeps the instance stopped until it is needed.
+
+@ Q001373 explain
+G: ## Config data is per account and per Region
+AWS Config records resources and evaluates rules separately in every account and Region. With 40 accounts and 3 Regions that is 120 separate views.
+## Aggregators
+A **Config aggregator** collects configuration and compliance data from many source accounts and Regions into one aggregator account.
+- An **organization aggregator** uses AWS Organizations, so every current and future member account is included automatically, without per-account authorization.
+- The aggregator console shows compliance by rule, account and Region in one place.
+- **Advanced queries** run SQL-like `SELECT` statements over the aggregated configuration data, for example:
+- `SELECT accountId, awsRegion, resourceId WHERE resourceType = 'AWS::S3::Bucket'` across the whole organization.
+The aggregator is typically set up in a delegated administrator or security account, which keeps the management account clean.
+W: Organization aggregator with advanced queries: it gathers configuration and compliance data from all accounts and Regions into one view, and advanced queries give SQL-style search across that aggregated data without building a data pipeline.
+X: A=Athena on each delivery bucket: this means querying 40 buckets of snapshot files (or first centralizing them), defining tables and partitions, and working from periodic snapshots instead of current compliance status; it is a do-it-yourself pipeline, not one view.
+B=Cross-account roles on demand: scripts that assume a role in each account and Region and call Config APIs give no persistent combined view and no SQL querying; every question requires a new fan-out of 120 calls.
+C=One rule deployed manually everywhere: deploying rules creates more per-account findings but does nothing to bring them together; results still live in 120 separate places.
+T: Use an organization Config aggregator for a single multi-account, multi-Region compliance view, and its advanced queries for SQL-style search.
+
+@ Q001374 explain
+G: ## How Config automatic remediation runs
+When a rule marks a resource `NON_COMPLIANT` and automatic remediation is enabled, Config starts the attached SSM Automation document for that resource.
+- The Automation run needs an **IAM role** to act with, usually passed in the `AutomationAssumeRole` parameter.
+- The role's trust policy must allow `ssm.amazonaws.com` to assume it.
+- The role's permissions must cover what the runbook does, here something like `s3:PutEncryptionConfiguration` on the bucket.
+## Where it breaks
+If Systems Manager cannot assume the role, the role lacks the permissions the runbook needs, or the remediation parameters are wrong, the remediation cannot run successfully: no useful Automation execution ever does the work, while the rule itself keeps reporting `NON_COMPLIANT` normally, because evaluation and remediation are separate steps.
+To troubleshoot, check the remediation configuration parameters, the role's trust policy, its permissions, and the Automation executions in Systems Manager.
+W: Remediation role problem: the rule evaluates correctly, so the failure is in the remediation step, and the most common cause is a role that SSM cannot assume or that lacks the S3 encryption permissions the runbook needs.
+X: A=Must click Remediate each time: that describes manual remediation. With automatic remediation enabled, Config starts the action itself for each non-compliant resource.
+C=Cross-Region bucket never supported: Config evaluates S3 buckets in the Region where the rule and recorder run, and the bucket was already evaluated as non-compliant, which shows the rule can see it.
+D=Only EC2 and IAM supported: remediation is resource-agnostic; any resource an SSM Automation document can act on can be remediated, and AWS publishes runbooks specifically for S3 bucket encryption.
+T: When compliance status is right but remediation does nothing, look at the remediation role (trust for SSM and permissions for the runbook actions), not at the rule.
+
+@ Q001375 explain
+G: ## Lambda vs. Automation runbooks for long remediations
+- **AWS Lambda** runs a single function invocation for at most **15 minutes**. Longer work has to be split across invocations, Step Functions or similar orchestration.
+- **SSM Automation runbooks** are multi-step documents. Each step can call AWS APIs (`aws:executeAwsApi`), wait for a resource state (`aws:waitForAwsResourceProperty`), sleep, branch, run commands on instances or run a script. A whole execution can run far longer than 15 minutes because it is a workflow, not a single function.
+## Prebuilt logic
+AWS publishes hundreds of managed runbooks (with name prefixes such as `AWS-`, `AWSSupport-` and `AWSConfigRemediation-`), for example to restart, stop or replace instances or apply encryption. Using one means less custom code to write, test and maintain. Runbooks can also invoke a Lambda function as one step when a small piece of custom logic is needed.
+Example: a 45-minute drain-and-replace can be steps like "deregister from target group", "wait until connection count is 0", "stop", "launch replacement", "wait until healthy".
+W: No 15-minute limit plus prebuilt runbooks: an Automation execution can orchestrate a 45-minute process with wait steps, and AWS-managed runbooks supply much of the logic, matching both requirements.
+X: B=Config cannot trigger Lambda at all: a remediation action targets an SSM document, but that runbook can call a function with an `aws:invokeLambdaFunction` step, and EventBridge can invoke Lambda on compliance changes. The real problem for this scenario is the 15-minute execution limit, not reachability.
+C=Automation is free, Lambda always costs: Systems Manager Automation has its own usage-based charges (for example per step executed), and Lambda has a free tier; cost is not the deciding factor here.
+D=SSM documents only in Python: runbooks are written in YAML or JSON, and script steps support Python and PowerShell; language is not what favors them here.
+T: For remediation longer than 15 minutes, use a multi-step SSM Automation runbook (ideally an AWS-managed one) instead of a single Lambda function.
+
+@ Q001376 explain
+G: ## Launch template changes do not touch running instances
+An Auto Scaling group uses its launch template (or a specific version of it) only when it **launches** an instance. Changing the AMI in a new template version affects future launches; instances that are already running keep the old AMI until they are replaced for some other reason, such as failing a health check or scale-in.
+## Instance refresh
+**Instance refresh** replaces instances in the group in a controlled rolling way:
+- You set **minimum healthy percentage** (for example 90%) so capacity stays up during the rollout.
+- **Instance warmup** makes it wait before counting a new instance as ready.
+- **Checkpoints** can pause at, for example, 20% and 50% so you can validate.
+- **Auto rollback** (with optional CloudWatch alarms) returns to the previous configuration if the refresh fails.
+- Skip matching can leave instances that already use the desired configuration alone.
+Example: `aws autoscaling start-instance-refresh --auto-scaling-group-name web --preferences MinHealthyPercentage=90`.
+W: Start an instance refresh: it proactively replaces every instance in controlled batches, keeping a minimum healthy percentage, with optional checkpoints and rollback, so the whole fleet ends up on the new AMI.
+X: B=Wait for normal replacement: that is exactly the current behavior; only failed or scaled-in instances get replaced, so the rollout could take weeks and is not controlled.
+C=Update the template version again: a new version still only applies to new launches; no running instance is replaced by editing the template.
+D=Terminate everything at once: this drops the whole fleet's capacity at the same moment and causes an outage while replacements boot, which is the opposite of a controlled rollout.
+T: Updating the launch template only changes future launches; use instance refresh to roll the change across running instances safely.
+
+@ Q001377 explain
+G: ## How Config rules are triggered
+An AWS Config rule runs its evaluation when one of its triggers fires:
+- **Configuration change trigger**: runs when Config records a change to a resource in scope, such as a new bucket policy on an `AWS::S3::Bucket`. This gives near-real-time evaluation.
+- **Periodic trigger**: runs on a fixed frequency (1, 3, 6, 12 or 24 hours), regardless of changes. It catches drift that a change event missed, or settings that are not captured as configuration changes.
+A custom rule (Lambda or Guard) can have **both** trigger types, and some managed rules support both as well. The rule then evaluates on every change and again on the schedule.
+Example: an S3 public-access rule with a change trigger scoped to `AWS::S3::Bucket` and a periodic trigger every `24 hours`.
+W: Both change and periodic triggers: the change trigger evaluates as soon as a bucket policy changes, and the 24-hour periodic trigger re-checks all buckets daily as a safety net.
+X: B=Manual daily run: relies on a person remembering to run it and gives no immediate evaluation after a policy change, failing both requirements.
+C=Periodic only at minimum interval: even the shortest period (1 hour) is not immediate, and it spends evaluations every hour on buckets that did not change.
+D=Change trigger only: this evaluates immediately but never re-checks buckets on a schedule, so a missed change stays undetected, which is what the daily check is meant to catch.
+T: Combine a configuration change trigger (immediate) with a periodic trigger (safety net) when a rule must do both.
+
+@ Q001378 explain
+G: ## Two Systems Manager tools working together
+- **Patch Manager** scans or installs patches on managed nodes against a patch baseline and reports each node as compliant or non-compliant, with missing patch details. Compliance data can be viewed across accounts and Regions, for example through Quick Setup patch policies and Systems Manager's multi-account views.
+- **Fleet Manager** is the Systems Manager console for managing nodes. From it you can see node details, start a **Session Manager** session, browse and view files in the file system, view logs and performance counters, and manage users, all without SSH keys or open inbound ports.
+## Why the combination fits
+The engineer needs to find non-compliant instances among thousands, then act on one. Patch compliance answers "which ones"; Fleet Manager lets them open that node and investigate from the same console, with access controlled by IAM and logged.
+W: Patch Manager compliance plus Fleet Manager: Patch Manager reports patch compliance for the whole fleet, and Fleet Manager opens sessions and browses file systems on a chosen node directly in Systems Manager.
+X: A=Config conformance packs: these bundle Config rules and report configuration compliance, but they do not report OS patch state in depth or give shell or file-system access to an instance.
+B=Change Manager requests: Change Manager handles approval workflows for operational changes; it neither reports patch compliance nor lets you browse an instance.
+C=Parameter Store hierarchies: Parameter Store holds configuration values and secrets in a path hierarchy; it has no compliance reporting or instance access.
+T: Use Patch Manager to find non-compliant nodes and Fleet Manager (with Session Manager) to open and inspect them from one console.
+
+@ Q001379 explain
+G: ## CloudWatch Logs Insights
+Logs Insights runs an interactive query language over one or more log groups for any time range. It searches every log stream in the group at once, so you do not open streams one by one.
+Key commands:
+- `filter` keeps matching events, for example `filter @message like /ERROR/`.
+- `stats` aggregates: `count(*)`, `avg()`, `max()` and so on, grouped with `by`.
+- `bin(5m)` groups timestamps into 5-minute buckets for a time series.
+- `sort` and `limit` pick the top results.
+## Example for this incident
+`filter @message like /ERROR/ | stats count(*) as errors by bin(5m), @message | sort errors desc`
+Set the time picker to the last 2 hours. The result shows each error message and how many times it occurred in every 5-minute bucket; the visualization tab can chart it.
+Queries only scan existing data, so the answer covers the past 2 hours right away.
+W: Logs Insights with filter, stats and bin(5m): one query searches all 60 streams over the last 2 hours, ranks error messages by count and breaks the counts into 5-minute intervals, which is the exact view the incident needs.
+X: A=Metric filter and wait: metric filters only produce metrics from events ingested after the filter is created, so they cannot answer anything about the past 2 hours during the incident.
+B=Read each stream in the console: reading 60 streams by hand is slow, error-prone and gives no counts or 5-minute trend.
+D=Download and grep: exporting logs takes time and grep does not easily produce ranked counts per 5-minute bucket; it is slower than a query that runs where the logs already are.
+T: For ad hoc questions over existing logs, query with Logs Insights; metric filters only help for data that arrives after they exist.
+
+@ Q001380 explain
+G: ## How alarm-based rollback works in CodeDeploy
+In a deployment group you can attach **CloudWatch alarms** and enable rollback when an alarm threshold is met. This works for EC2/on-premises, Lambda and ECS deployments. CodeDeploy watches the alarms **while the deployment is running**; if one goes to `ALARM`, it stops and rolls back.
+## Why timing matters
+An alarm changes state only after its evaluation window is met: for example `Period = 300s` with `EvaluationPeriods = 3` needs 15 minutes of bad data points.
+For ECS blue/green, the deployment runs through traffic shifting and then the wait time before the original task set is terminated. If this whole window (the "bake time") is shorter than the alarm needs to fire, the deployment finishes first and the alarm is no longer watched.
+Fix: use shorter periods and fewer data points (for example 1-minute periods, `2 out of 3`), and lengthen the traffic-shift or termination wait time so the alarm can fire during the deployment.
+W: Alarm evaluation longer than bake time: the alarm needed more time to reach `ALARM` than the deployment spent in its monitored window, so CodeDeploy completed normally before the alarm could trigger a rollback.
+X: A=Only for Lambda: CodeDeploy alarm-based rollback is supported for ECS deployments as well as Lambda and EC2/on-premises.
+C=It was in-place, not blue/green: the scenario states a blue/green deployment, and ECS deployments through CodeDeploy are always blue/green, so this does not explain anything.
+D=Only EC2 and on-premises: alarm monitoring and automatic rollback are available on ECS deployment groups too.
+T: CodeDeploy only reacts to alarms during the deployment, so make the alarm evaluation window shorter than the deployment's bake time.
+
+@ Q001381 explain
+G: ## Where CodeBuild output goes
+CodePipeline only shows a summary of each action, such as "Build failed", with a link to the provider. The real command output lives in **CodeBuild build logs**:
+- By default logs go to **CloudWatch Logs** in a log group like `/aws/codebuild/<project-name>`, one stream per build.
+- Logs can also (or instead) be sent to an **S3 bucket**.
+- The build's **phase details** show which phase failed (`INSTALL`, `PRE_BUILD`, `BUILD`, `POST_BUILD`), and the log shows the exact command and its exit code, for example `Command did not exit successfully npm test exit status 1`.
+## Keeping logs for audits
+A CloudWatch Logs group has a **retention setting**; by default it never expires. Setting it to `90 days` keeps logs for audits and deletes older ones automatically. With S3 logs, an S3 lifecycle rule does the same job.
+W: CodeBuild logs with 90-day retention: the build log shows the failing phase and command, and setting the log group retention (or an S3 lifecycle rule) to 90 days meets the audit requirement.
+X: A=Pipeline execution summary: the pipeline shows action status and a short error message, not the full build output; it links out to CodeBuild for details.
+B=Error file in the artifact bucket: the artifact store holds input and output artifacts between stages; CodeBuild does not write its log or an error file there, and a failed build usually uploads no output artifact.
+D=CloudTrail event history: CloudTrail records API calls such as `StartBuild`, not what commands printed inside the build container, and event history covers only 90 days of management events without compiler output.
+T: CodePipeline tells you which action failed; CodeBuild logs (in CloudWatch Logs or S3, with retention you set) tell you why.
+
+@ Q001382 explain
+G: ## OpsCenter and OpsItems
+**AWS Systems Manager OpsCenter** is a central place to view, investigate and resolve operational issues. Each issue is an **OpsItem** with:
+- a status (Open, In progress, Resolved) and priority, so it can be triaged and assigned;
+- **related resources** (for example the RDS instance ARN), with links to their configuration, CloudTrail events and Config history;
+- **associated runbooks** (SSM Automation documents) that can be run directly from the OpsItem;
+- deduplication so repeated alarms for the same issue do not flood the list.
+## Creating OpsItems from alarms
+A CloudWatch alarm can have a **Systems Manager action** that creates an OpsItem when it goes to `ALARM`, with a severity and category. OpsItems can also be created by EventBridge rules for other events.
+Email notifications, by contrast, disappear into inboxes and have no status, owner or history.
+W: CloudWatch alarms create OpsCenter OpsItems: each breach becomes a trackable work item with related resources and runbooks attached, which engineers can triage, assign and resolve in one place.
+X: A=Keep SNS email: email notifications are exactly the ephemeral mechanism the team wants to move away from; they give no central tracking, assignment or resource context.
+C=CloudTrail Insights tickets: CloudTrail Insights detects unusual API call volume or error rates; it does not track alarm state transitions or create tickets.
+D=Config recording alarm changes: Config can record `AWS::CloudWatch::Alarm` configuration, but not each state change as a work item, and it has no triage or assignment workflow.
+T: To turn alarms into trackable operational work, send them to Systems Manager OpsCenter as OpsItems instead of plain SNS email.
+
+@ Q001383 explain
+G: ## Inside-out vs. outside-in monitoring
+Server-side metrics and load balancer health checks measure the system **from the inside**: is the process up, does the target respond. They cannot see failures that happen before a request ever reaches the server, such as DNS resolution problems, CloudFront misconfiguration, certificate errors or broken routing from certain networks.
+## CloudWatch Synthetics canaries
+A **canary** is a scheduled script (Node.js or Python, using Puppeteer, Playwright or Selenium) that behaves like a customer:
+- It calls the public URL, for example `https://shop.example.com/checkout`, going through real DNS and CloudFront.
+- It can run a multi-step flow (add to cart, start checkout) and check responses, content and latency.
+- It runs as often as every minute, publishes success rate and duration metrics, and keeps screenshots, HAR files and logs for failed runs.
+- A CloudWatch alarm on the canary's success percentage alerts the team before customers report the issue.
+W: Synthetics canary on the external checkout path: it exercises the same public DNS and CloudFront path customers use, so it fails when that path breaks even while servers report healthy.
+X: A=More frequent ALB health checks: these still test from the load balancer to the targets inside the VPC; they never go through public DNS or CloudFront, so the failure stays invisible.
+C=More custom internal metrics: processing-time metrics are recorded only for requests that reach the application; requests that fail upstream never generate them.
+D=Container Insights: it reports CPU, memory, network and task metrics for the ECS cluster, which is healthy here; it does not test the external request path.
+T: Internal health checks show the server is up; only an outside-in test like a Synthetics canary shows customers can actually reach it.
+
+@ Q001384 explain
+G: ## Why ECS keeps replacing tasks behind an ALB
+When an ECS service uses a load balancer, a task is only considered healthy if it passes the **target group health check**. A task that fails it is deregistered and the service stops it and starts another, which creates the endless cycle described.
+Common causes when the application itself started fine:
+- **Health check path or port** is wrong, for example `/health` returns 404 or the check targets the wrong port.
+- **Success codes** do not match what the app returns (the check expects `200`, the app returns `301` to a login page).
+- **Security groups**: with Fargate (`awsvpc` mode) each task has its own ENI and security group, which must allow inbound traffic on the container port from the ALB's security group.
+- **Timing**: thresholds or interval too tight, or no **health check grace period** on the service for a slow start.
+- The app listens only on `127.0.0.1` instead of all interfaces.
+The target group's **target health** view shows the reason, such as `Target.Timeout` or `Target.ResponseCodeMismatch`.
+W: Target group health check settings and security groups: logs prove the app starts, so the deregistration comes from failed ALB health checks, which are usually caused by a wrong path, port or success code, or a task security group that does not allow the ALB in.
+X: B=Maximum CPU and memory: the app starts and logs successfully, so it is not starved of resources; raising task size to maximum just increases cost without addressing health check failures.
+C=Container Insights enabled: Container Insights adds metrics and does not affect whether tasks pass health checks; enabling it would not change the deregistrations.
+D=Fargate platform version LATEST: the platform version affects runtime features, not load balancer health checks; the tasks already run and start fine.
+T: When ECS tasks start fine but keep being replaced behind an ALB, check the target group health check and the path from ALB to task (security groups, port) first.
+
+@ Q001385 explain
+G: ## CloudWatch Container Insights for EKS
+**Container Insights** collects, aggregates and summarizes metrics and logs from containerized workloads on Amazon EKS, Amazon ECS and Kubernetes on EC2.
+- It is installed on EKS with the **Amazon CloudWatch Observability** add-on (CloudWatch agent plus Fluent Bit).
+- It reports CPU, memory, network and disk at cluster, node, namespace, pod and container level.
+- It records Kubernetes signals such as **pod restart counts** and container status, which makes crash loops visible.
+- Container logs go to CloudWatch Logs, so you can move from a pod's metrics to its logs.
+- The enhanced observability version adds curated dashboards to drill from the cluster down to a single container.
+Example: filter the dashboard to the failing namespace, see which pods restart every few minutes, and whether memory rises to the limit right before each restart (a typical OOMKilled pattern).
+W: CloudWatch Container Insights: it gives container-level CPU and memory, pod restart counts and container logs for EKS in one CloudWatch view, without running commands against each node.
+X: A=Inspector image scanning: Inspector finds software vulnerabilities in container images; it gives no runtime CPU, memory or restart data.
+B=X-Ray traces: X-Ray traces requests across services and shows latency and errors per call, but it does not report container resource usage or pod restarts.
+C=Config evaluation of the cluster: Config records and evaluates the cluster's configuration (for example logging or endpoint access), not runtime pod health or metrics.
+T: For container-level metrics, restarts and logs on EKS, use Container Insights; X-Ray is for request traces and Inspector for vulnerabilities.
+
+@ Q001386 explain
+G: ## Traces, metrics and logs in one place
+**AWS X-Ray** records traces: the path of a request through services, with timing for each segment. Traces alone tell you where time was spent, but you usually also need the service's metrics, alarms and logs to understand why.
+## ServiceLens
+**CloudWatch ServiceLens** (now surfaced as the trace map and application views in the CloudWatch console) ties these together:
+- A **service map** built from X-Ray traces shows each service node with its latency, error and fault rates.
+- Selecting a node shows its CloudWatch metrics, alarms and related logs.
+- From a slow trace you jump to that service's dashboard and to its log events for the same time range, without switching consoles.
+It relies on X-Ray tracing being enabled, and on logs that can be correlated with traces (for example logs containing the trace ID).
+W: CloudWatch ServiceLens: it builds on X-Ray traces and joins them with CloudWatch metrics, logs and alarms in one service map, so the team can pivot from a slow trace straight to that service's data.
+X: A=X-Ray alone: raw X-Ray shows traces and a service graph; the combined view with CloudWatch metrics, logs and alarms is what the CloudWatch integration adds.
+C=Amazon Detective: Detective analyzes security data such as CloudTrail, VPC Flow Logs and GuardDuty findings for security investigations; it does not work with application traces.
+D=Config aggregator: an aggregator combines configuration and compliance data across accounts and Regions; it has no trace or metric data.
+T: X-Ray provides the traces; CloudWatch ServiceLens (the CloudWatch trace map view) connects them to metrics, logs and alarms for one end-to-end view.
+
+@ Q001387 explain
+G: ## AWS Health and instance retirement
+**AWS Health** reports events that affect your specific resources, not only general service status. One common event type is **EC2 instance retirement**: AWS detects that the underlying host hardware is degraded or failing and schedules the instances on it to be stopped or terminated.
+- The event lists the affected instance IDs and a retirement date.
+- Instances can fail, or be stopped or terminated, when the hardware fails or the date arrives.
+- Stopping and starting an EBS-backed instance moves it to healthy hardware; in an Auto Scaling group, replacing the instance does the same.
+## Acting on it
+AWS Health events are delivered to **Amazon EventBridge**, so they can trigger automation. For example, an EventBridge rule for `AWS_EC2_INSTANCE_RETIREMENT_SCHEDULED` can start an SSM Automation runbook or Lambda function that replaces or stop-starts the instance during a quiet period, well before the retirement date.
+W: Hardware degradation with proactive automation: the Health event names the same instances, so the root cause is host hardware; confirm the impact, then automate EventBridge-driven replacement so future retirements are handled before they fail.
+X: B=Health event unrelated: account-specific Health events describe real impact on your resources, and this one lists exactly the instances that failed.
+C=Dispute as misconfiguration: retirement events come from AWS detecting degraded hardware, not from customer configuration; there is nothing to dispute.
+D=No action needed: Auto Scaling did recover capacity, but the instances failed unexpectedly first; handling retirement events proactively avoids that unplanned loss next time.
+T: When AWS Health lists the failing instances in a retirement event, the cause is hardware; route Health events to EventBridge and replace instances before they fail.
+
+@ Q001388 explain
+G: ## What stack drift is
+A CloudFormation stack is **drifted** when a resource's actual configuration differs from what the template and parameters define, typically after someone changes it outside CloudFormation (console, CLI, another tool).
+## Drift detection
+- **Detect drift** on a stack compares the current properties of each supported resource with the expected values.
+- Each resource gets a status: `IN_SYNC`, `MODIFIED`, `DELETED` or `NOT_CHECKED`.
+- For a `MODIFIED` resource, the drift details show every differing property, with the expected and actual values, for example an extra ingress rule `0.0.0.0/0` on port 22 in `SecurityGroupIngress`.
+- You can also detect drift on a single resource.
+With that information the team can either put the change into the template and update the stack, or revert the manual change so the resource matches the template again. Drift detection itself changes nothing.
+W: Run drift detection: it lists exactly which resources are modified and shows expected versus actual values for each property, which is precisely what the team needs before deciding how to fix it.
+X: A=Delete and recreate: CloudFormation can detect out-of-band changes with drift detection, and deleting a production stack causes an outage and destroys resources without telling you what changed.
+C=Manual line-by-line comparison: slow and error-prone, and the console shows values in a different form than the template; drift detection automates this comparison.
+D=Enable Config recording: recording starting now does not capture a change that already happened (if Config was not already recording), and Config does not compare resources with the stack template.
+T: To find what changed outside CloudFormation, run stack drift detection and read the expected vs. actual property values.
+
+@ Q001389 explain
+G: ## The confused deputy problem
+A third party (for example an auditing or monitoring vendor) often serves many customers from one AWS account. Each customer creates a role that trusts the vendor's account. If trust depends only on the account ID, another customer of that vendor could give the vendor your role ARN, and the vendor's system (the "deputy") would assume your role on that customer's behalf.
+## External ID
+The fix is an **external ID**: a unique value, agreed with the third party for your account, that must be passed in the `AssumeRole` call.
+- The trust policy adds a condition like `"StringEquals": {"sts:ExternalId": "a1b2c3-unique-value"}`.
+- The third party stores the external ID per customer and always sends the one belonging to that customer, so a request made on another customer's behalf carries the wrong ID and fails.
+The external ID is not a secret password; it makes each customer's trust relationship unique.
+W: Require a unique ExternalId: the trust policy only allows `AssumeRole` calls that carry the external ID agreed for this relationship, which stops the third party from being tricked into assuming the role for someone else.
+X: A=aws:SourceIp restriction: the third party's own systems send the legitimate and the tricked requests from the same IP ranges, so the IP check cannot tell them apart.
+B=Permissions boundary: a boundary limits what the role can do after it is assumed; it does not control who can assume it, which is where confused deputy happens.
+D=Require MFA: third-party services assume roles programmatically, usually without an MFA device, so this would break the legitimate access and still would not identify which customer a request is for.
+T: Confused deputy with third-party role access is solved by requiring a unique `sts:ExternalId` in the trust policy.
+
+@ Q001390 explain
+G: ## How SCPs fit into permission evaluation
+**Service control policies (SCPs)** in AWS Organizations set the maximum permissions for IAM users and roles in member accounts. An explicit `Deny` in any SCP that applies to an account blocks the action, no matter what the identity policy allows.
+## The exception: the management account
+SCPs **do not affect any user or role in the management account**, including its root user. Even if the management account sits under a policy path with a deny, its principals are not restricted by SCPs.
+- This is one reason AWS recommends running no workloads in the management account.
+- Workloads belong in member accounts, where SCPs do apply to every principal, including the member account's root user.
+Example: an SCP denying `ec2:TerminateInstances` blocks a developer in a member account, but a developer in the management account can still terminate instances if their IAM policy allows it.
+W: It is the management account: SCPs never restrict principals in the organization's management account, so the identity policy's Allow is enough there even though a Deny SCP is in the hierarchy.
+X: A=Explicit Allow overrides Deny: in IAM evaluation an explicit Deny always wins, and an SCP Deny cannot be overridden by any Allow in an identity policy.
+B=SCPs affect only the root user: it is the other way around; SCPs apply to all IAM users and roles in member accounts, including the root user of those accounts.
+D=Attached to the wrong OU: the scenario says the account is in the OU that has the SCP, so it applies to member accounts there; misattachment does not fit the facts given.
+T: SCP denies apply to every principal in member accounts, but never to the management account, so keep workloads out of it.
+
+@ Q001391 explain
+G: ## The MFA condition key and roles
+`aws:MultiFactorAuthPresent` is `true` in a request's context only when the caller authenticated with MFA (for example a user who called `GetSessionToken` or `AssumeRole` with an MFA code). Temporary credentials that were obtained **without MFA**, such as a CI/CD role assumed by a pipeline or service, do not have the key set to true, and for many session types the key is not present at all.
+## How the "deny unless MFA" policy behaves
+A typical statement is `"Effect": "Deny"` with `"BoolIfExists": {"aws:MultiFactorAuthPresent": "false"}`.
+- `BoolIfExists` treats a missing key as a match, so the Deny applies to any request without MFA.
+- An automated role session has no MFA, so every call is denied.
+The fix is to scope the Deny: attach it only to human users or groups, or exclude automation principals (for example with an `aws:PrincipalArn` condition), instead of applying it to everything.
+W: Missing MFA key triggers the Deny: pipeline role sessions are not MFA-authenticated, so the MFA condition is not true for them and the blanket Deny blocks every API call.
+X: A=Roles cannot use MFA conditions: roles can be assumed with MFA, and MFA conditions work with role sessions; the problem is that this pipeline does not use MFA.
+B=Needs an explicit Allow too: the pipeline role already had Allow permissions that worked before; an explicit Deny beats any Allow, so adding more Allows changes nothing.
+C=Pipelines must use IAM users: long-lived user keys are worse practice, and automation using users would also lack MFA; the right fix is to scope the policy.
+T: A blanket "deny unless MFA" also blocks automated role sessions, because they carry no MFA; scope such policies to human principals.
+
+@ Q001392 explain
+G: ## Giving pods their own AWS permissions on EKS
+Pods need AWS credentials to call services such as S3 or DynamoDB. Sharing the node's instance profile gives every pod on the node the same permissions, and static access keys have to be stored and rotated.
+## IAM Roles for Service Accounts (IRSA)
+- The cluster has an **OIDC identity provider** registered in IAM.
+- An IAM role trusts that provider, with a condition on a specific Kubernetes service account, for example `system:serviceaccount:payments:payments-api`.
+- The service account is annotated with `eks.amazonaws.com/role-arn`.
+- Pods using that service account receive a projected web identity token; the AWS SDK calls `AssumeRoleWithWebIdentity` and gets short-lived credentials for that role only.
+Each workload gets its own least-privilege role, and no long-term keys exist anywhere. **EKS Pod Identity** is a newer AWS option with the same goal and a simpler setup, using an agent add-on and pod identity associations instead of an OIDC provider.
+W: IRSA: each pod's service account maps to its own IAM role, and pods get temporary credentials through web identity federation, so permissions are least privilege per workload and nothing long-lived is stored.
+X: A=Static credentials in Secrets Manager: rotation helps, but these are still long-term access keys that must be fetched and managed; the requirement is temporary credentials without stored keys.
+B=Access keys in a Kubernetes Secret: anyone or anything that can read the Secret can use the keys, and the keys never expire on their own; this is exactly the long-term credential storage to avoid.
+C=Shared node instance profile: every pod on the node gets the same, union of all permissions, which breaks per-pod least privilege.
+T: On EKS, give each workload its own IAM role through IRSA (or EKS Pod Identity) instead of node roles or stored keys.
+
+@ Q001393 explain
+G: ## Two policies guard an encrypted secret
+A secret in Secrets Manager is encrypted with a KMS key. Reading it cross-account needs permission for **both** services, because `GetSecretValue` makes Secrets Manager decrypt the value with the key on the caller's behalf.
+In Account A (owner):
+- A **secret resource policy** allowing Account B's role `secretsmanager:GetSecretValue`.
+- The **KMS key policy** allowing that role `kms:Decrypt` (typically limited with `kms:ViaService` to Secrets Manager).
+In Account B (caller):
+- The role's **identity policy** must also allow `secretsmanager:GetSecretValue` on the secret ARN and `kms:Decrypt` on the key ARN, since cross-account access needs an Allow on both sides.
+The secret must use a **customer managed key**; the AWS managed key `aws/secretsmanager` cannot be shared with another account, which is why this scenario uses a customer managed key.
+W: Secret resource policy plus KMS key policy: in the owning account, both the secret and the key must allow Account B's role, otherwise either the read or the decryption is denied.
+X: A=Only the KMS key policy: without a resource policy on the secret, a principal from another account has no permission to call `GetSecretValue` on it, so the request fails before decryption.
+B=Only the resource policy: the value is still encrypted with Account A's key, and decryption fails with an access error if the key policy does not allow Account B's role.
+C=Copy the KMS key to Account B: KMS keys cannot be copied between accounts (key material never leaves KMS), and the secret would still be encrypted under Account A's key.
+T: Cross-account secret access needs the secret's resource policy and the customer managed key's key policy to allow the caller, plus the caller's own IAM Allow.
+
+@ Q001394 explain
+G: ## Permission sets and provisioning
+In **IAM Identity Center**, a **permission set** is a template of policies (AWS managed, customer managed references, inline policy, permissions boundary). When you assign it to users or groups in an account, Identity Center **provisions** it: it creates an IAM role named like `AWSReservedSSO_DataAnalyst_<id>` in that account with those policies.
+## Updating a permission set
+Editing the permission set changes the template, not the roles already created in accounts.
+- The changes reach the accounts only when the permission set is **reprovisioned** to them.
+- The console shows accounts that need it and offers an "Update in accounts" action; the API is `ProvisionPermissionSet` with `TargetType` set to all provisioned accounts.
+- After reprovisioning, users get the new permissions the next time they sign in to the account (existing sessions keep old credentials until they expire).
+W: Reprovision the permission set: the roles in the 12 accounts still hold the old policies until the updated permission set is provisioned to those accounts again.
+X: B=Only new users get changes: permission sets apply per account through roles, not per user; recreating users would not update the existing roles in the accounts.
+C=Browser cache: permissions are enforced by IAM roles in each account, not by anything stored in the browser; clearing cookies only forces a new sign-in to the same old role.
+D=24-hour automatic propagation: updates are not pushed on a timer; until the permission set is reprovisioned, the accounts keep the old version.
+T: Changing a permission set does not update accounts by itself; reprovision it so the IAM roles in each account are updated.
+
+@ Q001395 explain
+G: ## Cross-account AssumeRole needs two Allows
+When a principal in one account assumes a role in another, **both** accounts must permit it:
+- **Target account (222222222222)**: the role's **trust policy** must list the caller as a principal, for example the ARN of the Lambda execution role. A trust policy is the role's resource-based policy.
+- **Source account (111111111111)**: the caller's **identity policy** must allow `sts:AssumeRole` on the target role ARN, for example `arn:aws:iam::222222222222:role/ReportReader`.
+For requests inside one account, a resource-based policy alone can be enough. Across accounts, the resource policy only says "the other account may come in"; the caller's own account still has to grant the action.
+Example execution role statement: `"Effect": "Allow", "Action": "sts:AssumeRole", "Resource": "arn:aws:iam::222222222222:role/ReportReader"`.
+W: Execution role needs sts:AssumeRole: the trust policy is correct, so the missing half is the Allow in the Lambda execution role's own permissions for `sts:AssumeRole` on the target role.
+X: B=STS not cross-account from Lambda: STS supports cross-account `AssumeRole` from any AWS principal with credentials, including Lambda execution roles.
+C=Lambda limited to own account: Lambda code uses its execution role's credentials like any other client and can assume roles in other accounts when both sides allow it.
+D=Target needs another resource policy: for an IAM role, the trust policy is its resource-based policy; there is no additional policy to attach.
+T: Cross-account role assumption needs the target's trust policy and the caller's identity policy to both allow it.
+
+@ Q001396 explain
+G: ## How Secrets Manager rotation works
+A rotation Lambda function is called four times per rotation, each time with a `Step` value, in this order:
+- `createSecret`: generate the new value and store it as a new version labeled `AWSPENDING`.
+- `setSecret`: apply the pending value to the target system, for example create the new API key in the vendor's system or change a database password.
+- `testSecret`: use the `AWSPENDING` value against the target system to confirm it works.
+- `finishSecret`: move the `AWSCURRENT` label to the new version; the old one becomes `AWSPREVIOUS`.
+## Keeping applications working
+Applications read `AWSCURRENT`. Until `finishSecret`, they keep using the old key, so the old key must stay valid while the new one is activated and tested. A vendor that allows two active keys at once makes this seamless: activate the new key in `setSecret`, test it, switch the label, and revoke the old key later (for example on the next rotation).
+W: createSecret, setSecret, testSecret, finishSecret; activate in setSecret: `setSecret` is the step designed to push the new credential to the external system, so it is valid before `testSecret` checks it and before `finishSecret` makes it current.
+X: A=Test before set, activate in testSecret: the order is wrong; `testSecret` comes after `setSecret` and should only verify, since testing a key that has not been activated yet would fail.
+B=finishSecret first: `finishSecret` is the last step and promotes the pending version to `AWSCURRENT`; `AWSPENDING` is created by `createSecret`.
+C=setSecret before createSecret, activate in finishSecret: there is no pending value to set before `createSecret`, and activating only in the final step leaves `testSecret` testing a key the vendor does not yet accept.
+T: Rotation runs createSecret, setSecret, testSecret, finishSecret; activate the new credential in setSecret and keep the old one valid until finishSecret switches the label.

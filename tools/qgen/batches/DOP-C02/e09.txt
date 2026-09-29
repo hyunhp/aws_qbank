@@ -1,0 +1,381 @@
+# DOP-C02 detailed explanations e09 (explanation-only rewrites; letters are the published ones)
+
+@ Q002038 explain
+G: ## Two permission models for StackSets
+A CloudFormation StackSet deploys one template as stack instances into many accounts and Regions. It can run with two permission models:
+- **Self-managed**: you create an administration role in the admin account and an execution role in every target account, and you list target **account IDs** yourself. A new account gets nothing until someone adds it.
+- **Service-managed**: the StackSet is integrated with AWS Organizations (trusted access), AWS creates the needed roles, and you target **organizational units** instead of account IDs.
+## Automatic deployment
+With service-managed permissions you can turn on **automatic deployment**. When an account joins or is moved into a targeted OU, CloudFormation creates the stack instance in it; when an account leaves the OU, the instance is deleted or retained depending on the `RetainStacksOnAccountRemoval` setting.
+Example: target `ou-prod` in `us-east-1` and `eu-west-1` with the baseline template (Config recorder, IAM roles, alarms). Moving a new account into `ou-prod` deploys the baseline with no further action.
+W: Service-managed StackSet with automatic deployment: targeting the OU covers every existing account now and every account added later automatically, so there is no list to maintain and no custom code to run.
+X: A=Self-managed with manual IDs: each new account needs the execution role created and its account ID added by hand, which is exactly the recurring effort the requirement wants to avoid, and a forgotten account stays unprotected.
+B=Daily Lambda creating stacks: it rebuilds StackSets badly, needs cross-account roles, drift and error handling you must maintain, and leaves new accounts uncovered for up to a day.
+D=Account owners deploy: relying on people gives no guarantee the baseline is deployed, deployed identically or kept up to date, and it does not scale across an OU.
+T: Target the OU with a service-managed StackSet and automatic deployment; self-managed StackSets need every account listed and prepared by hand.
+
+@ Q002039 explain
+G: ## Replacement during a stack update
+Some property changes cannot be applied in place. For an `AWS::RDS::DBInstance`, changing properties such as the DB instance identifier or certain storage settings makes CloudFormation create a **new** DB instance and then delete the old one. Without protection, the old database and its data are gone.
+## The two attributes that protect data
+- `DeletionPolicy` controls what happens when the resource is removed from the template or the stack is deleted.
+- `UpdateReplacePolicy` controls what happens to the **old physical resource when an update replaces it**.
+Both accept `Delete`, `Retain` and, for resources that support it such as RDS, `Snapshot`. Setting both to `Snapshot` or `Retain` covers deletion and replacement.
+## Seeing the impact first
+A **change set** lists each resource change with its `Action` and a `Replacement` field (`True`, `False` or `Conditional`). Reviewing it before executing reveals an accidental replacement before anything happens.
+W: UpdateReplacePolicy and DeletionPolicy plus a change set: the two policies keep a snapshot or the original instance if a replacement or deletion happens, and the change set shows `Replacement: True` before the update runs.
+X: A=Drift detection: drift detection compares live resources with the template to find manual changes; it neither previews an update nor preserves the old database when it is replaced.
+C=DeletionPolicy only, update directly: `DeletionPolicy` does not apply to the old resource removed by a replacement, which is governed by `UpdateReplacePolicy`, and running the update directly skips the requested impact review.
+D=Termination protection: termination protection only blocks deleting the whole stack; it does not stop an update from replacing and deleting an individual resource inside it.
+T: Replacement is governed by `UpdateReplacePolicy`, not just `DeletionPolicy`; pair both with a change set review to see the replacement before it happens.
+
+@ Q002040 explain
+G: ## What stack drift is
+**Drift** means a resource created by CloudFormation no longer matches its template because someone changed it outside CloudFormation, for example adding an inbound rule to a security group in the console. CloudFormation can detect drift on demand per stack, showing each resource as `IN_SYNC`, `MODIFIED` or `DELETED` with the differing properties.
+## Making drift detection automatic
+The AWS Config managed rule `cloudformation-stack-drift-detection-check` runs drift detection on stacks for you and marks a stack `NON_COMPLIANT` when it has drifted. It needs an IAM role (the `cloudformationRoleArn` parameter) that Config uses to call the drift detection APIs.
+- Config publishes compliance changes as events, so an EventBridge rule can send them to SNS, chat or a ticketing system.
+- It can be deployed to many accounts through conformance packs or organization Config rules.
+Example: an operator opens port 22 on a stack's security group; on the next evaluation the stack turns `NON_COMPLIANT` and the team is notified.
+W: Config drift rule with notifications: it detects drift automatically and repeatedly, and its compliance-change events can trigger alerts, which is exactly the "alert when resources no longer match the template" requirement.
+X: B=Termination protection: it only prevents deleting the whole stack; it neither detects nor reports changes made to resources inside the stack.
+C=Stack policy: a stack policy only restricts updates performed through CloudFormation stack updates. Direct console or API changes to the security group bypass it completely, and it sends no alerts.
+D=Weekly manual CloudTrail search: this is manual, delayed by up to a week and error-prone; nothing alerts the team automatically.
+T: Detect out-of-band changes with the Config drift detection rule plus notifications; stack policies and termination protection only govern CloudFormation's own actions.
+
+@ Q002041 explain
+G: ## How ECS places tasks on EC2 capacity
+When a service runs tasks on EC2 container instances, ECS decides where each task goes using:
+- **Placement strategies**: `spread` distributes tasks evenly over a field, such as `attribute:ecs.availability-zone` or `instanceId`; `binpack` fills the fewest instances by CPU or memory; `random` picks any valid instance.
+- **Placement constraints**: rules that exclude instances, such as `distinctInstance` (at most one task of the group per instance) or a `memberOf` expression.
+Strategies can be combined in order, for example spread by AZ first, then binpack by memory inside each AZ.
+## Why the service failed
+If nothing requires AZ balance, ECS can legitimately place all 6 tasks in one AZ, for example because only that AZ had free capacity or because binpack concentrated them. An AZ outage then removes every task.
+With `spread` on `attribute:ecs.availability-zone`, 6 tasks over 3 AZs land 2 per AZ (as long as each AZ has capacity), so losing one AZ leaves 4 running.
+W: Spread on availability zone: this strategy explicitly balances tasks across AZs, so a single AZ failure can only take down its share of the tasks.
+X: A=distinctInstance only: it only ensures no two tasks share an instance; six different instances can still all be in the same AZ.
+B=binpack on memory: binpack deliberately packs tasks onto as few instances as possible, which makes concentration in one AZ more likely, not less.
+D=More tasks with random: random placement gives no distribution guarantee; more tasks raise the odds of spreading by chance but can still cluster in one AZ.
+T: Only a spread strategy on `attribute:ecs.availability-zone` guarantees AZ balance; constraints like `distinctInstance` spread across hosts, not zones.
+
+@ Q002042 explain
+G: ## Lifecycle hooks in Auto Scaling
+A **lifecycle hook** pauses an instance at a transition so you can run custom actions:
+- `autoscaling:EC2_INSTANCE_LAUNCHING` holds a new instance in `Pending:Wait`.
+- `autoscaling:EC2_INSTANCE_TERMINATING` holds an instance chosen for termination in `Terminating:Wait` before it is terminated.
+While waiting, the hook's **heartbeat timeout** runs (one hour by default, configurable). Your code can extend it with `RecordLifecycleActionHeartbeat`, and signals completion with `CompleteLifecycleAction` (`CONTINUE` or `ABANDON`). If the timeout expires, the default result applies.
+## Example for this scenario
+Set a termination hook with a heartbeat timeout of, say, 15 minutes. The hook event goes to EventBridge (or SNS/SQS), which triggers a script on the instance, for example via SSM Run Command, to drain in-flight jobs and `aws s3 cp` the logs. When the upload finishes, the script calls `CompleteLifecycleAction` and termination proceeds.
+W: Termination lifecycle hook: it pauses the chosen instance before termination long enough to finish jobs and upload logs, and the application releases it by completing the hook.
+X: A=OldestInstance termination policy: a termination policy only decides which instance is picked for scale-in; the instance is still terminated immediately without time to finish work.
+B=Scale-in protection on all instances: protection prevents these instances from being terminated by scale-in at all, which breaks scaling rather than allowing a graceful shutdown.
+C=ALB deregistration delay: Auto Scaling waits for connection draining only so in-flight HTTP requests can complete; it gives the application no hook to finish background jobs or upload logs and no way to confirm that work is done.
+T: Use a termination lifecycle hook to run cleanup before scale-in; termination policies choose which instance, and scale-in protection blocks termination entirely.
+
+@ Q002043 explain
+G: ## CloudWatch cross-account observability
+CloudWatch cross-account observability lets one **monitoring account** see telemetry that stays stored in many **source accounts**. It is built on Observability Access Manager (OAM):
+- In the monitoring account you create a **sink** and a sink policy saying which accounts or which organization may link to it.
+- In each source account you create a **link** to that sink and choose the data types to share, such as CloudWatch metrics, log groups and X-Ray traces (and related features like Application Signals).
+Links can be rolled out to all accounts in an organization, for example with a CloudFormation StackSet.
+## What the monitoring account gets
+Operators in the monitoring account can graph metrics from any linked account on one dashboard, create alarms on them, run Logs Insights queries across accounts and view cross-account X-Ray trace maps. The data is not copied: queries read it where it lives, so there is no pipeline to build or keep in sync.
+W: Cross-account observability: linking the 40 source accounts to a monitoring account sink gives live, unified metrics, logs and traces with cross-account dashboards and no data copying.
+X: B=Nightly S3 export with Athena: this copies data, is up to a day old, covers only logs, and gives no metric dashboards or trace view.
+C=Kinesis subscription per log group: it copies log data into another account and requires a subscription on every log group; it still does not bring metrics or traces together.
+D=IAM users in every account: operators would have to sign in to 40 accounts separately; it provides no single view and adds 40 sets of long-term credentials to manage.
+T: Use CloudWatch cross-account observability (sink and links) to view telemetry in place across accounts, instead of exporting or streaming copies.
+
+@ Q002044 explain
+G: ## CloudWatch embedded metric format
+The **embedded metric format (EMF)** is a JSON structure written to CloudWatch Logs that also tells CloudWatch which fields are metrics. A log line contains an `_aws` object with `CloudWatchMetrics` (namespace, dimensions, metric names and units) next to the actual values.
+Example: a Lambda function prints `{"_aws":{"Timestamp":...,"CloudWatchMetrics":[{"Namespace":"Orders","Dimensions":[["Service"]],"Metrics":[{"Name":"OrderValue","Unit":"None"}]}]},"Service":"checkout","OrderValue":42,"orderId":"o-123"}`.
+## Why it fits high-volume Lambda
+- Lambda already ships stdout to CloudWatch Logs, so emitting a metric is just a log write: no extra API call in the request path.
+- CloudWatch extracts the metrics asynchronously, so there is no `PutMetricData` latency or API throttling.
+- High-cardinality fields such as `orderId` stay in the log event, searchable with Logs Insights, without becoming expensive dimensions.
+Client libraries (for example Powertools for AWS Lambda) generate the format for you.
+W: Embedded metric format: metrics are written as structured logs and extracted by CloudWatch asynchronously, removing the synchronous API call that causes the latency and throttling.
+X: B=More memory: more memory adds CPU and network speed but does not change `PutMetricData` request quotas, so throttling and per-call latency remain.
+C=X-Ray annotations as metrics: annotations are indexed key-value pairs for filtering traces; they are not CloudWatch metrics and are subject to trace sampling, so they cannot count every invocation.
+D=DynamoDB with hourly aggregation: it adds a write to every invocation, needs custom aggregation code and delivers metrics an hour late instead of in near real time.
+T: For high-volume custom metrics from Lambda, log them in embedded metric format rather than calling `PutMetricData` synchronously.
+
+@ Q002045 explain
+G: ## Alert storms and composite alarms
+When one underlying problem triggers many metric alarms at once, each with its own notification, on-call engineers get a burst of pages for a single incident.
+A **composite alarm** watches other alarms and evaluates a rule expression over their states, using `AND`, `OR` and `NOT`. For example:
+- `ALARM("db-latency-high") AND ALARM("db-error-rate-high")`
+The composite goes to `ALARM` only when the rule is true, and only the composite has the paging action.
+## How the setup looks
+- Keep the individual alarms (CPU, latency, errors, queue depth, 5xx) but remove their paging actions, or send them to a low-priority channel.
+- Attach the pager notification only to the composite alarm.
+- Optionally use the composite's actions suppressor feature to silence alarms during a known condition such as a maintenance window.
+The team still sees every signal on dashboards, but gets one page when the customer-facing symptoms coincide.
+W: Composite alarm with AND: it pages once, only when both latency and error rate are in `ALARM`, while the other alarms stay available for diagnosis without paging.
+X: A=Delete all but the CPU alarm: this throws away the symptom signals that matter and pages on CPU, which is not the condition the team asked for.
+B=Anomaly detection on CPU only: anomaly detection changes how one metric's threshold is set; it does not combine latency and error rate or reduce the other pages.
+C=More evaluation periods: longer evaluation only delays each alarm; when the database slows down, all five alarms still fire and page separately.
+T: Combine alarm states with a composite alarm to page on a meaningful combination; tuning individual alarms does not deduplicate them.
+
+@ Q002046 explain
+G: ## Event-driven remediation
+EC2 publishes an `EC2 Instance State-change Notification` event to Amazon EventBridge whenever an instance changes state. A rule can match only the relevant ones, for example:
+- `source`: `aws.ec2`, `detail-type`: `EC2 Instance State-change Notification`, `detail.state`: `stopped`
+- optionally filtered further in the runbook by a tag such as `env=prod`.
+## Systems Manager Automation as the target
+An EventBridge rule can start an **SSM Automation runbook** directly, passing the instance ID from the event. A runbook is a sequence of steps such as:
+- collect diagnostics (for example capture the console output or screenshot, or copy logs from the EBS volume),
+- `aws:changeInstanceState` to start the instance again,
+- `aws:executeAwsApi` to publish to an SNS topic that feeds the team's channel.
+Runbooks run with an assumed IAM role, log each step and can be reused across accounts and Regions.
+W: EventBridge rule starting an SSM Automation runbook: the stop event triggers the runbook within seconds, which performs diagnostics, restart and notification the same way every time without people or polling.
+X: B=Auto Scaling group with desired 0: an Auto Scaling group with zero desired capacity would terminate instances, not restart a stopped one, and it has no diagnostics or notification step.
+C=Dashboard reviewed by on-call: a person must notice the change first, so nothing happens automatically and response time depends on when someone looks.
+D=Hourly polling cron job on a bastion: it can miss an event for up to an hour, depends on one self-managed host, and needs custom code for diagnostics and alerts.
+T: React to EC2 state changes with an EventBridge rule that runs an SSM Automation runbook; polling and dashboards are slow and manual.
+
+@ Q002047 explain
+G: ## How ApplicationStop works in CodeDeploy
+In an EC2/on-premises in-place deployment, the CodeDeploy agent runs lifecycle hooks in order: `ApplicationStop`, `DownloadBundle`, `BeforeInstall`, `Install`, `AfterInstall`, `ApplicationStart`, `ValidateService`.
+The key detail: `ApplicationStop` runs the script from the **last successfully deployed revision**, because the new revision has not been downloaded yet. It is meant to stop the version that is currently running.
+## The trap
+If the previous revision's stop script is broken, every new deployment fails at `ApplicationStop` before the fixed script can even be installed. Changing anything in the new revision does not help.
+## The way out
+Create the deployment with the option to ignore ApplicationStop failures, for example `aws deploy create-deployment ... --ignore-application-stop-failures` or the matching console checkbox. CodeDeploy then continues past the failing hook, installs the new revision, and the next deployment uses the fixed stop script.
+W: Ignore ApplicationStop failures: the broken hook comes from the old revision, so skipping its failure is the supported way to get the fixed revision installed.
+X: A=Longer timeout in the new appspec: the new `appspec.yml` is not used for `ApplicationStop`; the old revision's hook and settings run, and a broken script fails regardless of timeout.
+B=Recreate the deployment group: the old revision stays on the instances, so the agent still runs its broken stop script on the next deployment; this adds effort without fixing anything.
+C=AllAtOnce deployment configuration: it only changes how many instances are deployed to at a time; each instance still runs the old broken script and fails.
+T: `ApplicationStop` runs the previous revision's script, so a broken one is bypassed with "ignore ApplicationStop failures", not by editing the new revision.
+
+@ Q002048 explain
+G: ## Detect and fix with AWS Config
+AWS Config records resource configurations and evaluates them against rules. The managed rule `restricted-ssh` marks a security group `NON_COMPLIANT` when it allows inbound TCP port 22 from `0.0.0.0/0`. It is evaluated when the security group's configuration changes, so findings appear shortly after the change.
+## Automatic remediation
+A Config rule can have a **remediation action**: an SSM Automation runbook run automatically for non-compliant resources, with retry settings. For open SSH, the AWS-owned runbook `AWS-DisablePublicAccessForSecurityGroup` removes the rules that open SSH and RDP to all addresses; a custom runbook can instead replace the rule with a corporate CIDR.
+## Across all accounts
+Deploy the rule and its remediation to every account, for example with an organization conformance pack, which deploys Config rules together with their remediation actions to all member accounts (per Region) and to accounts that join later, or with CloudFormation StackSets. Compliance can be aggregated in a delegated administrator account.
+W: restricted-ssh with SSM auto-remediation org-wide: Config detects the open SSH rule on change and the runbook removes it within minutes in every account, without blocking normal security group work.
+X: A=SCP denying AuthorizeSecurityGroupIngress: this blocks every inbound rule change for everyone, breaking legitimate use, and does nothing about groups that are already open.
+C=Inspector reachability reviewed weekly: Inspector reports exposure, but nothing is fixed automatically and a weekly review misses the "within minutes" requirement.
+D=Trusted Advisor email: Trusted Advisor flags unrestricted ports but only notifies; someone still has to fix each group by hand, and checks are not per-change.
+T: Pair a detective Config rule with SSM auto-remediation for fast, automatic fixes; SCPs are preventive and too coarse here, and reports only notify.
+
+@ Q002049 explain
+G: ## GuardDuty in AWS Organizations
+Amazon GuardDuty is a **Regional** threat detection service that analyzes CloudTrail events, VPC Flow Logs and DNS logs, plus optional protection plans (S3, EKS, runtime, malware and others).
+To run it org-wide:
+- The management account designates a **delegated administrator**, typically the security account. This is done per Region, because GuardDuty is enabled per Region.
+- In each Region, the delegated administrator turns on **auto-enable** for the organization: all existing member accounts can be enabled, and new accounts get GuardDuty as soon as they join.
+- Findings from all member accounts appear in the delegated administrator's GuardDuty console and can be forwarded with EventBridge or aggregated in Security Hub.
+Example: security account `111122223333` is delegated administrator in all enabled Regions with auto-enable for all accounts, so an account created next month is monitored from day one.
+W: Delegated administrator per Region with auto-enable: it covers every current and future account in each Region and centralizes findings in the security account.
+X: B=CloudTrail Lake queries instead: CloudTrail Lake is a query store for activity events; it performs no threat detection and produces no findings unless you write and run your own queries.
+C=Management account only: GuardDuty in one account monitors only that account's activity, leaving every workload account uncovered.
+D=Manual enable per account with email: new accounts are missed until someone enables them, and emailed findings are not a central, searchable view.
+T: Org-wide GuardDuty means a delegated administrator with auto-enable in every Region; enabling it in one account or by hand leaves gaps.
+
+@ Q002050 explain
+G: ## Secrets in CodeBuild
+Values written in the `env` `variables` section of a buildspec, or typed as plaintext environment variables, are visible to anyone who can read the repository or the project configuration.
+A buildspec can instead reference secret stores:
+- `env` `secrets-manager`: maps a variable to a Secrets Manager secret, in the form `secret-id:json-key:version-stage:version-id`.
+- `env` `parameter-store`: maps a variable to a Systems Manager Parameter Store parameter, such as a `SecureString`.
+Example: `secrets-manager:` then `API_TOKEN: prod/partner-api:token`. At build time CodeBuild retrieves the value using the project's service role, which needs `secretsmanager:GetSecretValue` (and KMS decrypt if a customer managed key encrypts the secret).
+## Central rotation
+Secrets Manager can rotate the secret on a schedule with a rotation Lambda function. Builds always read the current version, so no buildspec change is needed after rotation.
+W: Secrets Manager referenced in the buildspec: the token leaves source control, is fetched at build time with IAM control, and can be rotated centrally without touching the pipeline.
+X: A=README in a private repository: the token is still stored in source control in plaintext, readable by everyone with repository access and kept in history.
+C=Base64 encoding: Base64 is an encoding, not encryption; anyone can decode it instantly, so the token is effectively still plaintext in the repository.
+D=Plaintext console environment variable: the token is visible to anyone who can view the project, and rotating it means editing each project by hand.
+T: Keep build secrets in Secrets Manager (or Parameter Store) and reference them from the buildspec; encoding or relocating plaintext does not protect it.
+
+@ Q002051 explain
+G: ## Two kinds of IAM Access Analyzer findings
+IAM Access Analyzer can create different analyzers, each with a zone of trust of either an account or the whole organization:
+- **External access analyzer**: finds resources (S3 buckets, KMS keys, IAM roles and others) whose policies grant access to principals **outside** the zone of trust, such as another account or the public.
+- **Unused access analyzer**: finds access that exists but is **not being used** within a tracking period you choose, such as 90 days. Findings cover unused roles, unused IAM user access keys and passwords, and unused service or action permissions on roles and users.
+## Using it to shrink permissions
+Created in the management account or a delegated administrator with the organization as zone of trust, one unused access analyzer covers all member accounts. The findings dashboard shows which roles to delete and which permissions to remove. For unused permissions, Access Analyzer can also suggest a refined policy.
+W: Unused access analyzer: it is built precisely to list unused roles, access keys, passwords and permissions across the organization, so they can be removed.
+X: B=Config resource inventory: Config records what IAM resources exist and how they are configured, but not whether they were used, so it cannot show stale roles or permissions.
+C=External access analyzer: it answers who outside the zone of trust can reach a resource, not which permissions are unused inside the organization.
+D=Credential report for the management account: it lists only IAM users' credential status in one account and says nothing about roles or permissions in the other accounts.
+T: Use the unused access analyzer to find stale access; the external access analyzer finds access granted outside your zone of trust.
+
+@ Q002052 explain
+G: ## Permissions boundaries
+A **permissions boundary** is a managed policy attached to an IAM user or role that caps its maximum permissions. Effective permissions are the intersection of the identity policies and the boundary: a role with `AdministratorAccess` but a boundary allowing only `s3:*` and `dynamodb:*` can do only S3 and DynamoDB actions.
+## Safe self-service role creation
+Give developers `iam:CreateRole` with a condition that the new role must carry the approved boundary:
+- `Condition`: `StringEquals` `iam:PermissionsBoundary` = `arn:aws:iam::111122223333:policy/DevBoundary`
+- Apply the same condition to `iam:PutRolePolicy` and `iam:AttachRolePolicy`.
+- Deny `iam:DeleteRolePermissionsBoundary`, and deny changes to the `DevBoundary` policy itself, so the cap cannot be removed.
+Developers then create Lambda execution roles freely, but no role can exceed what the boundary allows, even if they attach broad policies.
+W: CreateRole only with a required boundary: the condition forces every developer-created role to include the boundary, so self-service works while the ceiling on privileges is enforced by IAM.
+X: B=Shared administrator role: everyone gets full administrator power, nothing limits the roles they create, and actions are hard to attribute to a person.
+C=SCP denying iam:CreateRole: it blocks role creation entirely, which removes the self-service the developers need.
+D=iam:* with monthly review: developers can create or become administrators immediately, and a monthly review only finds problems after the damage is possible.
+T: Delegate role creation safely by requiring a permissions boundary on `iam:CreateRole`; blanket denies remove self-service and broad grants remove the ceiling.
+
+@ Q003429 explain
+G: ## Pipelines as reusable templates
+When many services need the same CI/CD flow (source, build, test, deploy), the pipeline itself should be infrastructure as code, written once and **instantiated per service with parameters** such as repository name, branch, build image and target accounts.
+Common ways to do this on AWS:
+- A **CDK construct** (for example a `ServicePipeline` class) that each service instantiates with its own properties.
+- A **CloudFormation template** with parameters, deployed once per service, optionally distributed through AWS Service Catalog as a product teams can launch.
+## Why it helps
+- Consistency: every service gets the same stages, security scans and approvals.
+- Central change: improving the template (adding a scan stage, for example) rolls out to all 40 pipelines by redeploying.
+- Independence: each service still has its own pipeline, so one service's failed build does not block the others.
+W: Reusable IaC pipeline template instantiated per service: it gives all 40 services an identical, independently running pipeline that is maintained in one place.
+X: A=Single pipeline for all services: every commit rebuilds and redeploys all 40 services, coupling their releases so one failing service blocks the rest and builds become slow.
+C=Each team designs its own pipeline: this produces 40 different pipelines, the opposite of the consistency and shared standards the company wants.
+D=Copy a pipeline manually in the console: each copy is a hand-made definition that drifts over time, and updates have to be repeated 40 times.
+T: Define the pipeline once as a parameterized IaC template and stamp it out per service; one shared pipeline couples releases and manual copies drift.
+
+@ Q003430 explain
+G: ## Connecting CodePipeline to GitHub
+CodePipeline reaches GitHub, GitHub Enterprise Server, GitLab and Bitbucket through **AWS CodeConnections** (formerly CodeStar Connections). A connection is authorized once through an app installed in the GitHub organization, and the pipeline's source action (`CodeStarSourceConnection`) references its ARN.
+## Starting on push
+With change detection enabled on the source action, a push to the configured branch starts the pipeline automatically, with no polling or webhooks to manage yourself.
+V2 pipelines add **triggers** with filters, for example:
+- push to branch `main` only,
+- push with changed file paths matching `services/api/**`,
+- Git tags such as `v*`.
+Example: source action for `my-org/orders-service`, branch `main`, trigger on push; each merge to `main` starts a new execution with that commit.
+W: CodeConnections source action with change detection: it is the native, event-driven integration that starts the pipeline on every push to `main`.
+X: A=Developers start manually: nothing is automatic, pushes are easily forgotten, and the requirement explicitly asks for automatic starts.
+C=S3 upload event notification: this depends on developers zipping and uploading code by hand instead of reacting to the GitHub push, so pushes alone never start the pipeline.
+D=Hourly cron polling on EC2: it delays pipelines by up to an hour, needs custom code, credentials and a server to maintain, and duplicates what the built-in integration does.
+T: Use a CodeConnections source action with change detection (and V2 triggers for filtering) to start pipelines on GitHub pushes.
+
+@ Q003431 explain
+G: ## Build once, promote across accounts
+The safest release flow builds an artifact **once** in a central tooling account and promotes that exact artifact to dev, staging and prod accounts. The deployment in each account then reflects what was tested earlier.
+## How CodePipeline does it cross-account
+- **Target account roles**: each environment account has a role that trusts the tooling account. The pipeline's deploy action (for example a CloudFormation or CodeDeploy action) uses `RoleArn` to assume it, and that role holds the deployment permissions.
+- **Encrypted artifact store**: the artifact bucket is encrypted with a **customer managed KMS key**; the key policy and bucket policy allow the target account roles to read. The AWS managed S3 key cannot be shared across accounts, so it cannot be used here.
+- **Ordered stages**: dev, staging, prod stages in sequence, often with tests and a manual approval before prod.
+W: Cross-account deploy actions with assumed roles and a shared KMS key: one pipeline deploys the same artifact to each account in order using temporary credentials and no copying.
+X: A=Email artifacts to operations teams: manual copying is slow, error-prone and gives no guarantee that each environment receives the same artifact.
+B=Separate rebuilding pipelines per account: rebuilding per environment means prod may run a different build than what was tested, breaking the build-once principle.
+C=One IAM user with long-term keys: long-term access keys spread across accounts are a security risk and must be rotated; cross-account role assumption gives temporary credentials instead.
+T: Promote one artifact through accounts by assuming target account roles and sharing a customer managed KMS key; do not rebuild per environment or use long-term keys.
+
+@ Q003432 explain
+G: ## Caching in CodeBuild
+Each CodeBuild build runs in a fresh environment, so dependencies such as npm packages, Maven artifacts or pip wheels are downloaded again every time unless you cache them.
+Two cache types are available:
+- **Amazon S3 cache**: listed directories are uploaded to an S3 bucket at the end of a build and restored at the start of the next. Works on any build host.
+- **Local cache**: stored on the build host and reused when a later build lands on the same host. Modes are `LOCAL_SOURCE_CACHE` (Git metadata), `LOCAL_DOCKER_LAYER_CACHE` (Docker image layers) and `LOCAL_CUSTOM_CACHE` (directories you list).
+## Example
+In the buildspec: `cache:` with `paths:` such as `/root/.m2/**/*` or `node_modules/**/*`, plus a cache type set on the project. The next build restores these directories, so only changed dependencies are downloaded.
+W: Enable S3 or local dependency caching: reusing downloaded dependencies attacks the actual cause of the 20-minute builds.
+X: A=More buildspec phases: phases only organize commands (`install`, `pre_build`, `build`, `post_build`); adding more does not avoid downloading dependencies.
+C=Older runtime image: an older image does not include your project's dependencies and may lack security fixes; downloads still happen on every build.
+D=More stages with approvals: splitting work across stages with approvals adds waiting time and still downloads dependencies in each build.
+T: Speed up repeated dependency downloads with CodeBuild caching (S3 or local); restructuring phases or stages does not remove the downloads.
+
+@ Q003433 explain
+G: ## Pull request checks with CodeBuild
+A CodeBuild project with a GitHub, GitHub Enterprise, Bitbucket or GitLab source can use **webhooks** that start a build on pull request events, such as `PULL_REQUEST_CREATED` and `PULL_REQUEST_UPDATED`, with filters on branch names.
+With **build status reporting** enabled, CodeBuild posts the build result back to the pull request's commit as a status check (pending, success or failure).
+## Blocking the merge
+- The buildspec runs the unit tests and a security scan (for example a SAST or dependency scan tool); any failing command fails the build.
+- In the repository, a branch protection rule on `main` requires that status check to pass before merging.
+Example: a developer opens a PR, CodeBuild runs `npm test` and the scanner, the check turns red on a critical finding, and the merge button stays disabled until a new commit passes.
+W: PR-triggered CodeBuild with status checks: every pull request is tested and scanned automatically, and a required failing check blocks the merge.
+X: A=Reviewers run tests locally: results depend on individual machines and honesty, are not enforced, and cannot block a merge by themselves.
+C=Weekly scans on main with email: problems are found after they are already merged, up to a week late, and nothing blocks the merge.
+D=Merge first and test in production: this exposes users to broken or vulnerable code, the exact outcome the checks are meant to prevent.
+T: Run CodeBuild on pull request events and require its status check in branch protection; checks after merge cannot block anything.
+
+@ Q003434 explain
+G: ## CodeBuild reports
+CodeBuild can publish **test reports** and **code coverage reports** into **report groups**. Each build adds a report, and the report group shows trends over time, such as pass rate, test duration and line or branch coverage.
+In the buildspec, a `reports:` section names the report group and points to the result files, for example:
+- `files:` `target/surefire-reports/*.xml` with `file-format: JUNITXML`
+- a coverage file with `file-format: JACOCOXML`
+Supported test formats include JUnit XML, Cucumber JSON, NUnit XML, TestNG XML and Visual Studio TRX; coverage formats include JaCoCo XML, Cobertura XML, Clover XML, SimpleCov JSON and LCOV INFO.
+## What you get
+The console shows each report's test cases with status and duration, failed tests with messages, and coverage percentages, and the report group aggregates them over builds. Report results can also be exported to S3 and read through the API.
+W: CodeBuild test and coverage reports: report groups store each build's test and coverage results and display them as trends over time.
+X: A=CloudTrail management events: CloudTrail records who called CodeBuild APIs such as `StartBuild`, not test cases or coverage percentages.
+B=S3 lifecycle rules on logs: lifecycle rules only move or expire stored objects; they do not parse or visualize test results.
+C=Config rules on the project: Config evaluates the build project's configuration for compliance; it knows nothing about test outcomes or coverage.
+T: Publish test and coverage results through the buildspec `reports` section into CodeBuild report groups to see trends.
+
+@ Q003435 explain
+G: ## Performance as a release gate
+A pipeline gate is a step that must succeed before the next stage runs. In CodePipeline, if an action fails, the stage fails and the artifact is not promoted further.
+## Building a load test gate
+- Add a test stage after the staging deployment with a CodeBuild action (or a Lambda or Step Functions invoke action) that runs a load test tool against staging, such as JMeter, k6 or Locust.
+- Evaluate the results against thresholds in the same step, for example `p99 latency <= 300 ms` and error rate below 1%. The script exits with a non-zero code when a threshold is breached, which fails the action.
+- Alternatively, the test can publish metrics to CloudWatch, and a CloudWatch alarm on p99 latency can be checked by the gate, for example through a CodePipeline V2 stage condition that fails when the alarm is in `ALARM`.
+Example: p99 measures 340 ms, the action fails, and production never receives this version.
+W: Automated load test with thresholds that fail the action: the pipeline measures p99 latency objectively on every release and stops promotion when it exceeds 300 ms.
+X: A=Always promote and review later: users in production experience the slow release before anyone looks, so the gate does not exist.
+C=Manual approval based on a guess: approvers have no measurement to judge p99 latency, so the decision is subjective and can let a regression through.
+D=Quarterly manual load tests: most releases go out untested, and results in a shared document cannot stop a pipeline automatically.
+T: Make performance a gate by running load tests in the pipeline and failing the action on threshold breaches, not by human judgment after the fact.
+
+@ Q003436 explain
+G: ## AWS CodeArtifact
+CodeArtifact is a managed artifact repository for package formats such as npm, Maven, PyPI, NuGet, Swift, Ruby and generic packages. It works with the standard clients (`npm`, `mvn`, `pip` and others).
+Key concepts:
+- A **domain** groups repositories and stores each package version once, even if it appears in several repositories.
+- A repository can have **upstream repositories**, forming a chain searched in order.
+- A repository can have an **external connection** to a public registry such as npmjs.com or Maven Central. When a package is requested, CodeArtifact fetches it from the public registry and keeps a copy.
+## Example setup
+Create a `shared` repository with external connections to npmjs and Maven Central, and a `team` repository with `shared` as upstream. CodeBuild projects run `aws codeartifact login` or get a token with `get-authorization-token`, then install from the `team` endpoint. Private packages and cached public packages come from one place, controlled with IAM.
+W: CodeArtifact with upstream repositories: it provides private npm and Maven repositories that cache public packages through upstream and external connections, usable by every CodeBuild project with IAM control.
+X: A=S3 static website hosting: it only serves files over HTTP; it does not implement the npm or Maven repository protocols, authentication, versioning or caching of public packages.
+B=CodeCommit with branch protections: CodeCommit hosts Git source code; it is not a package registry and cannot proxy npm or Maven.
+C=ECR with lifecycle policies: ECR stores container images and OCI artifacts, not npm or Maven packages, and lifecycle policies only expire images.
+T: Use CodeArtifact (upstreams and external connections) for private package repositories that cache public packages; ECR is for container images.
+
+@ Q003437 explain
+G: ## ECR image scanning
+Amazon ECR offers two scanning modes, set per registry:
+- **Basic scanning**: scans for OS package vulnerabilities, on push or manually.
+- **Enhanced scanning**: integrated with **Amazon Inspector**. Images are scanned on push and then **continuously**, rescanned when new vulnerabilities are published, and covers OS packages and programming language packages. Findings include a severity such as `CRITICAL`.
+## Gating the pipeline
+Scanning alone reports findings; blocking deployment needs a gate:
+- A pipeline step (for example CodeBuild or Lambda) reads the image's findings through the Inspector or ECR API and fails if any finding has severity `CRITICAL`.
+- Inspector findings also go to EventBridge and Security Hub, so newly found criticals on already-deployed images can alert the team.
+Example: a push of `app:1.4.0` produces a critical OpenSSL finding, the gate step fails, and the deploy stage never runs.
+W: Enhanced scanning with Inspector plus a pipeline gate: images are scanned on push and continuously, and the pipeline refuses to deploy an image with critical findings.
+X: A=Yearly scans: vulnerabilities published during the year go undetected and every image deploys regardless of findings, so nothing is blocked.
+C=Developers read release notes: this is manual and incomplete, misses application-level packages, and gives no enforcement at deployment time.
+D=Public registry for community reports: it exposes the company's images publicly and relies on strangers instead of scanning, with no gate at all.
+T: Scan images on push with ECR enhanced scanning (Inspector) and fail the pipeline on critical findings; scanning without a gate does not block anything.
+
+@ Q003438 explain
+G: ## ECR lifecycle policies
+An ECR **lifecycle policy** is a set of JSON rules on a repository that automatically expires images. Each rule has a priority, a selection and an action: `expire` deletes images (newer rules can also `transition` images to a cheaper archive storage class). Selections can filter by:
+- `tagStatus`: `tagged` (with prefix or wildcard patterns), `untagged` or `any`.
+- `countType`: `imageCountMoreThan` (keep only the newest N) or `sinceImagePushed` (older than N days).
+Example rules:
+- expire `untagged` images older than 14 days,
+- keep only the last 30 images tagged with the prefix `release-`.
+You can preview a policy to see which images would be removed before applying it. Expired images are deleted, which lowers storage cost without manual clean-up.
+W: Lifecycle policies expiring untagged or old images: they automatically delete images matching age or count rules, which directly removes the accumulated storage.
+X: A=Pull-through cache rules: they cache images from upstream public registries into ECR, which adds more stored images rather than removing old ones.
+B=Tag immutability: it only stops existing tags from being overwritten; it deletes nothing and can leave more distinct tagged images behind.
+C=Cross-Region replication: replication copies images to another Region, roughly doubling storage and cost instead of reducing it.
+T: Clean up ECR storage with lifecycle policies; replication and pull-through cache add images, and immutability only protects tags.
+
+@ Q003439 explain
+G: ## CodeDeploy blue/green on EC2
+In a CodeDeploy **blue/green** deployment for EC2 behind a load balancer, CodeDeploy provisions a replacement (green) fleet, installs the new revision, registers the green instances with the target group, and deregisters the original (blue) instances. The deployment configuration controls how many instances are shifted at a time (for example `CodeDeployDefault.OneAtATime` or a custom minimum-healthy setting), and you can wait before shifting and keep blue instances for a time for fast rollback.
+## Automatic rollback
+A deployment group can list **CloudWatch alarms**, such as ALB 5xx count or target response time. If an alarm goes to `ALARM` during the deployment, CodeDeploy stops it and, with automatic rollback enabled, rolls back, sending traffic back to the original instances while they still exist.
+## Note on percentages
+Percentage-based canary and linear configurations (such as `CodeDeployDefault.ECSCanary10Percent5Minutes`) exist only for Lambda and ECS. For EC2 blue/green, traffic is rerouted in instance batches set by the deployment configuration: with `OneAtATime`, the green instances are registered one at a time, so the first ones receive only a small share of requests while alarms watch for errors.
+W: CodeDeploy blue/green with traffic shifting and alarm rollback: new instances take traffic gradually and CloudWatch alarms trigger an automatic rollback, which is the only option that is gradual and automatic.
+X: A=In-place to all instances at once: every user gets the new version immediately, there is no small test slice, and rollback means redeploying.
+C=Manual SSH replacement per day: it is slow, error-prone, bypasses deployment tooling, and has no automatic rollback.
+D=Hand-edited DNS weights: DNS caching makes the split imprecise and slow to reverse, and it relies on people watching instead of alarms rolling back automatically.
+T: Use CodeDeploy blue/green with alarm-based automatic rollback for gradual, safe EC2 releases; manual or all-at-once changes have no automatic safety net.

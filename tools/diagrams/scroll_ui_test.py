@@ -1,6 +1,6 @@
 import functools, http.server, threading, sys
 from playwright.sync_api import sync_playwright
-import pathlib
+import pathlib, tempfile
 ROOT=str(pathlib.Path(__file__).resolve().parents[2])
 class Q(http.server.SimpleHTTPRequestHandler):
     def log_message(self,*a): pass
@@ -9,6 +9,9 @@ threading.Thread(target=srv.serve_forever,daemon=True).start()
 BASE=f"http://127.0.0.1:{srv.server_address[1]}/"
 res=[]
 def ok(n,c): res.append((n,bool(c))); print(("PASS " if c else "FAIL ")+n)
+# Wait until the page stops scrolling (smooth scrolls take longer on slow machines than a fixed sleep).
+SETTLE="() => new Promise(r => { let y = scrollY, n = 0; const t = setInterval(() => { if (scrollY === y) { if (++n >= 4) { clearInterval(t); r(true); } } else { y = scrollY; n = 0; } }, 50); })"
+settle=lambda pg: pg.evaluate(SETTLE)
 with sync_playwright() as p:
     b=p.chromium.launch()
     for scheme in ("light","dark"):
@@ -27,15 +30,15 @@ with sync_playwright() as p:
         ok(f"[{scheme}] top button shown", vis("#toTop"))
         bh=pg.evaluate("document.getElementById('examBar').getBoundingClientRect().height")
         ok(f"[{scheme}] bar is compact ({bh:.0f}px)", bh<=48)
-        pg.screenshot(path=f"/tmp/scroll_{scheme}.png")
+        pg.screenshot(path=str(pathlib.Path(tempfile.gettempdir(), f"scroll_{scheme}.png")))
         # answer a question while scrolled -> score appears in bar
         card=pg.locator(".qcard").nth(5); card.scroll_into_view_if_needed(); card.locator(".choice").first.click(); pg.wait_for_timeout(300)
         ok(f"[{scheme}] bar shows score", "/" in pg.inner_text("#examBarScore"))
-        pg.click("#examBarChange"); pg.wait_for_timeout(900)
+        pg.click("#examBarChange"); pg.wait_for_timeout(100); settle(pg)
         ct=pg.evaluate("document.getElementById('chipRow').getBoundingClientRect().top")
         ok(f"[{scheme}] Change scrolls to chips (top={ct:.0f})", -5<=ct<=60)
-        pg.mouse.wheel(0,4000); pg.wait_for_timeout(400)
-        pg.click("#toTop"); pg.wait_for_timeout(1200)
+        pg.mouse.wheel(0,4000); pg.wait_for_timeout(100); settle(pg); pg.wait_for_selector("#toTop.show")
+        pg.click("#toTop"); pg.wait_for_timeout(100); settle(pg)
         ok(f"[{scheme}] top button returns to top", pg.evaluate("window.scrollY")<5)
         pg.wait_for_timeout(300)
         ok(f"[{scheme}] bar hides again at top", not vis("#examBar"))

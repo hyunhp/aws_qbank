@@ -1,8 +1,10 @@
 """Regression tests for opening mock exams by link, including stale saved exam state."""
 import subprocess, time, json, sys, re
 from playwright.sync_api import sync_playwright
+import pathlib
+ROOT = str(pathlib.Path(__file__).resolve().parents[1])
 PORT = 8768
-srv = subprocess.Popen(["python3", "-m", "http.server", str(PORT)], cwd="/home/claude/aws_qbank",
+srv = subprocess.Popen([sys.executable, "-m", "http.server", str(PORT)], cwd=ROOT,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 time.sleep(1.2)
 BASE = f"http://localhost:{PORT}/"
@@ -18,7 +20,7 @@ def active(ids, **kw):
 try:
     with sync_playwright() as p:
         b = p.chromium.launch()
-        soa = json.load(open("/home/claude/aws_qbank/data/SOA-C03.json"))
+        soa = json.load(open(pathlib.Path(ROOT, "data", "SOA-C03.json"), encoding="utf-8"))
         real = [q["id"] for q in soa[:5]]
         cases = [
             ("fresh", None, "setup"),

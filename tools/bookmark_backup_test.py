@@ -1,6 +1,8 @@
 import subprocess, time, json, sys
 from playwright.sync_api import sync_playwright
-srv = subprocess.Popen(["python3","-m","http.server","8765"],cwd="/home/claude/aws_qbank",stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+import pathlib
+ROOT = str(pathlib.Path(__file__).resolve().parents[1])
+srv = subprocess.Popen([sys.executable,"-m","http.server","8765"],cwd=ROOT,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 time.sleep(1.2)
 ok=0; fail=0
 def check(name,cond,info=""):

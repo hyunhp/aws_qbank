@@ -1,0 +1,378 @@
+# DEA-C01 detailed explanations, e04 (explanation-only rewrites; letters are the published ones)
+
+@ Q000326 explain
+G: ## How Redshift locks work
+Amazon Redshift uses table-level locks. A statement that changes a table (COPY, INSERT, DELETE, ALTER, some VACUUM phases) needs a lock that conflicts with other writers, and a session that runs `BEGIN` and never commits keeps every lock it took until the transaction ends.
+- Other sessions that need a conflicting lock do not fail: they wait, so they look "hung".
+- Redshift does not break these waits on its own after a short time; they last until the holder commits, rolls back or is terminated (or a configured `statement_timeout` fires).
+## Finding the blocker
+- `STV_LOCKS` and `SVV_TRANSACTIONS` show which transaction holds or waits for a lock on the table, and since when.
+- `STV_RECENTS` or `STV_SESSIONS` show what that process is doing.
+- `SELECT PG_TERMINATE_BACKEND(pid);` ends the blocking session and rolls back its open transaction.
+Example: an analyst opened a transaction in a SQL client, updated one row and went to lunch. VACUUM, the next COPY and queries on that table all queue behind that one open transaction.
+W: Long transaction holding a lock: several different operations blocked on the same table at once is the classic lock-wait pattern. Find the holder in the lock and transaction system views, confirm it is safe to stop, and terminate it; then fix the client or job that leaves transactions open.
+X: B=Maximum row count: Redshift tables have no practical row limit that makes statements hang, and adding nodes changes storage and compute, not locks. A full disk produces explicit errors, not silent waits.
+C=Disable WLM: workload management cannot be switched off, every cluster always has at least a default queue, and queue waits show up as queued queries in the WLM views. The symptom here is sessions waiting on a lock, which WLM changes would not release.
+D=Auto-resolved in 30 seconds: Redshift has no automatic 30-second lock resolution. Lock waits persist until the holding transaction ends, so doing nothing leaves the ETL stuck.
+T: When VACUUM, COPY and queries on one table all stall together, look for an open transaction holding a lock and terminate it; capacity and WLM settings do not release locks.
+
+@ Q000327 explain
+G: ## File format versus table format
+A **file format** such as Parquet or ORC describes how bytes are laid out inside one file: columnar storage, compression and statistics. It knows nothing about which files together make up a table or which change happened when.
+A **table format** adds a metadata layer over many files in S3:
+- a snapshot log recording which data files belong to the table at each commit, giving atomic commits and isolation between writers and readers
+- schema tracked by column ID, so columns can be added, renamed or reordered safely
+- older snapshots kept, so you can query the table as it was (time travel)
+Apache Iceberg is an open table format that stores its data files usually as Parquet. Athena can run `INSERT`, `UPDATE`, `MERGE` and time-travel queries such as `FOR TIMESTAMP AS OF` on Iceberg tables, and EMR Spark and Redshift can read the same tables through the Glue Data Catalog.
+W: Apache Iceberg: it is the table format that adds ACID commits, schema evolution and snapshot-based time travel on top of S3 files, and it is supported across Athena, EMR and Redshift, so every engine sees the same consistent table.
+X: A=Apache Parquet: Parquet is an efficient columnar file format, but on its own it has no transaction log, so concurrent writers can leave partial results and there are no snapshots to travel back to.
+B=Apache ORC: ORC is also a columnar file format. Plain ORC files in S3 give no multi-engine ACID commits or time travel; those come from a table format layered above the files.
+D=CSV with manifest files: a manifest only lists which files to read. It provides no atomic commits, no schema evolution tracking and no history of snapshots, and CSV is also slow and costly to scan.
+T: Parquet and ORC are file formats; ACID, schema evolution and time travel over S3 come from a table format such as Apache Iceberg.
+
+@ Q000328 explain
+G: ## DynamoDB keys follow access patterns
+A DynamoDB table's primary key is either a partition key alone or a partition key plus a sort key.
+- The **partition key** decides which items live together; a `Query` must name exactly one partition key value.
+- The **sort key** orders items inside that partition and supports range conditions such as `BETWEEN` or `begins_with`.
+## Example
+With partition key `CustomerID` and sort key `OrderDate` stored as an ISO 8601 string (for example `2026-09-14T10:22:00Z`), one call returns a customer's orders in date order:
+- `KeyConditionExpression: CustomerID = :c`
+- add `AND OrderDate BETWEEN :from AND :to` for a date range
+- set `ScanIndexForward=false` for newest first
+Because a primary key must be unique, real designs often make the sort key `OrderDate#OrderID` so two orders placed at the same moment do not collide.
+W: CustomerID partition key, OrderDate sort key: all of a customer's orders sit in one item collection, already sorted by date, so a single `Query` returns them in order without a scan or client-side sorting.
+X: B=OrderID only: each order is its own partition, so finding a customer's orders needs a full table `Scan` with a filter (or an extra index), and the results come back unsorted.
+C=OrderDate partition key: this groups orders by date, not by customer. Getting one customer's history means querying every date separately, and busy dates become hot partitions.
+D=Random UUID partition key: a random value spreads writes evenly but gives no way to address a customer's orders; every lookup by customer would need a full scan.
+T: Put the value you look up by in the partition key and the value you sort or range on in the sort key: CustomerID then OrderDate.
+
+@ Q000329 explain
+G: ## Where you control the big-data stack
+Amazon EMR runs open-source frameworks (Spark, Hive, Presto/Trino, HBase and more) on clusters you configure:
+- a **release label** such as `emr-7.x` pins specific versions of Spark, Hive and the other applications
+- **bootstrap actions** run your scripts on every node at launch, for example to install libraries or agents
+- **configuration classifications** such as `spark-defaults` or `hive-site` tune the applications
+- you choose instance types, node counts, managed scaling and Spot usage, or run the same engines on EMR on EKS or EMR Serverless
+Other services run Spark or SQL for you but hide most of this. AWS Glue picks the Spark version from the Glue version, Athena gives serverless SQL, and AWS Batch runs any container you supply.
+W: Amazon EMR: it is the service built for running chosen versions of Spark and Hive with bootstrap actions and cluster-level tuning, while still being managed by AWS.
+X: A=AWS Glue defaults: Glue is serverless Spark whose version comes from the Glue version you select. It does not run Hive, has no bootstrap actions and gives no access to nodes or cluster tuning.
+B=Amazon Athena SQL: Athena is serverless interactive SQL over data in S3. There is no cluster to tune, no Hive service to run and no bootstrap actions.
+C=AWS Batch container: Batch schedules container or job workloads, so the team would have to build, configure and operate its own Spark and Hive distribution, which is exactly the work EMR already does.
+T: Need specific open-source versions, bootstrap actions and cluster tuning: EMR. Need serverless Spark with minimal control: Glue.
+
+@ Q000330 explain
+G: ## Fine-grained access for a data lake
+IAM and S3 bucket policies decide who can read which objects. They cannot hide a column inside a Parquet file or return only some rows of it.
+AWS Lake Formation adds a permission layer on top of the Glue Data Catalog:
+- `GRANT SELECT` on a database, table or a list of columns to IAM users, roles, or IAM Identity Center users and groups
+- **data filters** combine column lists with a row filter expression, such as `region = 'EU'`, for row- and cell-level security
+- **LF-Tags** grant access by tag at scale
+Integrated engines such as Athena, Redshift Spectrum, EMR and Glue ask Lake Formation for credentials and enforce the same grants, so one rule covers every query path.
+Example: analysts in the EU group get `SELECT` on the `sales` table minus the `card_number` column, filtered to `region = 'EU'`.
+W: AWS Lake Formation: it defines table, column and row permissions once in the catalog layer and has them enforced consistently by Athena and Redshift Spectrum.
+X: A=Glue crawlers: crawlers discover schemas and write table definitions into the Data Catalog. They do not grant or enforce any access permissions.
+C=S3 IAM policies only: object-level permissions can allow or deny a whole file but cannot remove specific columns or rows from query results.
+D=Amazon Macie: Macie scans S3 to find sensitive data such as PII and reports findings. It does not control who can query which columns or rows.
+T: Object permissions stop at the file; column and row security on cataloged tables comes from Lake Formation grants and data filters.
+
+@ Q000331 explain
+G: ## What a metastore does
+Files in S3 have no built-in schema. A query engine needs a **metastore** that says, for each table, which S3 location holds the data, which format and SerDe to use, the columns and types, and the partitions.
+The AWS Glue Data Catalog is a managed, Hive-compatible metastore per account and Region:
+- Athena and Redshift Spectrum use it for their table definitions
+- EMR can use it instead of a cluster-local Hive metastore
+- Glue ETL jobs and crawlers read and write it
+Example: a crawler creates `sales.orders` pointing at `s3://lake/orders/`. Athena, a Spark job on EMR and a Redshift external schema all read that one definition, so a new column added once becomes visible everywhere.
+W: Glue Data Catalog as a shared metastore: one managed catalog that all these engines read, so every engine sees the same schema and partitions without copying definitions around.
+X: A=S3 object tags: tags are a few key-value labels per object used for access control, lifecycle and cost tracking. Query engines do not read them as column definitions.
+C=README in each prefix: a README helps humans, but engines need machine-readable table definitions they can query at planning time.
+D=Local metastore per engine: separate metastores drift apart, must each be updated when a schema or partition changes, and a cluster-local one disappears with the cluster.
+T: Many engines sharing table definitions over S3 means one catalog: the Glue Data Catalog.
+
+@ Q000332 explain
+G: ## Hive metastore options on EMR
+Hive and Spark on EMR look up tables through the Hive metastore API. By default EMR keeps that metastore on the cluster itself, so it disappears when the cluster terminates and other clusters cannot see it.
+EMR can instead use the **Glue Data Catalog** as its metastore:
+- tick the option when creating the cluster, or set `hive.metastore.client.factory.class` to `com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory` in the `hive-site` and `spark-hive-site` classifications
+- Hive and Spark keep calling the same metastore API, so existing HiveQL and Spark SQL work with minimal changes
+- several clusters, transient or long-running, share one catalog that Athena, Glue and Redshift Spectrum can also read
+W: Glue Data Catalog as EMR's Hive metastore: jobs keep using the Hive metastore interface, while the catalog becomes managed, persistent and shared across clusters and other AWS services.
+X: A=RDS with a schema redesign: an external MySQL or Aurora metastore is possible and does not need a table redesign, but you would operate and scale that database yourself, and it is not the managed catalog other AWS analytics services share.
+B=DynamoDB as metadata store: Hive cannot use DynamoDB as its metastore, so this would mean rewriting queries and tools around a custom design with no benefit.
+D=Local metastore only: a cluster-local metastore is lost when the cluster ends and is invisible to other clusters, which fails the central sharing requirement.
+T: Keep the Hive metastore API but make it managed and shared by pointing EMR at the Glue Data Catalog.
+
+@ Q000333 explain
+G: ## What a Glue crawler does
+A Glue crawler reads files in S3, uses classifiers to infer the format and schema (including nested JSON), and creates or updates tables and partitions in the Glue Data Catalog. Athena queries those tables directly.
+## Handling schema changes
+Each crawler has a **schema change policy**:
+- update behavior: update the table definition in the catalog (`UPDATE_IN_DATABASE`) or only log the change (`LOG`)
+- delete behavior: what to do in the catalog when objects disappear
+New JSON fields show up as new columns on the existing table. Queries that do not reference them keep working, and the table's permissions and partitions stay in place.
+Example: a crawler scheduled after the daily drop sees a new `promo_code` field and adds it as a column; yesterday's queries run unchanged.
+W: Scheduled crawler with a schema update policy: it discovers new data and new fields automatically, adds columns to the existing table instead of replacing it, and needs no custom code.
+X: A=Lambda editing DDL: you would have to write your own JSON schema inference and handle nesting, type changes and partitions. That is fragile code reproducing what a crawler already does.
+B=Daily CTAS rebuild: CTAS reads and rewrites the whole dataset into a new table every day, adding cost and delay, and it still needs an existing table with the right schema to select from.
+D=Delete and recreate tables: dropping the table removes it while queries run and discards its partitions and any permissions granted on it, breaking consumers each day.
+T: Automatic schema discovery with safe additions is a crawler with a schema change policy, not scripts that rebuild or rewrite tables.
+
+@ Q000334 explain
+G: ## How Athena finds partitions
+For a partitioned table, Athena does not list S3 on every query. It asks the Glue Data Catalog which partitions exist and reads only their locations. A folder such as `s3://logs/dt=2026-09-28/` that is not registered as a partition is invisible to queries, even though the files are there.
+Ways to register new partitions:
+- `MSCK REPAIR TABLE logs;` scans Hive-style `key=value` paths and adds missing partitions (slow on very large tables)
+- `ALTER TABLE logs ADD PARTITION (dt='2026-09-28') LOCATION '...'` from the job that writes the data
+- a Glue crawler run after each load
+- **partition projection**, where Athena computes partitions from a pattern in the table properties and nothing needs registering
+W: Partitions not registered in the catalog: old dates work and only the newest ones return nothing, which is exactly what happens when data lands in S3 but no step adds the new partitions to the Glue table.
+X: A=Versioning disabled: versioning only controls whether older copies of objects are kept. New objects are readable either way.
+B=Deleted IAM role: Athena runs queries with the caller's credentials. A missing or denied permission produces an access error for the whole query, not empty results only for new dates.
+D=No partition support: Athena fully supports partitioned tables and partition pruning; that is why registering partitions matters.
+T: Files in S3 are invisible to Athena until their partition is in the catalog: add it, run MSCK REPAIR or a crawler, or use partition projection.
+
+@ Q000335 explain
+G: ## Technical catalog versus business catalog
+The Glue Data Catalog holds technical metadata: databases, tables, columns, types and S3 locations. Engines need that, but business users need more:
+- search by business terms from a **glossary**, such as "active customer" or "net revenue"
+- descriptions, owners and data quality information on each dataset
+- a way to **request access** that the owning team approves
+Amazon SageMaker Catalog, part of SageMaker Unified Studio and built on Amazon DataZone, provides this. Producers publish curated assets with business metadata; consumers search, subscribe and wait for the owner's approval, after which access to the underlying data is granted automatically.
+Example: a marketing analyst searches "churn", finds the `customer_churn` asset owned by the data team with its quality scores, and requests access; the owner approves in the portal.
+W: Amazon SageMaker Catalog: it combines business glossary search, ownership and quality metadata, and a publish-and-subscribe approval workflow for governed access.
+X: A=Glue Data Catalog console alone: it shows technical schemas and locations, but has no business glossary, no owner approval workflow and is not aimed at business users.
+B=AWS Config inventory: Config records the configuration of AWS resources for compliance. It does not describe datasets, business terms or quality, and has no access requests.
+D=S3 bucket listing: a list of object keys has no business meaning, ownership, quality information or request workflow.
+T: Technical metadata for engines is the Glue Data Catalog; business discovery with owner-approved access is SageMaker Catalog.
+
+@ Q000336 explain
+G: ## Why a crawler's schema can "flap"
+A crawler infers types from the files it reads using classifiers. If the data is inconsistent, each run can conclude something different:
+- a field is `123` in some files and `"123"` in others (int versus string)
+- some files have extra or missing columns, or different CSV headers or delimiters
+- mixed formats or compression in one folder
+Each different inference writes a new table version to the catalog, and Athena then reads files whose values do not match the current column type, which gives errors such as `HIVE_BAD_DATA` or partition schema mismatches.
+## Fixes
+- standardize the producer output: one format, one schema, stable types
+- add a custom classifier for the real format
+- set the schema change policy to log changes instead of updating, or define the table yourself
+- use crawler grouping options such as combining compatible schemas, and crawl only new folders
+W: Classifiers inferring varying schemas: inconsistent files make each crawl infer different types, creating new table versions; making the files consistent and tuning the classifier and crawler settings stops the churn.
+X: A=Expected and unfixable: this is caused by inconsistent input and crawler settings, both of which you control through classifiers, schema change policies and data standardization.
+C=Athena lacks schema versioning: Athena always queries the table's current definition. The problem is that the definition keeps changing underneath it, not a missing Athena feature.
+D=S3 versioning: crawlers read the current version of each object, so bucket versioning does not change what schema is inferred, and disabling it would not stop the flapping.
+T: A crawler that keeps changing column types is reading inconsistent data: fix the files and the crawler configuration, not S3 or Athena.
+
+@ Q000337 explain
+G: ## How crawler runs are billed and scheduled
+A Glue crawler is charged for the processing it uses (DPU-hours, billed per second with a minimum charge per run), whether or not it finds anything new. Running it far more often than the data changes is paying for empty work.
+Scheduling options:
+- a cron schedule, which can be as infrequent as you like (daily, weekly, monthly)
+- on demand, or from a workflow or trigger after the load job finishes
+- event-based crawling from S3 event notifications, which crawls only changed prefixes
+Example: data lands on the first of each month. A monthly schedule, or a run triggered by the load job, does the same work as 720 hourly runs for about 1/720 of the runs.
+W: Needless runs add cost: 700-plus hourly crawls a month find nothing new, yet each is billed. Matching the schedule to the monthly change, or triggering on the load, gives the same catalog for far less.
+X: A=Hourly required: AWS has no rule that crawlers run hourly; many run daily, monthly or only on demand.
+B=Can't schedule less often: crawler schedules use cron expressions, so they can run as rarely as monthly, and crawlers can also run only on demand.
+C=Crawler runs are free: crawler runs are billed for the processing capacity they use, so frequent empty runs do cost money.
+E=Deletes the table: a run that finds no changes leaves the table as it is. Table or partition removal only follows the delete behavior policy when source objects are actually gone.
+T: Run crawlers when the data changes, not on a fixed fast schedule; every run is billed even when it finds nothing.
+
+@ Q000338 explain
+G: ## Granting table and column access in a data lake
+Once S3 data is described in the Glue Data Catalog, AWS Lake Formation can control access at the catalog level instead of the bucket level:
+- **register** the S3 location with Lake Formation so it vends temporary credentials for that data to integrated engines
+- grant `SELECT` on specific tables, or on specific columns of a table, to the data science team's role or group
+- the grant is read-only because only `SELECT` (and `DESCRIBE`) is given
+Athena and Redshift Spectrum both check Lake Formation, so the same grant applies whichever engine the team uses.
+Example: grant `SELECT` on `claims (claim_id, amount, status)` to `DataScienceRole`, leaving out `patient_name`.
+W: Register in Lake Formation and grant table/column access: a single set of read-only grants on the existing catalog tables is enforced by both Athena and Redshift Spectrum, with no copies of data or metadata.
+X: A=Copy bucket policies to a second bucket: a policy copy does not move any data, and bucket policies work on objects, so they still cannot restrict individual columns; it also doubles the policies to maintain.
+B=Separate catalog with duplicated metadata: each account has one default Data Catalog per Region, so this means copying tables into another account or database that drift out of sync, and it still gives no column-level control.
+D=Full bucket-level IAM access: this grants every object in the bucket, including tables and columns the team should not see, which breaks least privilege.
+T: For read-only access to chosen tables and columns across Athena and Spectrum, grant Lake Formation permissions on the existing catalog, not broader S3 access or copies.
+
+@ Q000339 explain
+G: ## COPY loads, UNLOAD exports
+In Amazon Redshift:
+- `COPY` reads files from S3 (or other sources) **into** a table
+- `UNLOAD` runs a query and writes the result **out** to S3
+By default UNLOAD writes in parallel, each slice producing its own files. It supports `FORMAT PARQUET` or CSV and `PARTITION BY` to write Hive-style folders.
+Example:
+- `UNLOAD ('SELECT * FROM sales WHERE sale_date = CURRENT_DATE - 1')`
+- `TO 's3://exports/sales/'`
+- `IAM_ROLE 'arn:aws:iam::111122223333:role/RedshiftUnload'`
+- `FORMAT PARQUET PARTITION BY (sale_date);`
+This produces folders such as `s3://exports/sales/sale_date=2026-09-28/` with Parquet files ready for Athena or Spark.
+W: UNLOAD with FORMAT PARQUET and PARTITION BY: it is the Redshift command made for exporting query results to S3, writing Parquet in parallel and splitting output into date partitions in one statement.
+X: A=INSERT INTO external table: Redshift can insert query results into a Spectrum external table, but only into an external schema and table (with matching format and partition columns) defined in the catalog beforehand, and it is meant for appending to an existing lake table. Exporting an ad hoc query result to an S3 path as partitioned Parquet is exactly what UNLOAD is for.
+B=Query editor download: downloading results through the browser is manual, limited in size, not parallel and cannot write partitioned Parquet to S3 on a schedule.
+D=COPY with Parquet: COPY moves data into Redshift. It reads Parquet from S3 but never writes files out.
+T: Into Redshift is COPY; out of Redshift to S3 is UNLOAD, which can write partitioned Parquet in parallel.
+
+@ Q000340 explain
+G: ## Why many files load faster
+A Redshift cluster is split into **slices**, and COPY hands files to slices in parallel. Each slice reads its own files at the same time as the others.
+- A single large gzip file cannot be split by COPY, so one slice reads it while the rest stay idle.
+- Many files of roughly equal size (about 1 MB to 1 GB each after compression), with a count that is a multiple of the number of slices, keep every slice busy.
+Example: a cluster with 16 slices loads 64 equal gzip files under `s3://staging/orders/part-` with one command:
+- `COPY orders FROM 's3://staging/orders/part-' IAM_ROLE '...' CSV GZIP;`
+A manifest file can list the exact files when the prefix is not enough.
+W: COPY from many split files: COPY distributes the files across all slices, so splitting the data into many similarly sized compressed files uses the whole cluster for the load.
+X: B=One huge file: a single compressed file is read by one slice, so the load runs serially and most of the cluster sits idle.
+C=UNLOAD into the table: UNLOAD exports query results from Redshift to S3; it cannot load files into a table.
+D=Row-by-row INSERT: single-row inserts go through the leader node one statement at a time and are far slower than a bulk COPY for large volumes.
+T: Bulk load into Redshift with COPY from many evenly sized files so every slice works in parallel.
+
+@ Q000341 explain
+G: ## S3 Lifecycle transitions
+An S3 Lifecycle configuration is a set of rules that act on objects by age (and optionally by prefix, tag or size):
+- **transition** actions move objects to cheaper storage classes
+- **expiration** actions delete them after a set time
+Storage classes trade storage price against retrieval cost and speed, and colder classes have minimum storage durations.
+## Example for these logs
+- day 0 to 30: S3 Standard for frequent access
+- day 30: transition to S3 Standard-IA for occasional access
+- day 90: transition to S3 Glacier Flexible Retrieval or S3 Glacier Deep Archive for rare, compliance-only access
+- about 7 years (`2555` days): expire the objects
+All of this runs automatically once the rule is in place.
+W: Lifecycle policy with transition rules: it moves each log to a cheaper class as its access pattern cools and can expire it after the retention period, with no manual work.
+X: A=S3 Object Lock: Object Lock prevents objects from being deleted or overwritten during a retention period. It never moves data between storage classes, so it does not reduce cost.
+B=Transfer Acceleration: it speeds up long-distance uploads and downloads through edge locations and adds a per-GB charge; it has nothing to do with storage classes.
+C=Cross-Region Replication: CRR copies objects to another Region, which adds storage and transfer cost instead of lowering it.
+T: Access that declines with age calls for Lifecycle transitions (and expiration), not features for locking, speed or replication.
+
+@ Q000342 explain
+G: ## DynamoDB Time to Live
+TTL lets DynamoDB delete items for you. You pick an attribute, for example `expiresAt`, and store a Unix epoch time in seconds, such as creation time plus 86400 for 24 hours.
+- A background process removes expired items without consuming write capacity.
+- Deletion is not instant; it typically happens within a few days of expiry, so reads should filter out items whose `expiresAt` is in the past.
+## Archiving with Streams
+With DynamoDB Streams enabled (view type `OLD_IMAGE` or `NEW_AND_OLD_IMAGES`), each TTL deletion appears as a `REMOVE` record whose `userIdentity` shows the DynamoDB service (`dynamodb.amazonaws.com`) as the principal. A Lambda function with an event filter for those records can write the old item image to S3, directly or through a Firehose stream.
+W: TTL with Streams for archiving: TTL expires sessions without spending write capacity, and the resulting stream records let a consumer archive each deleted item to S3.
+X: A=On-demand capacity: on-demand only changes how reads and writes are billed. It does not delete anything, and deletes you issue would still be charged.
+B=Scheduled scan-and-delete Lambda: scanning consumes read capacity across the whole table and each delete consumes write capacity, the opposite of the requirement, and it adds code to maintain.
+C=GSI on creation time: an index can help find old items, but items must still be deleted by your own writes, which consume capacity; the index also costs extra storage and writes.
+T: Automatic, capacity-free expiry in DynamoDB is TTL, and TTL deletions in Streams are how you archive them.
+
+@ Q000343 explain
+G: ## What S3 Versioning keeps
+With versioning enabled, every object key can hold multiple versions, each with its own version ID.
+- **Overwrite**: a PUT to an existing key creates a new current version; the old one becomes noncurrent and stays.
+- **Delete** without a version ID adds a **delete marker**; the data remains as noncurrent versions.
+To recover, you remove the delete marker or copy the earlier version back as the current one.
+Example: someone uploads a wrong `report.csv` over the correct one. The correct file is still there as the previous version and can be restored in seconds.
+Lifecycle rules for noncurrent versions keep storage costs in check, and MFA Delete or Object Lock can protect the versions themselves.
+W: S3 Versioning: it preserves every previous version on overwrite or delete, which is exactly what makes accidental changes recoverable.
+X: A=Transfer Acceleration: it speeds up transfers over long distances using edge locations; it keeps no copies of earlier data.
+B=Intelligent-Tiering: it moves objects between access tiers to save cost based on usage; it does not keep previous versions.
+C=Requester Pays: it makes the requester pay for requests and data transfer; it has no effect on data protection.
+T: Recovering overwritten or deleted S3 objects needs versioning; the other features are about speed, cost and billing.
+
+@ Q000344 explain
+G: ## Object Lock modes
+S3 Object Lock applies write-once-read-many (WORM) protection to **object versions** and requires versioning.
+- **Governance mode**: most users cannot delete or change the lock, but a user with `s3:BypassGovernanceRetention` can by sending the bypass header.
+- **Compliance mode**: no user, including the account root user, can delete a locked version or shorten its retention until the retain-until date passes.
+- **Legal hold**: a separate flag with no end date, removed explicitly.
+A delete request without a version ID only adds a delete marker; the locked version itself still exists until retention ends.
+## Why this matters for erasure requests
+Choosing compliance mode is a deliberate promise that data cannot be removed early. Data that may need to be erased on request should not be locked in compliance mode, or should use a retention period the policy allows.
+W: Compliance mode blocks deletion by anyone: that is the defining property of compliance mode, so the locked versions cannot be deleted until their retention period expires.
+X: A=Only the current version: Object Lock is set on individual versions, and every locked version is protected. Deleting the current object just adds a delete marker; locked versions remain.
+C=Versioning disables Object Lock: versioning is a prerequisite for Object Lock, not an override. Turning it on does not relax any retention.
+D=Bypass permission: `s3:BypassGovernanceRetention` works only for governance mode. Compliance-mode retention cannot be bypassed by any IAM permission.
+T: Governance mode can be bypassed with a special permission; compliance mode cannot be bypassed by anyone until retention ends.
+
+@ Q000345 explain
+G: ## Two goals: fast export, fast reads
+**Export throughput** depends on how many slices write at once. UNLOAD runs with `PARALLEL ON` by default, so every slice writes its own files at the same time. `PARALLEL OFF` writes serially from one stream.
+**Athena performance and cost** depend on how much data is scanned. Athena charges per byte scanned, and columnar, compressed files let it read only the needed columns and skip row groups using statistics.
+UNLOAD with `FORMAT PARQUET` writes compressed columnar files (Snappy by default), so one choice serves both goals.
+Example:
+- `UNLOAD ('SELECT ...') TO 's3://exports/events/'`
+- `IAM_ROLE '...' FORMAT PARQUET;`
+A query selecting 3 of 50 columns then scans a small fraction of the data a CSV export would need.
+W: Parallel UNLOAD to compressed Parquet: every slice writes at once for a fast export, and Athena then reads compact columnar files, scanning and paying for far less data.
+X: A=Single uncompressed CSV: a single output stream removes the parallelism, and Athena must read every byte of every row, which is slow and costly.
+C=Disable compression: compression is done by the compute slices, not a leader-node bottleneck, and uncompressed output means more bytes to write to S3 and more bytes for Athena to scan.
+D=Lambda row-by-row writes: S3 has no row INSERT; objects are written whole, so writing rows one at a time would produce huge numbers of tiny objects, slowly, and badly hurt Athena performance.
+T: For big Redshift-to-Athena exports, use the default parallel UNLOAD with a compressed columnar format like Parquet.
+
+@ Q000346 explain
+G: ## Replication across Regions
+S3 stores data across multiple Availability Zones in one Region, which protects against losing a data center but not against a whole Region being unavailable.
+**S3 Cross-Region Replication (CRR)** copies new objects asynchronously to a bucket in a different Region:
+- versioning must be enabled on both buckets
+- it can replicate to another account, change the storage class, and replicate delete markers if configured
+- **Replication Time Control** adds a 15-minute replication SLA and metrics
+- existing objects are copied with S3 Batch Replication
+Example: `s3://fin-data-use1` in us-east-1 replicates to `s3://fin-data-usw2` in us-west-2, and applications fail over to the second bucket during a regional outage.
+W: Cross-Region Replication: it keeps an up-to-date copy of the data in another Region, so the datasets stay readable and recoverable if the primary Region is unavailable.
+X: A=Same-Region Replication: SRR copies to another bucket in the same Region, useful for log aggregation or separate accounts, but both copies are lost together if that Region is down.
+B=Lifecycle expiration: expiration deletes objects after a set age, which reduces data rather than protecting it.
+D=S3 Select: S3 Select only filters the contents of a single object during a read; it creates no copies anywhere.
+T: Surviving a Regional outage needs a copy in another Region: Cross-Region Replication, not SRR.
+
+@ Q000347 explain
+G: ## Redshift snapshots
+Snapshots are point-in-time backups of a Redshift cluster stored in S3.
+- **Automated snapshots**: incremental, taken roughly every 8 hours or after a set amount of data change, kept for a retention period you set (1 to 35 days).
+- **Manual snapshots**: taken whenever you choose, for example before a risky change, and kept until you delete them.
+- Snapshots can be copied to another Region for disaster recovery.
+## Restoring
+- restore a whole snapshot to a **new cluster**
+- or restore a single table from a snapshot into the existing cluster (table-level restore)
+Redshift Serverless offers the same idea through recovery points and snapshots.
+Example: a bad `UPDATE` corrupts the `orders` table at 14:00. Restore `orders` from the 10:00 snapshot as `orders_restored` and compare.
+W: Automated and manual snapshots: they are Redshift's native backup mechanism and let you restore a cluster or an individual table to the state at a snapshot time.
+X: A=Materialized views: they store precomputed query results to speed up queries. They are derived from the same tables, so corruption flows into them and they cannot restore anything.
+C=Concurrency scaling: it adds temporary capacity for bursts of queries; it keeps no copies of data.
+D=Redshift Spectrum: Spectrum queries external data in S3. It does not back up or restore the cluster's own tables.
+T: Recovering Redshift data means restoring from snapshots; views, scaling and Spectrum are performance or query features.
+
+@ Q000348 explain
+G: ## Per-object costs of Glacier classes
+S3 Glacier Deep Archive has a very low per-GB price, but small objects bring fixed per-object costs:
+- **Lifecycle transition requests** are charged per 1,000 objects, so transitioning millions of tiny objects costs real money.
+- About **40 KB of metadata** is added per archived object: 8 KB billed at S3 Standard rates and 32 KB at the Deep Archive rate.
+- A **minimum storage duration** of 180 days applies.
+Example: a 4 KB object in Deep Archive is billed a transition fee plus about 36 KB at the Deep Archive rate and 8 KB at the Standard rate, for at least 180 days, so it can cost more than the 4 KB it used in Standard.
+Because of this, Lifecycle configurations created or updated since September 2024 by default do not transition objects smaller than 128 KB; a rule can override that with an object size filter (`ObjectSizeGreaterThan`). Aggregating small files (for example with tar or a compaction job) before archiving avoids the overhead.
+W: Per-object transition and overhead costs: transition fees plus the added per-object metadata outweigh the lower per-GB price when objects are only a few KB.
+X: A=No fees in Deep Archive: Deep Archive charges for transition requests, retrievals, per-object metadata and early deletion, so small objects can cost more than expected.
+C=128 KB limit: 128 KB is only the default minimum size for lifecycle transitions, which a size filter on the rule can override; it is not a hard restriction, and it would not explain higher costs.
+D=Small objects deleted: a transition action never deletes objects; only an expiration action does, and deleted objects would cost nothing to store.
+T: Glacier classes charge per object as well as per GB; for many tiny files the per-object fees and metadata dominate, so filter them out or bundle them first.
+
+@ Q000349 explain
+G: ## DynamoDB point-in-time recovery
+With PITR enabled, DynamoDB continuously backs up a table without affecting performance or needing a schedule.
+- You can restore to any second within the recovery period, which is 35 days by default and can be set from 1 to 35 days.
+- A restore always creates a **new table**; you then compare data or switch the application.
+Example: a bug starts writing bad data at 09:12. Restore the table to 09:11 as `orders_restored`, then copy corrected items back or repoint the app.
+## How it compares
+- **On-demand backups** are full backups you (or AWS Backup) create at chosen times; you can restore only to those moments.
+- **Streams** is a 24-hour change log for triggers and replication, not a backup.
+- **Global tables** replicate writes to other Regions, including bad writes.
+W: Point-in-Time Recovery: it provides continuous backups with restore to any second in the recovery window, with no manual backup scheduling.
+X: B=On-demand backups only: each backup captures the table at the moment it is taken, so recovery is limited to those snapshots, and they must be created or scheduled.
+C=DynamoDB Streams: stream records are kept for only 24 hours and are a change feed, not a restore mechanism for a table.
+D=Global tables: they replicate every write to other Regions within seconds, so the buggy writes are copied too; they protect against Regional outages, not bad data.
+T: Restoring DynamoDB to any second in the past 35 days is PITR; backups give fixed points, and replication copies mistakes.
+
+@ Q000350 explain
+G: ## Lifecycle expiration in a versioned bucket
+In a bucket with versioning enabled, an **Expiration** action on current versions does not delete data:
+- S3 adds a **delete marker** as the new current version.
+- The previous version becomes **noncurrent** and is kept, and still billed, indefinitely.
+Removing old data needs separate actions:
+- `NoncurrentVersionExpiration` with `NoncurrentDays` (for example 30) deletes noncurrent versions
+- `ExpiredObjectDeleteMarker` cleans up delete markers that have no versions left
+Example: `logs/app.log` expires at day 90. Listing the bucket shows nothing, yet the bytes are still stored as a noncurrent version, and storage keeps growing as more objects expire.
+W: Delete marker added, noncurrent versions remain: expiration only hides objects behind delete markers, so without a noncurrent-version rule the storage and cost keep growing over time.
+X: A=Versioning disabled automatically: Lifecycle rules never change the versioning setting, and a bucket with versioning enabled can only be suspended, not returned to unversioned.
+B=Rules ignored in versioned buckets: Lifecycle rules work in versioned buckets; they simply act on current and noncurrent versions separately.
+C=All versions deleted: expiring the current version never removes noncurrent versions; that requires a separate noncurrent version expiration rule.
+T: In versioned buckets, current-version expiration only adds delete markers; add noncurrent version expiration to actually free storage.

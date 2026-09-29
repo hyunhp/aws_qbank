@@ -1,0 +1,355 @@
+# DEA-C01 detailed explanations, batch e11 (explanation-only rewrites; letters are the published ones)
+
+@ Q003738 explain
+G: ## Hot warehouse storage versus a cold S3 tier
+Data inside Redshift tables lives on the cluster's managed storage and is optimized for fast, frequent queries. Paying warehouse prices for years of history that almost nobody reads is wasteful.
+## How the offload works
+- `UNLOAD ('SELECT *, EXTRACT(year FROM sale_date) AS sale_year FROM sales WHERE sale_date < ''2022-01-01''') TO 's3://lake/sales_archive/' ... FORMAT AS PARQUET PARTITION BY (sale_year)` writes the old rows to S3 as compressed, columnar files.
+- An external schema pointing at the AWS Glue Data Catalog lets Redshift Spectrum query those files with normal SQL, even joined to the hot tables, for example through a view that unions recent and archived data.
+- After the unload is verified, the old rows are deleted from the local table and a vacuum reclaims the space.
+Spectrum charges by bytes scanned, so Parquet with partitions keeps the occasional query cheap, while S3 storage costs far less than warehouse storage.
+W: UNLOAD to Parquet plus Spectrum: the history stays queryable with SQL at any time, but it is stored in low-cost S3 and only incurs compute cost when someone actually queries it.
+X: A=Delete and restore from backups: the data is no longer available for ad hoc analysis; every question requires a manual restore of a snapshot into a cluster, which is slow and costly.
+C=Copy into DynamoDB: DynamoDB is a key-value store built for lookups by key, not for scans, joins and aggregations over history, and its per-GB storage is not cheaper than S3.
+D=Keep everything hot: it works functionally, but the company keeps paying warehouse storage (and possibly extra nodes) for data that is rarely touched, which is the opposite of low cost.
+T: Keep hot data in Redshift tables and move cold history to Parquet in S3 queried through Spectrum; deleting or relocating it to an operational store loses easy SQL access.
+
+@ Q003739 explain
+G: ## What S3 Object Lock does
+Object Lock stores objects in a write-once-read-many (WORM) model. Each object version can carry a retention period (a retain-until date) and optionally a legal hold. While the retention is active, that version cannot be overwritten or deleted. Object Lock works together with versioning, which is required on the bucket.
+## The two retention modes
+- **Governance mode**: most users cannot delete or change the lock, but principals with `s3:BypassGovernanceRetention` can remove it. Useful for testing or internal policy.
+- **Compliance mode**: no user, including the account root user, can delete the locked version or shorten its retention until the date passes. This is what regulators mean by immutable storage.
+Example: a bucket default retention of 5 years in compliance mode protects every new object version for 5 years automatically.
+W: Object Lock in compliance mode: it enforces the 5-year retention for every principal, so neither deletion nor modification of the protected versions is possible until retention expires.
+X: A=Versioning without MFA Delete: versioning keeps older versions when objects are overwritten, but any user with the right permissions can still permanently delete those versions, so nothing is immutable.
+C=Intelligent-Tiering archive tiers: these tiers move objects to cheaper access tiers based on access patterns; they reduce cost but do not stop anyone from deleting or overwriting data.
+D=Requester Pays: it only changes who pays for requests and data transfer out of the bucket; it has no effect on deletion or modification rights.
+T: Immutable, tamper-proof retention needs Object Lock in compliance mode; versioning alone or governance-style controls can still be bypassed by privileged users.
+
+@ Q003740 explain
+G: ## Hidden storage in a versioned bucket
+With versioning enabled, an overwrite or delete does not remove the old data. The previous object becomes a **noncurrent version**, and you keep paying for it. In a data lake that rewrites files daily, noncurrent versions can grow larger than the current data.
+Another hidden cost is **incomplete multipart uploads**: when a large upload fails midway, the uploaded parts stay in the bucket, billed as storage, but are not visible as objects.
+## Lifecycle rules clean both up
+- `NoncurrentVersionExpiration` with `NoncurrentDays: 30` permanently removes versions 30 days after they became noncurrent (optionally keeping a few newest ones).
+- `AbortIncompleteMultipartUpload` with `DaysAfterInitiation: 7` deletes parts of uploads that never completed.
+Both run automatically with no application changes.
+W: A=Abort incomplete multipart uploads: removes orphaned parts from failed uploads, which are billed as storage but serve no purpose.
+E=Expire noncurrent versions: removes old versions after a retention window, which is usually the largest hidden cost in a versioned bucket.
+X: B=Replicate to three Regions: each replica is a full additional copy billed in its Region, plus inter-Region transfer charges, so storage cost rises roughly fourfold.
+C=Disable compression: uncompressed files are larger, so the bucket stores more bytes; it also makes Athena and Spectrum scan more data.
+D=Transfer Acceleration: it speeds up long-distance uploads through edge locations and adds a per-GB transfer charge; it does not reduce the amount of data stored.
+T: In versioned buckets, use lifecycle rules to expire noncurrent versions and abort incomplete multipart uploads; replication and acceleration add cost rather than removing it.
+
+@ Q003741 explain
+G: ## Schema evolution in a data lake
+Sources often add columns over time, for example a new `loyalty_tier` field. The lake needs to store new data with the column while old files, which lack it, remain readable, and existing queries keep working.
+## How open table formats handle it
+- **Parquet** files carry their own schema, so readers can match columns by name and return `NULL` for a column missing from older files.
+- **Apache Iceberg** tracks the table schema in metadata and gives each column a stable ID. `ALTER TABLE orders ADD COLUMNS (loyalty_tier string)` is a metadata-only change: no data files are rewritten. Iceberg also supports safe renames, drops, reordering and some type promotions such as `int` to `bigint`.
+Existing queries that do not reference the new column are unaffected, and new queries can use it immediately. Athena, EMR and AWS Glue can all read and write Iceberg tables.
+W: Schema-evolution-capable formats: Parquet with Iceberg records schema changes in table metadata, so new columns are added without rewriting history and without breaking current readers.
+X: A=Separate bucket per schema version: queries would have to union several unrelated tables, and every new column creates another silo, which fragments the lake rather than evolving one table.
+B=Rewrite all history per column: rewriting every historical file for each change is slow and expensive at lake scale, and is unnecessary because modern formats handle added columns in metadata.
+D=Reject files with new columns: the pipeline drops valid data every time the source evolves, which breaks ingestion instead of accepting the change.
+T: Accept new columns through table formats with metadata-level schema evolution such as Iceberg; rewriting, splitting or rejecting data are the costly alternatives.
+
+@ Q003742 explain
+G: ## AWS Glue Schema Registry
+The Schema Registry is a central store of versioned schemas (Avro, JSON Schema or Protobuf) for streaming data in Amazon MSK, Apache Kafka, Kinesis Data Streams and others.
+- Producers use the Schema Registry serializer library: before sending, it checks that the record's schema is registered and embeds a schema version ID in the record.
+- Consumers use the deserializer, which fetches the exact schema by that ID, so both sides always agree on the structure.
+## Compatibility modes
+Each schema has a compatibility setting such as `BACKWARD`, `FORWARD`, `FULL` (and their `_ALL` variants), `NONE` or `DISABLED`. When a producer tries to register a new version, the registry checks it against earlier versions. Example: under `BACKWARD`, adding an optional field with a default is accepted, but adding a new required field without a default fails the check and the new version is not registered.
+W: Glue Schema Registry with compatibility modes: it validates every new schema version against the chosen rule before producers can use it, so incompatible changes are blocked automatically.
+X: B=Wiki page: documentation informs people but enforces nothing; a producer can still publish a breaking change and consumers find out when they fail.
+C=CloudWatch alarms on errors: alarms react after consumers have already failed on bad records, so incompatible data has already entered the stream.
+D=Shared spreadsheet: like a wiki, it depends on humans updating it correctly and cannot reject a schema change at publish time.
+T: Enforce streaming contracts with Glue Schema Registry compatibility checks at write time, not with documentation or after-the-fact alarms.
+
+@ Q003743 explain
+G: ## Keys decide which queries DynamoDB can serve
+A `Query` must specify a partition key value and can add a range condition on the sort key. A table keyed on `customer_id` answers "orders for customer X" efficiently but not "all SHIPPED orders from last week".
+## Secondary indexes
+- A **global secondary index (GSI)** has its own partition key and optional sort key, chosen from any attributes, and can be added to an existing table at any time. DynamoDB keeps it updated asynchronously.
+- A **local secondary index (LSI)** must use the table's partition key with a different sort key, and can only be created when the table is created.
+Example: a GSI with partition key `status` and sort key `order_date` supports `Query(status = "SHIPPED" AND order_date BETWEEN ...)`. Because status has few values, very high write volumes may need a sharded key such as `status#3` to spread load.
+W: GSI on status and date: a GSI is the mechanism for a new access pattern with different keys, can be added to the existing table, and is maintained automatically.
+X: A=Second table by hand: application code must write every item twice and keep both copies in sync, which a GSI already does for you without consistency bugs.
+B=LSI keyed on status: an LSI must keep `customer_id` as its partition key, so it cannot use status as the partition key, and it cannot be added to an existing table.
+D=Scan with filters: a Scan reads the whole table and filters afterward, consuming capacity for every item on every request, which is slow and expensive as the table grows.
+T: A new query pattern with a different partition key needs a GSI; LSIs only add alternate sort keys under the same partition key and must exist from table creation.
+
+@ Q003744 explain
+G: ## Dimensional modeling
+Analytical warehouses are often modeled around business processes.
+- A **fact table** holds measurable events, one row per event, such as a sale with `quantity`, `amount` and foreign keys.
+- **Dimension tables** hold descriptive context, such as `dim_product` (name, category, brand), `dim_customer` (segment, city) and `dim_date` (day, month, fiscal quarter).
+## Why it is called a star
+Drawn as a diagram, the fact table sits in the middle and each dimension joins directly to it, like the points of a star. A query such as "revenue by product category per quarter" joins `fact_sales` to two dimensions and aggregates. If dimensions are further normalized into sub-tables (category split out of product), the design is a **snowflake schema**. In Redshift, small dimensions are often given `DISTSTYLE ALL` so joins to the fact table stay local.
+W: Star schema: it is exactly the design of a central fact table of measures surrounded by denormalized dimension tables used for filtering and grouping.
+X: A=Key-value model: it stores opaque values looked up by a single key, as in DynamoDB, with no concept of facts joined to descriptive dimensions.
+B=Graph model: it stores nodes and relationships for traversal queries, as in Neptune, which is a different structure from fact and dimension tables.
+C=Document model: it stores self-contained nested documents, as in DocumentDB, typically embedding related data instead of separating facts from dimensions.
+T: Facts (measures) at the center joined to descriptive dimensions is a star schema; key-value, graph and document are NoSQL data models, not warehouse designs.
+
+@ Q003745 explain
+G: ## Slowly changing dimensions
+Dimension attributes such as a customer's address change over time. How the dimension records those changes is called a slowly changing dimension (SCD) type.
+- **Type 1** overwrites the value: simple, but history is lost.
+- **Type 2** adds a new row for each change, with its own surrogate key and validity columns such as `effective_from`, `effective_to` and `is_current`.
+## Type 2 example
+Customer 42 moves in March. `dim_customer` then holds two rows: key 1001 (old address, valid until 2026-03-14) and key 1002 (new address, valid from 2026-03-15, current). Each order row in the fact table stores the surrogate key that was current when the order happened, so a February order still joins to the old address. Queries can also join on the order date between `effective_from` and `effective_to`.
+W: SCD type 2 with effective dates: every address version is kept with its validity period, so each order can be matched to the address that applied at order time.
+X: B=Overwrite in place: this is SCD type 1; the old address disappears, so past orders would show the new address instead of the historical one.
+C=Current address in the fact table: storing only the latest address copies it onto rows at load time and loses every earlier address, so history cannot be reconstructed for older orders.
+D=Delete old orders: removing facts destroys the very history analysts need and corrupts totals; it does not model address changes at all.
+T: Point-in-time history of dimension attributes requires SCD type 2 rows with effective dates; overwriting (type 1) keeps only the current value.
+
+@ Q003746 explain
+G: ## Time-series workloads
+Sensor and telemetry data arrives as timestamped measurements, is written constantly, and is mostly queried by time range, for example "average temperature per device over the last hour". Recent data is queried often and older data rarely.
+## How Amazon Timestream fits
+Amazon Timestream is AWS's purpose-built time-series database family. The description below is the serverless Timestream for LiveAnalytics engine; since June 2025 that engine is no longer open to new customers, and AWS points new workloads to Amazon Timestream for InfluxDB, a managed time-series engine with its own retention settings.
+- Recent data lands in a fast **memory store**; as it ages past the configured retention it moves automatically to a cheaper **magnetic store**, and it can be deleted when its retention ends.
+- Queries use SQL with time-series functions such as binning by time interval and interpolation.
+Example: memory store retention of 24 hours and magnetic store retention of 1 year keeps dashboards fast for today's data while keeping a year of history at low cost, with no manual tiering jobs.
+W: Amazon Timestream: it is designed for time-stamped data, optimizes time-range queries, and tiers data between its storage layers automatically based on retention settings.
+X: A=Glue DataBrew: a visual data preparation tool for cleaning and transforming datasets; it does not store data or serve queries.
+C=DocumentDB: a MongoDB-compatible document database for JSON documents; it has no built-in time-series tiering and is not optimized for time-range aggregations at sensor scale.
+D=Neptune: a graph database for relationship traversal queries; time-range queries over measurements are not what it is built for.
+T: Timestamped sensor data with time-range queries and automatic hot-to-cold tiering maps to a time-series database such as Timestream, not to document or graph stores.
+
+@ Q003747 explain
+G: ## Coupled versus decoupled storage in Redshift
+Older Redshift node types such as DC2 store data on each node's local SSDs. Storage capacity is fixed per node, so the only way to get more disk is to add nodes, and you pay for their CPU and memory too.
+## RA3 and Redshift managed storage
+RA3 nodes keep data in **Redshift managed storage (RMS)**, which is backed by Amazon S3, and use large local SSDs as a cache for hot data. Storage is billed separately per GB-month and grows automatically.
+- A cluster can hold far more data than its local SSD capacity.
+- Compute is sized by node type and count for query performance only.
+Example: a 2-node cluster whose data grows from 5 TB to 50 TB can stay at 2 nodes if query load has not changed. Redshift Serverless uses the same managed storage model.
+W: RA3 with managed storage: it decouples storage from compute, so storage grows on demand while the node count stays matched to the actual query workload.
+X: A=DC2 local SSD only: DC2 storage is tied to each node, which is precisely the coupling that caused the cluster to fill up.
+B=Manually attached EBS: Redshift is a managed service; you cannot attach your own EBS volumes to its nodes to extend storage.
+D=More DC2 nodes: it adds disk but also adds compute you do not need, paying for idle CPU just to get storage.
+T: When a warehouse needs storage but not compute, RA3 managed storage (or Serverless) scales them separately; DC2 forces you to buy both together.
+
+@ Q003748 explain
+G: ## Redshift data sharing
+Data sharing lets a producer warehouse grant read access to live data to consumer warehouses without copying or moving it. It works with RA3 provisioned clusters and Redshift Serverless.
+## How cross-account sharing works
+- The producer creates a datashare and adds objects: `CREATE DATASHARE sales_share; ALTER DATASHARE sales_share ADD TABLE public.orders;`
+- It grants the share to another AWS account: `GRANT USAGE ON DATASHARE sales_share TO ACCOUNT '111122223333';` and the share is authorized.
+- In the consumer account, an administrator associates the share, and the consumer creates a database from it and queries it with its own compute.
+Consumers always see the producer's current committed data, and the consumer's queries run on its own warehouse, so workloads stay isolated. Data sharing through AWS Lake Formation adds centralized, fine-grained permissions.
+W: Data sharing: it provides live, read-only, cross-account access to the producer's data with no copies, no pipelines and no refresh delay.
+X: A=Resize: resizing changes a cluster's node count or type; it has nothing to do with giving another account access to data.
+C=UNLOAD jobs: UNLOAD writes a copy of query results to S3, which becomes stale immediately and must be reloaded by the other cluster.
+D=Snapshots: a shared snapshot must be restored into a new cluster, producing a point-in-time copy rather than live data.
+T: Live, copy-free access to Redshift data across clusters and accounts is data sharing; snapshots and UNLOAD always create copies that go stale.
+
+@ Q003749 explain
+G: ## Getting DynamoDB data into S3 for analytics
+Analytics tools such as Athena, Glue and EMR need the table's data in S3. Reading it through the table API would compete with the application for capacity.
+## Export to S3
+DynamoDB export to S3 requires point-in-time recovery (PITR) to be enabled. The export reads from the PITR backup data, not from the live table, so it consumes no read capacity and does not affect application latency.
+- **Full export**: the whole table as of any point in the PITR window.
+- **Incremental export**: only items changed between two points in time, useful for keeping a lake up to date.
+- Output formats: DynamoDB JSON or Amazon Ion, written to a bucket you choose (even in another account), ready to catalog with Glue and query with Athena.
+Example: a daily incremental export feeds changed orders into the lake without adding load to the table.
+W: Export to S3: it copies table data to S3 from PITR data, so analytics gets a complete copy while the table's read capacity and performance are untouched.
+X: A=DAX: DAX is an in-memory cache that speeds up repeated key-value reads for applications; it does not move data to S3 and does not help analytical scans.
+B=TTL on every item: TTL automatically deletes items after an expiry time; it removes data rather than replicating it.
+C=Hourly full Scan: each Scan reads every item and consumes read capacity, competing with production traffic, which is exactly the performance impact to avoid.
+T: Use DynamoDB export to S3 (backed by PITR) for analytics copies; Scans consume table capacity and DAX or TTL do not move data.
+
+@ Q003750 explain
+G: ## What zero-ETL integration means
+Traditionally, getting OLTP data into a warehouse needs a pipeline: extract from the database, stage in S3, transform and load, then schedule and monitor it. Every step adds delay and operational work.
+## Aurora zero-ETL integration with Amazon Redshift
+You create an integration between an Aurora cluster (MySQL-compatible or PostgreSQL-compatible) and a Redshift Serverless workgroup or RA3 cluster. AWS then:
+- seeds Redshift with an initial copy of the selected data,
+- continuously replicates inserts, updates and deletes from Aurora's change log, typically within seconds,
+- runs with minimal impact on the Aurora workload and no extraction jobs to build.
+In Redshift you create a database from the integration and query the replicated tables directly, joining them with other warehouse data. Data filters can limit which databases or tables are replicated.
+W: Zero-ETL integration: it delivers Aurora changes to Redshift in near real time with no pipeline to build or operate, which is exactly the stated requirement.
+X: B=Manual SQL dumps: data is at least a day old and depends on a person doing the import, so it is neither near real time nor zero-ETL.
+C=Nightly CSV exports with COPY: this is a classic batch ETL pipeline with up to a day of latency, and it must be built, scheduled and maintained.
+D=Lambda polling every minute: custom polling adds load on Aurora, misses deletes unless specially designed, and is a hand-built pipeline to maintain.
+T: Near-real-time Aurora-to-Redshift analytics without pipelines is zero-ETL integration; dumps, nightly COPY loads and polling functions are the ETL it replaces.
+
+@ Q003751 explain
+G: ## OLTP versus OLAP
+- **OLTP (online transaction processing)** serves applications: many concurrent users, each reading or writing a few rows, such as "insert order", "update stock", "get customer 42". It needs ACID transactions, row-level locking and millisecond latency.
+- **OLAP (online analytical processing)** serves analysts: fewer, heavy queries that scan and aggregate millions of rows, such as "revenue by region last year".
+## Matching stores to workloads
+Row-oriented relational engines such as Amazon RDS (MySQL, PostgreSQL, SQL Server, Oracle, and others) and Amazon Aurora are built for OLTP: indexes find single rows fast and transactions keep concurrent writes consistent. Columnar warehouses and query engines like Redshift and Athena are built for OLAP and perform poorly on thousands of tiny concurrent updates.
+Example: a checkout service writing 2,000 orders per second fits Aurora; the nightly sales report fits Redshift.
+W: Aurora or RDS: they are transactional relational databases optimized for many concurrent small reads and writes with ACID guarantees.
+X: A=Athena with partitions: Athena is a serverless query engine over S3 files; it runs analytical SQL with seconds of latency and has no transactional row updates for an application.
+B=S3 with Parquet: Parquet files are immutable columnar files for analytics; updating a single row means rewriting files, and there are no transactions or locking.
+C=Redshift with sort keys: Redshift is a columnar OLAP warehouse; sort keys speed up scans, but frequent small concurrent writes are inefficient there.
+T: Transactional applications with many small concurrent operations belong on Aurora or RDS; Redshift, Athena and Parquet on S3 serve analytics.
+
+@ Q003752 explain
+G: ## What partitioning does
+A partitioned table stores data in folders by column value, such as `s3://lake/sales/dt=2026-09-29/`. When a query filters on that column (`WHERE dt = '2026-09-29'`), engines like Athena read only the matching folders and skip the rest, which is called partition pruning.
+## Choosing partition columns
+- Pick columns that appear in most query filters, typically date, sometimes region or tenant.
+- Keep cardinality moderate: each partition should hold a meaningful amount of data. Many partitions with a few KB each create huge numbers of tiny files and partitions, which slows planning (listing and metadata lookups) and reading.
+- Keep one consistent layout so the catalog and every query understand it.
+Example: an events table partitioned by `dt` with daily files of about 128 MB to 1 GB works well; the same table partitioned by `event_id` would create millions of tiny folders.
+W: C=Partition on common filters: date and similar filter columns let queries prune most of the data, which cuts both run time and bytes scanned.
+E=Avoid tiny partitions: moderately sized partitions keep file counts and partition metadata manageable, so planning and reads stay fast.
+X: A=Different scheme each day: the catalog describes one partition layout per table, so changing it per load breaks pruning and makes older data hard to query.
+B=Partition on a unique ID: millions of values create millions of tiny partitions, and queries rarely filter on a single ID, so there is almost nothing to prune and a lot of overhead.
+D=Single flat folder: without a partition layout every query reads every file, so there is no pruning at all.
+T: Partition on columns people filter by, at a granularity that keeps partitions reasonably large; high-cardinality or inconsistent schemes cause tiny files and slow queries.
+
+@ Q003753 explain
+G: ## Why many partitions slow Athena
+For a normal partitioned table, Athena asks the AWS Glue Data Catalog for the partitions that match the query before it can plan. With hundreds of thousands of partitions, retrieving and filtering that metadata can take longer than reading the data. Every new partition also has to be added to the catalog by a crawler or `MSCK REPAIR TABLE`.
+## Partition projection
+With partition projection, Athena calculates partition values and S3 locations from table properties instead of reading them from the catalog. Example properties:
+- `projection.enabled` = `true`
+- `projection.dt.type` = `date`, `projection.dt.range` = `2020-01-01,NOW`, `projection.dt.format` = `yyyy-MM-dd`
+- `storage.location.template` = `s3://lake/events/dt=${dt}/`
+For `WHERE dt BETWEEN '2026-09-01' AND '2026-09-07'`, Athena computes the seven locations directly. New dates need no catalog updates.
+W: Partition projection: for predictable patterns such as dates, Athena derives partitions from configuration, removing the catalog lookup that slows planning.
+X: A=Larger result files: result file size affects how output is written to S3 after the query; it does nothing for the planning phase that is slow.
+C=Workgroup tagging: tags on workgroups are for cost allocation and access control; they do not change how Athena finds partitions.
+D=More Glue crawlers: crawlers register partitions in the catalog; more of them keep the catalog up to date but do not reduce the metadata Athena must retrieve.
+T: For huge numbers of predictably named partitions, use Athena partition projection to skip catalog lookups; crawlers only add more metadata.
+
+@ Q003754 explain
+G: ## Why deletes are hard in a plain data lake
+Files in S3 are immutable. To remove one customer's rows from plain Parquet or CSV, you have to find every file that contains the customer, rewrite each without those rows, and swap the files carefully so readers do not see partial results.
+## Row-level deletes with Apache Iceberg
+Iceberg is an open table format that tracks data files, delete files and snapshots in metadata, so engines can run transactional DML:
+- In Athena: `DELETE FROM customers_orders WHERE customer_id = 'C-1042'`. Athena writes delete files that mark the rows as removed (merge-on-read), and the change is atomic.
+- `OPTIMIZE ... REWRITE DATA USING BIN_PACK` later merges delete files into rewritten data files.
+- Expiring old snapshots (for example with `VACUUM`) removes the older files, so the data is physically gone and not just hidden, which matters for deletion requests.
+W: Iceberg row-level deletes: the engine handles finding and removing the rows transactionally, avoiding manual rewrites of whole datasets while keeping the table consistent.
+X: B=Excel on a laptop: moving customer data to personal devices is a security and compliance risk and does not scale to lake-sized data.
+C=Hand-rewritten CSV files: finding and rewriting every affected file manually is slow and error-prone, and readers may see inconsistent data mid-rewrite.
+D=JSON in Glacier Deep Archive: objects must be restored (hours) before they can be read, then still rewritten by hand; the storage class adds delay and no delete capability.
+T: Record-level deletion in a data lake is practical with a transactional table format like Iceberg; remember to expire snapshots so deleted rows are physically removed.
+
+@ Q003755 explain
+G: ## Serverless scheduled jobs
+A recurring job needs two pieces: something that **runs** the code and something that **starts** it on time. Using managed services for both removes servers to patch and pay for when idle.
+## Compute options for Python
+- **AWS Lambda**: runs Python code up to 15 minutes per invocation, billed per millisecond. Good for light preparation tasks.
+- **AWS Glue Python shell job**: runs a Python script with longer run times and data libraries, billed per DPU-hour for the duration. Good when the task exceeds Lambda limits.
+## Scheduling
+**Amazon EventBridge Scheduler** invokes targets on cron or rate expressions, for example `cron(0 2 * * ? *)` for 02:00 UTC daily, with time zone support, retries and a dead-letter queue. It can target Lambda or start a Glue job through the API. Glue also has its own scheduled triggers.
+W: A=EventBridge Scheduler: a fully managed scheduler that reliably starts the job every day with no cron host to maintain.
+E=Lambda or Glue Python shell: serverless compute that runs the Python preparation logic only when invoked, with nothing to manage between runs.
+X: B=Always-on EC2 with cron: the instance runs and bills 24 hours a day for a short daily job, and you must patch, monitor and recover it yourself.
+C=Manual laptop run: it depends on a person being available, is not automated at all, and moves data processing onto an unmanaged device.
+D=Redshift running the Python: Redshift is a data warehouse for SQL; it is not a general-purpose runner for scheduled Python scripts.
+T: Pair a managed scheduler (EventBridge Scheduler) with serverless compute (Lambda or Glue Python shell) for recurring jobs; cron on EC2 means managing a server.
+
+@ Q003756 explain
+G: ## Automating a recurring Athena query
+Athena always writes query results as files to an S3 output location, so the only missing parts are starting the query on a schedule and handling success or failure.
+## A typical design
+- **EventBridge Scheduler** fires every morning, for example `cron(0 6 * * ? *)`, and starts a Step Functions state machine.
+- **AWS Step Functions** uses its Athena integration `StartQueryExecution` with the `.sync` pattern, which waits until the query finishes.
+- The results land in a chosen S3 prefix such as `s3://reports/daily/`; later states can copy them, trigger a notification through SNS, or retry on failure.
+Analysts or tools then read the ready file each morning instead of running the query by hand. The same state machine can chain several queries.
+W: EventBridge plus Step Functions writing to S3: the query runs on schedule without anyone clicking, results are stored automatically, and failures can be retried or alerted.
+X: A=Spreadsheet formula: spreadsheet formulas cannot submit Athena queries or run on a server-side schedule; this is not a real automation of the query.
+C=Analysts arriving earlier: it changes who waits, not how the query runs, and the work is still manual and repeated daily.
+D=Raise the scan limit: data usage controls cap how much a query may scan; raising them changes nothing about scheduling or downloading results.
+T: Recurring queries should be scheduled with EventBridge and orchestrated with Step Functions writing to S3; changing limits or people's habits is not automation.
+
+@ Q003757 explain
+G: ## The problem with drivers in Lambda
+A traditional Redshift client opens a JDBC or ODBC connection, keeps it alive and handles credentials. In Lambda that means packaging drivers, managing connection pools across short-lived invocations, and often placing the function in the VPC.
+## Redshift Data API
+The Data API runs SQL through HTTPS calls in the AWS SDK, with no persistent connection:
+- `ExecuteStatement` or `BatchExecuteStatement` submits SQL and returns a statement ID immediately (asynchronous).
+- `DescribeStatement` checks the status, and `GetStatementResult` fetches rows.
+- Authentication uses IAM with temporary database credentials or a secret in AWS Secrets Manager.
+Example: a Lambda function calls `execute_statement(WorkgroupName='analytics', Database='dev', Sql='CALL refresh_sales()')` through boto3. It works with provisioned clusters and Redshift Serverless.
+W: Redshift Data API: it runs SQL over HTTPS with IAM or Secrets Manager authentication, so Lambda needs no JDBC drivers or connection management.
+X: A=Resize: it changes the cluster's node type or count; it is not a way to submit SQL from code.
+B=Snapshots: they are backups for restore or copy; they do not provide any query interface.
+D=UNLOAD: it is a SQL command that exports query results to S3; it still has to be sent over some connection, so it does not remove the driver problem.
+T: Call Redshift from Lambda or other serverless code through the Data API; resize, snapshots and UNLOAD are cluster operations, not a client interface.
+
+@ Q003758 explain
+G: ## Transient versus long-running EMR clusters
+A **long-running** cluster stays up and bills continuously, which suits constant workloads. A **transient** cluster is created for a job, runs its steps and terminates, so you pay only while work is happening. For a monthly job, transient clusters are almost always cheaper.
+## Orchestrating a transient cluster
+- **AWS Step Functions** has EMR integrations: `createCluster.sync`, `addStep.sync` for each Spark step, then `terminateCluster`, with error handling that still terminates the cluster on failure.
+- **Amazon MWAA (Apache Airflow)** provides operators such as `EmrCreateJobFlowOperator` and step sensors in a DAG.
+- As a safety net, an EMR **auto-termination policy** shuts the cluster down after an idle timeout, and a cluster can also be set to terminate after its last step.
+EMR Serverless is another option that avoids cluster management entirely.
+W: Transient clusters via Step Functions or MWAA: the orchestrator creates the cluster, runs the Spark steps and terminates it, so compute is billed only for the job's duration.
+X: A=Lambda within 15 minutes: Lambda has a 15-minute limit and limited memory and cannot host a distributed Spark job over large data.
+B=Always-on cluster for one monthly job: the cluster is idle roughly 29 days out of 30 but is billed the whole time.
+C=Manual cluster shutdown: relying on a person to remember termination leads to forgotten clusters and surprise bills, and it is not automated.
+T: Periodic Spark jobs should run on transient EMR clusters created and terminated by an orchestrator, with auto-termination as a backstop.
+
+@ Q003759 explain
+G: ## Business intelligence on AWS
+Amazon Quick Sight is AWS's managed BI service. It connects to Redshift, Athena, RDS, S3 and many other sources, and users build interactive dashboards with filters, drill-downs and visuals in the browser. Data can be queried directly or imported into the in-memory SPICE engine for fast interaction.
+## Row-level security (RLS)
+RLS restricts which rows each viewer sees on the same dashboard.
+- You create a permissions dataset mapping users or groups to allowed values, for example `UserName=alice, region=EU` and `GroupName=na-sales, region=NA`.
+- You attach it to the dataset as row-level security rules.
+- When Alice opens the dashboard, Quick Sight filters every visual to `region = 'EU'`.
+Tag-based RLS is also available when dashboards are embedded for anonymous or external users.
+W: Quick Sight: it provides interactive dashboards on Redshift and Athena and enforces per-user row-level security, such as restricting each user to their region.
+X: A=Glue crawlers: crawlers scan data stores and populate the Data Catalog with table definitions; they do not render dashboards or control who sees which rows.
+B=Kinesis Firehose (now named Amazon Data Firehose): it delivers streaming data to destinations such as S3 or Redshift; it has no visualization or user-facing access control.
+C=SNS topics: SNS pushes notifications to subscribers such as email or Lambda; it cannot display interactive charts.
+T: Interactive BI dashboards with per-user row filtering are a Quick Sight job; catalogs, streaming delivery and notifications only support the pipeline around it.
+
+@ Q003760 explain
+G: ## How Athena charges
+Athena bills per TB of data scanned by each query (with a small per-query minimum). Anything that lets Athena read fewer bytes lowers the bill directly.
+## Three levers that reduce bytes scanned
+- **Columnar format**: Parquet or ORC store each column separately, so `SELECT order_id, amount` reads only those two columns.
+- **Compression**: Snappy or ZSTD compressed Parquet shrinks the bytes on S3 that must be read.
+- **Partition pruning**: with data under `dt=2026-09-29/` and a filter `WHERE dt = '2026-09-29'`, Athena skips every other partition.
+Example: a 1 TB JSON table queried for one day and three columns may scan well under 1 GB after conversion to partitioned, compressed Parquet.
+W: C=Compressed Parquet with needed columns: columnar storage plus column selection means only the requested columns are read, and compression shrinks those further.
+E=Partition and filter on partitions: filters on partition columns let Athena skip whole folders of data, so scanned bytes drop in proportion.
+X: A=Remove WHERE clauses: without filters Athena cannot prune partitions and returns and scans more data, raising cost.
+B=Many small uncompressed JSON files: JSON is row-based so every query reads whole records, no compression means more bytes, and many small files add overhead.
+D=SELECT * everywhere: it forces Athena to read every column even in Parquet, which cancels the benefit of a columnar format.
+T: Cut Athena cost by scanning less: compressed columnar files, selecting only needed columns, and filtering on partition columns.
+
+@ Q003761 explain
+G: ## Athena workgroups
+A workgroup is a named container for queries, users and settings. Teams run their queries in their own workgroup, and each workgroup can enforce its own configuration.
+## Controls a workgroup provides
+- **Per-query data usage control**: a limit such as 10 GB scanned per query; Athena cancels any query that exceeds it.
+- **Workgroup-wide data usage controls**: thresholds on total data scanned per hour or day that trigger an alarm notification through Amazon SNS.
+- **Enforced settings**: a fixed query result location and encryption that users cannot override.
+- **Cost separation**: per-workgroup CloudWatch metrics, and tags on workgroups for cost allocation reports.
+IAM policies can restrict each team to its own workgroup, for example allowing `athena:StartQueryExecution` only on `arn:aws:athena:us-east-1:111122223333:workgroup/marketing`.
+W: Athena workgroups with data usage controls: they cap data scanned per query, alert on team-level usage, and keep usage and cost separated per team.
+X: B=Glue job bookmarks: bookmarks let Glue ETL jobs remember which data they already processed; they have no effect on Athena queries.
+C=Versioning on result bucket: versioning keeps old copies of result files; it neither limits scans nor separates cost, and it actually adds storage.
+D=Redshift WLM for Athena: workload management queues exist only inside Redshift; Athena is a separate service and is not governed by them.
+T: Govern Athena usage and cost per team with workgroups and their data usage controls; Glue, S3 and Redshift settings do not control Athena queries.
+
+@ Q003762 explain
+G: ## Why short queries get stuck
+Redshift runs a limited number of queries concurrently. If long ETL statements occupy the available slots or memory, a two-second dashboard query waits in line behind them.
+## Workload management (WLM)
+- **Automatic WLM** lets Redshift manage memory and concurrency and supports **query priorities** (`HIGHEST` to `LOWEST`). Mapping dashboard users to a high-priority queue and ETL to low priority lets short queries go first.
+- **Manual WLM** defines separate queues with their own concurrency and memory, routed by user group or query group, such as `SET query_group TO 'dashboard';`
+- **Short query acceleration (SQA)** runs predicted short queries in a dedicated space so they do not wait behind long ones.
+- **Query monitoring rules** can log, hop or abort runaway queries.
+Example: an `etl` queue at low priority and a `bi` queue at high priority keep dashboards responsive during loads.
+W: WLM queues or automatic WLM priorities: they separate or prioritize workloads so short dashboard queries are not blocked by long-running ETL.
+X: A=Remove indexes and sort keys: Redshift has no traditional indexes, and removing sort keys makes queries scan more blocks, slowing everything instead of prioritizing anything.
+C=Convert to UNLOAD: UNLOAD exports results to S3 files, which does not suit interactive dashboards and still competes for the same query slots.
+D=ETL in business hours: running heavy ETL while users are active increases contention, which is the cause of the waiting in the first place.
+T: Prioritize mixed Redshift workloads with WLM (queues, priorities, SQA); tuning physical design or schedules the wrong way only adds contention.

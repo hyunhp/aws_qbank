@@ -2,7 +2,7 @@
 
 @ Q000276 explain
 G: ## How Athena charges for a query
-Athena bills by the bytes it reads from S3. Two things decide how many bytes that is:
+With the default per-query pricing, Athena bills by the bytes it reads from S3 (an approximate per-TB rate, with a small minimum per query). Two things decide how many bytes that is:
 - **File format.** CSV is row-based: to get 5 columns, Athena must read every row in full, including the other 75 columns. Parquet (and ORC) is **columnar**: each column is stored separately, so Athena reads only the column chunks the query names. Parquet also keeps min/max statistics per row group, so some blocks can be skipped entirely.
 - **Partitioning.** If data is laid out as `s3://lake/sales/dt=2026-09-01/`, a query with `WHERE dt = '2026-09-01'` touches only that prefix (partition pruning) instead of the whole table.
 ## A quick example
@@ -88,7 +88,7 @@ T: Partition on the columns queries actually filter by (here year, month and cou
 
 @ Q000282 explain
 G: ## Two ways to run Spark on Amazon EMR
-- **EMR Serverless**: you create an application (for example Spark), submit jobs, and EMR provisions and scales workers for each job automatically. You choose the release, worker size (vCPU, memory, disk), CPU architecture and optional pre-initialized capacity, but you never pick EC2 instance types or manage nodes. You pay for the resources the job actually uses.
+- **EMR Serverless**: you create an application (for example Spark), submit jobs, and EMR provisions and scales workers for each job automatically. You choose the release, worker size (vCPU, memory, disk), CPU architecture and optional pre-initialized capacity, but you never pick EC2 instance types, supply AMIs or manage nodes (custom container images can add software, not choose hardware). You pay for the resources the job actually uses.
 - **EMR on EC2**: you launch a cluster of EC2 instances. You choose instance types and families, instance fleets, Spot or On-Demand, custom AMIs, bootstrap actions and cluster configuration. In return you own sizing, scaling policies and shutting clusters down.
 ## Picking between them
 Sporadic, unpredictable jobs fit Serverless well because nothing sits idle between runs. Needs such as a specific instance family or a custom AMI with special drivers push toward EMR on EC2, where the underlying hardware is under your control.
@@ -129,7 +129,7 @@ T: For rare ad hoc SQL over data already in S3, Athena's pay-per-query model bea
 
 @ Q000285 explain
 G: ## The small files problem
-Spark splits input into tasks, and with many tiny files each file tends to become its own task. With millions of files of a few KB:
+A Glue Spark job splits input into tasks, and without grouping, many tiny files tend to become many tiny tasks. With millions of files of a few KB:
 - Listing S3 prefixes takes a long time before any data is read.
 - The driver schedules millions of tasks, and each task spends more time starting up than reading data.
 - Adding workers does not help much, because the bottleneck is per-file overhead, not compute.
@@ -137,8 +137,8 @@ Spark splits input into tasks, and with many tiny files each file tends to becom
 - **Compaction**: rewrite the data periodically into larger files, commonly in the range of about 128 MB to 1 GB, often as Parquet.
 - **Grouping on read**: Glue can combine many small files into one task with the connection options `groupFiles` set to `inPartition` and a target `groupSize`, for example `{"groupFiles": "inPartition", "groupSize": "134217728"}` for about 128 MB groups.
 W: Compact or group small files: both reduce the number of files or tasks Spark must handle, which removes the listing and scheduling overhead that dominates this job.
-X: B=Convert to JSON: changing the format leaves the same millions of tiny files, and JSON is larger and slower to parse than most formats, so the overhead remains.
-C=Disable job bookmarks: bookmarks track which data was already processed; turning them off makes the job reprocess everything, which adds work instead of reducing per-file overhead.
+X: B=Convert to JSON: changing the format leaves the same millions of tiny files, and JSON is verbose and slow to parse, so the listing and scheduling overhead remains.
+C=Disable job bookmarks: bookmarks track which data was already processed; turning them off can make the job reprocess data it already handled, which adds work instead of reducing per-file overhead.
 D=More DPUs only: more workers cannot fix a job bound by listing and per-file task overhead; you pay more for capacity that mostly waits on scheduling.
 T: With millions of tiny files, reduce the file count (compaction or `groupFiles`) instead of adding more compute.
 
@@ -199,7 +199,7 @@ G: ## Event routing with Amazon EventBridge
 ## Example
 One rule starts a state machine; a second rule on the same pattern sends the event to an SQS queue for an audit consumer and to a Lambda function for parallel processing.
 W: Amazon EventBridge: rules match the specific custom event and route it to Step Functions and other independent targets at the same time, with no code to fan it out.
-X: B=SNS used exclusively: SNS fans out messages, but it cannot start a Step Functions execution directly as a subscriber and has no content-based rules over event fields; you would need extra glue code.
+X: B=SNS used exclusively: SNS fans out messages, but Step Functions is not a supported SNS subscription type, so starting the state machine would need extra code such as a Lambda subscriber; EventBridge has it as a native rule target.
 C=Systems Manager Automation: Automation runs operational runbooks against resources, such as patching or restarting instances; it is not an event bus that routes application events.
 D=AWS Config rules: Config evaluates resource configuration for compliance; it reacts to configuration changes, not to custom application events.
 T: For custom application events that must start a state machine and fan out to other targets, EventBridge rules are the routing layer.
@@ -293,7 +293,7 @@ G: ## Where failed events go with EventBridge
 When an EventBridge rule sends an event to a target, EventBridge retries delivery with a **retry policy** (by default up to 24 hours and up to 185 attempts, both configurable). Without a dead-letter queue, events that still cannot be delivered are dropped.
 - A **dead-letter queue (DLQ)** is an SQS queue attached to the **rule target**. Undeliverable events land there with attributes describing the error, so you can inspect and redrive them later.
 ## A Lambda detail worth knowing
-EventBridge invokes Lambda asynchronously. Failures EventBridge sees, such as throttling or missing permissions, go to the target DLQ. Errors thrown by the function code itself are retried by Lambda's own asynchronous invocation settings; to keep those events too, also configure an **on-failure destination** or DLQ on the Lambda function.
+EventBridge invokes Lambda asynchronously. Delivery failures EventBridge sees, such as missing invoke permissions or a deleted function, go to the target DLQ after retries. Errors thrown by the function code itself are retried by Lambda's own asynchronous invocation settings; to keep those events too, also configure an **on-failure destination** or DLQ on the Lambda function.
 W: DLQ on the rule target: it stores events that exhaust the configured retries in an SQS queue instead of discarding them, so they can be inspected and reprocessed.
 X: A=S3 Versioning on output: versioning keeps older versions of objects already written; it records nothing about events that never finished processing.
 B=Disable retries: turning retries off makes more events fail on the first transient error, and without a DLQ they are still discarded.
@@ -304,7 +304,7 @@ T: Attach an SQS dead-letter queue to the EventBridge target (and an on-failure 
 G: ## How Amazon MWAA runs Airflow
 **Amazon Managed Workflows for Apache Airflow (MWAA)** runs the Airflow scheduler, web server, workers and metadata database for you.
 - **Workers scale automatically**: you set a minimum and maximum worker count, and MWAA adds workers as queued and running tasks grow, then removes them when the load drops.
-- **High availability**: an environment is created in two private subnets in **different Availability Zones**, and MWAA runs its components across them, so the environment tolerates a single AZ failure.
+- **High availability**: an environment is created in two private subnets in **different Availability Zones**, and MWAA places its components across them, so the environment is not tied to a single AZ.
 - Environment classes (for example `mw1.small` to larger sizes) set the capacity of schedulers and workers.
 ## Example
 With `MinWorkers: 1` and `MaxWorkers: 10`, a quiet night runs on one worker, and a morning backfill with dozens of tasks scales toward ten without anyone launching instances.

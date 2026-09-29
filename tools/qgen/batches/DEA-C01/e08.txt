@@ -1,0 +1,355 @@
+# DEA-C01 detailed explanations, batch e08 (explanation-only rewrites; letters are the published ones)
+
+@ Q000426 explain
+G: ## What AWS Config records
+AWS Config keeps an inventory of your resources and records a **configuration item** every time a supported resource changes. Each item is a snapshot of the resource's settings at that moment, with a timestamp and links to related resources.
+- The **configuration history** (timeline) of a resource shows every recorded version, so you can compare the settings before and after a change.
+- Config is populated by the **configuration recorder**, which must be turned on in each Region for the resource types you care about.
+## Example
+A pipeline starts failing on Tuesday. Opening the timeline for the S3 bucket shows that the bucket policy changed at 09:14 and lists the old and new policy documents. Glue resource types that the recorder covers get the same kind of timeline, and AWS CloudTrail adds the API call itself (for example `UpdateConnection`, with who made it and the request parameters), so you know what changed, when, and by whom.
+W: Config configuration history: it stores point-in-time snapshots of the settings of recorded resources, so the team can see when the bucket policy and the Glue configuration changed and what the previous values were. It is the only option that keeps earlier versions of resource settings at all.
+X: B=CloudWatch metrics: metrics are numeric time series such as request counts or error rates. They can show that failures started, but they do not store resource settings or earlier policy versions.
+C=Macie bucket inventory: Macie discovers sensitive data and summarizes bucket security posture (public access, encryption, sharing) as it is now. It is not a change log and does not cover Glue connections.
+D=Trusted Advisor: it runs best-practice checks for cost, security, performance and limits and reports current findings. It does not keep a per-resource history of configuration changes.
+T: "What did this resource look like before, and when did it change?" is AWS Config's configuration history; metrics, Macie and Trusted Advisor only describe the present state or behavior.
+
+@ Q000427 explain
+G: ## Preventive versus detective controls
+- A **detective** control (CloudTrail logs, AWS Config rules) tells you after the fact that something happened.
+- A **preventive** control stops the action from happening at all. Data sovereignty ("never stored or processed outside the EU") needs a preventive control.
+## Service control policies (SCPs)
+SCPs are attached in AWS Organizations to the root, an OU or an account. They set the maximum permissions for every IAM user and role in those accounts, including administrators, and cannot be bypassed from inside the member account.
+A Region guardrail uses the `aws:RequestedRegion` condition key, for example a `Deny` on all actions when the Region is not `eu-central-1`, `eu-west-1` or `eu-west-3`. Global services such as IAM, Organizations or Route 53 are usually listed in a `NotAction` exception because their API calls are served from a US Region. AWS Control Tower offers the same pattern as its Region deny control.
+W: SCPs denying non-EU Regions: an organization-level `Deny` on requests outside approved EU Regions prevents any principal in the member accounts from creating storage or compute elsewhere, which is the enforcement the requirement asks for.
+X: A=CloudTrail only: logging in every Region records API calls but blocks nothing. It would show a violation after the data had already left the EU.
+C=Macie moving data: Macie finds and classifies sensitive data in S3. It does not move or replicate data between Regions, and moving data would not prevent it from being stored outside the EU in the first place.
+D=Application checks only: each microservice would have to implement the rule correctly, and anyone with console or API access could still create resources in other Regions. There is no central enforcement.
+T: Sovereignty rules need a preventive guardrail that no one in the account can override: an SCP on `aws:RequestedRegion`, not logging or per-application checks.
+
+@ Q000428 explain
+G: ## Publish and subscribe in SageMaker Unified Studio
+Amazon SageMaker Unified Studio uses the Amazon DataZone governance model. Work happens in **projects**, and each project has members and its own IAM role that tools use to access data.
+- A producer project **publishes** assets such as Glue tables, Redshift tables or S3 data to the business **catalog**, with business names, glossary terms and descriptions.
+- A consumer project finds the asset in the catalog and sends a **subscription request** with a reason.
+- The asset owner approves or rejects it. On approval, the service grants access for the subscribing project, for example Lake Formation permissions on a Glue table or a Redshift grant, so every member of the project can query it through the project's tools.
+## Example
+The marketing project requests the `sales.orders_curated` table. The sales data owner approves, and marketing members can now query it in Athena from their project, while the owner can revoke the subscription later.
+W: Catalog subscriptions: members get access to shared assets through their project's approved subscriptions, which keeps access tied to a request, an owner approval and an auditable grant rather than to personal permissions.
+X: A=No shared assets: the business catalog of published assets is a core part of SageMaker Unified Studio; sharing across teams is exactly what it is designed for.
+B=Account-wide admin: giving every member administrator access would bypass governance entirely and violate least privilege. Access is granted per asset to the project.
+D=Unencrypted local copies: governed access means querying data in place with managed permissions. Copying it unencrypted to laptops loses control and auditability.
+T: In SageMaker Unified Studio, data is shared by publishing to the catalog and granting approved subscriptions to projects, not by broad IAM rights or data copies.
+
+@ Q000429 explain
+G: ## Cross-account sharing with Lake Formation
+AWS Lake Formation manages fine-grained permissions (database, table, column, row, cell) on Data Catalog tables whose data sits in S3. It can grant those permissions to **another AWS account** without copying data.
+- The producer (Business Unit A) grants permissions on selected tables, columns or data filters to B's account ID, either on named resources or through LF-Tags. The share is carried by AWS Resource Access Manager.
+- In B's account, the data lake administrator accepts the share, creates a **resource link** to the shared table, and grants access to B's own analysts.
+- Queries from Athena, Redshift Spectrum, EMR or Glue in B read the data directly from A's S3 location, and every access is governed by A's grants.
+## Why ownership stays with A
+A can narrow or revoke the grant at any time, and the data never leaves A's buckets, so there is one copy with one owner.
+W: Lake Formation cross-account share: A grants a curated subset of tables to B's account, B queries it in place with its own services, and A keeps ownership and full control over permissions and revocation.
+X: B=Root credentials: sharing the root user gives B unrestricted control over all of A's account and resources, the opposite of controlled, curated access. Root credentials should never be shared.
+C=Merge the accounts: consolidating accounts removes the isolation and billing separation of the business units and is a huge migration, while governance can already be done across accounts.
+D=Weekly full dumps: copies go stale between exports, duplicate storage, and once in B's bucket A loses control over who sees the data and cannot revoke it.
+T: Cross-account analytics with the producer keeping control is a Lake Formation grant to the consumer account (plus resource links), not credential sharing or data copies.
+
+@ Q000430 explain
+G: ## How AWS Config evaluates rules
+AWS Config rules evaluate **configuration items**, and configuration items exist only for resources the **configuration recorder** is recording.
+- The recorder is set up per Region and per account. It can record all supported resource types or only a selected list.
+- If the recorder is stopped in a Region, or the list excludes `AWS::S3::Bucket`, a new bucket never produces a configuration item, so a change-triggered rule such as `s3-bucket-server-side-encryption-enabled` has nothing to evaluate and the bucket does not appear in the results.
+- Since January 2023, S3 applies SSE-S3 default encryption to every new bucket, so in current accounts real findings usually come from stricter rules such as `s3-default-encryption-kms`. The diagnosis is the same for any rule: a bucket that appears in no rule results at all points to recording, not to the rule.
+- When recording works, change-triggered rules normally evaluate within minutes of a change; periodic rules run on a set schedule (for example every 1, 3, 6, 12 or 24 hours).
+## Where to look first
+In the Config console, check **Settings** in the bucket's Region: recorder status on, S3 buckets included in the recorded resource types, and a working delivery channel. Then check the rule's trigger type and scope.
+W: Recorder not covering S3 in that Region: without a configuration item for the bucket, the rule cannot evaluate it, which matches a bucket that never shows up even hours later.
+X: A=Delete and recreate: Config detects new resources automatically when recording is on. Recreating the bucket would change nothing if S3 is not being recorded.
+B=Once a year: rules run when a recorded resource changes or on a periodic schedule measured in hours, not once a year.
+D=S3 not supported: S3 buckets are a supported resource type and there are several S3 managed rules, including ones that check default encryption.
+T: If Config shows nothing for a resource, first confirm the recorder is on in that Region and records that resource type; rules can only evaluate what is recorded.
+
+@ Q002151 explain
+G: ## Amazon Data Firehose record format conversion
+Amazon Data Firehose is a fully managed delivery service: producers send records, and Firehose buffers and writes them to destinations such as S3, Redshift or OpenSearch. You write no consumer code and manage no servers.
+- **Record format conversion** turns incoming JSON into **Apache Parquet** or **Apache ORC** before writing to S3. It reads the target schema from a table in the AWS Glue Data Catalog.
+- **Buffering hints** control how often files are written: a size threshold and an interval of up to 900 seconds, whichever comes first. With conversion enabled, the size buffer is at least 64 MB.
+- **Dynamic partitioning** can also write to prefixes such as `event_date=2026-09-29/`.
+## Example
+The clickstream table `clicks` is defined in the Data Catalog. Firehose receives JSON events, converts them with that schema and writes Snappy-compressed Parquet files to `s3://lake/clicks/` every few minutes, ready for Athena.
+W: Firehose with Parquet conversion: it delivers near real time (within the buffer interval), converts JSON to Parquet natively using the Data Catalog schema, and is fully managed with no consumer application to maintain.
+X: A=KCL application: a Kinesis Client Library consumer works, but it is exactly the custom code (checkpointing, scaling, Parquet writing) the requirement wants to avoid.
+B=SQS with Lambda per event: one file per event creates millions of tiny files, which makes Athena slow, and the Lambda code still needs maintenance, including any Parquet conversion it would have to implement itself.
+C=Hourly Glue job to CSV: it misses the "within a few minutes" latency and writes CSV, a row format that makes Athena scan far more data than Parquet.
+T: Streaming JSON into S3 as Parquet with no code is Firehose record format conversion; custom consumers and batch jobs add code or latency.
+
+@ Q002152 explain
+G: ## How Kinesis picks a shard
+A Kinesis data stream is split into **shards**. Each shard accepts up to 1 MB/s or 1,000 records/s of writes. The producer supplies a **partition key** with every record; Kinesis hashes the key (MD5) and the hash decides which shard gets the record.
+- Records with the same partition key always go to the same shard, which preserves their order.
+- If one key value dominates, all of its traffic lands on one shard, a **hot shard**, while other shards sit idle.
+## Example
+With the key `event_type`, 90% of traffic has the key `page_view`, so one of the 20 shards receives 90% of all writes and throttles with `WriteProvisionedThroughputExceeded`. Using a high-cardinality key such as `session_id` or `user_id` (or appending a random suffix when strict per-type ordering is not needed) spreads records evenly across all 20 shards.
+W: Higher-cardinality partition key: many distinct key values hash to many shards, spreading the `page_view` traffic across the stream so no single shard exceeds its write limit.
+X: B=Synchronous PutRecord: changing the call style does not change where records go. It actually lowers throughput compared with batched `PutRecords`, and the hot shard stays hot.
+C=Double the shards: all `page_view` records still share one partition key, so they hash to a single shard no matter how many shards exist. Cost doubles and the hot shard remains.
+D=Longer retention: retention controls how long records are kept for reading. It has no effect on write throughput per shard.
+T: A hot shard is a partition-key problem: spread writes with a high-cardinality key; adding shards does not help when one key carries most of the traffic.
+
+@ Q002153 explain
+G: ## AWS Glue job bookmarks
+A **job bookmark** is state that AWS Glue keeps between runs of a job so it can process only new data.
+- For S3 sources, the bookmark remembers which objects were already processed (based on their paths and modification timestamps). The next run reads only files added since the last successful run.
+- Enable it with the job parameter `--job-bookmark-option job-bookmark-enable`. In the script, sources need a `transformation_ctx` name, and the run must end with `job.commit()` so the state is saved.
+- A bookmark can be paused or reset, for example to reprocess everything after a bug fix.
+## Example
+On Monday the prefix holds 1,000 files, and the job processes all of them. On Tuesday 40 new files arrive; with bookmarks enabled the job reads only those 40, so runtime tracks the daily volume instead of the total history.
+W: Job bookmarks: the job tracks what it has already processed and reads only new files, so runtime and cost stay proportional to each day's new data.
+X: B=Crawler before each run: a crawler updates table schemas and partitions in the Data Catalog. It does not tell the job which files it has already processed.
+C=S3 Versioning: versioning keeps older versions of overwritten objects. It does not stop the job from listing and reading every current object in the prefix.
+D=More DPUs: more capacity may make each run faster, but the job still reads all history, so the work and cost keep growing every day.
+T: Incremental processing in Glue means job bookmarks; more capacity only speeds up reprocessing data that did not need to be read again.
+
+@ Q002154 explain
+G: ## Why small files slow down Athena
+Athena reads data from S3 in parallel, and every file adds fixed overhead: listing it, opening it, reading its footer or metadata, and issuing S3 `GET` requests. With millions of 20 KB files, the engine spends most of its time on that overhead rather than on reading data.
+## The fix: fewer, larger, columnar files
+- **Compact** small files into larger files, commonly in the range of about 128 MB to 1 GB each, using a Glue or EMR job, an Athena `CTAS` or `INSERT INTO` query, or `OPTIMIZE` on Apache Iceberg tables.
+- Use **Parquet** with compression, so queries read only the needed columns and skip row groups using min/max statistics.
+- Fix the source: raise **buffering** in the ingestion layer (for example Firehose buffer size and interval) so fewer, larger files are written from the start.
+## Example
+Compacting a day of 50,000 small JSON files into 20 Parquet files cuts per-file overhead by thousands of times and lets Athena skip most of the bytes.
+W: Compaction plus upstream buffering: larger Parquet files remove per-file overhead and let Athena prune columns, and larger buffers stop the small-file problem from coming back.
+X: A=More columns per file: adding columns makes each row wider but does not reduce the number of files, which is the actual bottleneck.
+B=Uncompressed JSON: JSON is a row format with no column pruning, and removing compression increases the bytes scanned. Queries get slower and more expensive.
+C=Longer timeout: a longer timeout only lets slow queries run longer. It does not make them faster or cheaper.
+T: Millions of tiny files are an Athena anti-pattern: compact into large, compressed Parquet files and buffer more at ingestion, rather than tuning timeouts or formats that scan more.
+
+@ Q002155 explain
+G: ## Amazon MWAA
+Amazon Managed Workflows for Apache Airflow (MWAA) runs open-source Apache Airflow as a managed service. AWS operates the scheduler, workers, web server and metadata database, scales workers, and patches the environment.
+- You upload DAG files, a `requirements.txt` and plugins to an S3 bucket, and the environment picks them up.
+- Existing DAGs keep using the same Airflow operators, such as the Amazon provider operators for Glue jobs, EMR steps and Redshift SQL, so migration is mostly about matching the Airflow version and dependencies.
+- Access is controlled with IAM, and the environment runs in your VPC.
+## Example
+A team copies its 150 DAG files to `s3://mwaa-dags/dags/`, pins the same provider versions in `requirements.txt`, and gives the execution role permission to start Glue, EMR and Redshift work. The DAGs run largely unchanged.
+W: MWAA: it is managed Airflow, so the existing 150 DAGs can run with little or no rewriting while AWS takes over the servers.
+X: A=EventBridge Scheduler with Lambda: it schedules single targets on a timetable but has no DAG dependencies, retries across tasks or backfills. All 150 workflows would have to be rebuilt as custom code.
+B=Glue workflows only: Glue workflows orchestrate Glue jobs, crawlers and triggers. They are not built to run existing Airflow DAGs and would require a rewrite of each workflow.
+D=Step Functions rewrite: Step Functions is a capable orchestrator, but converting 150 DAGs into state machines is exactly the large rewrite the team wants to avoid.
+T: Existing Airflow DAGs plus "managed, minimal rewrite" points to MWAA; other orchestrators mean rebuilding every workflow.
+
+@ Q002156 explain
+G: ## Change data capture with AWS DMS
+AWS Database Migration Service (DMS) moves data from a source database to a target such as S3. A task can run in three modes: full load, CDC only, or **full load and ongoing replication**.
+- The **full load** copies existing tables once.
+- **Change data capture (CDC)** then reads the database's transaction log instead of querying tables. For MySQL that is the binary log, which must use `binlog_format=ROW`.
+- Every insert, update and delete is written to S3 within seconds to minutes. For S3 targets, DMS can add an operation column (`I`, `U`, `D`) so downstream jobs know how to apply each change.
+## Example
+The `orders` table is copied once to `s3://lake/raw/orders/`. After that, an update to order 42 appears as a new file row with `Op=U` shortly after the commit, without any repeated full exports.
+W: DMS full load plus CDC: it seeds the lake once and then streams inserts, updates and deletes from the binary log with low latency, putting almost no query load on the source.
+X: A=Glue crawler: a crawler reads schemas to create Data Catalog tables. It does not copy data or capture changes.
+B=AppFlow: Amazon AppFlow moves data from SaaS applications such as Salesforce or ServiceNow. It is not a change data capture tool for an on-premises MySQL database.
+C=Nightly mysqldump: a nightly full export is exactly the repeated full export that loads the source, and a daily copy cannot deliver changes within minutes or clearly show deletes.
+T: Minutes-level inserts, updates and deletes from a relational database without full exports is DMS full load plus CDC from the transaction log.
+
+@ Q002157 explain
+G: ## How Redshift distributes rows
+Amazon Redshift spreads each table's rows across node slices according to its **distribution style**:
+- **KEY**: rows are placed by a hash of one column, so equal values of that column always land on the same slice.
+- **EVEN**: rows are spread round-robin, ignoring values.
+- **ALL**: a full copy of the table is stored on every node; good for small dimension tables only.
+- **AUTO**: Redshift chooses and adjusts the style.
+## Why joins redistribute
+To join two tables, matching rows must sit on the same slice. If they do not, Redshift moves data during the query, shown in `EXPLAIN` as steps like `DS_DIST_BOTH` or `DS_BCAST_INNER`. When both tables use `DISTKEY(order_id)`, every order and its items share a slice, and the plan shows `DS_DIST_NONE`: no data movement.
+W: KEY distribution on order_id for both tables: rows with the same `order_id` are colocated, so the frequent join runs locally on each slice without redistributing data across nodes.
+X: A=More sort keys: sort keys order rows within each slice to help range filters and merge joins. They do not change which node a row lives on, so redistribution continues.
+C=DISTSTYLE ALL on both: copying two large tables to every node multiplies storage and slows loads; ALL is meant for small dimension tables.
+D=EVEN on both: round-robin placement ignores `order_id`, so matching rows are scattered and every join still has to move data.
+T: For two large tables joined on the same column, give both a KEY distribution on that column; sort keys, EVEN or ALL do not colocate large joins.
+
+@ Q002158 explain
+G: ## Open table formats
+Plain files in S3 cannot be changed row by row: deleting one customer means rewriting whole files, and readers may see half-finished rewrites. **Apache Iceberg** is a table format that adds a metadata layer on top of Parquet files.
+- **ACID transactions**: each write creates a new **snapshot** atomically, so readers never see partial changes.
+- **Row-level operations**: `DELETE FROM customers_events WHERE customer_id = 'c-981'` and `MERGE INTO` work directly in Athena and in Glue (Spark).
+- **Time travel**: queries such as `FOR TIMESTAMP AS OF` read the table as it was at an earlier snapshot, which supports audits.
+## GDPR note
+Older snapshots still reference the deleted rows. To remove them physically, expire old snapshots and clean up unreferenced files (for example `VACUUM` in Athena) within the retention window, while keeping enough history for audit needs.
+W: Apache Iceberg tables: they provide ACID row-level deletes that satisfy erasure requests, plus snapshot-based time travel for audits, with native support in Athena and Glue.
+X: A=JSON with Object Lock: Object Lock prevents deletion or overwriting for a retention period, which directly conflicts with the requirement to erase a customer's data.
+C=Plain Parquet by date: deleting one customer means finding and rewriting every affected file with custom code, with no transactions and no time travel.
+D=CSV with a manifest: a manifest lists files but gives no ACID guarantees, row-level deletes or snapshots, and CSV is slow to scan.
+T: Row-level deletes with ACID and time travel on S3 require an open table format such as Iceberg; plain files and Object Lock cannot do both.
+
+@ Q002159 explain
+G: ## How a Glue crawler decides on tables
+A crawler scans files under an S3 path, infers a schema for each group of files and writes tables to the Data Catalog. By default, when files in sibling folders have schemas that look different enough, it can decide they are different datasets and create a separate table per folder, sometimes hundreds of them.
+## Combining compatible schemas
+The crawler setting **Create a single schema for each S3 path** (in the API, the configuration `{"Version":1.0,"Grouping":{"TableGroupingPolicy":"CombineCompatibleSchemas"}}`) tells it to merge compatible schemas into one table for the include path.
+- Columns that exist only in some files are added to the combined schema; files without them return `NULL` for those columns.
+- Folder levels under the path become partitions of that one table instead of separate tables.
+## Example
+Files in `s3://logs/app/2026/09/28/` have 12 columns and some in `.../29/` have 13. With grouping enabled the crawler creates one table `app` with 13 columns and date partitions.
+W: Combine compatible schemas per S3 path: the crawler merges slightly different column sets into one table, which is how the data should be modeled.
+X: B=Delete files with extra columns: it loses real log data just to satisfy the crawler, and the problem returns the next time a new column appears.
+C=Run more frequently: each run applies the same logic and creates the same separate tables, only more often.
+D=Different Region: crawler behavior is the same in every Region; the table-grouping decision depends on settings and schemas, not location.
+T: When a crawler splits one dataset into many tables because of small schema differences, enable schema grouping for the path instead of changing the data or the schedule.
+
+@ Q002160 explain
+G: ## Redshift Spectrum
+Redshift Spectrum lets a Redshift cluster or Serverless workgroup query data that stays in S3, without loading it.
+- You create an **external schema** that points to a database in the AWS Glue Data Catalog, for example `CREATE EXTERNAL SCHEMA history FROM DATA CATALOG DATABASE 'sales_history' IAM_ROLE '...'`.
+- External tables (Parquet, ORC, CSV and more) can be queried and joined with local Redshift tables in the same SQL.
+- The scan is done by a separate Spectrum layer, and cost depends on the data scanned, so columnar Parquet and partitioning (for example by year) keep it cheap.
+## Tiered warehouse pattern
+Keep recent, frequently used data (2 years) in local Redshift storage for speed, and leave older history (8 years) in S3. An analyst can run `SELECT ... FROM sales_local UNION ALL SELECT ... FROM history.sales_old` when they occasionally need the full range.
+W: Spectrum external tables: the 8 years of Parquet in S3 become queryable from Redshift, and joinable with hot data, without paying to load and store it in the cluster.
+X: B=CSV for Excel: exporting data to spreadsheets does not give analysts access to the S3 history, and Excel cannot handle warehouse-scale data.
+C=Quarterly COPY of all history: loading everything is exactly the expense the team wants to avoid, and repeated full loads also waste time.
+D=Move to DynamoDB: DynamoDB is a key-value database without joins or large analytical scans; it is not a replacement for a data warehouse.
+T: Keep hot data in Redshift and query cold history in S3 with Spectrum instead of loading it all into the cluster.
+
+@ Q002161 explain
+G: ## AWS Glue Schema Registry
+The Glue Schema Registry stores versioned schemas (Apache Avro, JSON Schema or Protobuf) for streaming data and enforces **compatibility rules** between versions. It works with Apache Kafka clients (including Amazon MSK), Kinesis Data Streams and other integrations.
+- Producers use the registry **serializer**. Before sending, it checks the record's schema against the registry; a new version is accepted only if it passes the compatibility mode.
+- Modes include `BACKWARD` (new readers can read old data, such as adding an optional field), `FORWARD`, `FULL`, their `_ALL` variants, and `NONE`.
+- Consumers use the **deserializer**, which fetches the right schema version by the ID embedded in each message.
+## Example
+With `BACKWARD` compatibility, a producer that adds a new field without a default value or changes a type from `int` to `string` gets an error at produce time instead of breaking downstream consumers.
+W: Glue Schema Registry with a compatibility mode: incompatible schema versions are rejected when the producer serializes, so breaking changes are blocked before they reach the topic.
+X: A=More retention: longer retention keeps messages longer; it does not check or block schema changes.
+B=Single partition: the number of partitions affects parallelism and ordering, not schema validation, and one partition would also limit throughput.
+C=Wiki documentation: documentation is not enforced. A producer can still publish an incompatible change and break consumers.
+T: To block breaking changes at produce time, validate with a schema registry and compatibility rules; retention, partitions and documentation enforce nothing.
+
+@ Q002162 explain
+G: ## Athena workgroups
+An Athena **workgroup** separates users, teams or applications that share Athena, and carries its own settings.
+- **Per-query data usage control**: a limit on bytes scanned per query. A query that exceeds it is cancelled, which caps the cost of any one query.
+- **Workgroup-wide data usage controls**: thresholds on total data scanned per period (for example per hour or per day) that trigger CloudWatch alarms and SNS notifications.
+- A separate **query result location** and encryption settings per workgroup, which can be enforced so users cannot override them.
+- CloudWatch metrics per workgroup and tags for cost allocation.
+## Example
+The analytics team is placed in workgroup `adhoc` with a 1 TB per-query limit. A careless `SELECT *` over the whole data lake is cancelled after scanning 1 TB instead of running on to tens of terabytes. IAM policies limit each team to its own workgroup.
+W: Workgroups with data usage limits: per-query scan limits stop runaway queries, workgroup-wide thresholds alert on overall usage, and separate result locations keep teams isolated and costs attributable.
+X: B=Requester Pays: it shifts S3 request and transfer charges to the requester's account. It does not limit how much data an Athena query scans.
+C=Delete IAM users: removing the team's access stops their work entirely and does not create any lasting cost control for the other teams.
+D=Convert to JSON: JSON is a row format without column pruning, so queries would scan more data and cost more.
+T: Athena costs are controlled per team with workgroups and data usage limits, not by changing data formats or S3 billing settings.
+
+@ Q002163 explain
+G: ## AWS Glue Data Quality
+Glue Data Quality checks data with rules written in **DQDL** (Data Quality Definition Language). In a Glue ETL job you add the **Evaluate Data Quality** transform before the load step.
+- `Completeness "customer_id" >= 0.99` passes only if at least 99% of rows have a non-null `customer_id`.
+- `ColumnValues "order_total" >= 0` checks that no totals are negative.
+- The transform can be configured to **fail the job** when rules fail, so the write to the warehouse never runs. Results are also published to CloudWatch and EventBridge for alerting.
+## Example
+A daily file has 2% null `customer_id`. The completeness rule fails, the job stops before its Redshift write, and an EventBridge rule notifies the on-call engineer, so bad data never reaches the warehouse.
+W: Glue Data Quality rules that fail the job: DQDL rules express both thresholds exactly and stop the pipeline automatically before loading.
+X: A=Rely on Redshift: Redshift enforces `NOT NULL` only if the column is defined that way, and then rejects any null rather than applying a 1% threshold. It has no check constraints for negative totals.
+C=More DPUs: DPUs add processing capacity; they do not validate data.
+D=Manual morning checks: manual checks are slow and error-prone, and by the time someone looks the bad data has already been loaded.
+T: Automated data-quality gates belong in the pipeline: Glue Data Quality rules that fail the job before load, not database defaults or manual review.
+
+@ Q002164 explain
+G: ## Materialized views in Redshift
+A **materialized view** stores the precomputed result of a query. Dashboards read the stored result instead of rerunning expensive joins and aggregations over large tables.
+- `CREATE MATERIALIZED VIEW sales_summary AUTO REFRESH YES AS SELECT ...` asks Redshift to refresh it automatically when base tables change. Where possible the refresh is **incremental**, processing only changed rows.
+- Redshift can also use **automatic query rewrite** to answer matching queries from a materialized view.
+## Why it fits here
+The aggregation runs every few minutes but the data changes only hourly, so the same work is repeated about a dozen times per hour. With a materialized view, the heavy work happens once per data change, and each dashboard query becomes a fast read of a small stored result, typically in well under a second instead of 40.
+W: Auto-refreshed materialized view: the expensive aggregation is computed once per data change, and the dashboard reads the precomputed result, cutting query time dramatically.
+X: B=Faster dashboard refresh: running the 40-second query more often adds load to the cluster and makes nothing faster.
+C=DISTSTYLE ALL on the fact table: copying a large fact table to every node wastes storage and slows loads, and it does not avoid recomputing the aggregation.
+D=Disable result caching: the result cache can already serve repeated identical queries when data has not changed; disabling it only makes things slower.
+T: Repeated heavy aggregations over data that changes rarely should be precomputed with a materialized view, not rerun or tuned with distribution styles.
+
+@ Q002165 explain
+G: ## Data skew in Spark joins
+During a shuffle join, Spark sends all rows with the same join key to the same task. If one key holds 30% of the rows, one task receives 30% of the data while hundreds of others get almost nothing. That task runs slowly and its executor may run out of memory.
+## Ways to fix skew
+- **Salting**: add a random suffix (for example 0-19) to the hot key on the large side and replicate the matching rows on the other side 20 times, so the hot key is split over 20 tasks.
+- **Adaptive query execution (AQE)** in Spark 3: with `spark.sql.adaptive.skewJoin.enabled` (on by default together with `spark.sql.adaptive.enabled` since Spark 3.2, and enabled on current Amazon EMR releases), Spark detects oversized shuffle partitions at run time and splits them.
+- **Broadcast join**: if one side is small enough, `broadcast(dim_df)` sends a full copy to every executor, so the large side is never shuffled and the skew disappears.
+W: Salting, AQE skew-join or broadcast: each technique spreads or removes the concentrated key, so no single task has to process 30% of the data.
+X: A=More output files: the number of files written after the join does not change how rows are distributed during the join shuffle.
+B=Switch to CSV: CSV is larger and slower to parse than columnar formats, and the skewed key still goes to one task.
+D=More executors of the same size: all rows of the hot key still go to one task on one executor; extra executors stay idle while that one still runs out of memory.
+T: A few failing tasks and one dominant key mean data skew: salt the key, let AQE split skewed partitions, or broadcast the small side; more executors do not help.
+
+@ Q002166 explain
+G: ## Tag-based access control in Lake Formation
+**LF-Tags** are key-value labels such as `classification=pii` or `classification=public` that you attach to databases, tables and individual columns in the Data Catalog. Permissions are then granted on **tag expressions**, not on named tables.
+- Grant analysts `SELECT` where `classification=public`. Columns tagged `pii` are never returned, on every current and future table that uses the tags.
+- New tables are governed as soon as they are tagged, so hundreds of tables need no per-table grants.
+## Row-level security with data filters
+A Lake Formation **data filter** combines a row filter expression, such as `region = 'EU'`, with column rules. Analysts in the EU unit are granted the filter, so Athena, Redshift Spectrum or EMR return only EU rows.
+## Example
+Adding the tag `classification=pii` to a new column `email` hides it from all analysts immediately, without editing any policy.
+W: LF-Tags with row-level data filters: tags hide PII columns by classification across all tables, and data filters restrict each unit to its own region's rows, all enforced centrally by Lake Formation.
+X: A=Copies per region: duplicating every table per region multiplies storage and pipelines, copies can drift out of sync, and it still does not hide PII columns.
+B=IAM policies with column names: IAM policies grant access to S3 objects and API actions, not to columns inside a table, and listing names per table does not scale to hundreds of tables.
+D=Bucket policies per prefix: they control access to whole objects, so they cannot filter rows or hide columns inside a file.
+T: Classification-based column control at scale is LF-Tags, and row control is Lake Formation data filters; IAM and bucket policies work on objects, not rows and columns.
+
+@ Q002167 explain
+G: ## Redshift dynamic data masking
+**Dynamic data masking (DDM)** changes what a query returns based on who runs it, while the stored data stays unchanged.
+- A **masking policy** is a SQL expression, for example `CREATE MASKING POLICY mask_card WITH (card_no VARCHAR(16)) USING ('XXXX-XXXX-XXXX-' || SUBSTRING(card_no, 13, 4))`.
+- The policy is attached to a column for a role or user: `ATTACH MASKING POLICY mask_card ON payments(card_no) TO ROLE support_role PRIORITY 10`.
+- A role with no masking policy on that column, or one attached with a pass-through policy, sees the real value.
+## Example
+Support staff running `SELECT card_no FROM payments` see `XXXX-XXXX-XXXX-4821`; the fraud team runs the same query on the same table and sees the full number. There is one table and no copy to maintain.
+W: Dynamic data masking attached to roles: the same column returns the last four digits for support and full values for the fraud team, applied at query time with no extra tables.
+X: B=Shared encryption key: if everyone holds the key, everyone can decrypt the full numbers, so nothing is actually restricted.
+C=Concurrency scaling: it adds temporary cluster capacity for bursts of queries; it has nothing to do with what values users can see.
+D=Nightly masked copy: it creates the separate table the requirement rules out, doubles storage and is up to a day out of date.
+T: Different views of the same column for different roles is dynamic data masking; encryption with a shared key or masked copies do not meet the requirement.
+
+@ Q002168 explain
+G: ## Redshift data sharing
+Redshift data sharing lets a **producer** share live data with **consumers** without copying it. Consumers query it using their own compute, and the results reflect the producer's latest committed data.
+- The producer creates a **datashare**, adds schemas, tables or views, and grants it to consumer account IDs.
+- For cross-account sharing, the producer account authorizes the share, and each consumer account associates it with its cluster or Serverless namespace.
+- The consumer runs `CREATE DATABASE sales_shared FROM DATASHARE ...` and queries it like a local, read-only database. Provisioned clusters must use RA3 node types; Redshift Serverless is supported.
+## Why it fits
+Each business unit pays for and scales its own compute, the producer's workload is isolated from their queries, and there is one copy of the data with no pipelines to keep in sync.
+W: Cross-account data sharing: business units in other accounts get live, read-only access with their own compute, and no data is copied.
+X: A=Shared admin password: it gives full write and admin access to the producer cluster, uses the producer's compute, and violates least privilege.
+B=DMS replication: it creates and maintains full copies in each account with replication lag and extra cost, which is the copying the requirement rules out.
+D=Nightly UNLOAD and COPY: data is up to a day old, copied three times, and requires pipelines to maintain.
+T: Live, read-only, cross-account access with separate compute and no copies is Redshift data sharing.
+
+@ Q002169 explain
+G: ## Glue security configurations
+A **security configuration** in AWS Glue is a named set of encryption settings that you attach to jobs and crawlers. It covers three places data can end up:
+- **S3 encryption**: data the job writes to S3 using SSE-KMS with a chosen key (SSE-S3 is also possible).
+- **CloudWatch Logs encryption**: the job's log output encrypted with a KMS key.
+- **Job bookmark encryption**: the bookmark state encrypted with client-side KMS encryption.
+## Example
+You create `sc-kms-cmk` with the customer managed key `arn:aws:kms:eu-west-1:111122223333:key/...` for all three settings and attach it to every ETL job. The job's IAM role needs permission to use the key, and the log group needs the key's policy to allow CloudWatch Logs.
+W: Glue security configuration with KMS keys: one attached configuration makes the job encrypt its S3 output, logs and bookmarks with customer managed keys, covering all three requirements.
+X: A=SSL on the connection: SSL protects data in transit between Glue and a database. It does not encrypt data at rest in S3, logs or bookmarks.
+B=IAM deny on Glue: denying Glue blocks the jobs entirely rather than making them encrypt with the right keys.
+C=Default bucket encryption only: it may cover the S3 objects, but it does nothing for CloudWatch Logs or job bookmarks, and a job can still specify a different encryption setting.
+T: Encrypting everything a Glue job writes (S3, logs, bookmarks) with your own KMS keys is done with a security configuration attached to the job.
+
+@ Q003687 explain
+G: ## Streams versus queues and topics
+**Amazon Kinesis Data Streams** stores records in an ordered, replayable log split into shards.
+- **Retention** defaults to 24 hours and can be extended up to 365 days, so seven days (168 hours) is a simple setting.
+- **Multiple consumers** read the same records independently, each keeping its own position. With **enhanced fan-out**, each registered consumer gets its own 2 MB/s per shard.
+- Records are available to consumers within about a second of being written.
+## How the alternatives behave
+- An SQS queue delivers each message to one consumer, which then deletes it; separate teams would each need their own queue.
+- An SNS topic pushes messages to subscribers immediately and keeps no history to reread.
+## Example
+A real-time dashboard, a fraud detector and a Firehose delivery to S3 all read the same click stream, and a new consumer added on Friday can still replay Monday's events.
+W: Kinesis Data Streams: it ingests in real time, keeps data for a configurable retention period such as seven days, and lets several consumers read the same events independently.
+X: A=SQS standard queue: each message is processed by one consumer and deleted, so several consumers cannot each read every event from one queue.
+C=Snowball Edge: it is a physical device for offline bulk data transfer, not a real-time ingestion service.
+D=SNS standard topic: it fans out messages as they arrive but stores nothing, so consumers cannot reread events over seven days.
+T: Real-time ingestion with days of retention and independent replayable consumers is Kinesis Data Streams; queues delete on consume and topics keep no history.

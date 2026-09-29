@@ -1,0 +1,337 @@
+# DEA-C01 detailed explanations, batch e13 (explanation-only rewrites; letters are the published ones)
+
+@ Q003788 explain
+G: ## What data lineage is
+Data lineage is a record of where a dataset came from and every step that changed it on the way. It answers questions such as "which source tables feed this report?" and "which job added this column?".
+- **Upstream**: the sources (for example an RDS table and a CSV drop in S3).
+- **Transformations**: the jobs and queries in between (a Glue job that joins and filters, a Redshift view that aggregates).
+- **Downstream**: the datasets and dashboards that consume the result.
+## Where it lives
+Lineage is most useful when it is stored centrally, next to the dataset's catalog entry, so anyone who finds the table also sees its history. Amazon DataZone (SageMaker Catalog) can capture and display lineage graphs, including OpenLineage-compatible events emitted by pipeline tools.
+Example: an analyst doubts a revenue figure, opens the `sales_daily` table in the catalog and follows the graph back to the `orders` source and the Glue job that deduplicated it.
+W: Lineage in a catalog or governance tool: it records sources, transformations and consumers in a shared, searchable place, so the history is traceable by anyone and survives staff changes.
+X: A=Output file name only: a name such as `sales_clean.parquet` hints at content but says nothing about which inputs were used or which transformation steps ran.
+B=Last-modified date: a timestamp tells you when something changed, not what the sources were or what logic was applied, so it cannot support an audit or impact analysis.
+C=Comment in a local notebook: the note sits on one engineer's machine, is not discoverable by others, is not tied to the dataset, and is lost or stale as soon as the pipeline changes.
+T: Provenance must be captured as lineage in a shared catalog, not implied by file names, timestamps or private notes.
+
+@ Q003789 explain
+G: ## How AWS Glue jobs get credentials
+A Glue job does not store keys. When you create the job you choose an **IAM role** (a service role that trusts `glue.amazonaws.com`). At run time Glue assumes that role and the job code receives short-lived temporary credentials that rotate automatically.
+## Scoping the role
+The role's policy should allow only what the job needs:
+- `s3:ListBucket` on the source bucket (`arn:aws:s3:::raw-bucket`) and `s3:GetObject` on its objects (`arn:aws:s3:::raw-bucket/*`).
+- `s3:PutObject` on the target prefix, for example `arn:aws:s3:::curated-bucket/sales/*`.
+- If the buckets use SSE-KMS, `kms:Decrypt` / `kms:GenerateDataKey` on the relevant keys.
+Every call the job makes is logged in CloudTrail under the role's identity, so access is auditable.
+W: IAM role for the Glue job: Glue assumes the role and hands the job temporary, automatically rotated credentials limited to the two buckets, with nothing secret stored in the script.
+X: B=Hard-coded access keys: long-term keys in a script end up in source control, logs and copies of the script, never rotate on their own, and anyone who can read the script can reuse them.
+C=Public bucket policy: making the bucket public removes authentication for everyone on the internet, not just the job, and exposes the data; S3 Block Public Access exists to prevent exactly this.
+D=Root credentials as parameters: the root user has unrestricted access to the whole account and should never be used for workloads; job parameters are also visible to anyone who can view the job run.
+T: AWS services such as Glue authenticate with an assumed IAM role and scoped temporary credentials, never with stored keys or public access.
+
+@ Q003790 explain
+G: ## Glue connections and AWS Secrets Manager
+A **Glue connection** stores how to reach a data store: JDBC URL, VPC subnet and security group, and credentials. Instead of typing the username and password into the connection, you can point it at a secret in **AWS Secrets Manager**.
+- The secret holds a JSON value such as `{"username":"etl_user","password":"..."}`, encrypted with KMS.
+- The Glue job's IAM role needs `secretsmanager:GetSecretValue` on that secret (and decrypt permission on its KMS key if a customer managed key is used).
+- Secrets Manager can rotate RDS passwords on a schedule; the job always reads the current value, so no code changes are needed after rotation.
+Example: the `orders-rds` connection references the secret `prod/orders/etl`; when the password rotates every 30 days, the nightly job keeps working.
+W: Secrets Manager referenced by the connection: the password is encrypted, access to it is controlled by IAM and logged in CloudTrail, and it can be rotated without touching the job.
+X: A=Job description field: descriptions are plain metadata shown to anyone who can view the job in the console or API, and the job cannot read credentials from it anyway.
+C=Plain text in the script: the password is exposed to everyone who can read the script location or its copies, and every rotation requires editing and redeploying the code.
+D=CSV in the input bucket: a data bucket is not a secret store; the file is readable by anything with bucket access, may be picked up by crawlers or jobs as data, and has no rotation.
+T: Database credentials for Glue belong in Secrets Manager and are read through the job's role, never in scripts, descriptions or data files.
+
+@ Q003791 explain
+G: ## Federated access to Amazon Redshift
+Federation lets people sign in with their corporate identity (for example Microsoft Entra ID or Okta) instead of separate database passwords.
+- With **IAM Identity Center** integration, users sign in once and their directory groups are mapped to Redshift **roles**; permissions are granted to those roles with `GRANT ... TO ROLE`.
+- With **SAML/IAM federation**, the identity provider passes group information and Redshift issues temporary database credentials (for example through `GetClusterCredentials`), optionally auto-creating the user and adding it to groups.
+## Why this matters
+Joining or leaving a directory group automatically changes what the analyst can query. There are no long-lived database passwords to distribute, and every query is attributed to the individual person.
+Example: members of the `finance-analysts` directory group get the Redshift role `finance_read`, which can `SELECT` only from the `finance` schema.
+W: Federation with group-to-role mapping: analysts use their corporate sign-in, get temporary credentials, and receive exactly the permissions of their groups, managed in one place.
+X: A=Superuser for everyone: superusers bypass all permission checks, so every analyst could read and change any data; this is the opposite of least privilege.
+C=One shared database user: a shared password cannot be revoked for a single leaver, and audit logs show only the shared user, so actions cannot be traced to a person.
+D=Emailed yearly passwords: email is not a secure channel, the passwords are long-lived, and access does not follow group membership changes during the year.
+T: Map corporate groups to Redshift roles through federation; never hand out shared, broad or emailed database credentials.
+
+@ Q003792 explain
+G: ## What AWS Lake Formation adds to a data lake
+Data in S3 is organized into databases and tables in the Glue Data Catalog. **Lake Formation** lets you grant permissions on those catalog objects instead of on buckets and objects:
+- `SELECT` on a table, or on specific columns only (for example everything except `ssn`).
+- Row filters and cell-level filters through data filters.
+- Grants to IAM users and roles, IAM Identity Center users and groups, or other AWS accounts.
+Integrated engines such as Athena, Redshift Spectrum, EMR and Glue check these permissions and receive temporary, scoped credentials to read only the permitted data.
+## Why not bucket policies
+Bucket policies and ACLs work on object paths. They cannot say "this role may read the `orders` table but not the `card_number` column", because a column lives inside every file.
+W: Lake Formation permissions: grants are made centrally on databases, tables and columns in the catalog and enforced by the query engines, which bucket-level controls cannot express.
+X: A=Per-object ACLs: ACLs grant access to whole objects, cannot hide columns inside a file, and are now disabled by default (Object Ownership: bucket owner enforced) because they are hard to manage at scale.
+C=Route 53 private hosted zones: they resolve DNS names inside VPCs; they control name lookup, not who may read which table or column.
+D=EC2 security groups: they filter network traffic to instances and network interfaces by port and source; they have no notion of tables, columns or users' data permissions.
+T: Table- and column-level data lake access is granted centrally in Lake Formation, not in S3 bucket policies or ACLs.
+
+@ Q003793 explain
+G: ## Row-level security with Lake Formation data filters
+A **data filter** in Lake Formation is a named rule attached to one table. It can include:
+- A **row filter expression**, for example `region = 'EU'`.
+- A column list (include or exclude), which combined with a row filter gives cell-level security.
+You grant `SELECT` on the data filter, rather than on the whole table, to a principal. When that principal queries the table through Athena, Redshift Spectrum, EMR or Glue, only the matching rows come back, whatever SQL they write.
+Example: filter `eu_rows` (`region = 'EU'`) is granted to the EU analyst role and `us_rows` (`region = 'US'`) to the US role. Both teams query the same `sales` table in the same S3 location.
+W: Lake Formation data filters: the row condition is enforced by the service for each principal, so analysts cannot see other regions' rows even if they try, and there is only one copy of the data.
+X: A=Ask analysts to add a WHERE clause: a voluntary filter is not a control; anyone can omit it and read every region's rows.
+B=Separate bucket per region: copying the data multiplies storage and pipelines, the copies drift out of sync, and each copy needs its own permissions to maintain.
+C=Masking the region column: hiding a column changes which values are shown, not which rows are returned; analysts would still see every region's records, just without the label.
+T: Restrict rows with an enforced row filter (Lake Formation data filters), not with user discipline, copies or column masking.
+
+@ Q003794 explain
+G: ## Lake Formation tag-based access control (LF-TBAC)
+With named-resource grants you grant each principal on each table, so grants grow as users times tables. LF-TBAC replaces that with attributes:
+- Define **LF-Tags**, which are keys with allowed values, for example `department = sales | finance` and `sensitivity = public | confidential`.
+- Assign tags to databases, tables or columns. Tables inherit their database's tags, and columns inherit their table's.
+- Grant permissions on **tag expressions**, for example `SELECT` on everything where `department = sales` and `sensitivity = public`, to the sales analyst role.
+When a new table is created and tagged `department = sales`, the sales analysts can query it immediately without any new grant.
+W: LF-TBAC: permissions follow tags, so a small number of tag-based grants covers thousands of tables and new data is governed as soon as it is tagged.
+X: A=Individual grants per user and table: the number of grants explodes as users and tables grow, and every new table or new hire needs manual work, which leads to mistakes.
+B=Public tables: granting everyone read access ignores department and sensitivity entirely and exposes confidential data.
+D=One shared admin role: everyone gets full access and actions cannot be attributed to individuals, which breaks least privilege and auditing.
+T: To manage data lake access at scale by attributes, tag resources with LF-Tags and grant on tag expressions.
+
+@ Q003795 explain
+G: ## Column-level controls in Amazon Redshift
+Redshift has two features that limit what analysts see at column level:
+- **Column-level privileges**: `GRANT SELECT (order_id, amount) ON sales TO ROLE analyst;` lets the role read only the listed columns. A query that selects another column fails with a permission error.
+- **Dynamic data masking (DDM)**: a masking policy, created with `CREATE MASKING POLICY` and attached with `ATTACH MASKING POLICY` to a column for specific users or roles, rewrites the value at query time, for example returning `XXXX-XXXX-XXXX-1234`. Other roles can still see the real value.
+Physical design settings such as sort keys and distribution keys only decide how data is stored and moved between nodes; they never check who is querying.
+W: D=Dynamic data masking: masking policies control what values of a column each role sees at query time, so sensitive columns can be hidden or partially revealed without copying data.
+E=Column-level GRANT: privileges on named columns decide which columns a user or role may query at all.
+X: A=Automatic table optimization: it lets Redshift choose sort and distribution keys based on workload to improve performance; it has no effect on permissions.
+B=Sort keys: they order data on disk so range filters skip blocks; every user with table access still reads every column.
+C=DISTKEY: it decides how rows are spread across compute nodes to reduce data movement in joins; it does not restrict access.
+T: Restrict Redshift columns with column-level grants and dynamic data masking; sort keys, distribution keys and table optimization are performance settings only.
+
+@ Q003796 explain
+G: ## S3 server-side encryption options
+- **SSE-S3**: S3 encrypts with keys it fully manages. It is on by default for new objects, but you have no key policy, cannot disable or schedule deletion of the key, and individual key usage does not appear in CloudTrail.
+- **SSE-KMS with an AWS managed key** (`aws/s3`): KMS logs its use, but you cannot edit its key policy.
+- **SSE-KMS with a customer managed key**: you create the key in AWS KMS and control its key policy (who may encrypt or decrypt), rotation, and whether it is enabled. Every `GenerateDataKey` and `Decrypt` call is recorded in CloudTrail.
+Example: the key policy lets only the `analytics-reader` role decrypt. Even a user with `s3:GetObject` is denied the object without KMS permission, and each read shows up as a `Decrypt` event.
+W: SSE-KMS with a customer managed key: the company controls the key through its key policy, enabling and rotation, and every use of the key is logged in CloudTrail.
+X: A=SSE-S3: the data is encrypted, but S3 owns and manages the keys, so the company cannot restrict or revoke key use, and key usage is not logged per request.
+C=No encryption with versioning: versioning keeps older copies of objects for recovery; it does not encrypt anything.
+D=Base64 on the client: base64 is a reversible encoding that anyone can decode without a key, so it gives no confidentiality.
+T: Company-controlled keys with an audit trail mean SSE-KMS with a customer managed key; SSE-S3 encrypts but gives no key control or usage logging.
+
+@ Q003797 explain
+G: ## Why SSE-KMS can be expensive at high volume
+With SSE-KMS, S3 normally calls AWS KMS for each object: `GenerateDataKey` on upload and `Decrypt` on download. Millions of objects mean millions of KMS requests, which cost money and can hit KMS request-rate quotas.
+## How S3 Bucket Keys help
+With **S3 Bucket Keys** enabled, S3 asks KMS for a short-lived bucket-level key and uses it to generate data keys for many objects locally, instead of calling KMS every time.
+- AWS states KMS request costs can drop by up to 99%.
+- Objects are still protected by your KMS key, and key policies still apply.
+- CloudTrail shows fewer KMS events, and the encryption context is the bucket ARN rather than each object ARN.
+You enable it in the bucket's default encryption setting or per `PutObject`/`CopyObject` request.
+W: S3 Bucket Keys: a bucket-level key generated from the KMS key creates object data keys inside S3, cutting the number of KMS calls and their cost.
+X: B=S3 Select: it retrieves a subset of data from inside a single object with SQL (and is no longer offered to new customers); each read of an encrypted object still needs KMS to decrypt it.
+C=S3 Object Lock: it stores objects in a write-once-read-many mode to block deletion or overwrite for a retention period; it does not change how keys are requested.
+D=S3 Access Points: they give named endpoints with their own access policies for shared buckets; requests through them still call KMS per object.
+T: To reduce SSE-KMS request volume and cost, enable S3 Bucket Keys; access and retention features do not touch KMS calls.
+
+@ Q003798 explain
+G: ## Masking sensitive values
+Masking shows only part of a value, or a substitute, to people who do not need the real one.
+- **Dynamic data masking** in Redshift applies at query time. A masking policy attached to `card_number` for the `analyst` role returns `XXXX-XXXX-XXXX-1234`, while the fraud team's role sees the full number. The stored data is unchanged.
+- **Masking transforms** in a pipeline (for example the AWS Glue sensitive data detection transform or AWS Glue DataBrew recipes) replace or partially redact values before the data reaches the analytics layer.
+## Masking versus encryption
+Encryption protects data at rest or in transit, but whoever holds the key sees the whole value. Masking is about what an authorized user sees in results.
+W: Dynamic data masking or masking transforms: analysts get the last four digits they need while the full card number is never revealed to them, in results or in the data they can reach.
+X: A=Encrypt and give analysts the key: with the key, analysts can decrypt and see the full card number, so nothing is hidden from them.
+B=Separate public bucket: public access exposes the full card numbers to anyone on the internet, a far worse outcome, and it would breach PCI DSS requirements.
+D=Rename the column: a new name is only obscurity; the full numbers are still returned to anyone who queries the column.
+T: To show only part of a sensitive value, mask it (dynamically or in the pipeline); encryption with a shared key or renaming reveals the full value.
+
+@ Q003799 explain
+G: ## Encrypting client connections to Redshift
+Redshift supports TLS for JDBC/ODBC connections, but a client can still try to connect without it unless the cluster refuses. The **`require_ssl`** parameter in the cluster's parameter group makes the cluster reject any connection that is not encrypted.
+- Set `require_ssl = true` in a custom parameter group and associate it with the cluster. Default parameter groups cannot be edited; since early 2025, new clusters that use the default parameter group already have `require_ssl` set to true.
+- For Redshift Serverless there is no parameter group; `require_ssl` is set as a configuration parameter of the workgroup.
+- Clients connect with `sslmode=require` or stronger, for example `verify-full`, which also validates the server certificate.
+Example: a BI tool configured without SSL gets a connection error, which prompts the team to fix the driver setting instead of silently sending data in clear text.
+W: require_ssl = true: the cluster itself enforces TLS on every client connection, so unencrypted sessions are refused rather than merely discouraged.
+X: A=Enhanced VPC routing: it forces `COPY` and `UNLOAD` traffic between the cluster and data stores such as S3 through your VPC so you can control it; it does not encrypt client connections.
+C=Concurrency scaling: it adds temporary cluster capacity when many queries queue up; it has nothing to do with connection security.
+D=Automated snapshots: they back up the cluster to S3 for recovery; they do not affect how clients connect.
+T: Enforce encrypted client connections with `require_ssl`; enhanced VPC routing controls data-load paths, not client TLS.
+
+@ Q003800 explain
+G: ## Management events versus data events in CloudTrail
+- **Management events** record control-plane actions on resources, such as `CreateBucket`, `PutBucketPolicy` or `DeleteBucket`. They are logged by default.
+- **Data events** record operations on the data itself, for S3 object-level calls such as `GetObject`, `PutObject` and `DeleteObject`. They are not logged by default; you enable them on a trail or event data store, usually with advanced event selectors to limit them to specific buckets or prefixes, because they are high volume and charged separately.
+Each data event records who called (IAM identity), from which source IP, when, and which object key.
+Example: enable data events only for `arn:aws:s3:::hr-sensitive/`, and auditors can answer "who downloaded `salaries/2026.csv` last week?".
+W: CloudTrail data events for the bucket: they log every object-level read and write with the caller's identity, which is exactly the per-object access record auditors need.
+X: A=Management events only: they cover bucket configuration changes, not object reads, so a `GetObject` on the sensitive data would never be recorded.
+C=S3 Inventory: it produces scheduled lists of objects and their metadata (size, storage class, encryption status), not who accessed them.
+D=S3 Storage Lens: it shows aggregated storage and activity metrics across buckets, such as request counts, not individual callers and objects.
+T: Object-level "who accessed what" needs CloudTrail data events; management events, Inventory and Storage Lens do not record individual reads.
+
+@ Q003801 explain
+G: ## Where Redshift records user activity
+**Audit logging** writes three logs, delivered to Amazon S3 or CloudWatch Logs where they can be kept as long as required:
+- **Connection log**: authentication attempts, connections and disconnections.
+- **User log**: changes to database user definitions, such as creating, altering or dropping a user.
+- **User activity log**: each query before it runs (requires the `enable_user_activity_logging` parameter).
+## System tables and views
+**System tables and views**, such as `SYS_QUERY_HISTORY`, `STL_QUERY` and `STL_CONNECTION_LOG`, can be queried with SQL for recent query and connection history. They keep only a limited window of recent history (days, not months), so for long-term retention you rely on audit logs or copy the data out.
+Example: auditors query the connection log in CloudWatch Logs Insights for failed logins, and engineers use `SYS_QUERY_HISTORY` to see who ran a slow query yesterday.
+W: B=Audit logging: it captures connections, user changes and every query to S3 or CloudWatch Logs, where the logs can be retained and analyzed for as long as regulations require.
+E=System tables and views: they let you query recent query and connection history directly with SQL inside Redshift.
+X: A=Concurrency scaling: it adds temporary capacity for bursts of queries; it produces no audit record of who did what.
+C=Spectrum external schema: it lets Redshift query data in S3 through the data catalog; it is a data access feature, not an activity log.
+D=Snapshots every eight hours: snapshots are point-in-time backups of data, not a record of connections or queries.
+T: Redshift auditing combines audit logs (long-term, in S3 or CloudWatch Logs) with system tables (recent history in SQL); capacity, Spectrum and backups do not record activity.
+
+@ Q003802 explain
+G: ## Two ways to run SQL on CloudTrail events
+- **CloudTrail Lake**: events are stored in an **event data store** managed by CloudTrail, which can collect from all accounts in an AWS Organization and retain events for years. You query it directly with SQL in the console or API, with no tables or buckets to manage.
+- **Amazon Athena on CloudTrail logs in S3**: a trail (often an organization trail) delivers JSON log files to a central S3 bucket. You create an Athena table over the bucket, ideally with partition projection on account, Region and date, and query it with standard SQL.
+Since May 31, 2026, CloudTrail Lake is closed to new customers; existing customers can keep using it, and AWS points new customers to Amazon CloudWatch for similar capabilities. Athena over the S3 logs remains open to everyone.
+Example: to find every `DeleteBucket` call in the past year across 40 accounts, either run a SQL query on the event data store or run an Athena query filtered on `eventname = 'DeleteBucket'` and a date range.
+W: C=Athena over CloudTrail logs in S3: Athena queries the delivered log files in place with SQL, and partitioning keeps a year of multi-account data fast and cheap to scan.
+E=CloudTrail Lake: it stores events from multiple accounts in an event data store with long retention and provides built-in SQL queries (for existing customers; it is closed to new customers).
+X: A=Route 53 query logging: it records DNS queries resolved by Route 53, not API activity, so it contains no CloudTrail events.
+B=S3 Inventory only: it lists objects and their metadata in a bucket; it can tell you which log files exist but cannot query what is inside them.
+D=EC2 console output: it shows an instance's boot and system console text for troubleshooting, not account-wide API activity.
+T: SQL over CloudTrail history means CloudTrail Lake or Athena over the trail's S3 logs; DNS logs, inventories and console output are different data.
+
+@ Q003803 explain
+G: ## Amazon Macie
+Amazon Macie is a data security service that discovers sensitive data in Amazon S3.
+- It keeps an inventory of your buckets and evaluates their security, for example public access or missing encryption.
+- **Automated sensitive data discovery** samples objects across all buckets continuously; **sensitive data discovery jobs** scan chosen buckets in full, once or on a schedule.
+- It uses **managed data identifiers** (names, addresses, credit card numbers, passport numbers and more, across many countries) and **custom data identifiers** (regular expressions for your own formats such as employee IDs).
+- Findings go to the console, Amazon EventBridge and AWS Security Hub so they can trigger remediation.
+Example: a Macie finding reports that `s3://marketing-exports/2026/leads.csv` contains 12,000 email addresses and phone numbers.
+W: Amazon Macie: it scans S3 objects across many buckets and accounts with machine learning and pattern matching to identify personal data and report exactly where it is.
+X: A=AWS WAF: it inspects HTTP requests to web applications and blocks patterns such as SQL injection; it does not look inside stored S3 objects.
+B=Amazon Inspector: it scans EC2 instances, container images and Lambda functions for software vulnerabilities and network exposure, not data content.
+D=AWS Shield: it protects applications against DDoS attacks at the network and application layers; it does not classify data.
+T: Finding personal data inside S3 objects is Macie's job; WAF, Inspector and Shield protect applications and workloads, not data content.
+
+@ Q003804 explain
+G: ## Data residency on AWS
+Data residency means data is stored and processed only in approved locations. AWS does not move your data out of the Region you choose, so residency depends on where you place data and what you allow.
+- **Choose Regions deliberately**: create buckets, databases and analytics jobs only in EU Regions such as `eu-west-1` or `eu-central-1`.
+- **Enforce it with a guardrail**: an AWS Organizations service control policy (SCP) that denies actions when `aws:RequestedRegion` is not an approved EU Region, with exceptions for global services such as IAM, stops anyone creating resources elsewhere, even administrators in member accounts.
+Example: an engineer tries to launch an EMR cluster in `us-east-1` to process customer data; the SCP returns an explicit deny.
+W: A=EU-only storage and processing: keeping every copy and every job inside EU Regions is what actually satisfies the residency requirement.
+E=Region-restricting SCPs: they enforce the rule across all accounts in the organization, so resources cannot be created outside the approved EU Regions by mistake.
+X: B=Global tables in every Region: DynamoDB global tables replicate items to each replica Region, which would place customer data outside the EU.
+C=Replicate to all Regions: copying data worldwide for resilience directly violates residency; resilience should come from multiple EU Regions or Availability Zones.
+D=Analytics in a US Region: processing counts as well as storage, so moving the data to the US for jobs breaks the requirement even if the source stays in the EU.
+T: Residency means keeping storage and processing in approved Regions and enforcing it with SCPs; global replication or out-of-Region processing breaks it.
+
+@ Q003805 explain
+G: ## Sharing data without copying it
+- **Lake Formation cross-account sharing**: you grant a partner account permissions on catalog databases, tables, columns or tags. Sharing uses AWS Resource Access Manager (RAM); the partner creates a resource link and queries the data in your S3 location with Athena or other engines. You can revoke the grant at any time.
+- **Amazon Redshift data sharing**: a producer creates a datashare and grants it to a consumer account (RA3 clusters or Redshift Serverless). The consumer queries live, transactionally consistent data with its own compute; no data is copied or unloaded.
+In both cases access is granted to the partner's AWS account through IAM-based controls, is logged in CloudTrail and can be limited to specific objects.
+W: Lake Formation or Redshift data sharing: the partner queries the live data in place, access is scoped and revocable, and nothing is copied or exposed through shared credentials.
+X: A=Public bucket: public access exposes the data to anyone on the internet, not only the partner, and there is no governance or per-partner control.
+C=Email a spreadsheet: it creates an uncontrolled copy that cannot be revoked or updated, email is not a secure channel, and there is no audit of use.
+D=Share IAM user credentials: the partner acts as your user with all its permissions, actions cannot be attributed to them, and access cannot be limited to the dataset.
+T: Share data across accounts with governed, in-place mechanisms (Lake Formation or Redshift data sharing), not public access, copies or shared credentials.
+
+@ Q003806 explain
+G: ## Amazon DataZone and SageMaker Catalog
+Amazon DataZone is a data management service for publishing, finding and governing data. Amazon SageMaker Catalog, the catalog in Amazon SageMaker Unified Studio, is built on Amazon DataZone and offers the same capabilities.
+- **Publish**: producers publish assets (Glue tables, Redshift tables) to a business catalog with descriptions, glossary terms and metadata forms, for example a `sensitivity` field with the value `confidential`.
+- **Discover**: consumers search the catalog in the data portal (or in SageMaker Unified Studio).
+- **Subscribe**: a consumer project requests access to an asset. The asset owner approves or rejects the request, and after approval the access grants are created automatically, for example Lake Formation permissions.
+Example: an analyst requests the `customer_pii` table; the owner sees the request and business justification, approves it, and the analyst's project can query it.
+W: DataZone (SageMaker Catalog) with subscription approvals: classification metadata sits on each asset and access to sensitive data is granted only after the owner approves the request.
+X: A=CloudWatch dashboards: they visualize metrics and logs, so they could show usage, but they cannot classify datasets or gate access behind an approval.
+B=SES email templates: SES sends email; an approval email does not create or enforce any access grant, so access is not actually controlled.
+C=Batch job definitions: AWS Batch runs containerized compute jobs; job definitions describe how to run work, not who may subscribe to data.
+T: Classification plus approval-based subscriptions is DataZone (SageMaker Catalog); dashboards, email and compute services cannot govern data access.
+
+@ Q003807 explain
+G: ## Removing PII before it reaches analytics
+Pseudonymization and masking change personal data so analysts can still work with records without seeing who they belong to.
+- **Masking/redaction**: replace values, for example `jane@example.com` becomes `****@example.com`, or drop the field.
+- **Tokenization or hashing**: replace a value with a consistent substitute, for example `customer_email` becomes `a3f9...`, so joins and counts still work but the original is not visible.
+On AWS this is usually a step in the ETL job: the AWS Glue sensitive data detection transform can find and redact or hash PII, and Glue DataBrew offers PII masking and hashing recipe steps. Only the transformed output is loaded into the analytics store.
+W: Mask or tokenize PII before loading: the analytics environment never receives the raw personal data, so exposure is removed at the source rather than managed afterward.
+X: A=Encrypt and share the key widely: every analyst with the key can decrypt and read the personal data, so the PII is still fully exposed in analytics.
+C=Load raw data and ask analysts not to look: a request is not a technical control; the PII is present and readable by anyone with access.
+D=Delete data older than one day: it shortens retention but the most recent day still contains full PII, so the requirement is not met.
+T: Pseudonymize or mask PII in the pipeline before loading; encryption with widely shared keys, policies and short retention leave raw PII exposed.
+
+@ Q003808 explain
+G: ## Kerberos on Amazon EMR
+Kerberos is a network authentication protocol: users and services prove their identity with tickets from a Key Distribution Center (KDC) instead of sending passwords.
+On EMR you enable it through a **security configuration**, a reusable setting applied when a cluster is created:
+- A **cluster-dedicated KDC** runs on the primary node.
+- A **cross-realm trust** with Microsoft Active Directory lets users sign in with their corporate accounts.
+- An **external KDC** can also be used.
+After that, applications such as Hadoop, Hive and Spark require a valid Kerberos ticket, so each user's jobs run under their own identity.
+Example: an analyst runs `kinit jdoe@CORP.EXAMPLE.COM` and then submits a Spark job; HDFS and YARN see the job as `jdoe`.
+W: Security configuration with Kerberos: it is the EMR feature that sets up Kerberos authentication, including cross-realm trust to the corporate Active Directory.
+X: A=Managed scaling policies: they add and remove instances based on workload metrics; they decide cluster size, not how users authenticate, and are not tied to directory groups.
+B=Bootstrap actions only: they run custom scripts when nodes start; building and securing Kerberos by hand is fragile and is not the supported way to enable it.
+D=Instance fleet settings: they choose instance types, purchase options and target capacity for node groups; they have no authentication role.
+T: EMR user authentication with a corporate directory comes from a Kerberos security configuration, not from scaling, bootstrap scripts or instance settings.
+
+@ Q003809 explain
+G: ## Least privilege for pipeline roles
+Least privilege means each identity gets only the actions and resources it needs, and nothing else.
+- **Scope resources**: instead of `"Resource": "*"`, list exact buckets and prefixes, for example `arn:aws:s3:::raw-bucket/orders/*` for reading and `arn:aws:s3:::curated-bucket/orders/*` for writing.
+- **Scope actions**: `s3:GetObject` for a reader, `s3:PutObject` for a writer, not `s3:*`.
+- **Separate roles per stage**: the ingest Lambda, the Glue transform job and the Redshift loader each have their own role, so a bug or compromise in one stage cannot touch the data of another.
+IAM Access Analyzer can generate policies from actual CloudTrail activity to help tighten them.
+W: D=Scope S3 to buckets and prefixes: the role can reach only the exact data locations it uses, limiting what a mistake or stolen credential can affect.
+E=Separate roles per stage: each stage gets only its own permissions, so the blast radius of any one component stays small and audit logs show which stage acted.
+X: A=`s3:*` on all resources: it allows every S3 action, including deleting buckets and changing policies, on every bucket in the account.
+B=One role for every team and pipeline: it must hold the union of all permissions, so every pipeline has everyone's access and activity cannot be told apart.
+C=AdministratorAccess: it grants full control of the account, the opposite of least privilege, so any flaw in the pipeline could affect every service.
+T: Least privilege means narrow resources and actions plus one role per stage; wildcards, shared roles and admin policies grant far more than needed.
+
+@ Q003810 explain
+G: ## AWS Glue Spark jobs for large batch joins
+AWS Glue runs Apache Spark serverlessly: you supply a script (or build it visually in Glue Studio), choose a worker type and count, and Glue provisions, scales and tears down the compute.
+- Spark splits the 5 TB of S3 data across many workers and joins it with the dimension table in parallel; a small dimension can be broadcast to every worker.
+- Output is written directly as Parquet, partitioned for example by `dt`, to S3 and registered in the Data Catalog.
+- Jobs are scheduled with Glue triggers or workflows, EventBridge or Step Functions, and auto scaling adds or removes workers as needed.
+Example: a nightly Glue job with 40 G.2X workers reads the day's clickstream, joins it to `dim_customer` and writes Parquet partitions in well under an hour.
+W: Glue Spark job: serverless, distributed Spark handles a multi-terabyte join, writes Parquet natively, and runs on a schedule with no clusters to manage.
+X: B=Manual Athena console run: Athena could run the SQL, but a manual run is not an automated daily pipeline; someone has to start it every day and it has no retries or dependencies.
+C=RDS stored procedure: the S3 data would first have to be loaded into the database; a single RDS instance is not built to process 5 TB joins and write Parquet to S3.
+D=Single Lambda function: Lambda runs for at most 15 minutes with limited memory and local storage, so one function cannot join 5 TB of data.
+T: Large scheduled serverless joins that write Parquet fit Glue Spark; Lambda limits, manual Athena runs and RDS procedures do not.
+
+@ Q003811 explain
+G: ## Waiting for an external event in Step Functions
+A Task state that uses the **callback pattern** (`.waitForTaskToken`, for example `arn:aws:states:::sqs:sendMessage.waitForTaskToken`) sends a unique **task token** to another system and then pauses.
+- The token is sent to a place a human or system can act on, such as an SQS queue, an SNS email, or a Lambda function that creates an approval ticket.
+- When the steward approves, the approval app calls `SendTaskSuccess` with the token and the workflow continues to the load step. A rejection calls `SendTaskFailure`, which can be routed with a Catch to a notify step.
+- A Standard workflow can wait up to one year; `HeartbeatSeconds` or `TimeoutSeconds` can end the wait if nobody responds.
+Example: the steward clicks "Approve" in an internal web page, which calls `SendTaskSuccess`, and the Glue load job starts seconds later.
+W: Task token callback: the execution truly pauses until the steward's decision is returned with the token, so loading happens only after an explicit approval.
+X: A=Pass state: it just passes its input (optionally reshaped) to the next state immediately; it cannot wait for anything.
+B=Fixed Wait state: it pauses for a set time and then continues regardless of whether anyone approved, so data could load without approval or wait needlessly.
+C=Map state: it runs the same steps for each item in an array, possibly in parallel; it iterates over data rather than waiting for a person.
+T: Human approval in Step Functions uses a task token callback; Wait states pause for time, not for a decision.
+
+@ Q003877 explain
+G: ## How Glue crawlers handle schema changes
+A crawler infers schemas from data and updates tables in the Data Catalog. Its behavior on changes is configurable:
+- **Update behavior** (`SchemaChangePolicy.UpdateBehavior`): `UPDATE_IN_DATABASE` applies changes, while `LOG` only records them in the crawler's logs, leaving the table as it is (the console calls this "Ignore the change and don't update the table").
+- **Add new columns only**: set in the crawler's configuration JSON as `"AddOrUpdateBehavior": "MergeNewColumns"` (with update behavior `UPDATE_IN_DATABASE`); new columns are added, but existing columns are not removed and their types are not changed.
+- **Delete behavior**: `LOG`, `DEPRECATE_IN_DATABASE` or `DELETE_FROM_DATABASE` for objects that disappear.
+Example: a source file changes `amount` from `double` to `string`. With update behavior set to log, the table keeps `double`, queries keep working, and the team reviews the change in the crawler's CloudWatch logs before deciding whether to apply it.
+W: Ignore changes or add new columns only, and review: the crawler can no longer silently rewrite existing columns, so downstream queries stay stable while real changes get reviewed.
+X: B=Manual daily edits by analysts: hand edits are error-prone, add work every day, and a crawler that still updates the table can overwrite them on its next run.
+C=Run the crawler more often: more frequent runs apply unwanted schema changes sooner; a newer inferred schema is not necessarily a correct one.
+D=Delete the table after each run: removing the table breaks every query and view that depends on it until the next crawl recreates it.
+T: Protect downstream consumers by setting the crawler's schema change policy to log changes or only add columns, not by crawling more or editing by hand.

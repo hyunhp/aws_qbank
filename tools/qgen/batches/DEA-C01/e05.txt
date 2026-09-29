@@ -1,0 +1,361 @@
+# DEA-C01 detailed explanations (explanation-only rewrites; letters are the published ones)
+
+@ Q000351 explain
+G: ## Distribution keys and sort keys in Redshift
+A Redshift cluster spreads each table's rows across compute node slices. The **distribution style** decides which slice a row lands on; the **sort key** decides the order of rows on disk inside each slice.
+- `DISTKEY(customer_id)` on both the fact and the dimension table hashes the same `customer_id` value to the same slice, so a join on `customer_id` runs locally with no network redistribution (a "collocated join").
+- `SORTKEY(order_date)` stores rows in date order. Redshift keeps min/max values for every 1 MB block (zone maps), so a filter like `WHERE order_date >= '2026-01-01'` skips whole blocks that cannot match.
+## Example
+An orders fact table with billions of rows joined to `customers` on `customer_id` and filtered by last month's `order_date`: with these keys, the join avoids broadcasting data between nodes and the scan reads only the blocks for last month.
+W: DISTKEY customer_id and SORTKEY order_date: the distribution key matches the join column so joins are collocated, and the sort key matches the filter column so zone maps prune blocks during scans.
+X: A=Sort on customer_id with EVEN: EVEN distribution scatters matching customer rows across slices, forcing data redistribution for every join, and sorting on the join column does little for the `order_date` filters that dominate the workload.
+B=Unused sort column with ALL on the fact table: a sort key that never appears in filters prunes nothing, and ALL copies the entire large fact table to every node, multiplying storage and load time; ALL suits small dimension tables, not big fact tables.
+D=No keys, decided at query time: Redshift cannot pick a physical layout per query. AUTO distribution and sort keys are adjusted in the background over time, but when the join and filter columns are well known, choosing them explicitly gives the predictable win the question asks for.
+T: Distribute on the join column to avoid shuffling rows between nodes, and sort on the filter column so zone maps skip blocks; ALL distribution is for small tables only.
+
+@ Q000352 explain
+G: ## Fine-grained access in AWS Lake Formation
+Lake Formation governs tables registered in the AWS Glue Data Catalog. Instead of granting access to S3 paths, you grant permissions on databases, tables and columns, and integrated engines such as Athena, Redshift Spectrum, EMR and Glue enforce them.
+- **Column-level security**: grant `SELECT` on a table while including or excluding specific columns, for example everything except `national_id`.
+- **Data filters**: a data cells filter combines a column list with an optional row filter expression, such as `tenant_id = 'acme'`, and can be granted to a principal like a table.
+- **LF-Tags**: tag sensitive columns (for example `classification=pii`) and grant access by tag, so new tables inherit the policy.
+## Example
+A multi-tenant lake stores all tenants in one `customers` table. Analysts of tenant A get a data filter with `tenant_id = 'A'` and all columns except `national_id`; the compliance team gets the full column set.
+W: Identify sensitive columns and use Lake Formation filters: once sensitive columns are identified, column-level grants and data cells filters make the query engines themselves hide those columns (and rows) from principals who are not entitled to them.
+X: A=Same table, application-level filtering: any user or tool that queries the table directly bypasses the application, so the national IDs are fully exposed; nothing in the data layer enforces the restriction.
+B=One shared KMS key with decrypt for everyone: encryption at rest protects against storage-level access, but granting decrypt to all users means everyone can read every column. Encryption is not an authorization boundary per column.
+C=Separate account with no catalog entry: data with no Data Catalog entry cannot be governed by Lake Formation at all, and moving whole datasets to another account does not provide per-column control within a table that users still need.
+T: Column-level security in a Lake Formation data lake comes from column grants, data filters and LF-Tags enforced by the query engines, not from application logic or blanket encryption.
+
+@ Q000353 explain
+G: ## How DynamoDB spreads writes
+DynamoDB hashes the partition key value to choose a physical partition. Each partition has throughput limits (about 1,000 write units and 3,000 read units per second), so all writes for one key value go through one partition.
+- With `order_status` as the key there are only four values, such as `PENDING`, `PAID`, `SHIPPED`, `CANCELLED`. Most new orders share one status, so almost every write hits the same partition: a **hot partition**.
+- **Higher-cardinality key**: use an attribute with many distinct values, such as `order_id` or `customer_id`, so writes spread evenly.
+- **Write sharding**: append a suffix to a low-cardinality value, for example `PENDING#0` to `PENDING#9`, chosen randomly or by hash; readers query all shards and merge.
+## Example
+10,000 new orders per second all written with `order_status = PENDING` throttle; keyed by `order_id`, the same load spreads over many partitions.
+W: Higher-cardinality key or write sharding: both spread writes across many partition key values, which is the only way to remove a per-partition throughput bottleneck caused by a key with just four values.
+X: B=GSI on the same order_status key: a GSI with the same low-cardinality key is just as hot, and a throttled GSI can also throttle writes to the base table; it adds write cost instead of capacity.
+C=Reduce read capacity: read and write capacity are separate settings and lowering one does not transfer capacity to the other, and the limit being hit is per partition, not the table's total.
+D=Switch to provisioned billing: the billing mode does not change how keys map to partitions. A hot key throttles under either mode, and provisioned mode adds the risk of under-provisioning.
+T: Hot partitions come from low-cardinality keys; fix them by choosing a high-cardinality key or sharding the key, not by adding indexes or changing capacity settings.
+
+@ Q000354 explain
+G: ## Heterogeneous migration: schema first, then data
+Moving Oracle to Amazon Redshift changes the engine, so objects must be translated before data can be loaded.
+- **AWS Schema Conversion Tool (SCT)** is a desktop application that reads the source schema and converts tables, views, data types and code (for example PL/SQL procedures) to the target dialect.
+- **DMS Schema Conversion** is the managed, console-based equivalent inside AWS DMS for supported source and target pairs.
+- Both produce an **assessment report** that lists what converted automatically and which items need manual work, with an estimate of effort, such as an Oracle-specific type or a procedure with no direct Redshift equivalent.
+## Example
+An Oracle `NUMBER(38)` column maps to a Redshift numeric type automatically, while a PL/SQL package using Oracle-only features is flagged as an action item for a developer to rewrite.
+W: AWS SCT (or DMS Schema Conversion): these are the tools that convert schema objects and procedural code between engines and report the items that cannot be converted automatically.
+X: A=Glue crawlers over Oracle schemas: crawlers infer table structures into the Glue Data Catalog; they do not translate PL/SQL or produce a migration assessment report.
+B=Redshift COPY commands: COPY loads data files from S3 or other sources into existing Redshift tables; it neither creates converted schemas nor handles stored procedures.
+C=DMS full load alone: DMS replication tasks move table data, creating only basic tables, and do not convert procedures, functions or engine-specific types.
+T: Changing database engines needs schema conversion (SCT or DMS Schema Conversion) with its assessment report; data-movement tools like DMS tasks or COPY come after.
+
+@ Q000355 explain
+G: ## Two ways to convert schemas for AWS DMS
+AWS offers two tools that translate schemas and code between database engines:
+- **AWS Schema Conversion Tool (SCT)**: a desktop application you download and install on your own machine. It connects to source and target, converts objects, and writes an assessment report. It supports a broad range of sources, including data warehouses.
+- **DMS Schema Conversion**: the same kind of conversion as a managed feature inside AWS DMS. You create instance profiles, data providers and a migration project in the DMS console, with nothing to install, and then run DMS tasks for the data in the same service.
+## How they relate
+Both are heterogeneous conversion tools (for example Oracle to Amazon Aurora PostgreSQL) that feed a DMS data migration. DMS Schema Conversion supports a subset of the engine pairs that SCT supports, so teams with unusual sources may still need SCT.
+W: DMS Schema Conversion is built into DMS; SCT is installed: that is the essential difference, and it matches the team's goal of handling conversion and migration in one managed DMS project with no desktop application.
+X: B=Entirely unrelated tools: both convert schemas and code between engines and produce assessment reports; DMS Schema Conversion is a managed offering of the same kind of capability.
+C=SCT can migrate live data: SCT's core job is schema and code conversion; ongoing replication of changing source data (change data capture) is the role of DMS tasks. SCT data extraction agents can move data warehouse data in bulk, but that does not describe the difference the team is asking about: where the conversion runs.
+D=Only same-engine migrations: schema conversion exists for heterogeneous migrations; a same-engine move, such as MySQL to MySQL, needs no conversion at all.
+T: DMS Schema Conversion is the managed, in-console conversion inside DMS; SCT is the installed desktop tool, and ongoing replication of changing data is handled by DMS tasks.
+
+@ Q000356 explain
+G: ## What ML lineage tracks
+Amazon SageMaker ML Lineage Tracking records the steps of an ML workflow as a graph of **entities** linked by **associations**:
+- **Artifacts**: datasets in S3, container images, model artifacts.
+- **Actions**: for example a model deployment or approval.
+- **Contexts**: logical groupings such as an endpoint or experiment.
+- **Trial components**: processing and training jobs.
+SageMaker creates many of these entities automatically for jobs, pipelines, Model Registry packages and endpoints, and you can query the graph upstream or downstream from any entity.
+## Example
+Starting from a deployed endpoint, a lineage query walks back to the model package, the training job that produced it, the processing job before that, and the exact S3 dataset version used; starting from the model, it walks forward to every endpoint that serves it.
+W: SageMaker ML Lineage Tracking: it stores the relationships between datasets, processing jobs, training jobs, models and endpoints, which is exactly the audit chain the auditors want to trace in both directions.
+X: A=CloudTrail event history: CloudTrail logs individual API calls (who called CreateTrainingJob and when) and event history keeps only 90 days of management events; it does not link a dataset version to a model to an endpoint.
+C=S3 Inventory on the model bucket: inventory lists objects and their metadata in a bucket; it knows nothing about which jobs created an object or which endpoints load it.
+D=AWS Config timeline: Config tracks configuration changes of supported resources, not the data and training dependencies that produced a model.
+T: For "which data and jobs made this model and where is it deployed", use SageMaker lineage; API logs and resource inventories do not capture ML dependencies.
+
+@ Q000357 explain
+G: ## Lineage in Amazon SageMaker Catalog
+Amazon SageMaker Catalog, part of SageMaker Unified Studio and built on Amazon DataZone, lets producers publish data assets with **business metadata** (descriptions, glossary terms, owners) so consumers can find and subscribe to them.
+It also stores **data lineage**: a graph of which source datasets and which jobs produced an asset.
+- Lineage events follow the open **OpenLineage** format, so they can be captured automatically from supported sources such as AWS Glue and Amazon Redshift, or sent through the API from other tools.
+- The catalog shows the lineage graph on the asset page next to its business metadata, so a user sees upstream sources and transformation jobs without leaving the catalog.
+## Example
+A business user opens the `monthly_revenue` asset and sees that it was built by a Glue job from the `orders` and `refunds` tables, and who owns each upstream asset.
+W: It surfaces lineage alongside business metadata: lineage is captured as linked, system-recorded events and displayed in the catalog experience next to the asset's descriptions and glossary terms.
+X: A=Only column names and data types: the catalog stores far more than technical schema, including business descriptions, glossary terms, data quality information and lineage.
+B=Manual free-text notes only: lineage is recorded as structured events (automatically from supported services or via the API), not retyped as notes with no link to real jobs and datasets.
+C=Only through Glue table properties: Glue table properties are simple key-value settings with no lineage graph; lineage is viewed in the SageMaker Catalog itself.
+T: SageMaker Catalog combines business metadata with OpenLineage-based lineage graphs, so consumers see both what an asset means and how it was produced.
+
+@ Q000358 explain
+G: ## Partition pruning in Athena
+Athena charges by bytes scanned, so the fastest and cheapest query is the one that reads the fewest files.
+- **Partitioning** stores data in S3 prefixes by a column value, for example `s3://lake/events/event_date=2026-09-28/`. The Glue Data Catalog (or partition projection) knows which prefix holds which value.
+- When a query has `WHERE event_date = DATE '2026-09-28'`, Athena reads only that prefix and ignores the rest: this is **partition pruning**.
+- Parquet adds further savings: it is columnar and compressed, so only the needed columns are read.
+## Example
+A table with 3 years of daily data has about 1,100 partitions. A one-day query reads roughly 1/1,100 of the data instead of all of it.
+W: Partition by event_date: since almost every query filters on `event_date`, Athena can skip every partition outside the requested dates, which directly reduces bytes scanned, cost and latency.
+X: A=Global secondary index on the bucket: GSIs are a DynamoDB feature; S3 buckets have no indexes, and Athena prunes data through partitions and file statistics instead.
+B=One huge file regardless of date: a single file forces a full scan for every date filter and also limits parallel reading; very large or very small files both hurt performance.
+D=Uncompressed CSV instead of Parquet: CSV is row-based and uncompressed, so every query reads every column and many more bytes, raising cost and latency.
+T: For Athena, match partitions to the most common filter column and keep columnar compressed formats; bytes scanned drive both cost and speed.
+
+@ Q000359 explain
+G: ## Column compression encodings in Redshift
+Redshift stores each column separately and can compress each one with its own **encoding**, for example `AZ64` for numbers and dates, `ZSTD` or `LZO` for text, `BYTEDICT` for low-cardinality values, and `RAW` (no compression).
+- Smaller columns mean less disk usage and fewer blocks to read per scan, so queries become faster as well as cheaper to store.
+- `ANALYZE COMPRESSION table_name` samples the table and reports the recommended encoding per column and the estimated space saving.
+- You apply the result with `ALTER TABLE ... ALTER COLUMN ... ENCODE ...` or by recreating the table. Columns created with `ENCODE AUTO` let Redshift manage encodings over time.
+## Example
+A `status` column with five distinct values stored as `RAW` occupies far more blocks than the same column encoded with `BYTEDICT` or `ZSTD`.
+W: Apply suitable column encodings (ANALYZE COMPRESSION): the command recommends the best encoding per column from real data, and applying those encodings shrinks storage and the number of blocks each scan must read.
+X: B=Add nodes without changing encoding: more nodes add capacity and cost, but each column still wastes space and every scan still reads the same inflated blocks; it treats the symptom, not the cause.
+C=Convert the table to a view: a view stores no data of its own and must query an underlying table, so the data still has to live somewhere with the same encoding problem.
+D=Disable compression entirely: that is the cause of the problem; uncompressed columns take the most space and need the most I/O per scan.
+T: Wasteful storage and slow scans on a Redshift table point to missing column encodings; use ANALYZE COMPRESSION or ENCODE AUTO rather than adding hardware.
+
+@ Q000360 explain
+G: ## Two different tools for fast access
+- A **Redshift sort key** defines the physical order in which rows are stored inside each slice. Redshift keeps min/max values per 1 MB block (zone maps), so range filters on the sort key skip blocks. It is part of the table's storage layout; changing it rewrites the data (for example `ALTER TABLE ... ALTER SORTKEY`, which reorganizes the table in the background).
+- A **DynamoDB global secondary index (GSI)** is a separate, automatically maintained copy of selected attributes with its own partition key and optional sort key. It lets you query items by attributes other than the base table's primary key. The base table is not reordered.
+## Example
+A `game_scores` DynamoDB table keyed by `player_id` gets a GSI keyed by `game_id` and `score` to answer "top scores for a game". A Redshift `orders` table sorted by `order_date` answers "last week's orders" by reading only recent blocks.
+W: Sort keys order data on disk; GSIs add query patterns: a sort key is a storage-order optimization for scans in one table, while a GSI is an extra index structure that enables new access patterns.
+X: B=Identical purposes, different names: they solve different problems, scan pruning in a columnar warehouse versus alternative key lookups in a key-value database, and they work in completely different ways.
+C=A GSI reorders the base table: a GSI is stored separately from the base table and is updated asynchronously; the base table's item layout stays organized by its own primary key.
+D=Sort keys change at query time with no layout effect: a sort key is defined on the table and determines how data is stored; queries cannot choose a different one, and changing it means rewriting data.
+T: A Redshift sort key is about how one table's rows are physically ordered; a DynamoDB GSI is a separate index that adds new ways to query the data.
+
+@ Q000361 explain
+G: ## Where the embedding model fits in RAG
+Retrieval-augmented generation (RAG) has two stages: retrieve relevant text, then let a language model answer using it.
+- An **embedding model** turns text into a vector of numbers so that texts with similar meaning land close together, even with different wording.
+- At ingestion, a knowledge base (for example Amazon Bedrock Knowledge Bases) splits documents into chunks, embeds each chunk and stores the vectors in a vector store such as Amazon OpenSearch Serverless.
+- At query time the question is embedded with the same model, and the nearest vectors are returned as context.
+If the embedding model does not capture the meaning of your domain or language well, "How do I reset my login?" may not land near a chunk titled "Password recovery", and retrieval returns the wrong chunks.
+## Choosing better
+Pick an embedding model suited to the content (language, domain, dimensions), such as Amazon Titan Text Embeddings or Cohere Embed on Bedrock, and re-embed the documents when you change it.
+W: It maps text to vectors for semantic search; choose a suitable one: retrieval quality depends on how well the embedding model places paraphrased questions near the right chunks, so a better-suited model fixes mismatched wording.
+X: A=It generates the final answer; use a larger LLM: generation happens after retrieval, so a larger LLM still receives the same irrelevant chunks; the embedding model does not generate answers.
+B=It compresses documents; compress more: embeddings are not a storage compression step, and more aggressive reduction would lose meaning and make retrieval worse.
+C=It translates queries; turn translation off: an embedding model does not translate text, and there is no translation step to disable; the query must be embedded to be searched at all.
+T: In RAG, the embedding model decides what gets retrieved; fix paraphrase mismatches with a better-suited embedding model, not a bigger generator.
+
+@ Q000362 explain
+G: ## Normalized versus denormalized items in DynamoDB
+DynamoDB has no joins. How you store related data decides how many requests a read needs.
+- **Normalized**: an order item holds only `product_id`; showing an order means reading the order, then each product, which is several requests and more latency.
+- **Denormalized**: the order item embeds the product name and price at the time of purchase (or items share a partition key and are read with one `Query`), so one request returns the whole order view.
+## The cost of denormalizing
+Embedded copies of data must be kept consistent. If a product name changes, every copy that should reflect it has to be updated, for example through DynamoDB Streams and a Lambda function, and item sizes grow (items are limited to 400 KB).
+Some copies are intentionally frozen, such as the price an order was placed at, which is often exactly what the business wants.
+W: Faster reads, at the cost of duplicated data to keep in sync: denormalization designs the table around access patterns so reads need fewer requests, and the price is redundancy that writes must maintain.
+X: A=Only affects write costs, not reads: the main purpose of denormalizing is to change read patterns, turning several lookups into one request.
+B=No downsides; always prefer it: duplicated data increases storage and item size and requires update logic; normalized items still fit data that changes often and is read rarely.
+D=Not possible in DynamoDB: DynamoDB items can hold nested maps and lists, and single-table designs that denormalize are a standard, recommended pattern.
+T: Denormalizing in DynamoDB trades extra storage and sync work on writes for fewer, faster reads that match known access patterns.
+
+@ Q000363 explain
+G: ## Orchestrating mixed services with Step Functions
+AWS Step Functions runs **state machines** defined in Amazon States Language. Each state does one thing:
+- **Task** states call services; optimized integrations such as `glue:startJobRun.sync` and `elasticmapreduce:addStep.sync` start a job and wait until it finishes, and a Task can also invoke a Lambda function.
+- **Choice** states branch on data (for example, run a cleanup path when a row count is zero).
+- **Retry** and **Catch** blocks add retries with backoff and error handling per state.
+- **Wait**, **Parallel** and **Map** states handle delays and fan-out.
+The console draws the workflow as a graph and colors each state in every execution, so operators can see where a run is or where it failed.
+## Example
+Start a Glue job and wait, add an EMR step and wait, then a Choice state checks whether the job output is non-empty and, only if it is, a Task state invokes a Lambda function to publish results; failed steps retry three times.
+W: AWS Step Functions: it natively coordinates Glue, EMR and Lambda, waits for jobs to complete, supports branches and retries, and gives operators a visual execution view.
+X: A=A single Glue trigger: Glue triggers start Glue jobs and crawlers based on schedules or events within Glue workflows; they do not run EMR steps or Lambda with general branching logic.
+B=A cron job on an EC2 instance: this means writing and hosting your own orchestration code, retries and monitoring, with a server to patch and no built-in visual view of runs.
+C=An EventBridge rule per step: rules react to events one at a time; chaining them spreads the logic across many rules, with no single place for branching, retries or a view of the whole run.
+T: When a workflow spans several AWS services with branching, retries and waits, use Step Functions rather than per-service triggers or custom scripts.
+
+@ Q000364 explain
+G: ## Why MWAA tasks sit in "queued"
+In Amazon Managed Workflows for Apache Airflow (MWAA), the scheduler puts ready tasks on a queue, and **workers** pick them up. A task stays queued while no worker slot is free.
+- The **environment class** (`mw1.small`, `mw1.medium`, `mw1.large` and larger) sets how much CPU and memory each worker has and the default number of tasks a worker runs at once.
+- **Minimum and maximum workers** set how far MWAA can autoscale the worker fleet when the queue grows.
+- Airflow settings such as `celery.worker_autoscale` and pool sizes also cap concurrency.
+## Example
+An environment with `max workers = 1` on a small class can run only a handful of tasks at a time. If 40 tasks become ready at midnight, most wait in the queue; raising max workers lets MWAA add workers and drain the queue.
+W: Raise the environment class or max workers: long queue times with healthy DAGs and scheduler mean the environment lacks worker capacity, and a larger class or higher worker limit adds task slots.
+X: A=Enable S3 bucket versioning: MWAA already requires versioning on its bucket for DAGs, plugins and requirements; versioning affects file history, not how many tasks run at once.
+B=Decrease schedule_interval: running the DAG more often creates even more task instances, making the queue longer.
+D=Earlier start_date: moving the start date back can trigger catch-up runs for past intervals, which adds work instead of freeing workers.
+T: Tasks stuck in queued on MWAA signal too few worker slots; scale the environment class or max workers instead of changing DAG scheduling.
+
+@ Q000365 explain
+G: ## Starting a Glue job from code
+AWS Glue exposes a `StartJobRun` API. In Python, the AWS SDK Boto3 calls it as `glue.start_job_run()`:
+- `JobName` picks the existing job definition.
+- `Arguments` passes runtime parameters as key-value pairs, for example `{"--input_path": "s3://bucket/in/2026-09-28/"}`, which the script reads with `getResolvedOptions`.
+- The response contains `JobRunId`, which you can store (for example in DynamoDB or logs) and later check with `get_job_run()`.
+The Lambda execution role needs `glue:StartJobRun` permission on that job.
+## Example
+A Lambda function triggered by an SQS message reads the message body, calls `start_job_run(JobName="daily-etl", Arguments={"--file": key})`, and writes the returned `JobRunId` with the message ID to a tracking table.
+W: Call glue.start_job_run() with Boto3: the API starts the existing job with per-run arguments and returns the run ID in the response, which covers every requirement.
+X: A=Invoke through the S3 script URL: the script location in S3 is just where Glue reads the code from; fetching that URL downloads a file and does not start a job run.
+B=CloudFormation creates a new job each time: creating a stack per message is slow, leaves many job definitions to clean up, and still does not start a run or return a run ID by itself.
+D=Arguments in an SNS topic for Glue: Glue jobs do not subscribe to SNS topics; publishing a message does not start a job or pass arguments to it.
+T: To run an existing Glue job with parameters from Lambda, call the StartJobRun API through the SDK and keep the returned JobRunId.
+
+@ Q000366 explain
+G: ## Token-based pagination
+Many APIs return results in pages. Each response contains a slice of the data and, if more exists, a continuation token such as `nextToken`.
+- The client sends the first request without a token.
+- If the response includes `nextToken`, the client sends the next request with that token.
+- It repeats until a response arrives with no token, which means the last page has been read.
+## Example
+A loop in the Lambda function: call `GET /records`, save `items`, read `nextToken`; while the token is present, call `GET /records?nextToken=<value>` and append the results. After the loop, write the combined data to S3.
+Keep an eye on the Lambda 15-minute maximum: for very large result sets, save the last token (for example in DynamoDB) so a later invocation can continue, or move to a Step Functions loop.
+W: Loop, passing nextToken until none is returned: this reads every page the API offers and stops exactly when the API signals that no more data exists.
+X: A=API Gateway merges the pages: API Gateway fronts your own APIs; it does not call a third-party API repeatedly and combine paginated responses on your behalf.
+B=Increase the Lambda timeout: a longer timeout gives the function more time but does not make it request the next pages; without the loop it still reads only the first page.
+D=Single call, assume all data returned: the presence of `nextToken` shows the API returns partial results, so a single call silently drops every page after the first.
+T: Paginated APIs require a loop that follows the continuation token until it disappears; more time or a gateway does not fetch the missing pages.
+
+@ Q000367 explain
+G: ## Visual data profiling with AWS Glue DataBrew
+AWS Glue DataBrew is a visual data preparation service for analysts and engineers who want to explore and clean data without writing code.
+- A **profile job** computes statistics for each column: missing values, distinct counts, distributions, outliers and correlations, and shows them as charts.
+- A **project** loads a sample of the dataset into a grid where you apply transformations (over 250 built-in ones, such as removing nulls, fixing formats or splitting columns) and see the effect immediately.
+- The steps are saved as a **recipe** that a DataBrew job can later run on the full dataset on a schedule.
+## Example
+An engineer points DataBrew at a new CSV in S3, runs a profile, spots a `price` column with 8% nulls and a few negative values, and adds recipe steps to fill and filter them before any pipeline is written.
+W: AWS Glue DataBrew: it is built for exactly this, visual profiling of nulls, distributions and outliers plus no-code cleaning steps that can later be reused.
+X: A=Kinesis Data Firehose: Firehose delivers streaming data to destinations such as S3 and Redshift; it has no interactive profiling or cleaning interface.
+B=Athena: Athena runs SQL queries on data in S3, so profiling needs hand-written queries and there is no visual cleaning workflow.
+D=Glue crawler: a crawler infers schema and partitions into the Data Catalog; it records column names and types, not value distributions or outliers, and it does not clean data.
+T: For no-code, visual profiling and cleaning of a new dataset, use DataBrew; crawlers only detect schema and Athena needs SQL.
+
+@ Q000368 explain
+G: ## One workspace for data, analytics and AI
+Amazon SageMaker Unified Studio is a single web environment that brings together tools that used to live in separate consoles:
+- a SQL query editor (Athena and Amazon Redshift),
+- Jupyter notebooks and Spark processing,
+- visual ETL and data preparation,
+- model building, training and deployment with SageMaker AI, plus generative AI app development with Amazon Bedrock.
+Work is organized in **projects**: a project groups members, data, compute and code so a team shares the same resources. Data access flows through **SageMaker Catalog** and Lake Formation permissions, so everyone works on governed data.
+## Example
+A project for churn analysis: an engineer builds the ETL, an analyst queries results with SQL, and an ML engineer trains a model in a notebook on the same catalog tables.
+W: Amazon SageMaker Unified Studio: it combines SQL, notebooks, data prep and ML model building in one workspace with shared projects on governed catalog data.
+X: B=Amazon QuickSight: QuickSight is for dashboards and business intelligence; its dataset preparation only shapes data for visuals, and it provides no notebooks, Spark processing or model training.
+C=AWS Cloud9 with shared environments: Cloud9 was a general-purpose cloud IDE and is no longer available to new customers; it never provided governed data access or integrated analytics and ML tools.
+D=AWS Glue Studio: Glue Studio builds and runs ETL jobs visually; it does not cover SQL analytics for analysts or model building for ML engineers.
+T: When different data roles need one governed workspace with shared projects, SageMaker Unified Studio fits; BI and ETL tools each cover only one role.
+
+@ Q000369 explain
+G: ## CREATE TABLE AS SELECT in Athena
+A CTAS statement runs a query and saves its result as a new table in one step:
+- the result files are written to S3 in the format you choose, such as Parquet with Snappy compression,
+- a table definition pointing to those files is added to the AWS Glue Data Catalog,
+- optional properties set `partitioned_by` and `bucketed_by` columns.
+Example:
+`CREATE TABLE sales_summary WITH (format = 'PARQUET', write_compression = 'SNAPPY', external_location = 's3://lake/sales_summary/') AS SELECT region, month, SUM(amount) AS total FROM sales GROUP BY region, month`
+Downstream Athena, Glue or EMR jobs then query `sales_summary` directly instead of re-running the expensive query. `INSERT INTO` can add new rows later.
+W: CREATE TABLE AS SELECT (CTAS): it materializes the query result as compressed Parquet in S3 and registers a permanent Data Catalog table, exactly as required.
+X: B=Named query with parameters: a named query stores SQL text for reuse; running it returns results but creates no permanent table.
+C=Saved query: saving a query only keeps its text in the console for later; nothing is materialized or registered in the catalog.
+D=UNLOAD: UNLOAD writes query results to S3 in formats like Parquet, but it does not create a table in the Data Catalog, so downstream jobs would need a separate table definition.
+T: To persist a query result as a new cataloged table in a columnar format, use CTAS; UNLOAD writes files only, and saved or named queries store SQL text.
+
+@ Q000370 explain
+G: ## Two ways S3 can announce new objects
+- **S3 event notifications** send events directly to Lambda, SQS or SNS. Configurations for the same event type must not have overlapping prefixes and suffixes, so two independent consumers of the same `incoming/` events clash unless you fan out through SNS.
+- **Amazon EventBridge integration**: after enabling "Send notifications to Amazon EventBridge" on the bucket, every object event goes to the default event bus. Any number of **rules** can match on bucket, event type and key prefix, and each rule has its own targets.
+## Example
+Rule 1 matches `Object Created` with key prefix `incoming/` and targets the validation Lambda function. Later, team two adds rule 2 with the same pattern targeting their SQS queue or Step Functions workflow; rule 1 is untouched.
+Events arrive within seconds of the upload, so the validation still runs right after creation.
+W: S3 events to EventBridge, one rule per consumer: events are pushed as objects are created, and each team owns its own rule, so new consumers never modify the existing setup.
+X: B=Lambda polling the bucket: polling adds delay between polls and repeated LIST requests, and still gives the second team no event feed of its own.
+C=Crawler every minute: crawlers update Data Catalog schemas and partitions; they do not emit per-object events or run validation, and a one-minute schedule is not "the moment" an object arrives.
+D=CloudTrail Insights on writes: Insights detects unusual API call volume or error rates; it is for anomaly detection, not for delivering each object creation to consumers.
+T: For several independent consumers of S3 object events, route the bucket's events to EventBridge and give each consumer its own rule.
+
+@ Q000371 explain
+G: ## Event-driven start of a state machine
+To start Step Functions with no polling code, combine two features:
+- **S3 to EventBridge**: turn on EventBridge notifications for the bucket. Every object event, such as `Object Created`, is sent to the default event bus.
+- **An EventBridge rule**: an event pattern filters the events, for example on the bucket name and a key pattern using `prefix`, `suffix` or `wildcard` matching such as `uploads/*.csv`. The rule's target is the state machine ARN, with an IAM role that allows `states:StartExecution`.
+The event JSON (bucket, key, size) becomes the execution input, so the first state knows which object to process.
+## Example
+A rule matches objects created under `raw/` ending in `.parquet` and starts the `ingest-pipeline` state machine once per file.
+W: S3 EventBridge notifications and a rule targeting the state machine: S3 publishes the events, the rule filters for the object pattern, and EventBridge starts the execution directly with the event as input.
+X: A=Poll with a Wait state every 5 minutes: this is exactly the custom polling the company wants to avoid; it also adds up to five minutes of delay and needs an execution already running to poll.
+B=AWS Config plus manual start: Config records resource configuration changes, not individual object uploads, and a manual start is not automatic.
+D=SNS with only an email subscription: email is for people; someone still has to start the execution by hand, so nothing is automated.
+T: For automatic reaction to matching S3 uploads, send S3 events to EventBridge and target the state machine from a rule with the right key pattern.
+
+@ Q000372 explain
+G: ## Dashboards versus data preparation
+The two needs belong to different tools:
+- **Amazon QuickSight** is the business intelligence service. It builds interactive dashboards with filters, drill-downs (for example from country to region to store), and scheduled reports for business users, and it scales to many readers.
+- **AWS Glue DataBrew** is a visual data preparation service. It profiles datasets (missing values, distributions, outliers) and applies no-code cleaning steps saved as reusable recipes.
+## Example
+An engineer profiles a raw sales file in DataBrew, fixes invalid dates and duplicate rows, and writes the cleaned output to S3. QuickSight then reads the cleaned data through Athena, and executives drill from yearly totals into monthly figures.
+W: QuickSight for dashboards; DataBrew for profiling: each tool is matched to its purpose, BI dashboards with drill-down for executives and visual profiling and cleaning for the engineer.
+X: A=Athena for both: Athena runs SQL queries but has no dashboards or visual profiling interface; it is often the query layer underneath QuickSight.
+C=DataBrew for dashboards; QuickSight for profiling: the roles are swapped; DataBrew does not publish executive dashboards, and QuickSight has no column profiling or recipe-based cleaning; its dataset editing only shapes data for visuals.
+D=CloudWatch dashboards and Glue crawlers: CloudWatch dashboards show operational metrics, not business drill-downs, and crawlers only detect schemas; they do not clean data.
+T: QuickSight serves interactive business dashboards; DataBrew serves visual profiling and cleaning before data reaches them.
+
+@ Q000373 explain
+G: ## SageMaker Data Wrangler for ML data preparation
+Amazon SageMaker Data Wrangler, now available inside SageMaker Canvas, is a low-code tool for preparing data specifically for machine learning.
+- The **Data Quality and Insights report** shows feature distributions, missing values, outliers and **target leakage** (features that predict the label suspiciously well because they contain information about it).
+- **Bias analysis** uses SageMaker Clarify metrics to check whether classes or groups, such as age bands, are imbalanced.
+- Hundreds of built-in transforms (encoding, scaling, handling missing values) build a **data flow**.
+- The flow can be exported, for example as a processing step in SageMaker Pipelines or to SageMaker Feature Store, so the same transforms run again in production.
+## Example
+A churn dataset shows that `cancellation_date` perfectly predicts the label; the leakage check flags it, the column is dropped, and the flow is exported as a pipeline step.
+W: SageMaker Data Wrangler: it is the tool built for ML-focused visual exploration, target-leakage and bias analysis, and export of the transforms into repeatable ML pipelines.
+X: A=AWS Glue DataBrew: DataBrew profiles and cleans data visually for general analytics, but it has no target-leakage or ML bias reports and does not export steps into SageMaker pipelines.
+B=Amazon Athena: Athena runs SQL on S3 data; it has no visual feature analysis, bias reporting or pipeline export.
+C=Amazon QuickSight: QuickSight builds BI dashboards for business users; it is not designed to detect leakage or produce ML bias reports.
+T: For ML-specific data preparation with leakage and bias checks and reusable pipeline export, choose Data Wrangler; DataBrew is general-purpose data cleaning.
+
+@ Q000374 explain
+G: ## Interactive exploration with notebooks
+A **Jupyter notebook** mixes executable code cells with text cells:
+- run one cell at a time and keep variables in memory between cells,
+- display DataFrames as tables and draw charts inline (for example with pandas and matplotlib),
+- write Markdown notes next to the code so the notebook tells the story of the analysis,
+- share the notebook file so teammates can read and re-run it.
+In **Amazon SageMaker Studio** (and SageMaker Unified Studio), JupyterLab spaces run on managed compute that you size as needed, with access to data in S3 and other AWS services through the space's IAM role.
+## Example
+An engineer loads a 1% sample from S3 into pandas, checks `df.describe()`, plots a histogram of order amounts, adds a note that 3% of rows have negative totals, and shares the notebook for review.
+W: A Jupyter notebook in SageMaker Studio: notebooks are built for interactive, cell-by-cell Python with inline tables, plots and documentation that teammates can read and rerun.
+X: A=A CloudFormation template: templates declare infrastructure to deploy; they cannot run analysis code, show DataFrames or plot results.
+B=A Lambda function with print statements: each change needs a redeploy and a full run, output goes to CloudWatch Logs as plain text, and there is no inline plotting or narrative documentation.
+C=A Glue ETL job on a schedule: scheduled jobs run whole scripts in batch for production transformations; they are not interactive and do not display intermediate results or charts.
+T: For interactive exploration, plotting and documented findings, use a notebook; Lambda, Glue jobs and templates are for automated production work.
+
+@ Q000375 explain
+G: ## GROUP BY, then HAVING
+SQL evaluates a query roughly in this order: `FROM`, `WHERE`, `GROUP BY`, `HAVING`, `SELECT`, `ORDER BY`.
+- `WHERE` filters individual rows before grouping; it cannot use aggregates like `SUM`.
+- `GROUP BY region` collapses all rows with the same region into one group.
+- `HAVING` filters those groups after aggregation, so it is the place to test aggregates such as `SUM(amount) > 100000`.
+## Example
+Rows: East 60,000 + 70,000; West 40,000 + 30,000; North 150,000.
+- Groups: East 130,000, West 70,000, North 150,000.
+- `HAVING SUM(amount) > 100000` keeps East and North.
+Result: two rows, `East 130000` and `North 150000`. West disappears even though it exists, because its total is too small. No ranking or limit is applied, so several regions can qualify.
+W: Each region's total, only where the total exceeds 100000: the query sums `amount` per region and HAVING removes groups whose sum is 100,000 or less.
+X: A=Only the single highest region: nothing in the query sorts or limits results; returning only the top region would need `ORDER BY total_sales DESC LIMIT 1`.
+B=Error, HAVING cannot use aggregates: filtering on aggregates is the purpose of HAVING; it is WHERE that cannot contain aggregate functions.
+D=Individual rows with amount over 100000: that would be `WHERE amount > 100000` without grouping; this query compares each region's total, not single rows.
+T: WHERE filters rows before grouping; HAVING filters groups after aggregation, so this query returns every region whose total exceeds the threshold.

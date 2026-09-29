@@ -1,0 +1,350 @@
+# DOP-C02 detailed explanations, e02 (explanation-only rewrites; letters are the published ones)
+
+@ Q001241 explain
+G: ## How CodeArtifact repositories chain together
+AWS CodeArtifact stores packages in **repositories** that live inside a **domain**. A repository can list other repositories as **upstreams**, and it can have an **external connection** to a public registry such as `public:npmjs` or `public:maven-central`.
+When a client asks for a package version, CodeArtifact looks in the repository itself, then in its upstreams in the configured order, and finally through the external connection. A version fetched from a public registry is cached in the repository, so later builds get it even if the public registry is slow or the package is removed there.
+## A typical layout
+- `internal-approved`: packages the company published or vetted.
+- `npm-store` with an external connection to `public:npmjs`, `maven-store` with one to `public:maven-central`.
+- `team-repo`: upstreams `internal-approved`, then the public store repositories. Developers point npm and Maven at this one endpoint only.
+Because the internal repository is earlier in the order, an approved internal version is served first; anything missing falls through to the public registry.
+W: Upstreams plus an external connection: developers use one endpoint, internal approved versions are resolved first, and packages not yet available internally are fetched and cached from npmjs or Maven Central through the external connection.
+X: A=VPN to npmjs.com: CodeArtifact connects to public registries natively through external connections. A VPN adds cost and still gives no single managed endpoint that combines internal and public packages.
+B=S3 as the registry: an S3 bucket does not speak the npm or Maven repository protocols, has no upstream fallback to public registries and no package-level permissions, so developers could not simply run `npm install` against it.
+D=Separate unconnected repositories: developers would have to switch endpoints by hand, which defeats the single central endpoint and makes it easy to pull an unapproved public version.
+T: One CodeArtifact repository whose upstream chain puts internal packages first and ends in an external connection gives a single endpoint with public fallback; separate or non-CodeArtifact stores cannot do that.
+
+@ Q001242 explain
+G: ## Two scanning modes in Amazon ECR
+Amazon ECR can scan container images for known software vulnerabilities (CVEs). The registry-level scanning configuration chooses one of two modes:
+- **Basic scanning** uses AWS-native scanning of operating system packages. It runs on push (scan on push) or when you start a manual scan. The result is a snapshot: if a new CVE is published tomorrow, the old finding list is not updated unless you scan again.
+- **Enhanced scanning** is provided by **Amazon Inspector**. It scans operating system and programming language packages, and in continuous mode Inspector automatically rescans images whenever new vulnerability data is added to its database, for as long as the image stays within the configured rescan duration.
+## Example
+An image pushed in January had no findings. In March a critical CVE is published for a library inside it. With enhanced continuous scanning, Inspector re-evaluates the image and produces a new finding (and an EventBridge event) without anyone re-pushing it.
+W: Enhanced scanning with Inspector: continuous scan mode re-evaluates stored images as new CVE data arrives, which is exactly the "keep rescanning" requirement, and it covers language packages as well as OS packages.
+X: A=Basic scanning: it produces a point-in-time result at push or on a manual request and does not automatically re-evaluate the image when new CVEs are published.
+C=Daily re-push: re-pushing to trigger basic scans is a workaround that adds pipeline churn and still only yields daily snapshots of OS package findings; enhanced continuous scanning does this natively.
+D=Amazon Macie: Macie discovers sensitive data such as PII in Amazon S3 objects. It does not scan ECR container images for software vulnerabilities.
+T: Basic ECR scanning is a one-time snapshot; enhanced scanning with Amazon Inspector keeps rescanning images as new CVEs appear.
+
+@ Q001243 explain
+G: ## Tags are pointers, digests are fingerprints
+In ECR an image is identified two ways:
+- A **tag** such as `prod` or `v1.4` is a movable label. By default (mutable tags) pushing a new image with the same tag simply moves the label to the new image.
+- A **digest** such as `myrepo@sha256:3f9a...` is the SHA-256 hash of the image manifest. It is derived from the content, so it can never point to a different image.
+## Tag immutability
+Setting a repository to **immutable** tags makes ECR reject any push that would reuse an existing tag, so `prod` cannot be silently overwritten. (ECR also lets you exclude tag patterns, for example `latest`, from immutability when needed.)
+Deploying by digest in task definitions, Kubernetes manifests or CodeDeploy AppSpec files means the deployment references the exact bytes that were tested, even if tags change later.
+W: Tag immutability plus digest deploys: immutability stops anyone from overwriting a tag in the repository, and deploying by `@sha256:` digest pins the exact image, so neither an accidental push nor a later retag can change what runs.
+X: B=Enhanced scanning: it finds vulnerabilities in images; it does nothing to stop a tag from being moved to a different image.
+C=Single CodeBuild project: funneling pushes through one project changes who pushes, not whether a tag can be overwritten; the same project could still push a new image as `prod`.
+D=Untagged-image lifecycle rule: it cleans up images that lost their tag after an overwrite, which removes evidence and storage but does not prevent the overwrite or pin the deployment.
+T: Prevent overwrites with tag immutability and pin deployments with digests; scanning, pipeline funneling and cleanup rules do not stop a tag from moving.
+
+@ Q001244 explain
+G: ## Where CodePipeline artifacts go
+Every CodePipeline execution writes its input and output artifacts (source zips, build outputs) as objects in an S3 **artifact store** bucket. CodePipeline never deletes them, so the bucket grows with every run.
+## S3 Lifecycle rules
+An S3 Lifecycle configuration lets S3 act on objects automatically based on age and prefix:
+- **Transition** actions move objects to cheaper storage classes, for example to `STANDARD_IA` after 30 days or to Glacier classes later.
+- **Expiration** actions delete objects after a set age, for example 90 days.
+Example: a rule on the pipeline's prefix that transitions artifacts to Standard-IA after 30 days and expires them after 90 days keeps three months of artifacts for troubleshooting and removes the rest with no scripts. If the bucket is versioned, add a `NoncurrentVersionExpiration` action so old versions are removed too.
+W: Lifecycle transition and expiration: it runs automatically, keeps recent artifacts available, lowers the cost of older ones and deletes those past the retention window, which directly fixes the cost growth.
+X: A=Amazon EFS: CodePipeline's artifact store is S3; it cannot store artifacts on EFS, and EFS storage generally costs more per GB than S3.
+B=Delete and recreate the bucket: it throws away the recent artifacts the team still needs and is a one-off; the bucket will grow again from the next execution.
+C=Disable artifact storage: CodePipeline needs its artifact store to pass artifacts between stages, so artifact storage cannot be turned off.
+T: Manage artifact growth with S3 Lifecycle transitions and expirations, not by moving storage services or wiping the bucket.
+
+@ Q001245 explain
+G: ## EC2 Image Builder pipelines
+EC2 Image Builder automates the creation of "golden" AMIs. An **image pipeline** combines:
+- An **image recipe**: a base image plus **build components**, for example update-OS and CIS or STIG hardening components.
+- **Test components** that run on an instance launched from the new image; if a test fails, the image is not distributed.
+- An **infrastructure configuration** for the build instance.
+- A **distribution configuration** that copies the AMI to other Regions, shares it with or copies it to other accounts, and can update **launch templates** with the new AMI ID (and write it to an SSM parameter).
+- A **schedule**, such as a cron expression for the first day of each month.
+## Example
+One pipeline runs monthly, patches and hardens the image, runs tests, then distributes the AMI to 3 Regions and 20 accounts and sets it as the new default launch template version, so Auto Scaling groups pick it up.
+W: Image Builder pipeline: patching, hardening, automated tests, multi-Region and multi-account distribution and launch template updates are all built-in parts of one scheduled pipeline.
+X: B=Maintenance Window patching: it patches instances that are already running, producing drifting servers rather than a tested, versioned AMI distributed to other accounts and launch templates.
+C=ECR lifecycle policy: ECR lifecycle policies expire container images in a repository; they do not build, test or distribute AMIs.
+D=CodeBuild with CreateImage and CopyImage: it can be made to work, but you would have to script hardening, tests, cross-account sharing and launch template updates yourself, which Image Builder already provides.
+T: For tested, hardened AMIs distributed across Regions and accounts with launch template updates, use an Image Builder pipeline instead of custom scripts or in-place patching.
+
+@ Q001246 explain
+G: ## Two ways to package a Lambda function
+- **.zip archive**: limited to 50 MB zipped when uploaded directly and 250 MB unzipped, including all layers. Large ML libraries quickly exceed that.
+- **Container image**: the function is built as an OCI image, pushed to Amazon ECR and referenced by its image URI. Images can be up to **10 GB** uncompressed.
+## Why the container path fits
+With container images you use the same `docker build` and `docker push` steps as your other services, start from an AWS-provided Lambda base image (or add the Lambda Runtime Interface Client to your own), and let CI/CD scan, tag and promote the image like any other container. The function still runs on Lambda with the same event sources and scaling.
+Example: a Python inference function with PyTorch is built `FROM public.ecr.aws/lambda/python`, pushed to ECR, and the function's `ImageUri` is updated by the pipeline.
+W: Container image in ECR: it raises the package limit to 10 GB so large ML dependencies fit, and it reuses the team's existing container build, scan and push tooling.
+X: A=Split into smaller functions: each function would still need the large libraries it imports, so splitting adds complexity without solving the dependency size.
+B=Support quota increase: the deployment package size limits for .zip archives are fixed and cannot be raised through a quota request.
+D=Move to AWS Batch: Lambda can run ML libraries; the constraint was only the package format, which container images solve without changing compute service.
+T: When a Lambda .zip is too big, package the function as a container image (up to 10 GB) instead of splitting it or leaving Lambda.
+
+@ Q001247 explain
+G: ## Two layers of CodeArtifact permissions
+CodeArtifact uses resource-based policies at two levels, similar to an S3 bucket policy:
+- A **domain policy** controls who can use the domain, most importantly `codeartifact:GetAuthorizationToken`, which every client needs to get a token.
+- A **repository policy** controls what a principal can do in a repository, for example `codeartifact:ReadFromRepository` to download packages.
+The calling principal also needs identity-based permissions in its own account, including `sts:GetServiceBearerToken`.
+## Sharing with many accounts
+Instead of listing dozens of account IDs, the policies can allow all principals with a condition on `aws:PrincipalOrgID`, so every account in the organization can read, and nothing else. Each account's CodeBuild role then runs `aws codeartifact login` against the central domain and reads packages, but cannot publish or administer.
+W: Domain and repository resource policies: they grant only the read actions each consuming account needs on the single shared repository, with no duplication and no broad admin rights.
+X: A=AdministratorAccess: granting full admin in the platform account to dozens of build roles violates least privilege and exposes everything in that account.
+C=Copy to S3 in each account: it duplicates the repository, loses package-manager features such as version resolution and upstreams, and must be kept in sync.
+D=Cannot be shared: CodeArtifact explicitly supports cross-account access through domain and repository resource policies.
+T: Share a CodeArtifact repository across accounts with domain and repository resource policies (optionally scoped by organization ID), not by copying data or granting admin.
+
+@ Q001248 explain
+G: ## ECR replication
+Amazon ECR can replicate images at the **private registry** level. A replication configuration contains rules that name destination Regions (and optionally destination accounts), with optional **repository filters** by name prefix.
+How it works:
+- After the rule is in place, each image pushed to a matching repository in the source Region is copied automatically to the destination Region, including its tags.
+- The destination repository is created automatically if it does not exist.
+- Images pushed before the rule was created are not replicated retroactively.
+## Example
+A rule in `us-east-1` with destination `eu-west-1` and filter prefix `app/`: when the pipeline pushes `app/api:1.8`, ECS clusters in `eu-west-1` pull the same image from their local regional registry, avoiding cross-Region pulls and extra latency.
+W: ECR cross-Region replication: it copies each new push to `eu-west-1` automatically, so European clusters pull locally without any manual push step.
+X: A=S3 Cross-Region Replication: it replicates objects in S3 buckets you own; ECR image storage is managed by ECR and is not configured with S3 replication.
+B=No replication support: ECR supports both cross-Region and cross-account replication through the registry replication configuration.
+D=Pull-and-push script: it works but adds a manual, failure-prone step to every deployment, which the requirement explicitly wants to avoid.
+T: To make ECR images available in another Region automatically, configure registry replication rules instead of scripting copies.
+
+@ Q001249 explain
+G: ## What a buildspec can do
+A CodeBuild `buildspec.yml` runs commands in phases: `install`, `pre_build`, `build` and `post_build`. Any command you can run in a shell can run there, so one build can do several unrelated jobs.
+- Container images are not "artifacts" in the CodeBuild sense: the build runs `docker build` and `docker push` to ECR (with the project in privileged mode or another supported builder).
+- File outputs such as a Lambda `.zip` go into the `artifacts` section, and a build can declare several outputs with `secondary-artifacts`.
+## Example
+- `pre_build`: log in to ECR with `aws ecr get-login-password`.
+- `build`: `docker build -t backend:$CODEBUILD_RESOLVED_SOURCE_VERSION ./backend`; zip the processor code in `./processor`.
+- `post_build`: `docker push` the image; write `imagedefinitions.json`.
+- `artifacts`: output the Lambda zip and the image definitions file for later deploy stages.
+W: One build with separate phases: the buildspec pushes the backend image to ECR and packages the Lambda zip as a build artifact in the same run, publishing both correctly.
+X: A=Only one artifact type: CodeBuild can run any number of commands and declare secondary artifacts, so one project can produce an image and a zip.
+B=Split the repository: there is no rule tying a CodeBuild project to one artifact type, so restructuring the monorepo is unnecessary.
+D=CodeDeploy builds the image: CodeDeploy deploys revisions; it does not build or push container images.
+T: A single CodeBuild buildspec can push a container image and package a Lambda zip in its phases; CodeDeploy deploys but never builds.
+
+@ Q001250 explain
+G: ## Hardening AMIs with Image Builder
+**DISA STIGs** (Security Technical Implementation Guides) are US Department of Defense hardening baselines. EC2 Image Builder provides Amazon-managed **STIG components** for Linux and Windows that apply those settings during the image build, at different severity levels.
+A pipeline has two stages that matter here:
+- **Build**: the recipe's components run on a build instance: patching, STIG hardening, your own software.
+- **Test**: a new instance is launched from the resulting image and **test components** run against it. The AMI is only created and distributed if the tests pass.
+## Repeating on every patch
+The pipeline can run on a cron schedule or be set to run only when the base image or components have newer versions, so each patched base image produces a new hardened, tested AMI.
+W: Image Builder with STIG and test components: hardening is applied during the build, validation runs before the AMI is released, and the scheduled pipeline repeats the process for every new base image.
+X: A=AWS Config after launch: Config evaluates resource configurations and can flag noncompliance, but it does not harden the OS inside instances and acts after launch rather than before the AMI is used.
+B=Manual one-time hardening: the image would miss every later patch, and there is no automated validation or repeatability.
+D=Amazon Inspector: Inspector scans for vulnerabilities and exposure; it reports findings but does not modify AMIs to apply STIG settings.
+T: Build hardening into the image with Image Builder STIG components and prove it with test components on a schedule; Config and Inspector only detect, they do not harden.
+
+@ Q001252 explain
+G: ## Why untagged images pile up
+When CI pushes a new image with a tag that already exists (for example `latest`), ECR moves the tag to the new image. The previous image stays in the repository but now has no tag. After hundreds of builds, these untagged images consume storage you keep paying for.
+## ECR lifecycle policies
+A lifecycle policy is a JSON set of rules that ECR evaluates automatically. Each rule selects images by `tagStatus` (`tagged`, `untagged` or `any`) and a count type:
+- `sinceImagePushed` with a number of days, or
+- `imageCountMoreThan` to keep only the newest N images.
+Example rule: `tagStatus: untagged`, `countType: sinceImagePushed`, `countNumber: 7`, action `expire`. Every untagged image older than 7 days is deleted automatically, and you can preview the result before applying it.
+W: Lifecycle rule for untagged images: ECR expires the leftover images automatically on an ongoing basis, with no manual effort.
+X: A=Manual weekly deletion: it is toil and easy to forget, and the repository still grows between cleanups; a lifecycle policy does the same thing automatically.
+B=Enhanced scanning: scanning looks for vulnerabilities; it never deletes images.
+C=Tag immutability: it blocks pushes that reuse a tag, which would break this CI process, and it does not delete any existing untagged images.
+T: Clean up untagged ECR images with a lifecycle policy; scanning and tag immutability do not remove anything.
+
+@ Q001253 explain
+G: ## Encrypting ECR with a customer managed key
+An ECR repository can be created with `KMS` encryption using a **customer managed key**. ECR uses the key to protect image layers and decrypts them when an authorized principal pulls.
+## Cross-account pulls need two policies
+- The **repository policy** in Account A grants Account B's role the pull actions: `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`, and `ecr:BatchCheckLayerAvailability`. Account B also needs `ecr:GetAuthorizationToken` in its own IAM policy.
+- The **key policy** of Account A's key allows Account B's principals to use the key only for what the pull requires (for example `kms:Decrypt`), and Account B's IAM policy must allow that too.
+Account A keeps full control: it can rotate, disable or revoke access to the key at any time, and Account B cannot change the key or its policy.
+W: Key policy plus repository policy: Account A keeps ownership of the key while granting Account B only the pull actions and the key usage needed to read the image, which is least privilege on both the repository and the key.
+X: B=Full key administration: administrative rights would let Account B change the key policy, disable or schedule deletion of the key, far beyond what pulling an image needs.
+C=Copy the key to Account B: KMS keys cannot be exported or copied between accounts; cross-account use is granted through the key policy instead.
+D=Disable encryption: ECR supports cross-account pulls from KMS-encrypted repositories, and dropping encryption would break the requirement to use Account A's key.
+T: For cross-account pulls of a KMS-encrypted ECR image, grant minimal pull actions in the repository policy and minimal key use in the key policy; never give away key administration.
+
+@ Q001254 explain
+G: ## CodeDeploy on EC2: in-place vs blue/green
+- **In-place**: CodeDeploy stops the application on existing instances, installs the new revision and restarts, a few instances at a time. The fleet itself is reused, and rolling back means redeploying the old revision onto the same instances.
+- **Blue/green**: CodeDeploy creates a **replacement environment**, for example by copying the Auto Scaling group, installs the new revision there, and only then reroutes load balancer traffic from the original (blue) instances to the new (green) ones.
+## What blue/green adds
+- Hooks such as `BeforeAllowTraffic` let you run validation against green before any user sees it.
+- The original instances can be kept running for a set time after cutover. If something goes wrong, traffic is rerouted back to them, which is much faster than redeploying.
+- There is no capacity loss during the release because the old fleet keeps serving until the switch.
+W: Blue/green with a replacement ASG: each release gets a new fleet, it is validated before traffic moves, the switch is done at the load balancer with no downtime, and keeping the blue fleet allows near-instant rollback.
+X: A=In-place OneAtATime: it reuses the existing fleet, briefly takes instances out of service one by one, and rollback means redeploying the old revision instance by instance.
+C=Launch template update and manual termination: it is a manual rolling replacement with no validation gate before traffic shifts and no automatic, instant rollback.
+D=In-place AllAtOnce: every instance is updated at the same time, causing downtime, and a rollback script still has to reinstall the old version on the same instances.
+T: New fleet, pre-traffic validation and instant rollback are the definition of CodeDeploy blue/green; in-place variants reuse and modify the existing instances.
+
+@ Q001255 explain
+G: ## ECS rolling update vs CodeDeploy blue/green
+- **ECS rolling update**: the ECS scheduler replaces old tasks with new ones, controlled by `minimumHealthyPercent` and `maximumPercent`. Traffic reaches new tasks simply because they register in the same target group; you cannot say "send exactly 10% of requests to the new version". It can roll back via the deployment circuit breaker or CloudWatch alarms, but by then many tasks may already run the new version.
+- **CodeDeploy blue/green for ECS**: CodeDeploy creates a new **task set** in a second target group and moves traffic at the load balancer listener according to a deployment configuration such as `CodeDeployDefault.ECSCanary10Percent5Minutes` or `ECSLinear10PercentEvery1Minutes`. If an attached CloudWatch alarm fires during the shift, CodeDeploy routes traffic back to the original task set.
+## Example
+With the canary config, 10% of requests hit the new version for 5 minutes. A spike in 5xx errors triggers the alarm, and 90% of users never saw the bad release.
+(Amazon ECS has since added its own built-in blue/green, linear and canary strategies, but the choice here is between a rolling update and CodeDeploy.)
+W: CodeDeploy blue/green: it shifts a controlled percentage of traffic to the new task set, watches CloudWatch alarms, and reroutes traffic back automatically before most users are affected.
+X: B=Rolling updates have percentages: rolling update percentages control how many tasks are replaced, not what share of traffic goes to the new version, and it is CodeDeploy blue/green that offers traffic shifting.
+C=Functionally identical: they differ in the key requirement: only the blue/green path shifts a defined share of traffic at the listener and switches it back instantly.
+D=Rolling update with gradual shifting: a rolling update replaces tasks rather than shifting traffic percentages, so it cannot guarantee that only a small slice of users hits the new version first.
+T: Precise traffic percentages with alarm-driven rollback come from CodeDeploy blue/green (canary or linear); a rolling update only replaces tasks.
+
+@ Q001256 explain
+G: ## Lambda traffic shifting with aliases
+A Lambda **alias** such as `prod` points to a function version. It can also split invocations between two versions with weights, for example 90% to version 7 and 10% to version 8. CodeDeploy uses this weighting to shift traffic during a deployment.
+## Built-in Lambda deployment configurations
+- **Canary**: `CodeDeployDefault.LambdaCanary10Percent5Minutes`, `...10Minutes`, `...15Minutes`, `...30Minutes`: 10% first, then the rest after the wait.
+- **Linear**: `CodeDeployDefault.LambdaLinear10PercentEvery1Minute`, `...Every2Minutes` and similar: 10% more every interval until 100%.
+- **All at once**: `CodeDeployDefault.LambdaAllAtOnce`.
+If a CloudWatch alarm attached to the deployment group goes into ALARM during the wait, CodeDeploy points the alias back to the old version.
+W: LambdaCanary10Percent10Minutes: it sends exactly 10% to the new version through the alias, waits 10 minutes while alarms are monitored, then shifts the remaining 90% in one step.
+X: B=LambdaAllAtOnce: it shifts 100% immediately, so there is no 10% observation window before everyone is on the new version.
+C=Linear every minute: it keeps adding equal increments on a fixed interval instead of one 10% step followed by a 10-minute wait and a single final shift.
+D=Only full cutover: weighted aliases let Lambda split traffic between two versions, and CodeDeploy uses them for canary and linear deployments.
+T: "X% first, wait, then the rest" is a canary configuration; linear adds equal steps, and all-at-once has no observation window.
+
+@ Q001257 explain
+G: ## Progressive delivery on EKS
+CodeDeploy's compute platforms are EC2/on-premises, Lambda and ECS. It does not manage Kubernetes Deployments, so on Amazon EKS progressive delivery is usually done with Kubernetes-native controllers:
+- **Argo Rollouts** replaces a `Deployment` with a `Rollout` resource whose strategy is `blueGreen` or `canary` with steps such as `setWeight: 10` and `pause`. **AnalysisTemplates** query metrics (for example from Prometheus or CloudWatch) and abort the rollout if error rates rise.
+- **Flagger** automates canary, A/B and blue/green releases using a service mesh or ingress controller and metric checks.
+## Wiring it into the pipeline
+The pipeline (CodePipeline, CodeBuild or a GitOps tool) updates the image tag in the manifest; the controller in the cluster then shifts traffic step by step and promotes or rolls back based on the metrics.
+W: Argo Rollouts or Flagger: they add canary and blue/green strategies with metric-based promotion and automatic rollback inside the cluster, triggered by the pipeline updating the manifest.
+X: B=Only rolling updates: plain Deployments use rolling updates, but Kubernetes can run blue/green and canary through controllers, service meshes or two Deployments behind a Service.
+C=CodeDeploy ECS type for EKS: the ECS deployment type works with ECS services and task sets only; it cannot manage EKS workloads.
+D=Manual replica edits: changing replica counts by hand gives crude, unmonitored traffic ratios with no automatic analysis or rollback.
+T: On EKS, get CodeDeploy-style canary and blue/green from Kubernetes controllers such as Argo Rollouts or Flagger.
+
+@ Q001258 explain
+G: ## Mutable vs immutable deployments
+- **Mutable**: servers live a long time and are changed in place (SSH hotfixes, package upgrades, config edits). Over time each server drifts from the others and from any documented baseline, so nobody knows exactly what "the previous state" was.
+- **Immutable**: every release is a new **versioned artifact** (an AMI, a container image) built by the pipeline. You never modify a running server; you replace it with instances built from the new version.
+## Why immutability solves both incidents
+- **Drift**: nothing is changed in place, so all instances of version `v42` are identical. A hotfix becomes `v43`, built and tested like any other release.
+- **Rollback**: the previous state is a known artifact, for example `ami-v42` or `app:v42`. Rolling back means redeploying that artifact, which takes minutes instead of reconstructing what was changed.
+W: Immutable versioned artifacts: replacing instead of modifying removes configuration drift, and the previous known-good version is always available to redeploy quickly.
+X: A=Configuration management agent: it reduces drift, but servers are still changed in place and a rollback still depends on reversing state rather than redeploying a known artifact.
+C=SSH changes logged in a wiki: documentation depends on people remembering to update it and does nothing to prevent drift or speed up rollback.
+D=Snapshots before every change: they help recover single volumes, but they do not stop drift across a fleet and are not a versioned, repeatable release process.
+T: Immutable deployments of versioned artifacts eliminate drift and make rollback a redeploy; mutable approaches only try to track changes.
+
+@ Q001259 explain
+G: ## What happens to local data in blue/green
+In a CodeDeploy EC2 blue/green deployment, the green environment is a set of **new instances**, typically from a copied Auto Scaling group. Each new instance gets its own new EBS volumes from the launch template. Data written to the blue instances' volumes, such as session files, stays on the blue instances and is gone once they are terminated.
+In-place deployments keep the same instances and volumes, so local data usually survives a release. Moving to blue/green changes that assumption.
+## Externalizing state
+Before adopting blue/green, move state off the instances:
+- Sessions to **Amazon ElastiCache** (Redis or Memcached) or **DynamoDB**.
+- Files to **Amazon S3** or **EFS**.
+Once instances are stateless, any instance, blue or green, can serve any user, and replacing the fleet loses nothing.
+W: Fresh volumes on new instances: blue/green replaces the instances, so session data on the old EBS volumes is not carried over; state must be externalized before switching.
+X: B=Automatic EBS migration: CodeDeploy does not copy EBS data from blue instances to green ones; green instances start from the image and launch template.
+C=No EBS allowed: blue/green works fine with EBS-backed instances; the issue is only that data on the old volumes does not move.
+D=In-place also loses data: in-place deployments reuse the same instances and volumes, so local data normally survives; that is exactly the difference the team must handle.
+T: Blue/green replaces instances, so instance-local state is lost; externalize state first, while in-place keeps the same volumes.
+
+@ Q001260 explain
+G: ## Blue/green for a static site
+A static site on S3 behind CloudFront has two moving parts: the **content** in a bucket (or prefix) and the **origin** setting on the CloudFront distribution that says where to fetch it.
+Blue/green applies cleanly:
+- Blue: `site-v1` bucket, currently the origin.
+- Green: upload the new build to `site-v2` and test it through a separate test distribution or endpoint.
+- Cutover: change the production distribution's origin (or origin path) to `site-v2` and invalidate the cache. Rollback: point it back to `site-v1`, which is untouched.
+CloudFront **continuous deployment** offers a managed variant: a staging distribution receives a small share of traffic or requests with a specific header, and you promote its configuration when satisfied.
+W: Separate bucket and origin switch: the new version is fully validated before any production traffic, cutover is a single configuration change, and the previous version stays intact for instant rollback.
+X: B=CodeDeploy ValidateService hook: CodeDeploy deploys to EC2/on-premises, Lambda and ECS, not to S3 buckets, and ValidateService is an EC2/on-premises lifecycle hook.
+C=Not applicable to static content: blue/green only needs two versions and a switch between them, which an S3 bucket plus a CloudFront origin change provides.
+D=Overwrite and invalidate: users see the new files as soon as caches refresh with no prior validation, and rollback means re-uploading the old files.
+T: For S3 plus CloudFront, blue/green means a second bucket or prefix and a switch of the CloudFront origin; overwriting in place removes validation and easy rollback.
+
+@ Q001261 explain
+G: ## Shared storage in a blue/green deployment
+Amazon EFS is a regional, managed NFS file system. It is not attached to any single instance: many instances in multiple Availability Zones mount the same file system at the same time through **mount targets** (one per AZ).
+When CodeDeploy provisions the green fleet, those new instances are just more NFS clients. If the launch template or user data mounts the file system (for example with `amazon-efs-utils` and an `/etc/fstab` entry), green sees the same uploaded files that blue sees, with no copying.
+## What to verify
+- A mount target exists in every AZ the green instances use.
+- The mount target security group allows inbound NFS (TCP `2049`) from the green instances' security group.
+- The mount command runs at boot, and any EFS access points or IAM authorization also allow the new instance role.
+W: Shared EFS mount: the green fleet mounts the same file system, so uploads remain available; the team should confirm mounts, mount targets and NFS security group rules for the new instances.
+X: A=EFS incompatible with Auto Scaling: EFS is commonly mounted by Auto Scaling group instances precisely because it is shared and elastic.
+B=Separate EFS for green: blue/green replaces compute, not shared storage; a second file system would split the data and require copying.
+D=Manual copy: nothing needs copying because EFS data is not stored on the instances; every mounting instance sees the same files.
+T: EFS is shared, so blue and green fleets use the same data; just make sure the new instances can mount it (mount targets, port 2049, boot-time mount).
+
+@ Q001262 explain
+G: ## Built-in configurations for EC2 in-place deployments
+CodeDeploy deployment configurations decide how many instances are updated at once and how many must stay healthy. For EC2/on-premises there are three built-in ones:
+- `CodeDeployDefault.AllAtOnce`: deploys to as many instances as possible at once. Fastest, but the whole fleet can be out of service together. It succeeds if at least one instance succeeds.
+- `CodeDeployDefault.HalfAtATime`: up to half the instances at a time (10 of 20 here), and it succeeds if at least half the instances succeed.
+- `CodeDeployDefault.OneAtATime`: one instance at a time. Minimal capacity loss and the earliest stop on failure, but the slowest for a large fleet.
+You can also write a custom configuration with a minimum number or percentage of healthy hosts when none of these fit.
+W: AllAtOnce vs OneAtATime: AllAtOnce is fastest but takes the most capacity offline, OneAtATime keeps capacity but is slowest, and HalfAtATime is the built-in middle ground.
+X: A=Only for Lambda and ECS: EC2/on-premises deployments have their own deployment configurations, including these three built-ins.
+B=OneAtATime is concurrent: OneAtATime updates exactly one instance at a time, as its name says.
+D=AllAtOnce is safest: a short window does not make it safe; updating everything together risks taking the whole fleet out of service if the revision is bad.
+T: Speed vs capacity for EC2 in-place: AllAtOnce is fast but risky, OneAtATime is safe but slow, and HalfAtATime sits in between.
+
+@ Q001263 explain
+G: ## How CodeDeploy handles a failed in-place deployment
+During an EC2 in-place deployment, each instance runs the AppSpec lifecycle hooks (`ApplicationStop`, `BeforeInstall`, `AfterInstall`, `ApplicationStart`, `ValidateService`). A script that exits with a non-zero code fails that instance's deployment.
+When failures mean the deployment can no longer meet the configuration's minimum healthy hosts, CodeDeploy stops and marks the deployment **Failed**. What it does next depends on the deployment group:
+- With **automatic rollback** enabled for failed deployments (or for CloudWatch alarm breaches), CodeDeploy starts a new deployment of the last known good revision.
+- Without it, nothing is reverted. Some instances run the new revision, some the old one, and some may be in a broken intermediate state.
+## Recovering
+Fix the script and redeploy, or redeploy the previous revision manually, and consider enabling automatic rollback for next time.
+W: Failed and left mixed: with no automatic rollback configured, CodeDeploy stops, reports Failed, and leaves each instance in whatever state it reached until someone redeploys.
+X: A=Marked Succeeded: a non-zero exit from a hook script fails that instance, and enough instance failures fail the deployment; it is not ignored.
+B=Terminates instances: CodeDeploy does not terminate instances when a hook fails; it only reports the failure and stops deploying.
+C=Rollback by default: automatic rollback is an opt-in setting of the deployment group, and here it is not configured.
+T: Without automatic rollback, a failed CodeDeploy in-place deployment stops and leaves a mixed fleet; rollback only happens if you enable it.
+
+@ Q001264 explain
+G: ## The shared database problem
+In blue/green, the application tier is duplicated but the **database usually is not**. During the traffic shift, and while blue is kept for rollback, both versions read and write the same RDS database. If green requires a backward-incompatible change (dropping or renaming a column), blue breaks the moment the schema changes, and rolling back to blue no longer works.
+## Expand and contract (parallel change)
+- **Expand**: add new columns or tables without removing old ones; make the change backward compatible. Deploy code that can work with both shapes, writing to both if needed, and backfill data.
+- **Migrate**: shift all traffic to the new version and keep blue working until you are confident.
+- **Contract**: in a later release, once no running version uses the old structure, remove the old column.
+Example: to rename `name` to `full_name`, add `full_name`, write both, read `full_name`, then drop `name` a release later.
+W: Shared database with expand-and-contract: both versions hit the same database during the shift, so schema changes are split into backward-compatible expand and later contract steps.
+X: A=Recreate the database each time: it destroys production data and causes an outage, which is the opposite of a safe deployment.
+B=Only for Lambda: any compute type (EC2, ECS, Lambda) running two versions against one database faces the same compatibility problem.
+C=Migrated copy provided: blue/green deployment tools duplicate the application tier; they do not create a migrated copy of your RDS database for the green version.
+T: Two app versions share one database during blue/green, so make schema changes backward compatible with expand-and-contract.
+
+@ Q001265 explain
+G: ## Canary vs linear traffic shifting
+CodeDeploy Lambda and ECS deployments move traffic from the old version to the new one using predefined patterns:
+- **Canary**: traffic moves in **two increments**. A first slice (for example 10%) goes to the new version, CodeDeploy waits for the configured time, then shifts the remaining traffic at once. Example: `CodeDeployDefault.LambdaCanary10Percent5Minutes` = 10%, wait 5 minutes, then 100%.
+- **Linear**: traffic moves in **equal increments** with the same number of minutes between each. Example: `CodeDeployDefault.LambdaLinear10PercentEvery1Minute` = 10%, 20%, ... 100% over about 10 minutes.
+- **All at once**: 100% immediately.
+Both canary and linear watch the configured CloudWatch alarms throughout and roll back automatically if one fires; no manual approval is involved.
+W: Canary two steps, linear equal steps: canary sends a first slice, waits, then shifts the rest, while linear keeps adding the same increment at a fixed interval until 100%.
+X: A=Same behavior: they produce different traffic curves: two increments for canary versus many equal ones for linear.
+C=Linear needs manual approval: linear increments happen automatically on a timer; neither pattern requires approval between steps.
+D=Canary is always 50/50: the first canary increment is defined by the configuration, such as 10%, and is not fixed at 50%.
+T: Canary = one small slice, wait, then everything; linear = equal slices on a timer.
+
+@ Q001266 explain
+G: ## Why slow-starting tasks get rolled back
+In an ECS blue/green deployment, the new task set registers in a target group. The **load balancer health check** (path, interval, timeout, healthy and unhealthy thresholds) decides whether each task is healthy. If a task fails enough checks, ECS stops it and CodeDeploy may roll the deployment back.
+A task that needs about 3 minutes to load caches fails its first checks, gets replaced, and never reaches the healthy state.
+## The settings to tune
+- `healthCheckGracePeriodSeconds` on the ECS service: for this long after a task starts, ECS ignores failed load balancer health checks. Setting it above the startup time (for example 240 seconds) lets tasks finish warming up.
+- **Target group health check**: a health path that reports ready only after caches load, plus sensible interval and threshold values.
+- Optionally a container health check `startPeriod` in the task definition, which gives the same leeway to container-level checks.
+W: Longer grace period and tuned health checks: ECS stops judging tasks during the warm-up, and the target group health check reflects real readiness, so healthy-but-slow tasks are no longer rolled back.
+X: A=Fewer tasks: startup time is per task and comes from loading caches, so running fewer tasks does not make each one start faster.
+B=Disable health checks: target group health checks cannot simply be turned off, and without effective checks broken tasks would receive traffic.
+C=Rolling update without health checks: rolling updates also rely on load balancer health checks when a load balancer is attached, and switching would lose blue/green's traffic control.
+T: Slow-starting ECS tasks need a health check grace period and realistic target group health checks, not fewer tasks or disabled checks.

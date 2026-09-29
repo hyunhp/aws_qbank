@@ -1,0 +1,402 @@
+# DOP-C02 detailed explanations, e01 (explanation-only rewrites; letters are the published ones)
+
+@ Q001215 explain
+G: ## How CodePipeline moves artifacts
+Every action in a pipeline reads and writes **artifacts**: zip files kept in an S3 bucket called the **artifact store**. The store is encrypted with a KMS key, either the AWS managed `aws/s3` key or a customer managed key.
+## Cross-Region actions
+A deploy action in another Region cannot read a bucket through its own Regional endpoint in the pipeline's Region. So a cross-Region pipeline defines one artifact store per Region (the `artifactStores` map in the pipeline structure, one entry per Region with its bucket and key). CodePipeline copies the artifact into the target Region's bucket before that action runs.
+- A standard KMS key lives in a single Region, so the target Region needs its own key.
+- That key's policy must allow `kms:Decrypt` (and the S3 permissions must allow `s3:GetObject`) for the roles that read the artifact, such as the CodeDeploy or CloudFormation action role.
+Example: pipeline in `us-east-1`, deploy in `eu-west-1` → a bucket and key in `eu-west-1`, with the deploy role in the key policy.
+W: Per-Region artifact store with decrypt grants: CodePipeline places a copy of the artifact in the store of the action's Region, and the reading role can decrypt it only if that Region's key policy allows it. Missing either piece produces exactly this access denied error.
+X: A=Switch to SSE-S3: the claim is false (multi-Region KMS keys exist, and per-Region keys work fine), and changing the encryption type does not create the Regional artifact store that a cross-Region action needs.
+B=GetObject only: objects encrypted with SSE-KMS can be read only by a caller that also has `kms:Decrypt` on the key, so dropping KMS permissions causes access denied rather than fixing it.
+D=S3 Cross-Region Replication: CodePipeline does not read artifacts from a replica you manage. It copies artifacts itself into the Regional store defined in the pipeline, and replication would still leave the key permissions unsolved.
+T: Cross-Region actions need a Regional artifact store (bucket plus key) that the action's role can decrypt; changing encryption type or adding replication does not fix it.
+
+@ Q001216 explain
+G: ## Getting secrets into a CodeBuild build
+CodeBuild environment variables have a **type**:
+- `PLAINTEXT`: the value is stored in the project or buildspec and visible to anyone who can read them.
+- `PARAMETER_STORE`: the value is read from Systems Manager Parameter Store when the build starts.
+- `SECRETS_MANAGER`: the value is read from AWS Secrets Manager when the build starts.
+In a buildspec this looks like `env: secrets-manager: DB_PASSWORD: prod/db:password`, where `prod/db` is the secret name and `password` is a JSON key inside it.
+## Rotation in Secrets Manager
+Secrets Manager has built-in rotation for Amazon RDS databases: you turn it on, choose a schedule such as every 30 days, and a rotation function changes the password in the database and in the secret together.
+Because the build fetches the secret by name at start time, every build automatically gets the current password and the buildspec never changes.
+W: Secrets Manager with RDS rotation: rotation is a managed feature for RDS credentials, and the `secrets-manager` reference always resolves to the latest value, so the 30-day rotation needs no buildspec edits and no custom code.
+X: A=Parameter Store with a custom Lambda: Parameter Store has no native rotation, so you must write, test and maintain a function that changes the database password and the parameter consistently. That is more operational overhead.
+C=Plaintext in buildspec.yml: the password sits in the repository and its history, and every rotation requires a commit, which is exactly the change the requirement forbids.
+D=File in a private S3 bucket: S3 has no rotation, so someone must update the file and the database password together, and the build needs extra download and parsing logic.
+T: Credentials that must rotate automatically → Secrets Manager with managed rotation, referenced by name from the buildspec so every build gets the current value.
+
+@ Q001217 explain
+G: ## Connecting CodePipeline to GitHub
+AWS CodeConnections (formerly AWS CodeStar Connections) links AWS to GitHub, GitLab or Bitbucket through an installed **GitHub App**. You authorize the app once in GitHub; AWS stores a connection resource, not a password or token that you manage.
+- The pipeline's source action (`CodeStarSourceConnection`) references the connection ARN, repository and branch.
+- GitHub sends events to AWS when a push happens, so the pipeline starts within seconds.
+- In V2 pipelines, triggers can filter by branch, tag or file path.
+## The older options
+The **GitHub version 1** action is a legacy action that authenticates with an OAuth or personal access token and is not recommended. **Polling** checks the repository on a timer, which adds delay and API traffic.
+Example: a push to `main` in `org/app` fires an event through the connection and starts the pipeline for that commit.
+W: CodeStar Connections (CodeConnections) source action: the GitHub App integration triggers on push events with low latency, and there is no long-lived GitHub credential stored in AWS.
+X: B=Polling source action: polling only notices a change on the next check, so start latency is higher, and it is not the recommended way to detect GitHub changes.
+C=EventBridge schedule every 5 minutes: a timer starts the pipeline whether or not anything changed and can lag up to 5 minutes behind a push; it also does not tell the pipeline which commit to build.
+D=GitHub version 1 with a personal access token: this legacy action depends on exactly the long-lived token the requirement forbids, and storing it as a pipeline parameter exposes it further.
+T: GitHub source with fast triggers and no stored tokens → a CodeConnections source action; polling, schedules and PAT-based v1 actions are slower or less secure.
+
+@ Q001218 explain
+G: ## Two places to keep configuration and secrets
+**Systems Manager Parameter Store** holds key-value parameters. A `SecureString` parameter is encrypted with a KMS key. Standard-tier parameters have no storage charge (KMS usage still applies), which makes them cheap for static configuration. Parameter Store has no built-in rotation.
+**AWS Secrets Manager** stores secrets for a monthly fee per secret plus API calls, and adds managed rotation (for example for RDS, Redshift and DocumentDB credentials) on a schedule you choose, such as every 90 days.
+## Choosing per value
+- Static connection settings (host names, ports, database names) → Parameter Store `SecureString` or `String`.
+- Credentials that must rotate → Secrets Manager.
+CodeBuild can read both at build start with `parameter-store:` and `secrets-manager:` entries in the buildspec `env` section, so every project reads one central copy.
+W: SecureString for static values, Secrets Manager for credentials: each value goes to the cheapest service that meets its need, and only the rotating credentials pay for Secrets Manager and get its built-in rotation.
+X: A=Advanced tier with custom Lambda rotation: advanced parameters are billed per parameter per month, and custom rotation code is exactly what Secrets Manager provides built in, so this costs more and adds maintenance.
+C=Everything in Secrets Manager: the premise is false because `SecureString` parameters are also encrypted at rest with KMS, and paying a per-secret fee for values that never rotate is unnecessary cost.
+D=Encrypted environment variables per project: values are duplicated in every project, updating them means editing each project, and there is no rotation mechanism at all.
+T: Match the store to the need: Parameter Store for cheap static values, Secrets Manager only for credentials that need built-in rotation.
+
+@ Q001219 explain
+G: ## The manual approval action
+CodePipeline has a built-in **Manual approval** action. When the pipeline reaches it, the stage pauses until someone approves or rejects.
+- **Notification**: the action can publish to an SNS topic, which emails or chats the approvers.
+- **Review URL and comments**: you can set a URL (such as the staging site) and instructions that appear in the notification and in the console.
+- **Who may approve**: approving calls `codepipeline:PutApprovalResult`. Grant that action, scoped to the pipeline's ARN, only to the release-manager group's IAM role or policy.
+- **Timeout**: an approval that nobody acts on fails after 7 days. For a shorter expiry, such as 3 days, add small automation, for example a scheduled Lambda function that rejects approvals older than 3 days with `PutApprovalResult`.
+Example: stage `Approve` sits between `DeployStaging` and `DeployProd`, and SNS sends the staging URL to the release managers.
+W: Manual approval with SNS and IAM-scoped approvers: it is the native pause point in CodePipeline, shows the reviewer the staging URL, restricts approval through IAM, and has a built-in expiry that can be tightened to 3 days with a small reject automation.
+X: A=Lambda sleeping until a DynamoDB flag: a Lambda invocation runs for at most 15 minutes, so it cannot wait days, and you would rebuild notifications, permissions and expiry yourself.
+B=CodeBuild polling a ticket: it pays for build compute while waiting, needs custom ticket integration, and approval rights would live in the ticket system instead of IAM.
+C=Step Functions wait with no timeout: it adds a state machine and custom action for something built in, and "no timeout" directly contradicts the requirement that approvals expire.
+T: Human sign-off in CodePipeline → the Manual approval action (SNS, review URL, IAM on PutApprovalResult); custom sleep or polling steps rebuild it worse.
+
+@ Q001220 explain
+G: ## How VPC-connected builds get network access
+When a CodeBuild project is configured with a VPC, subnets and security groups, each running build gets its own **elastic network interface (ENI)** in one of those subnets. Every ENI takes one private IP address.
+## Counting addresses in a /28
+A `/28` holds 16 addresses. AWS reserves 5 in every subnet (network address, VPC router, DNS, one reserved for future use, broadcast), leaving **11 usable**. Other resources in the subnet use some of those too.
+- 5 concurrent builds → probably fine.
+- 15 concurrent builds → some builds cannot get an ENI and fail or time out while CodeBuild tries to set up networking.
+The pattern "worked before, fails intermittently only after raising concurrency" points to a per-build resource that runs out.
+## Fixing it
+Use larger subnets (for example `/24`) and spread the project across several subnets in different Availability Zones.
+W: ENIs exhausting the /28 subnet: each concurrent build consumes a private IP, only 11 are usable in a `/28`, and failures appear only when concurrency grows, which matches the symptom.
+X: B=RDS connection limit: the stem gives no sign the database reached its connection limit, and hitting that limit returns "too many connections" errors from MySQL rather than network timeouts tied to how many builds run.
+C=No VPC support for concurrent builds: CodeBuild supports VPC connectivity for concurrent builds of the same project; the only limit is the IP space and ENIs available in the chosen subnets.
+D=Security group rule missing: a missing inbound rule would block every build, including single builds that previously worked, not only some builds after concurrency was increased.
+T: VPC-connected builds each consume a subnet IP; if failures scale with concurrency, check subnet size before blaming the database.
+
+@ Q001221 explain
+G: ## The CodeDeploy in-place lifecycle on EC2
+The CodeDeploy agent runs a fixed sequence of events. You attach scripts to some of them in the `hooks` section of `appspec.yml`:
+- `ApplicationStop`: stop the running app. This runs the script from the **previous** revision, since the new files are not on disk yet.
+- `DownloadBundle`: the agent downloads the revision (not scriptable).
+- `BeforeInstall`: pre-copy work such as backing up config or decrypting files.
+- `Install`: the agent copies files per the `files` section (not scriptable).
+- `AfterInstall`: post-copy work such as setting permissions with `chmod` or `chown`.
+- `ApplicationStart`: start the new version.
+- `ValidateService`: verify it works; a script exiting non-zero fails the deployment on that instance.
+Example: `ValidateService` runs `curl -f http://localhost/health`, which exits non-zero on an HTTP error.
+W: ApplicationStop, BeforeInstall, AfterInstall, ApplicationStart, ValidateService: this is the real order of the scriptable hooks and maps each task to the hook designed for it: stop, back up, set permissions, start, verify.
+X: A=AfterInstall before BeforeInstall: permissions cannot be set on files that have not been copied yet, and validating the service before starting it would always fail.
+C=DownloadBundle and Install as hooks: these events are reserved for the CodeDeploy agent and cannot run your scripts, and this sequence also leaves out stopping the old app and the health check.
+D=BeforeInstall before ApplicationStop: CodeDeploy always runs ApplicationStop first, and AfterInstall cannot come after ApplicationStart because files must be in place before the app starts.
+T: In-place hook order is Stop → BeforeInstall → (Install) → AfterInstall → Start → ValidateService; DownloadBundle and Install belong to the agent.
+
+@ Q001222 explain
+G: ## What changes when leaving Jenkins
+A self-managed Jenkins setup means patching the controller, managing agents, plugins and disk space. The AWS-native replacement splits that work between managed services:
+- **CodePipeline** models the flow: source, build, test, approval and deploy stages, which correspond to the stages in a `Jenkinsfile`.
+- **CodeBuild** runs the commands in fresh managed containers, driven by a `buildspec.yml` with phases such as `install`, `pre_build`, `build` and `post_build`.
+## Keeping test logic with little rework
+Most Jenkins stages already call scripts or tools (`mvn test`, `npm test`, `pytest`). Those commands move into buildspec phases largely unchanged; what is rewritten is only the orchestration around them.
+Example: a Jenkins stage `sh 'npm ci && npm test'` becomes `build: commands: - npm ci - npm test` in a CodeBuild project used by the pipeline's Test stage.
+W: Translate Jenkins logic into buildspec commands and CodePipeline stages: the existing test commands are reused inside CodeBuild, while the managed services remove the servers the team had to operate.
+X: A=CodeStar converting Jenkinsfiles: CodeStar never offered Jenkinsfile conversion, and the service has been discontinued, so no automatic "no changes" migration exists.
+C=Jenkins controller inside CodeBuild: CodeBuild runs short-lived build containers with a maximum timeout, not a long-running server, and the team would still own the Jenkins controller, plugins and configuration.
+D=Lambda functions for every stage: Lambda stops after 15 minutes and has no build environment, artifact handling or pipeline orchestration, so test suites would have to be rewritten and chained by hand.
+T: Moving off Jenkins means reusing the test commands in buildspec files and rebuilding the flow as CodePipeline stages; there is no automatic converter.
+
+@ Q001223 explain
+G: ## What a permissions boundary does
+A **permissions boundary** is a managed policy attached to an IAM user or role that sets the **maximum** permissions it can have. It grants nothing by itself.
+For a request to be allowed, the action must be allowed by **both** the role's identity-based policies **and** its boundary (and not denied by any explicit deny, SCP or other policy).
+## Example
+- Role policy allows `cloudformation:CreateStack` and `s3:*`.
+- Boundary allows `s3:*` and `logs:*` only.
+- Effective permissions: `s3:*`. `CreateStack` is denied, even though the attached policy still lists it.
+## How CodeBuild uses the role
+CodeBuild assumes its service role, and every AWS call made by commands in the build uses that role's session, so all of the role's limits, including its boundary, apply.
+W: The boundary omits CreateStack: effective permissions are the intersection of the attached policy and the boundary, so adding a boundary that lacks `cloudformation:CreateStack` removes that permission while the attached policy looks unchanged.
+X: A=buildspec lists IAM actions: a buildspec has no section for IAM actions; permissions come only from the service role and other IAM policies.
+B=Boundaries apply only to users: permissions boundaries can be set on both IAM users and IAM roles, and applying them to CI/CD roles is a common guardrail.
+C=CodeBuild ignores boundaries: when CodeBuild assumes the service role, IAM evaluates the role's session like any other, boundary included; no service can bypass it.
+T: A permissions boundary caps a role; effective access is what the attached policy AND the boundary both allow, so check the boundary when a listed permission is denied.
+
+@ Q001224 explain
+G: ## Pipelines as code
+Instead of creating each pipeline by hand, describe it once in infrastructure as code:
+- **AWS CloudFormation**: a template with `AWS::CodePipeline::Pipeline`, `AWS::CodeBuild::Project` and IAM roles, with parameters such as `ServiceName` and `RepositoryName`.
+- **AWS CDK**: the same resources written in TypeScript, Python or another language; a construct such as `StandardServicePipeline` can be published as a library that teams import.
+## Why this scales
+- The template lives in Git, so every change goes through pull requests and code review.
+- A new microservice is one stack deployment with new parameter values.
+- An improvement to the template (a new security scan stage, for example) rolls out by updating each stack, instead of editing dozens of pipelines by hand.
+StackSets, AWS Service Catalog or a CDK library can distribute the template across accounts.
+W: Versioned CloudFormation/CDK pipeline template per team: one reviewed, version-controlled definition produces identical pipelines, and updating it updates every instance in a controlled way.
+X: A=Export and copy JSON: each copy starts to drift as soon as someone edits it, and there is no central version to review or roll out changes from.
+B=Config rules enforcing stage names: AWS Config evaluates resources after they exist. It can flag differences but does not create pipelines or keep them version-controlled.
+D=Console runbook: manual console steps are slow and error-prone, and nothing is stored in version control or code-reviewed.
+T: Many identical, reviewed pipelines → one versioned IaC template (CloudFormation or CDK) instantiated per team; copying, runbooks and after-the-fact checks drift.
+
+@ Q001225 explain
+G: ## Parameter Store tiers
+Systems Manager Parameter Store has two tiers per account and Region:
+- **Standard**: up to 10,000 parameters, values up to 4 KB, no parameter policies, no storage charge.
+- **Advanced**: up to 100,000 parameters, values up to 8 KB, supports **parameter policies**, charged per parameter per month.
+## Parameter policies
+Policies are attached to advanced parameters only:
+- `Expiration`: delete the parameter at a set date and time, such as 30 days from creation.
+- `ExpirationNotification`: send an EventBridge event before expiry.
+- `NoChangeNotification`: send an event if the value has not changed for a period.
+## Throughput
+Read rate is a separate account setting: enabling **higher throughput** raises the `GetParameter` limit well above the default, for an extra charge per API call.
+Example: 15,000 parameters with 6 KB values and 30-day expiry → advanced tier, plus higher throughput for heavy deploy-time reads.
+W: Advanced tier with expiration policies: it is the only tier that meets all three needs: more than 10,000 parameters, values over 4 KB, and automatic expiration through parameter policies.
+X: A=Split values in standard tier: splitting doubles the parameter count (pushing further past the 10,000 limit), makes readers reassemble values, and standard parameters still cannot use expiration policies.
+C=Standard tier with a quota increase: the way beyond the standard tier's parameter count, 4 KB value size and lack of policies is the advanced tier, not a quota request.
+D=Move everything to Secrets Manager: Secrets Manager also has API rate quotas, charges per secret per month, is intended for secrets rather than plain configuration, and does not offer a date-based expiration policy.
+T: Many parameters, values over 4 KB, or expiration policies → advanced tier; heavy read rates → the separate higher-throughput setting.
+
+@ Q001226 explain
+G: ## Two ways a source action detects changes
+**Event-based detection** (the default for CodeCommit sources): an EventBridge rule watches the repository and starts the pipeline as soon as a commit lands on the branch.
+**Periodic polling**: CodePipeline itself checks the repository at intervals to see whether the branch has a new commit.
+## What polling costs you
+- **Start latency**: a push waits for the next check before the pipeline starts.
+- **More API calls**: the service keeps asking the repository even when nothing changed, and the calls add up across many pipelines.
+- **Less precise**: several quick pushes may be seen as one change.
+Polling is still valid as a temporary setting, but AWS recommends event-based change detection and has moved pipelines off polling.
+Example: with events, a push at 10:00:00 starts the pipeline within seconds; with polling it starts only when the next check runs.
+W: Polling adds latency and more API calls: the pipeline waits for the next check instead of reacting immediately, and it keeps calling the repository whether or not anything changed.
+X: A=No tradeoff: polling and events differ in start latency, API usage and precision, which is why AWS recommends event-based detection.
+B=Polling is more secure: removing an EventBridge rule does not improve security; both methods use IAM-controlled access, and the rule only forwards repository events.
+C=Polling eliminates cost: the EventBridge rule for repository events adds no meaningful cost, while polling adds repeated API calls, so polling does not save money.
+T: Event-based triggers start pipelines immediately with fewer calls; polling adds delay and API traffic and is only a temporary fallback.
+
+@ Q001227 explain
+G: ## Trunk-based development
+In **trunk-based development** everyone integrates into one main branch (the trunk) at least daily. Branches, if used, are short-lived: hours or a day or two, and small.
+- Small changes merge easily, so there is no "merge hell" from branches that diverged for weeks.
+- Unfinished features hide behind **feature flags** instead of long branches.
+## Keeping main always releasable
+The trunk is protected by automated checks:
+- Every pull request triggers a build, for example a CodeBuild project with a GitHub webhook.
+- CodeBuild reports the build status back to GitHub on the commit.
+- GitHub branch protection rules or rulesets require that status check to pass before merging.
+- Each merge to `main` triggers CodePipeline, which delivers the change.
+Example: a developer opens a PR with a 50-line change, CodeBuild runs the tests in minutes, the check turns green, and the merge starts a release.
+W: Trunk-based development with required CodeBuild PR checks: small, frequent merges avoid merge conflicts, and mandatory build checks ensure only tested code reaches main, so every merge is releasable.
+X: A=GitFlow with long-lived branches: develop and release branches delay integration, so conflicts accumulate and main is only releasable at planned release points.
+B=Direct commits with weekly tests: code reaches main with no verification, and defects are found up to a week later, so main is often not releasable.
+D=Long feature branches merged without CI: long-lived branches cause merge hell, and merging without CI lets broken code into main.
+T: Every merge releasable + no merge hell → short-lived branches into one trunk, guarded by required automated PR checks.
+
+@ Q001228 explain
+G: ## CodeBuild webhooks for pull requests
+A CodeBuild project with a GitHub source can register a **webhook** in the repository. **Filter groups** decide which events start a build, for example:
+- event types `PULL_REQUEST_CREATED`, `PULL_REQUEST_UPDATED` and `PULL_REQUEST_REOPENED`
+- `BASE_REF` matching `^refs/heads/main$`, so only PRs targeting `main` build
+CodeBuild then builds the PR's head commit and, with build status reporting enabled, posts the result back to GitHub as a commit status.
+## Blocking the merge
+In GitHub, a branch protection rule or ruleset on `main` lists that CodeBuild status as a **required status check**. A PR whose build failed, or has not finished, cannot be merged.
+This runs only the unit-test project per PR, not the whole delivery pipeline.
+W: CodeBuild webhook for PR events as a required status check: builds start automatically on PR creation and update, report pass or fail to GitHub, and the required check blocks merging when tests fail, without starting a pipeline execution.
+X: B=CodeDeploy ApplicationStart hook: that hook starts an application during a deployment; it has no link to pull requests and cannot report a status that blocks a merge.
+C=Manual builds after each PR: people forget, and a manually started build does not by itself block the merge, so failing code can still reach main.
+D=Pipeline polling with a full execution per PR: running the whole pipeline per PR is exactly what the team wants to avoid, and polling adds delay before tests run.
+T: PR validation without full pipeline runs → a CodeBuild webhook on PR events, enforced by a required status check in GitHub.
+
+@ Q001229 explain
+G: ## SAST as a pipeline gate
+**Static application security testing (SAST)** analyses source code without running it, looking for flaws such as SQL injection, hard-coded secrets or unsafe deserialization. Tools such as Semgrep or SonarQube scanners run from the command line.
+## How a build fails
+In CodeBuild, any command in a buildspec phase that exits with a **non-zero code** fails that phase and the build. A failed build fails its CodePipeline action, so later stages (publishing the artifact, deploying) never run.
+Most SAST tools let you set a threshold so the exit code reflects severity, for example a flag that exits with code 1 when any high-severity finding exists.
+Example: `build: commands: - sast-scan --fail-on high .` runs before the step that pushes the artifact, so a high finding stops the pipeline.
+## Shift left
+Scanning before publishing is cheaper than finding the same flaw after release.
+W: SAST in the build phase with a non-zero exit: the scan runs before publishing, and a high-severity finding fails the build automatically, which blocks the artifact from reaching the repository.
+X: B=Scan in production after deployment: the vulnerable code is already published and running, which is the opposite of the requirement.
+C=Post-build scan reviewed manually later: the result is looked at only after the pipeline finishes, so the artifact is already published and nothing blocks it automatically.
+D=Amazon Macie: Macie discovers sensitive data such as personal information in S3 buckets; it does not analyse application code for vulnerabilities.
+T: A security gate must fail the build automatically before publishing; a scan that runs later or needs manual review is only a report.
+
+@ Q001230 explain
+G: ## Performance gates before production
+A **performance gate** is a pipeline stage that measures behaviour under load and fails the pipeline when a service level objective is missed.
+## Typical design
+- Deploy the new version to **staging**, sized like production.
+- A load-test stage (a CodeBuild project, or a tool such as the Distributed Load Testing on AWS solution for larger loads) drives the target traffic, for example 10,000 concurrent virtual users with k6, JMeter or Locust.
+- Compute the **p99 latency**: the value that 99% of requests are faster than. Publish it as a CloudWatch metric for history.
+- Compare with the SLA; if p99 is above, for example, 500 ms, exit non-zero so the action fails and production deployment never starts.
+## Why p99
+Averages hide slow tails; p99 shows what the slowest 1% of users experience.
+W: Staging load-test stage that fails on SLA breach: it applies realistic load before production, measures the exact p99 metric the SLA uses, and stops promotion automatically when it is exceeded.
+X: A=ValidateService during production deployment: that hook checks each instance after install, typically with a quick health check; it does not generate 10,000 users, and it runs in production, which is too late.
+C=Manual local load tests: a laptop cannot reliably simulate 10,000 users, results vary between runs and people, and nothing stops the pipeline automatically.
+D=Monitor production instead: real users hit the slow release before anyone notices, which is exactly what a pre-production gate should prevent.
+T: Enforce latency SLAs with an automated load-test stage in staging that fails the pipeline on p99 breach, before production sees the change.
+
+@ Q001231 explain
+G: ## Where custom checks go in CodeDeploy
+CodeDeploy runs lifecycle hooks on each instance in order: `ApplicationStop`, `BeforeInstall`, `AfterInstall`, `ApplicationStart`, `ValidateService`. Scripts attached in `appspec.yml` run on the instance through the CodeDeploy agent.
+`ValidateService` is the last hook: the new version is installed and started, so this is where you prove it works.
+## Example
+In `appspec.yml`, the `hooks` section lists `ValidateService` with `location: scripts/check_health.sh` and `timeout: 120`. The script retries `curl -fsS http://localhost/health` for a while and exits 1 if it never succeeds.
+## What happens on failure
+A script that exits non-zero, or runs past its timeout, fails that instance's deployment. Whether the whole deployment fails depends on the minimum healthy hosts setting, and with automatic rollback enabled CodeDeploy redeploys the last good revision.
+W: ValidateService with a non-zero exit: it runs after the new version starts, so it can test `/health` on the real new code, and a failing script marks that instance's deployment as failed.
+X: A=Only the built-in ELB check: lifecycle hooks run any script you provide, so custom health validation is fully supported alongside load balancer checks.
+B=ApplicationStop: this hook runs before the new version is installed and uses the previous revision's script, so it cannot test the new version.
+D=BeforeInstall and skipping failures: the new code is not on the instance yet, and a failed hook fails the instance's deployment rather than being skipped.
+T: Verify the new version in ValidateService, the only hook that runs after the app starts; a non-zero exit fails that instance's deployment.
+
+@ Q001232 explain
+G: ## Extending CodePipeline beyond built-in actions
+CodePipeline has built-in action types for source, build, test, deploy and approval. For anything else you can:
+- use a **Lambda invoke action**: the pipeline calls your function with a job ID, or
+- define a **custom action type** served by a job worker that polls CodePipeline for jobs.
+## The Lambda contract
+The function receives `CodePipeline.job` with an `id`. It must end by calling one of:
+- `PutJobSuccessResult` → the action succeeds and the pipeline continues.
+- `PutJobFailureResult` → the action fails and the stage stops.
+If it calls neither, the action eventually times out and fails. For work longer than one invocation, the function can return a `continuationToken` in `PutJobSuccessResult`; CodePipeline then invokes it again to check progress.
+Example: the function calls the internal test API, polls for the verdict, and reports pass or fail with the job ID.
+W: Lambda invoke action with PutJobSuccessResult/PutJobFailureResult: it runs any custom logic, such as calling the test API, and reports a real verdict that gates the pipeline.
+X: A=SNS asynchronous trigger: publishing to SNS starts the tests but never reports back, so the pipeline continues without waiting for pass or fail.
+B=Manual approval with a person running tests: this replaces automation with human work and depends on someone running the tests correctly every time.
+C=Only built-in actions: CodePipeline supports Lambda invoke actions and custom action types precisely for integrations it does not have natively.
+T: Custom gates in CodePipeline → a Lambda invoke (or custom) action that reports the result with PutJobSuccessResult or PutJobFailureResult.
+
+@ Q001233 explain
+G: ## Build environments in CodeBuild
+Every build runs in a container from a **build image**:
+- **AWS managed images** contain common runtimes and tools, and AWS updates them over time, so exact tool versions can change.
+- **Custom images** are Docker images you build and store, usually in Amazon ECR. You install exactly what you need, pinned to specific versions.
+## UI tests with Selenium
+Selenium drives a real browser through a matching driver, for example Chrome with a ChromeDriver of the same major version. In a container the browser runs **headless**, with no display.
+A custom image might install a specific Chrome version and its matching ChromeDriver, plus the test framework. The pipeline's test stage then runs a CodeBuild project on that image that points the suite at the staging URL and publishes results.
+Example: `ecr/ui-tests:chrome-126` is used by the project `ui-acceptance`, which runs `pytest tests/ui --base-url https://staging.example.com`.
+W: Custom CodeBuild image with the browser and driver: pinned versions make runs repeatable, the tests run headless automatically after the staging deployment, and failures fail the pipeline stage.
+X: A=Selenium cannot run in CodeBuild: CodeBuild runs any Linux container workload, and headless browsers with Selenium are a common use.
+B=Default image with cached browsers: the CodeBuild cache is best-effort and meant for dependencies, not for guaranteeing installed software across unrelated builds, so browser and driver versions would be unpredictable.
+C=Local runs and screenshots: this is manual, not repeatable, and cannot fail the pipeline automatically.
+T: Tests that need specific tools and versions → a custom CodeBuild image that pins them, not luck with the default image or cache.
+
+@ Q001234 explain
+G: ## Why shared test databases break
+When several pipeline executions (for different branches) run integration tests against one database at the same time, they read and write the same rows. One run deletes the fixtures another run is using, or two runs insert the same key: failures that appear randomly and depend on timing.
+## Ephemeral test environments
+The fix is **isolation**: each execution gets its own database, created at the start of the test stage and destroyed at the end.
+- A database container started inside the build (for example MySQL in Docker).
+- A new RDS instance restored from a seed snapshot, or an Aurora clone, created by CloudFormation for that run.
+- A unique schema per run on a shared server, when a full instance is too slow to create.
+Every run starts from a known state, runs can go in parallel, and cleanup removes the cost afterwards.
+W: Ephemeral, isolated database per execution: each run has its own data, so concurrent executions cannot interfere, tests become repeatable, and parallelism is preserved.
+X: A=Bigger RDS instance: more capacity does not separate the data; concurrent runs still overwrite each other's rows.
+B=Disable integration tests: this removes the symptom by removing coverage, so defects in database interactions reach later stages or production.
+D=Serialize all executions organization-wide: it removes the race but makes every team wait for each other, which slows delivery badly.
+T: Race conditions on shared test data are solved by isolating data per run with ephemeral databases, not by scaling or serializing.
+
+@ Q001235 explain
+G: ## CodeBuild test and coverage reports
+CodeBuild can read test result and code coverage files that your tools already produce and display them in the console as **reports**, grouped into **report groups**.
+- Test formats include JUnit XML, NUnit, TestNG, Cucumber JSON and Visual Studio TRX.
+- Coverage formats include Cobertura XML, JaCoCo XML, Clover XML and SimpleCov JSON.
+## Configuration
+Add a `reports` section to the buildspec with one entry per report group:
+- `unit-tests` with `files: '**/*.xml'`, `base-directory: build/test-results` and `file-format: JUNITXML`
+- `coverage` with `files: coverage.xml` and `file-format: COBERTURAXML`
+Each build adds a report; the report group shows pass rates, durations, failing test cases, and line or branch coverage trends across builds.
+W: Report groups for test and coverage reports: CodeBuild natively parses the JUnit and Cobertura files and shows per-build results and trends in the console, with no dashboard to build.
+X: A=X-Ray traces: X-Ray traces requests through running applications; it does not understand test result or coverage files.
+B=CloudWatch Logs Insights queries: you would parse log text yourself and build the dashboards and trend views, which is the custom work the team wants to avoid.
+C=Build badges: a badge shows only the latest pass or fail status of a build, with no test counts or coverage.
+T: Test results and coverage in the CodeBuild console → a buildspec `reports` section feeding report groups.
+
+@ Q001236 explain
+G: ## Phases versus stages
+- A **CodeBuild phase** (`install`, `pre_build`, `build`, `post_build`) runs inside one build container. Commands in one phase see the files from earlier phases immediately.
+- A **CodePipeline stage** is a separate step in the pipeline. A test stage usually starts a new CodeBuild project that downloads the build stage's artifact first.
+## Two ways to place unit tests
+- **In the build phase**: `npm test` runs right after compiling. A failure stops the build before packaging, feedback is fastest, and nothing extra is provisioned.
+- **As a separate stage**: build and test are separate actions with their own logs, permissions, images and retries, and tests can run on the exact packaged artifact, possibly in parallel test actions. The cost is extra time: provisioning another container, downloading the artifact and a stage transition.
+Many teams run fast unit tests in the build and slower suites in later stages.
+W: Fail-fast in the build versus isolation in a stage: in-build tests give the quickest feedback and stop bad code before packaging, while a separate stage separates concerns at the cost of extra pipeline time.
+X: A=Testing before packaging is impossible: running tests in `build` before the packaging commands or `post_build` is common and fully supported.
+B=Unit tests only after deployment: unit tests exercise code in isolation and need no live environment; tests that require deployment are integration or end-to-end tests.
+D=No meaningful difference: phases share one container and run immediately, while stages use separate actions with artifact transfer and extra startup time, so feedback speed and isolation differ.
+T: Unit tests in the build phase fail fastest; a separate test stage adds separation and flexibility but costs pipeline time.
+
+@ Q001237 explain
+G: ## Long-running external checks in CodePipeline
+Some steps call an outside service that takes minutes to answer. The action must neither block forever nor claim success before the answer exists.
+## Patterns that report the real verdict
+- **Lambda with a continuation token**: the first invocation submits the scan and calls `PutJobSuccessResult` with a `continuationToken` (the scan ID). CodePipeline re-invokes the function, which checks status and, once the verdict is known, reports success or calls `PutJobFailureResult`.
+- **Step Functions**: a state machine submits, waits and polls, and the pipeline's Step Functions invoke action ends with the machine's result.
+- **Custom action with a job worker**: a worker polls CodePipeline for jobs and reports the result when the scan finishes.
+Example: a 20-minute scan becomes a few short Lambda invocations; the action stays "In progress" until the verdict arrives, so the next stage waits.
+W: Submit, then report success or failure only when the real verdict arrives: the pipeline waits for the actual scan result, a failed scan stops promotion, and no compute sits idle during the wait.
+X: A=Report success immediately: the pipeline continues before the scan finishes, so vulnerable artifacts can be deployed; the gate does nothing.
+C=Manual dashboard check after deployment: the check happens after the artifact is already deployed and depends on a person remembering to look.
+D=CodeBuild sleep loop: it can work, but it pays for a build container that idles for up to 20 minutes, and timeouts and retries all live in hand-written script logic.
+T: Asynchronous external gates should report the real result when it arrives (continuation tokens, Step Functions or job workers), not succeed early or sleep in a build.
+
+@ Q001238 explain
+G: ## CloudWatch Synthetics canaries
+A **canary** is a script (Node.js or Python, for example with Puppeteer or Selenium) that CloudWatch Synthetics runs on a schedule, such as every 5 minutes, from AWS-managed infrastructure. It behaves like a user: open the site, add an item, check out.
+- Canaries publish metrics such as `SuccessPercent` and `Duration`, plus screenshots and logs.
+- By default they run outside your VPC, so they test the public path users take.
+## Connecting to rollback
+Create a CloudWatch alarm, for example `Duration > 2000 ms` or `SuccessPercent < 100`, and add it to the CodeDeploy **deployment group** with automatic rollback when an alarm is triggered. CodeDeploy watches the alarm while a deployment is in progress, so use a bake or wait period (for example in a blue/green deployment) that covers the first canary runs.
+W: Synthetics canary alarm on the deployment group: the canary produces real end-to-end checkout transactions from outside on a schedule, and its alarm tells CodeDeploy to roll back when latency exceeds 2 seconds.
+X: A=ALB health check with a 2-second timeout: health checks call one path from the load balancer, inside the network, and only mark targets unhealthy; they do not run a checkout flow or roll back a deployment.
+B=X-Ray sampling rules: X-Ray records real requests; it does not generate synthetic traffic, and sampling rules only decide how many requests are traced.
+C=Scheduled CodeBuild running curl: it rebuilds what canaries already do, without screenshots or built-in metrics, and it has no native link to CodeDeploy rollback.
+T: Scheduled synthetic user journeys → Synthetics canaries; attach their alarm to the CodeDeploy deployment group to trigger rollback.
+
+@ Q001239 explain
+G: ## Amazon CodeGuru Reviewer
+CodeGuru Reviewer uses automated reasoning and machine learning to comment on code quality and security, for example resource leaks, concurrency problems or unsafe handling of input. It supports Java and Python.
+- **Associate a repository** (such as a CodeCommit repository) with CodeGuru Reviewer.
+- When a pull request is opened or updated, it runs an incremental review and posts recommendations as comments on the PR.
+## Blocking merges
+Recommendations by themselves do not block a merge. To enforce a rule, add a check: for example, a CodeBuild job run on each PR that fails when unresolved critical findings exist, combined with a CodeCommit approval rule that requires that check's approval before merging.
+## Related but different
+**CodeGuru Profiler** examines running applications for CPU and latency hotspots; it does not review source code.
+W: Associate with CodeGuru Reviewer and fail builds on critical findings: the association gives automatic PR recommendations in CodeCommit, and a build gate turns critical findings into a merge blocker.
+X: A=Copy code into the console manually: this is manual work before every PR and is not integrated with the pull request workflow, so nothing can block merges.
+B=GitHub only: CodeGuru Reviewer supports CodeCommit repositories as well as GitHub and Bitbucket, so the premise is false.
+C=CodeGuru Profiler: Profiler analyses runtime performance of running applications, not pull request code for quality or security issues.
+T: Automated code review on PRs → CodeGuru Reviewer; runtime performance → CodeGuru Profiler; blocking needs an added build or approval gate.
+
+@ Q001240 explain
+G: ## Progressive promotion
+A release pipeline moves one artifact through environments in order, and each environment acts as a **gate** for the next:
+- **Dev stage**: deploy, run unit tests.
+- **Staging stage**: deploy, run unit, integration and load tests.
+- **Security scan action**: run in or before the production stage entry.
+- **Production stage**: starts only if everything earlier succeeded.
+In CodePipeline, stages run in sequence; a failed action stops the stage and the artifact never reaches later stages. Actions inside a stage can run in parallel (same `runOrder`) or in order.
+Example: `Source → Build → Dev (deploy, unit) → Staging (deploy, integration, load) → Security (scan) → Prod (deploy)`.
+## Why sequence matters
+Integration and load tests only mean something against the environment they ran in. Promoting the same tested artifact step by step keeps that evidence valid.
+W: Sequential per-environment stages with their own tests: each environment runs the test depth it needs, and production is reached only after staging's tests and the security scan pass.
+X: A=All tests once at the start: integration and load tests need a deployed environment, and results from one context do not prove the others work, so the gates are meaningless.
+B=Parallel deploy to all environments: production gets the change before staging tests pass, so nothing gates production; rollback only limits damage after users are affected.
+D=One environment separated by feature flags: flags hide features but do not isolate data, capacity or configuration, so load and integration tests would run against production.
+T: Different test depth per environment → sequential stages with gates, so production receives only an artifact that passed every earlier stage.

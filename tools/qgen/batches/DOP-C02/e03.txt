@@ -1,0 +1,356 @@
+# DOP-C02 detailed explanations e03 (explanation-only rewrites; letters are the published ones)
+
+@ Q001267 explain
+G: ## SAM is a CloudFormation transform
+An AWS SAM template starts with `Transform: AWS::Serverless-2016-10-31`. That line tells CloudFormation to run the SAM transform, a macro hosted by CloudFormation itself, before creating anything.
+- The transform expands short resource types such as `AWS::Serverless::Function` or `AWS::Serverless::Api` into standard resources: `AWS::Lambda::Function`, an IAM role, `AWS::ApiGateway::RestApi`, permissions and so on.
+- Because the processed template differs from the one you submitted, CloudFormation asks you to acknowledge `CAPABILITY_AUTO_EXPAND`. SAM-generated IAM roles usually also require `CAPABILITY_IAM`.
+## Example
+`aws cloudformation create-stack --stack-name api --template-body file://template.yaml --capabilities CAPABILITY_AUTO_EXPAND CAPABILITY_IAM`
+The SAM CLI (`sam deploy`) does the same thing for you: it packages code to S3 and creates a change set that CloudFormation processes server-side.
+W: CloudFormation transform plus CAPABILITY_AUTO_EXPAND: the transform runs inside CloudFormation, so plain create-stack works once the template's transforms are acknowledged with `CAPABILITY_AUTO_EXPAND` (and IAM capabilities for the generated roles).
+X: B=Deployed by Lambda: Lambda only runs functions; it has no role in processing templates. SAM templates are deployed as CloudFormation stacks, and the stack shows the expanded standard resources.
+C=Compile to Terraform: SAM has nothing to do with Terraform. Its output is a regular CloudFormation template produced by the transform at deploy time.
+D=Transform only in the SAM CLI: the SAM CLI can validate and build locally, but the transform itself is executed by the CloudFormation service, which is why a template can be deployed with the AWS CLI, the console or a pipeline action.
+T: SAM is a CloudFormation-hosted transform; deploy it with any CloudFormation tool and acknowledge CAPABILITY_AUTO_EXPAND, rather than assuming only the SAM CLI or Lambda can process it.
+
+@ Q001268 explain
+G: ## Why CloudFormation templates get repetitive
+Plain JSON or YAML templates have limited logic: `Conditions`, `Fn::If`, `Mappings` and (with the `AWS::LanguageExtensions` transform) `Fn::ForEach`. Dozens of similar microservice stacks still end up as copy-pasted blocks that drift apart.
+## What the AWS CDK adds
+The AWS Cloud Development Kit lets you describe infrastructure in TypeScript, Python, Java, C# or Go.
+- **Constructs** are reusable classes, for example a `MicroserviceStack` construct that creates a service, its queue and its alarms from a few typed properties.
+- Real loops (`for svc in services`), conditionals and type checking come from the programming language.
+- `cdk synth` generates the actual CloudFormation templates into `cdk.out`, and `cdk diff` compares them with what is deployed, so reviewers see the exact resources before `cdk deploy`.
+Deployment is still done by CloudFormation, so stacks, change sets and rollback behave as before.
+W: CDK constructs reviewed with cdk synth: constructs remove duplication with typed, reusable code, and `cdk synth` (plus `cdk diff`) shows the exact generated resources before anything is deployed.
+X: A=Nested stacks only: nested stacks let you reuse a child template, but every parent still repeats parameter wiring, and templates gain no loops or typed objects.
+B=Macros as the only way to add logic: macros can transform templates, but they require you to write and host Lambda code, and they are not the only option; the CDK, intrinsic functions and the language extensions transform also add logic.
+D=OpsWorks stacks: OpsWorks was a Chef/Puppet configuration management service (now end of life); it never replaced CloudFormation templates for defining infrastructure.
+T: For repetitive templates, the CDK gives real loops, conditionals and typed constructs while `cdk synth` keeps the generated CloudFormation reviewable; nested stacks and macros only partly address duplication.
+
+@ Q001269 explain
+G: ## What drift detection tells you
+CloudFormation drift detection compares each supported resource's actual configuration with the template's expected values. A resource is `IN_SYNC`, `MODIFIED`, `DELETED` or `NOT_CHECKED`. Detection only reports; it never changes resources.
+## What happens on the next update
+CloudFormation updates resources by comparing the new template with the previous template, not with the live configuration. So a manually added inbound rule can be:
+- left in place if the resource is untouched,
+- overwritten when the security group is next updated from the old template values,
+- or cause the update to fail if the manual change conflicts.
+## Reconciling on purpose
+If the drifted values are the ones you want to keep, write them into the template (for example add the new `SecurityGroupIngress` entry), create a change set and check which resources will be modified or replaced before executing it. After that, the template and the live resource agree again and CloudFormation continues to manage it.
+W: Update the template to match, then review a change set: this keeps the incident fix, makes the template the source of truth again, and the change set shows whether CloudFormation would modify or replace anything before you execute it.
+X: A=continue-update-rollback: this command only resumes a stack stuck in `UPDATE_ROLLBACK_FAILED`. The stack here is healthy with drift, so there is nothing to roll back.
+C=Ignore the drift: CloudFormation does not reconcile drift automatically. Updates are calculated from template to template, so the manual rule may be silently reverted or cause a failed update later.
+D=Delete and recreate: rebuilding a production stack causes downtime, may lose data, and reverts the manual fix the team explicitly wants to keep.
+T: CloudFormation never auto-reconciles drift; to keep a manual change, put it into the template and verify with a change set instead of ignoring or rebuilding the stack.
+
+@ Q001270 explain
+G: ## CloudFormation modules
+A module is a reusable piece of template registered in the CloudFormation registry with a type name ending in `::MODULE`, for example `MyOrg::Network::StandardVpc::MODULE`.
+- The module fragment holds the resources (VPC, subnets, NACLs, flow logs) plus parameters it exposes.
+- Consumers add it to their own template like any resource: `Type: MyOrg::Network::StandardVpc::MODULE` with a few `Properties`.
+- At deploy time CloudFormation expands the module into its resources inside the consumer's stack, and you can still reference individual resources it creates.
+## Versioning and sharing
+Registering a new version of the module and setting it as the default version is how updates are rolled out. The registry type can be made available to other accounts in the organization, so the platform team owns one governed definition.
+W: CloudFormation module in the registry: it is designed exactly as a versioned, reusable building block that other teams drop into their own templates as a single resource type.
+X: A=Nested stack with a hardcoded S3 URL: it works as reuse, but consumers embed an `AWS::CloudFormation::Stack` pointing at a file; there is no type name, and versioning depends on everyone editing URLs.
+B=StackSets: StackSets deploy one stack to many accounts and Regions. They do not let a team embed a building block inside its own template.
+D=Service Catalog product: Service Catalog lets users launch approved products from a portfolio. It provisions whole products, not a resource type composed inside another CloudFormation template.
+T: Reusable component embedded in other templates as one type → registry module; deploy the same stack everywhere → StackSets; self-service launch → Service Catalog.
+
+@ Q001271 explain
+G: ## AWS AppConfig
+AppConfig is a capability of Systems Manager for deploying application configuration and feature flags separately from code.
+- A **configuration profile** stores the data, for example a feature flag `newPricing` or a JSON document.
+- A **deployment strategy** controls rollout: for example linear 20% every 2 minutes, followed by a bake time.
+- An **environment** can have CloudWatch alarms as monitors. If an alarm goes into `ALARM` during deployment or bake time, AppConfig stops and rolls the configuration back automatically.
+## How Lambda reads it
+Lambda functions use the AppConfig Lambda extension, which fetches and caches the configuration locally, so switching the pricing algorithm needs no code redeploy. Only the configuration version changes.
+W: AppConfig with a gradual strategy and alarm monitor: it rolls out configuration incrementally, watches the CloudWatch alarms, and reverts automatically if error rates spike, with no code deployment.
+X: A=Secrets Manager rotation: rotation changes secret values on a schedule for security. It has no gradual rollout, alarm monitoring or automatic rollback of configuration.
+B=Parameter Store standard parameters: a parameter change is visible to all readers at once. There is no percentage-based rollout or alarm-triggered rollback.
+D=CloudFormation change sets with approval: change sets preview infrastructure updates. They do not gradually release a configuration value to a running API or watch error rates to roll it back.
+T: Gradual, alarm-guarded, automatically rolled-back configuration or feature flag changes are what AppConfig is built for; Parameter Store and Secrets Manager only store values.
+
+@ Q001272 explain
+G: ## Two stores with different jobs
+- **AWS Secrets Manager** stores secrets such as database credentials and has managed rotation: a rotation Lambda function (templates exist for RDS, Aurora, Redshift and others) changes the password on the database and in the secret on a schedule such as every 30 days. It is charged per secret per month plus API calls.
+- **Systems Manager Parameter Store** stores configuration as `String`, `StringList` or `SecureString`. Standard parameters have no storage charge; advanced parameters add a per-parameter charge and features such as parameter policies. Parameter Store has no built-in rotation.
+## Using them from CloudFormation
+Both work with dynamic references: `{{resolve:ssm:/app/env}}` for parameters, `{{resolve:secretsmanager:prod/db:SecretString:password}}` for secrets.
+W: Secrets Manager with rotation plus Parameter Store standard: rotating credentials get managed rotation where it is needed, and the many non-sensitive values sit in free standard parameters that templates can still reference.
+X: B=Advanced parameters with custom Lambda rotation: you pay per advanced parameter for values that do not need it and rebuild rotation logic that Secrets Manager already provides.
+C=Everything in Secrets Manager: CloudFormation dynamic references also support Parameter Store, and paying per secret for plain environment names and toggles is not cost-effective.
+D=Credentials in Parameter Store, toggles in Secrets Manager: this swaps the services, leaving credentials without managed rotation and putting non-secret toggles in the paid secret store.
+T: Rotating credentials belong in Secrets Manager; ordinary configuration belongs in Parameter Store standard parameters, and both can be resolved by CloudFormation.
+
+@ Q001273 explain
+G: ## OpsWorks Stacks lifecycle events
+OpsWorks Stacks (end of life since May 2024, so this is legacy knowledge) ran Chef recipes in response to five lifecycle events on each layer:
+- **Setup**: runs on an instance after it finishes booting. Used to install packages and agents.
+- **Configure**: runs on all instances in the stack whenever an instance enters or leaves the online state, so configuration such as load balancer member lists stays current.
+- **Deploy**: runs when you deploy an app (and after Setup on a new instance).
+- **Undeploy**: runs when an app is removed.
+- **Shutdown**: runs before an instance is shut down.
+A replaced instance boots as a new instance, so Setup runs again. Today the same need is met with Systems Manager State Manager associations or EC2 user data and launch templates.
+W: Setup: it fires once each new or replacement instance finishes booting, which is exactly when a monitoring agent should be installed.
+X: A=Configure: Configure runs on every instance whenever topology changes, so it would repeat the install across the whole layer instead of performing it on the new instance's boot.
+C=Deploy: Deploy is tied to deploying an application. Agent installation should not depend on an app deployment happening.
+D=Shutdown: Shutdown runs just before an instance stops, the opposite of installing software on boot.
+T: Install base software on boot with Setup; update peer configuration on topology changes with Configure.
+
+@ Q001274 explain
+G: ## Nested stacks
+A parent template contains `AWS::CloudFormation::Stack` resources that point to child templates. Parent and children are created, updated and deleted together, and values flow through child `Outputs` read with `Fn::GetAtt` in the parent. One owner manages the whole tree.
+## Cross-stack references
+A stack exports an output (`Export: Name: net-PrivateSubnets`), and any other stack in the same account and Region imports it with `Fn::ImportValue`. Stacks keep separate lifecycles and owners.
+- While any stack imports an export, you cannot delete the exporting stack or change or remove that exported value.
+- Export names must be unique per account and Region.
+## Choosing
+Shared network values used by independently owned application stacks fit exports. Components that always ship together fit nested stacks.
+W: Nested stacks share one lifecycle; exports serve independent stacks but lock used outputs: this is the real distinction and the reason exports suit the VPC owner sharing subnet IDs with independent teams.
+X: A=Exports can change freely: the opposite is true. An exported output that is imported somewhere cannot be modified or removed until the imports are gone.
+B=Swapped mechanisms: nested stacks are the ones using `AWS::CloudFormation::Stack`, and cross-stack references use `Export` with `Fn::ImportValue`.
+D=Functionally identical: they differ in lifecycle, ownership and update constraints, not just file layout.
+T: Same owner and lifecycle → nested stacks; independent stacks sharing values → exports, which cannot change while imported.
+
+@ Q001275 explain
+G: ## StackSets operation preferences
+A StackSets create, update or delete operation runs across target accounts and Regions using settings you choose:
+- `MaxConcurrentCount` / `MaxConcurrentPercentage`: how many accounts per Region are processed at the same time.
+- `FailureToleranceCount` / `FailureTolerancePercentage`: how many stack instance failures per Region are allowed before the operation stops in that Region and does not start new accounts.
+- `RegionConcurrencyType` (`SEQUENTIAL` or `PARALLEL`) and `RegionOrder`.
+- `ConcurrencyMode`: `STRICT_FAILURE_TOLERANCE` lowers concurrency as failures occur; `SOFT_FAILURE_TOLERANCE` keeps the chosen concurrency.
+## Example
+With a tolerance of 0 and concurrency of 5, one failure stops the Region, and the other accounts already in progress may also fail at the same time. Fix the root cause (often a missing execution role, a service quota or a name conflict), then retry with values that match your risk appetite.
+W: Low tolerance and concurrency settings stopped it: the operation halted because failures exceeded `FailureToleranceCount`; fixing the underlying error and tuning tolerance and concurrency lets future rollouts finish.
+X: A=No failure tolerance settings: StackSets explicitly offers failure tolerance as a count or percentage, and failed instances can be retried by running the operation again.
+B=Halts on any single failure: that only happens when tolerance is set to 0. It is configurable, so splitting into 25 separate stacks throws away central management for no reason.
+C=Same OU required: a stack set can target several OUs or explicit account lists; OU membership is not what stopped this operation.
+T: StackSets rollouts are governed by failure tolerance and max concurrency; fix the failing accounts and tune those preferences instead of abandoning StackSets.
+
+@ Q001276 explain
+G: ## What a CDK Aspect is
+An Aspect is a class implementing `IAspect` with a `visit(node)` method. You attach it with `Aspects.of(app).add(new EncryptionChecker())`, and during synthesis the CDK calls `visit` for every construct in that scope, including constructs inside other stacks and third-party libraries.
+## Example
+The aspect checks `if (node instanceof s3.CfnBucket && !node.bucketEncryption)` and calls `Annotations.of(node).addError('Bucket must use encryption')`. Error annotations make `cdk synth` and `cdk deploy` fail with that message and the construct path, so the problem is caught before any template reaches CloudFormation.
+- Aspects can also modify constructs (for example add tags), but for policy enforcement reporting an error keeps the developer in control.
+- Tools such as cdk-nag are built on Aspects.
+W: CDK Aspect that fails synthesis: an aspect visits every construct in the app and raises an error annotation for unencrypted buckets, so synthesis fails with a clear message before deployment.
+X: A=StackSet after deployment: StackSets deploy stacks; they do not inspect CDK code, and anything found after deployment is already too late for the requirement.
+C=AWS Config rule: Config evaluates resources after they exist. It is useful as a detective backstop, but it cannot make CDK synthesis fail.
+D=cdk.json context value: context supplies values and feature flags that code can read. It does not enforce or validate anything unless each construct reads it, so a forgotten bucket still slips through.
+T: Checks at synthesis time across every construct → CDK Aspects; Config rules only detect after resources are created.
+
+@ Q001277 explain
+G: ## How a Lambda-backed custom resource reports back
+CloudFormation invokes the function asynchronously with an event that contains `RequestType` (Create, Update, Delete) and a `ResponseURL`, a pre-signed S3 URL. The return value of the handler is ignored.
+The function must send an HTTPS `PUT` to `ResponseURL` with a JSON body containing `Status` (`SUCCESS` or `FAILED`), `PhysicalResourceId`, `StackId`, `RequestId`, `LogicalResourceId` and optional `Data` (for example the AMI ID for `Fn::GetAtt`).
+## If the PUT never happens
+CloudFormation waits until the custom resource timeout (one hour by default, adjustable with the `ServiceTimeout` property) and then fails with the stabilization error. Common causes: returning a value instead of calling the URL, an exception before the response is sent, or a function in a VPC with no route to S3.
+- The `cfn-response` module (available for inline Node.js and Python code) or the CDK Provider framework handles the PUT for you.
+W: Returned instead of signaling the response URL: CloudFormation only learns the result from the PUT to the pre-signed S3 URL, so a successful function that just returns leaves the stack waiting until timeout.
+X: B=Must become a macro: custom resources routinely do work such as API lookups; macros transform templates and are not a replacement for provisioning-time logic.
+C=Missing Lambda invoke permission: the logs show the function actually ran, so the invocation succeeded; the missing piece is the response.
+D=No external HTTP calls: a Lambda function behind a custom resource can call any reachable API, provided it has network access.
+T: A custom resource finishes only when the function PUTs a result to `ResponseURL`; a successful run without that signal still ends in a timeout.
+
+@ Q001278 explain
+G: ## Account vending with Control Tower
+AWS Control Tower sets up a landing zone: an organization with OUs, a log archive account, an audit account, organization CloudTrail and Config, and IAM Identity Center.
+**Account Factory** creates new accounts that are enrolled in that landing zone. Each account gets:
+- the OU's enabled controls (guardrails),
+- centralized logging to the log archive account,
+- Identity Center access for the named user.
+Account Factory is published as an AWS Service Catalog product, so authorized users can request accounts themselves.
+## Adding a standard VPC
+Baseline content beyond Control Tower's defaults is added by customization: Account Factory Customization (blueprints from Service Catalog), Customizations for Control Tower (CfCT) or Account Factory for Terraform (AFT). These can deploy a standard VPC into every new account automatically.
+W: Account Factory through Service Catalog plus customizations: it delivers governed, logged, SSO-enabled accounts from a self-service request, and customizations add the standard VPC without platform-team steps.
+X: A=CreateAccount scripts with a checklist: the account is created, but guardrails, logging and SSO are applied by hand, which violates the no-manual-steps requirement and invites drift.
+B=Config aggregator alerts: an aggregator only collects compliance data. It detects new accounts after the fact and still leaves the setup work to the platform team.
+C=Permission sets for self-built VPCs: permission sets grant access; they do not create accounts, apply guardrails or guarantee a standard VPC.
+T: Self-service, governed account vending is Control Tower Account Factory in Service Catalog, extended with customizations for baseline resources such as a VPC.
+
+@ Q001279 explain
+G: ## Control Tower control behaviors
+Control Tower controls (formerly called guardrails) have one of three behaviors:
+- **Preventive**: stops an action before it happens. Implemented with service control policies (and for some newer controls, resource control policies or declarative policies). Example: deny `config:StopConfigurationRecorder` and `config:DeleteConfigurationRecorder` in governed Regions.
+- **Detective**: evaluates resources and reports noncompliance. Implemented with AWS Config rules. Example: report S3 buckets that allow public read access.
+- **Proactive**: checks resources before provisioning through CloudFormation Hooks.
+Results appear in the Control Tower console per OU and account. A detective control never blocks the API call; it only flags the resource.
+W: First preventive (SCP), second detective (Config rule): blocking the disabling of Config is enforced by an SCP, while reporting publicly accessible buckets is a Config rule evaluation.
+X: A=Both preventive SCPs: an SCP can only allow or deny API calls; it cannot "report" on the state of existing buckets, so the second control cannot be an SCP.
+B=Both detective: Control Tower does block API calls through its preventive controls, which is exactly what the first control does.
+C=Reversed classification: the first one prevents an action, and the second one reports a condition; calling them detective and preventive swaps both.
+T: Blocks an action → preventive control (SCP); reports a condition → detective control (Config rule).
+
+@ Q001280 explain
+G: ## The confused deputy problem
+A vendor that serves many customers uses one AWS account to assume roles in all of them. If a role only trusted the vendor's account, another customer could give the vendor your role ARN and trick it into accessing your account.
+## External ID
+The customer adds a condition to the role's trust policy:
+- `"Principal": {"AWS": "arn:aws:iam::111122223333:root"}`
+- `"Condition": {"StringEquals": {"sts:ExternalId": "cust-7f3a9"}}`
+The vendor passes `--external-id cust-7f3a9` in `AssumeRole`. STS allows the call only when the principal and the value both match. A typo, a missing condition key, a different value or the wrong trusted principal all produce Access Denied.
+- The vendor side also needs an IAM policy that allows `sts:AssumeRole` on the role ARN.
+W: ExternalId condition missing or mismatched: the vendor sends an ExternalId, so the likely failure is a trust policy condition whose `sts:ExternalId` value is absent or does not equal what the vendor passes, which makes STS deny the call.
+X: B=Must use IAM Identity Center: third-party cross-account access is normally done with an IAM role, trust policy and ExternalId; Identity Center is for workforce users.
+C=Same organization required: cross-account AssumeRole works between any AWS accounts as long as the trust policy and the caller's permissions allow it.
+D=ExternalId not allowed for another account: ExternalId exists precisely for roles trusted by another AWS account, most often a third party.
+T: Third-party role access relies on an exact `sts:ExternalId` match in the trust policy; a mismatch there, not organization membership or Identity Center, causes Access Denied.
+
+@ Q001281 explain
+G: ## How SCPs are evaluated
+Service control policies set the maximum permissions for accounts. For a request in a member account, AWS evaluates the SCPs attached at **every** level: the root, each OU on the path, and the account.
+- An action must be allowed at every level to be permitted. That is why `FullAWSAccess` (or a specific Allow) is normally attached at each level.
+- An explicit `Deny` in any SCP on the path wins. Nothing below it can override it, not an OU Allow, not an account Allow, not an IAM policy.
+## Example
+Root → Security-OU → Prod-OU → Payments-OU → account. The root SCP denies `ec2:TerminateInstances`. The Prod-OU Allow cannot cancel that Deny, so the action is blocked for every account under the root, whatever identity policies say.
+To permit termination here, remove or narrow the root Deny (for example with a condition that exempts certain accounts or roles).
+W: SCPs apply together and an ancestor's Deny wins: every level is evaluated for the account, and the explicit Deny at the root blocks the action regardless of the Prod-OU Allow.
+X: A=Lower OUs override higher: SCPs do not inherit by override; they intersect, so a child OU can only narrow permissions, never widen what an ancestor denies.
+C=Allow overrides Deny: in all AWS policy evaluation, an explicit Deny beats any Allow.
+D=Identity deny needed: an SCP Deny takes effect by itself; no matching identity policy is required for it to apply.
+T: SCP permissions are the intersection of all levels and an explicit Deny anywhere on the path cannot be overridden lower down.
+
+@ Q001282 explain
+G: ## GuardDuty in an organization
+GuardDuty is a Regional threat detection service. In AWS Organizations you manage it centrally:
+- The management account designates a **delegated administrator**, usually a security tooling account.
+- The delegated administrator sees all member accounts, enables GuardDuty for them, manages protection plans (S3, EKS, Malware Protection and so on) and receives all findings.
+- **Auto-enable** set to `NEW` covers accounts that join later; `ALL` also enables every existing member.
+This is configured per Region, so repeat it in each Region you use (or use a multi-Region approach such as Security Hub central configuration).
+## Why not the management account
+AWS recommends keeping workloads and day-to-day security operations out of the management account, and enabling it there does not cover other accounts anyway.
+W: Delegated administrator with auto-enable: the security account manages configuration and findings for all 120 accounts, and auto-enable turns GuardDuty on in new accounts without manual steps.
+X: B=Management account only: GuardDuty monitors only the account where it runs, so the other 119 accounts would have no detection.
+C=Manual enablement and invitations: this is the legacy invitation model; it needs every owner to act and must be repeated for each new account.
+D=Config rules enabling GuardDuty: Config evaluates resource compliance; a rule does not turn GuardDuty on by itself, and it would still not provide centralized findings.
+T: Organization-wide GuardDuty uses a delegated administrator plus auto-enable, not per-account manual setup or detection-only Config rules.
+
+@ Q001283 explain
+G: ## Account Factory as a Service Catalog product
+When you set up Control Tower, it creates a Service Catalog portfolio containing the **AWS Control Tower Account Factory** product.
+- Launching that product runs Control Tower's provisioning workflow: the account is created, enrolled in the chosen OU, receives that OU's controls and logging, and gets Identity Center access.
+- Who can launch it is controlled by granting access to the portfolio, for example to an IAM group, role or user, or an Identity Center permission set.
+## Example
+Grant the `SandboxRequesters` IAM group access to the Account Factory portfolio. Members open the Service Catalog console, choose the product, enter an account name, email and target OU such as `Sandbox`, and the account arrives with the standard guardrails.
+W: Account Factory product shared only with the approved group: Service Catalog gives self-service requests, portfolio access restricts who can request, and Control Tower applies the guardrails automatically.
+X: A=Direct CreateAccount access: the account would not be enrolled in Control Tower, so no guardrails or baseline apply, and anyone given the permission could create accounts.
+B=Conformance packs creating accounts: conformance packs are collections of Config rules and remediations; they cannot create AWS accounts.
+C=Tickets and manual console work: it may be governed, but it is not self-service and adds platform-team toil for every request.
+T: Governed, self-service account requests limited to a group → Control Tower Account Factory in Service Catalog with portfolio access for that group.
+
+@ Q001285 explain
+G: ## Drift in AWS Control Tower
+Control Tower deploys baseline resources into governed accounts and OUs: CloudTrail configuration, Config recorders, IAM roles, SCPs for controls and so on. Changing these outside Control Tower (for example editing the trail, moving an account between OUs directly in Organizations, or detaching a control's SCP) creates **drift**, reported in the console and by notification.
+## How drift is resolved
+- **Landing zone drift**: use **Repair** or update the landing zone in the Control Tower console to redeploy the baseline.
+- **OU or account drift**: re-register the OU, or update the enrolled account (for example through Account Factory), which re-applies the baseline and controls.
+Some drift types are resolved only through these actions, so a manual revert is not the documented fix. Afterwards Control Tower shows the resource as enrolled and compliant again.
+W: Re-register or repair to reapply the baseline: these are the documented Control Tower mechanisms that redeploy the expected CloudTrail setup and clear the drifted status.
+X: B=SCP blocking all CloudTrail calls: this would break Control Tower's own management and legitimate auditing tasks, and it does not repair the drift that already exists.
+C=Manual revert and wait: Control Tower does not guarantee that drift clears on its own after a hand-made revert; the supported way is to repair or re-register through Control Tower.
+D=Remove the account from Organizations: leaving the organization is disruptive, loses central logging and guardrails in the meantime, and is far more than needed to reapply a baseline.
+T: Fix Control Tower drift through Control Tower itself (repair, re-register, update); do not rely on manual reverts or drastic account moves.
+
+@ Q001286 explain
+G: ## Organizations tag policies
+A tag policy is an AWS Organizations policy type that standardizes tags across accounts. For a key such as `CostCenter` you define:
+- the exact key capitalization,
+- the allowed values, for example `["CC100", "CC200", "CC300"]`,
+- optionally, resource types for which noncompliant tagging operations are prevented (`enforced_for`).
+## What it does and does not do
+Tag policies are evaluated when tags are changed. Noncompliance shows in each account's compliance view and in an organization-wide report from the management account or delegated administrator. They do not stop someone from creating a resource that has no tag at all. To block untagged creation you would add SCPs using `aws:RequestTag` conditions, so SCPs and tag policies complement each other.
+W: Tag policy for CostCenter values that reports noncompliance: it defines the approved values, surfaces resources that need correction, and does not block creation, which matches the finance team's "flag, don't block" requirement.
+X: A=SCP as the only enforcement: SCPs can deny untagged creation, but that blocks resources, which the team does not want, and they are not the only tagging feature in Organizations.
+B=AWS Budgets enforcing tags: Budgets tracks cost and usage against thresholds and can take budget actions; it does not require or validate tags on resources.
+D=Organizations has no tagging feature: tag policies are an Organizations policy type built for this; Config rules such as required-tags are a separate, account-level check.
+T: Tag policies standardize and report tag values without blocking creation; SCPs are what block.
+
+@ Q001287 explain
+G: ## How long AssumeRole credentials last
+`AssumeRole` returns temporary credentials that expire after `DurationSeconds`, which defaults to 3,600 seconds (1 hour). The maximum you can request is the role's `MaxSessionDuration`, which you can set between 1 and 12 hours.
+## Example
+- Set the role's maximum: `aws iam update-role --role-name DeployRole --max-session-duration 14400` (4 hours).
+- Request it: `aws sts assume-role --role-arn arn:aws:iam::222233334444:role/DeployRole --role-session-name deploy --duration-seconds 10800`.
+A 90-minute job with default 1-hour credentials fails partway with an expired token.
+## Caveat: role chaining
+If the pipeline is itself running under role credentials and then assumes another role, that is role chaining, and the session is capped at 1 hour regardless of `MaxSessionDuration`. In that case refresh credentials during the job instead.
+W: Raise MaxSessionDuration and request a longer DurationSeconds: the single AssumeRole call currently gives about an hour of credentials; allowing and requesting a longer session covers the 90-minute deployment.
+X: B=ExternalId extends sessions: `sts:ExternalId` only controls who may assume the role; it has no effect on how long the credentials last.
+C=15-minute maximum: 15 minutes is the minimum `DurationSeconds`, not the maximum; sessions can last up to the role's configured maximum of up to 12 hours.
+D=GetFederationToken never expires: all STS credentials expire. GetFederationToken is for federated users from IAM user credentials and does not give credentials for a role in another account.
+T: Long jobs need a longer role session (MaxSessionDuration up to 12 hours plus DurationSeconds); remember role chaining is still limited to 1 hour.
+
+@ Q001288 explain
+G: ## Step Functions for human-in-the-loop remediation
+A **Standard workflow** can run for up to one year, records every state transition in its execution history, and runs each step exactly once, which suits audited remediation.
+## Waiting for approval with a task token
+- A task state using `.waitForTaskToken`, for example on `arn:aws:states:::sns:publish.waitForTaskToken`, sends a message that includes `$$.Task.Token` to the owner and pauses.
+- The approval link calls `SendTaskSuccess` or `SendTaskFailure` with that token.
+- Set `TimeoutSeconds: 14400` (4 hours); on `States.Timeout`, a `Catch` or `Choice` path moves to a Lambda task that revokes the inbound rule with `RevokeSecurityGroupIngress`.
+The trigger can be an EventBridge rule on the Config compliance change event, which starts the execution.
+W: Standard workflow with waitForTaskToken, Choice and revoke task: it waits hours for a callback, branches on approval or timeout, runs the Lambda revoke, and keeps a full audit trail in the execution history.
+X: B=Express workflow: Express workflows run for at most 5 minutes and do not support the `.waitForTaskToken` pattern, so a 4-hour approval wait is impossible.
+C=Lambda sleeping 4 hours: a Lambda invocation has a 15-minute maximum timeout, and one function would hide the steps from any audit trail.
+D=EventBridge plus Lambda retries: retries repeat a failed invocation after errors; they are not an approval wait, and no callback path or audit history exists.
+T: Long human-approval waits with audit history → Standard workflow and task tokens; Express and Lambda are limited to minutes.
+
+@ Q001289 explain
+G: ## AWS Config remediation
+A Config rule evaluates resources and marks them `COMPLIANT` or `NON_COMPLIANT`. A **remediation configuration** attached to the rule links it to a Systems Manager Automation runbook:
+- It can be **automatic**, running every time a resource becomes noncompliant, with retry settings, or manual (triggered from the console).
+- Parameters are passed to the runbook, for example the bucket name from the noncompliant resource ID, plus an `AutomationAssumeRole` that has permission to change the bucket.
+- AWS provides managed runbooks for common S3 fixes (such as blocking public access or removing public policy statements), or you write your own.
+## Example
+Rule `s3-bucket-public-read-prohibited` → automatic remediation with a runbook that removes the public statement from the bucket policy, typically within minutes of detection.
+W: Config remediation configuration with an SSM Automation document: it is Config's built-in way to fix noncompliant resources automatically after evaluation, with no person in the loop.
+X: A=CloudWatch alarm paging on-call: this only notifies someone; the requirement is to fix buckets without a human reviewing each finding.
+C=Config aggregator remediates: an aggregator collects configuration and compliance data from many accounts and Regions for viewing; it does not run any remediation.
+D=Trusted Advisor fixes Config violations: Trusted Advisor runs its own best-practice checks and recommendations; it does not execute remediation for Config rule findings.
+T: Automatic fixes for Config findings come from remediation configurations running SSM Automation runbooks; aggregators and alarms only report.
+
+@ Q001290 explain
+G: ## Custom AWS Config rules
+When no managed rule fits, Config supports custom rules:
+- **Custom Lambda rules**: Config invokes your function on configuration changes (for example of `AWS::DynamoDB::Table`) and/or periodically. The function reads the configuration item, applies any logic and calls `PutEvaluations` with `COMPLIANT`, `NON_COMPLIANT` or `NOT_APPLICABLE`.
+- **Custom policy rules** written in Guard can also express simpler conditions without Lambda.
+## Example logic
+- If the table's tag `Classification` equals `Restricted` and continuous backups are not enabled → `NON_COMPLIANT`.
+- If it is `Restricted` with point-in-time recovery → `COMPLIANT`.
+- If the tag is missing or different → `NOT_APPLICABLE`.
+Point-in-time recovery status may need a `DescribeContinuousBackups` call from the function, which only Lambda-backed rules can make.
+W: Custom Lambda-backed Config rule with PutEvaluations: the function can combine the tag value with the table's backup setting and report per-table compliance, which no managed rule expresses.
+X: A=CloudFormation Hook: Hooks check resources before CloudFormation provisions them, so tables created or changed outside CloudFormation would never be evaluated, and Config does support custom logic.
+B=required-tags managed rule: it only checks that listed tag keys (and optionally values) exist; it cannot relate a tag value to a setting such as point-in-time recovery.
+C=Trusted Advisor custom checks: Trusted Advisor provides AWS-defined checks; it is not a framework for writing your own conditional compliance logic.
+T: Conditional, organization-specific compliance logic → custom Config rule (Lambda calling PutEvaluations); managed rules and Trusted Advisor only cover predefined checks.
+
+@ Q001291 explain
+G: ## Systems Manager Run Command
+Run Command executes a document such as `AWS-RunShellScript` on managed instances immediately, as a one-time action.
+- **Targets**: instance IDs, a resource group, or tags such as `Key=tag:Role,Values=web`.
+- **Rate control**: `--max-concurrency 10%` runs on at most 10% of targets at once; `--max-errors 5` stops sending the command to new instances after more than 5 failures.
+- **Output**: `--output-s3-bucket-name` keeps full output in S3, beyond the truncated output shown in the console; CloudWatch Logs is another option.
+## Example
+`aws ssm send-command --document-name AWS-RunShellScript --targets Key=tag:Role,Values=web --parameters commands="systemctl restart myapp" --max-concurrency 10% --max-errors 5 --output-s3-bucket-name ops-logs`
+No SSH ports or keys are needed; the SSM Agent pulls the command.
+W: Run Command by tag with concurrency, error limits and S3 output: it runs the restart now across the tagged fleet, 10% at a time, stops after the error threshold, and stores output in S3.
+X: B=SSH loop from a bastion: it needs open inbound ports and managed keys, gives no built-in concurrency or error threshold, and leaves no central output record.
+C=State Manager association: associations keep instances in a desired state on a schedule or on registration; a one-off restart right now is a Run Command job.
+D=Automation runbook with approvals and a CloudFormation stack: approvals and a stack add steps and delay to a simple immediate restart that Run Command already handles with rate control.
+T: One-time fleet commands with rate control → Run Command; ongoing desired state → State Manager.
+
+@ Q001292 explain
+G: ## Standard vs Express workflows
+- **Standard**: runs up to one year, exactly-once execution of each step, full execution history retained for 90 days and viewable in the console, priced per state transition. Supports callback (`.waitForTaskToken`) and `.sync` job patterns. Good for long, auditable business or compliance processes.
+- **Express**: runs up to 5 minutes, very high event rates, priced by number of requests plus duration and memory. Asynchronous Express runs are at-least-once, synchronous ones at-most-once. History is not kept by the service; you send logs to CloudWatch Logs.
+## Example
+Millions of sub-second telemetry transformations per day would create huge state-transition costs in Standard but are cheap and fast in Express. A multi-hour remediation that must be audited and run exactly once cannot fit in 5 minutes and needs Standard's retained history.
+W: Express for the high-volume pipeline, Standard for the remediation: each workload gets the type that matches its duration, volume, execution semantics and audit needs.
+X: A=Express for both: Express stops at 5 minutes, is not exactly-once, and keeps no built-in execution history, so it fails the long compliance workflow.
+B=Standard for telemetry, Express for remediation: this is reversed; it makes the high-volume pipeline expensive and gives the multi-hour workflow a 5-minute limit.
+C=Standard for both: it works functionally but paying per state transition for millions of short events is far more expensive than Express.
+T: High-volume, short-lived → Express; long-running, exactly-once and auditable → Standard.

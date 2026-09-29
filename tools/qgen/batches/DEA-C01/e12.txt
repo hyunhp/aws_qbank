@@ -1,0 +1,345 @@
+# DEA-C01 detailed explanations, batch e12 (explanation-only rewrites; letters are the published ones)
+
+@ Q003763 explain
+G: ## One workspace for data and analytics
+**Amazon SageMaker Unified Studio** is the single development environment of the next generation of Amazon SageMaker. Inside a project, users get a query editor and Jupyter notebooks that can reach several engines without switching consoles.
+- SQL against Amazon Redshift (provisioned or Serverless) and against the data lake through Amazon Athena.
+- Spark and notebook work on Amazon EMR or AWS Glue compute.
+- A shared catalog and governed access, so the same tables and permissions apply across tools.
+## Example
+An analyst opens a notebook, runs a SQL cell against a Redshift sales table, a second cell against an Athena table in S3, and then a Spark cell on EMR to enrich the result, all in one project with one set of project permissions.
+W: SageMaker Unified Studio: it is built for exactly this, one environment where notebooks and SQL can use Redshift, Athena and EMR, with shared data catalog and project-level access control.
+X: A=AWS Artifact: Artifact is a portal for downloading AWS compliance reports (such as SOC and ISO reports) and accepting agreements; it has no query engine or notebooks.
+B=CloudShell: CloudShell is a browser-based shell for running the AWS CLI and scripts; it offers no notebooks and no integrated SQL experience across analytics engines.
+C=WorkDocs: WorkDocs was a document storage and sharing service, which AWS has since retired; it never ran queries or notebooks against analytics services.
+T: When the need is one notebook and SQL workspace across Redshift, Athena and EMR, choose SageMaker Unified Studio, not a general-purpose shell or document tool.
+
+@ Q003764 explain
+G: ## How Redshift distributes rows
+A Redshift cluster spreads each table's rows across compute nodes and slices. The distribution style decides where rows go:
+- `KEY`: rows with the same value in the distribution column land on the same slice, so joins on that column stay local.
+- `EVEN`: rows are spread round-robin.
+- `ALL`: a full copy of the table is stored on every node.
+- `AUTO`: Redshift chooses and can change the style as the table grows.
+## Why joins redistribute
+If matching rows of two joined tables are on different nodes, Redshift must move or broadcast data at query time (visible as `DS_BCAST_INNER` or `DS_DIST_*` steps in `EXPLAIN`). For a star schema, a small dimension table (for example a 5,000-row `dim_store`) stored with `DISTSTYLE ALL` is already present on every node, so each node joins its slice of the fact table locally.
+W: DISTSTYLE ALL on the small dimension: copying a small table to every node costs little storage and removes the per-query redistribution, because every node already holds all dimension rows it could need.
+X: A=ALL on the large fact table: copying billions of fact rows to every node multiplies storage and slows every load, and the fact table is the one that should stay distributed to use all nodes in parallel.
+B=Split into monthly tables: many small tables force UNION views and more maintenance, but the join still needs the dimension rows on the same node, so redistribution continues.
+C=Remove sort keys: sort keys control block ordering and zone-map pruning, not where rows live; removing them makes scans read more blocks and does nothing about data movement.
+T: Replicate the small dimension with DISTSTYLE ALL and keep the large fact table distributed; ALL on a big table wastes storage without fixing anything.
+
+@ Q003765 explain
+G: ## Where AWS Glue writes diagnostic data
+Glue jobs send their output to Amazon CloudWatch.
+- **CloudWatch Logs**: driver and executor output goes to log groups such as `/aws-glue/jobs/output` and `/aws-glue/jobs/error`; with continuous logging enabled, near-real-time logs appear in `/aws-glue/jobs/logs-v2`.
+- **CloudWatch metrics**: with job metrics enabled, Glue publishes Spark metrics (memory, elapsed time, bytes read, records processed) in the `Glue` namespace; observability metrics add views of skew and worker utilization.
+- **Job run details**: the Glue console shows each run's state, error message and duration, and the Spark UI can show stages and tasks.
+## Example
+An intermittent failure is traced by comparing the error log of a failed run with a successful one and checking the memory metric: if driver memory spikes only on large input days, the cause is data volume, not the code.
+W: CloudWatch Logs and Glue job metrics: they hold the actual error messages, stack traces and resource trends of each run, which is what is needed to find why only some runs fail.
+X: A=Route 53 query logs: they record DNS queries resolved by Route 53; they contain nothing about Spark stages, errors or memory inside a Glue job.
+C=Billing console: it shows charges by service; cost can confirm a job ran longer, but it has no error messages or per-run diagnostics.
+D=IAM credential report: it lists IAM users with the status of their passwords, access keys and MFA; it does not record job executions or failures.
+T: Diagnose Glue runs with CloudWatch Logs and job metrics; billing, DNS and credential reports never contain job errors.
+
+@ Q003766 explain
+G: ## Driver versus executors in Spark
+A Spark job has one **driver**, which plans the work, and many **executors** on the workers, which process partitions in parallel. Data normally stays distributed across executors.
+- Actions such as `collect()` or `toPandas()` pull every row back to the driver's memory. With a large result, the driver runs out of memory even if the workers are fine.
+- Writing with the DataFrame writer or a Glue sink (for example `df.write.parquet("s3://bucket/out/")`) lets each executor write its own partitions, so the driver never holds the full dataset.
+## Example
+A job that runs `results = df.collect()` on 200 million rows fails with a driver `OutOfMemoryError`. Replacing it with a parallel write to S3, and using `take(20)` or `limit()` only when a sample is needed, removes the failure.
+W: Avoid collecting to the driver: the error comes from moving the whole result into one process; parallel writes keep the data spread across executors, where the memory and throughput scale with the workers.
+X: A=Uncompressed JSON: JSON is larger and slower to parse than compressed columnar formats, so it increases memory and I/O; it does not change what `collect()` pulls to the driver.
+B=More input files: splitting input changes how reading is parallelized, but the collected result is the same size; many small files can even add planning and listing overhead on the driver.
+D=Fewer workers: Glue workers do not share a memory pool, each worker type has fixed memory; removing workers reduces parallelism and does not give the driver more memory.
+T: Driver out-of-memory on collect is fixed by keeping data distributed and writing in parallel, not by changing file counts, formats or worker counts.
+
+@ Q003767 explain
+G: ## Alerting on something that did not happen
+A failed or late pipeline often produces no signal at all: no error, no log line, just missing output. Monitoring must therefore treat absence as a problem.
+- The pipeline publishes a **completion metric** at its last step, for example a custom CloudWatch metric `PipelineCompleted` with value `1` via `PutMetricData`.
+- A **CloudWatch alarm** watches that metric. Its **missing data** setting (`TreatMissingData`) can be `breaching`, so if no data point arrives in the evaluation window the alarm goes to `ALARM` and notifies an SNS topic.
+- An alarm evaluates a rolling window, not a clock time, so its period is sized to one daily run. For a strict 06:00 deadline, a scheduled check (for example EventBridge Scheduler invoking a Lambda function at 06:00) can publish `0` when no output exists, and the alarm fires on that value.
+## Example
+If the nightly job finishes at 04:30, the metric receives `1` and the alarm stays `OK`. If the job hangs, no data point is written, and the missing data is treated as breaching, so the on-call engineer is paged.
+W: CloudWatch alarm with missing data as breaching: it turns the absence of a completion signal into an automatic alert, which is exactly what a missed deadline looks like.
+X: A=Dashboard reviewed occasionally: it depends on a person remembering to look; a late run can go unnoticed for hours, and nothing notifies anyone.
+B=S3 lifecycle rule: lifecycle rules expire or transition objects by age, prefix or tags; they send no alerts and would delete evidence of the problem.
+D=Crawler at 06:00: a crawler updates the Data Catalog with whatever files exist; it does not judge whether the run finished and does not notify anyone.
+T: Detect a late pipeline by alarming on a missing completion metric (missing data = breaching), not by hoping someone checks a dashboard.
+
+@ Q003768 explain
+G: ## Auditing API changes with CloudTrail
+Every change to a Glue job, whether made in the console, the CLI or an SDK, is an API call such as `UpdateJob`. **AWS CloudTrail** records these calls as management events.
+- Each event includes `userIdentity` (the IAM user or assumed role), `eventTime`, `sourceIPAddress` and `requestParameters`, which show the new job settings such as the script location.
+- The CloudTrail **Event history** keeps the last 90 days of management events and can be filtered by event name or resource; a trail or CloudTrail Lake keeps events longer for queries.
+## Example
+Filtering Event history for `eventName = UpdateJob` and the job name shows that the role `DataEngAdmin`, assumed by a specific user, changed `ScriptLocation` to a new S3 path last Tuesday.
+W: CloudTrail: it keeps a record of who called which API, when and from where, so it directly answers who changed the job's script location.
+X: A=Quick Sight: it builds dashboards and visualizations from data sources; it does not record API activity on Glue jobs.
+C=Athena: it runs SQL queries on data; it can query CloudTrail logs stored in S3, but by itself it is not the service that records the change.
+D=Glue DataBrew: it is a visual tool for cleaning and profiling data; it has no audit history of changes to Glue job definitions.
+T: "Who changed this resource and when" is answered by CloudTrail's API records; analytics tools can only query those records, not create them.
+
+@ Q003769 explain
+G: ## What a healthy Kinesis consumer looks like
+A consumer of Amazon Kinesis Data Streams is healthy when it keeps up with incoming data and is not being throttled.
+- **`GetRecords.IteratorAgeMilliseconds`** is the age of the last record returned by `GetRecords`. Near zero means the consumer reads records as they arrive; a steadily growing value means it is falling behind and risks losing data once it passes the retention period.
+- **`ReadProvisionedThroughputExceeded`** counts `GetRecords` calls that were throttled. Shared-throughput consumers split a per-shard read limit (about 2 MB/s and five calls per second), so several consumers polling the same shard can hit it.
+## Example
+Iterator age rises from seconds to 40 minutes while read throttling is high: too many consumers share each shard. Enhanced fan-out (dedicated throughput per consumer) or more shards fix it.
+W: A=ReadProvisionedThroughputExceeded: it shows when reads are being throttled, which directly slows the consumer and explains rising lag.
+E=GetRecords.IteratorAgeMilliseconds: it measures how far behind the newest data the consumer is, the most direct signal of consumer lag.
+X: B=S3 bucket size: it is a daily storage metric for a bucket; it says nothing about how quickly records are read from a stream.
+C=Route 53 health check: it tests whether an endpoint answers; stream consumers read from Kinesis and are not measured by DNS health checks.
+D=EC2 CPU credit balance: it applies only to burstable instances and describes host CPU, not whether the consumer keeps up with the stream.
+T: Watch iterator age for lag and read throttling for capacity; infrastructure metrics from other services do not show stream consumer health.
+
+@ Q003770 explain
+G: ## Step Functions execution history
+Each run of a state machine is an **execution**. For Standard workflows, Step Functions records every event of the execution: state entered, task scheduled, task succeeded or failed, state exited.
+- The console's graph view colors each state by status, and selecting a state shows its **input**, **output**, and for a failure the `Error` and `Cause`.
+- The event list shows timestamps and retries, so you can see how often a `Retry` block fired before the `Catch` or failure.
+- Express workflows do not keep this history in the console by default; they send it to CloudWatch Logs when logging is enabled.
+## Example
+The third state, a Glue `StartJobRun.sync` task, shows `Error: States.TaskFailed` with the Glue error message in `Cause`, and its input shows the wrong S3 prefix passed from step two.
+W: Execution history and event details: they show the exact input, output and error of every state in the failed run, which is what the engineer needs to pinpoint the problem.
+X: A=S3 server access logs: they record object-level requests to one bucket; they do not show state inputs, outputs or the error of a workflow step.
+B=AWS Health Dashboard: it reports AWS service events and scheduled changes affecting the account, not the logic errors of your own workflow.
+C=Unrelated EC2 system logs: they describe boot and OS events on instances that are not part of the workflow, so they cannot explain a failed state.
+T: To debug a failed state, open the Step Functions execution history, which records every state's input, output and error.
+
+@ Q003771 explain
+G: ## Data quality checks inside the pipeline
+**AWS Glue Data Quality** evaluates rules written in DQDL (Data Quality Definition Language) against a dataset, either on a Data Catalog table or as a step inside a Glue ETL job.
+- A completeness rule such as `Completeness "customer_id" >= 0.95` passes only if at least 95% of values are non-null, which means at most 5% nulls.
+- In a Glue job, the evaluate data quality step can be set to fail the job when rules fail, which stops bad data before it is written.
+- Results are published to CloudWatch and EventBridge, so a failed evaluation can trigger an SNS alert.
+## Example
+A daily batch arrives with 12% null `customer_id` values. The completeness rule fails, the job stops before loading, and an EventBridge rule sends the result to the data team.
+W: Glue Data Quality rules in the pipeline: they check the null threshold on the incoming data itself and can stop the run and raise an alert before bad data reaches the target.
+X: A=S3 lifecycle rule: lifecycle rules act on object age, prefix or tags and never read file contents, so they cannot count nulls in a column.
+B=Crawler renaming columns: crawlers infer schema and partitions for the Data Catalog; they do not measure null rates, rename columns by quality or stop a pipeline.
+C=Dashboard after load: it shows the problem only after the bad data is already loaded, and a dashboard neither stops the pipeline nor alerts by itself.
+T: Enforce thresholds such as "at most 5% nulls" with Glue Data Quality rules that run before loading, not with after-the-fact dashboards.
+
+@ Q003772 explain
+G: ## Rule recommendations in Glue Data Quality
+Writing data quality rules by hand for every column is slow. **AWS Glue Data Quality rule recommendations** start a run that scans a Data Catalog table, computes statistics per column (row count, completeness, distinct values, value ranges) and proposes DQDL rules based on what it sees.
+- Example output: `RowCount between 45000 and 55000`, `IsComplete "order_id"`, `ColumnValues "status" in ["NEW","SHIPPED","CANCELLED"]`.
+- The team reviews the list, edits thresholds and saves it as a ruleset that runs on a schedule or inside ETL jobs.
+- The recommendation engine is built on the open-source Deequ library.
+## Why this helps
+It gives a sensible starting ruleset in minutes, grounded in the real data profile, instead of guessing thresholds.
+W: Glue Data Quality rule recommendations: they analyze the existing data's statistics and generate candidate rules automatically, which is exactly the requirement.
+X: A=IAM Access Analyzer: it analyzes resource and IAM policies for external or unused access and validates policy syntax; it never looks at data values.
+B=AWS Config managed rules: they check whether AWS resources are configured compliantly (for example, bucket encryption on); they do not inspect the rows inside datasets.
+C=CloudWatch anomaly detection: it models the expected band of a CloudWatch metric such as job duration; it does not profile table columns or produce data quality rules.
+T: Automatically suggested rules based on data statistics come from Glue Data Quality recommendations; Config and Access Analyzer check resources and permissions, not data.
+
+@ Q003773 explain
+G: ## Idempotent loads
+A load is **idempotent** when running it twice gives the same result as running it once. Pipelines retry after timeouts and partial failures, so every load step must be safe to repeat.
+- **MERGE / upsert**: match incoming rows to the target on a unique business key; update matches and insert only new keys. Amazon Redshift supports `MERGE`, and Apache Iceberg tables support `MERGE INTO` from Athena or Spark.
+- **Delete and insert**: load into a staging table, delete target rows with the same keys or partition, then insert, all in one transaction.
+- **Partition overwrite**: rewrite a whole date partition instead of appending to it.
+## Example
+A retry reloads orders 1001 to 1500. With `MERGE ... ON target.order_id = source.order_id`, those rows are updated in place instead of being inserted a second time.
+W: Idempotent loads with MERGE or upserts: matching on a unique key means a retried batch updates the existing rows rather than duplicating them, while retries still protect against transient failures.
+X: A=Disable retries: failed loads would simply be missing, trading duplicates for data loss, and transient errors would need manual reruns.
+B=Larger batches: fewer retries still append each retried batch again, and a larger batch duplicates even more rows each time it is retried.
+D=Append and dedupe later: every consumer sees duplicates until someone cleans them, and manual cleanup is error-prone and does not scale.
+T: Make loads safe to repeat with key-based MERGE or upserts; disabling retries or cleaning up later only trades duplicates for other problems.
+
+@ Q003774 explain
+G: ## Reconciling a load
+After moving data from a source into a warehouse, two questions matter: did every row arrive (completeness), and are the values right (correctness)?
+- **Row counts**: compare `SELECT COUNT(*)` in the source extract with the count in the target for the same date or batch. A gap shows missing or duplicated rows.
+- **Checksums or column sums**: compare aggregates such as `SUM(amount)`, `MIN`/`MAX` of dates, or a hash over key columns. Matching counts with different totals reveal truncated, shifted or wrongly converted values.
+## Example
+The source shows 1,204,331 rows with a total `amount` of 98,412,007.25. The warehouse has the same count but a total that is 0.4% lower, which points to a decimal precision issue in the load.
+W: A=Checksums or key column sums: they confirm that the values arrived intact, catching conversion or truncation errors that counts alone miss.
+E=Source and target row counts: they confirm that no rows were dropped or duplicated during the load.
+X: B=Log group size: the volume of log output depends on logging verbosity and errors, not on whether the data in the target is complete or correct.
+C=Unique job name: a job's name is metadata about the pipeline; it says nothing about the rows that were loaded.
+D=Console color theme: it is a display preference of the user interface and has no connection to data accuracy.
+T: Validate a load by reconciling data itself, counts for completeness and sums or checksums for correctness, not pipeline metadata.
+
+@ Q003775 explain
+G: ## Data profiling
+Before building a pipeline, engineers **profile** a dataset to learn its shape: which columns are often empty, which values dominate, and which values look suspicious.
+**AWS Glue DataBrew** profile jobs run over a dataset in S3 or another supported source and produce a report with:
+- Per-column statistics: missing values, distinct and unique counts, minimum, maximum, mean and quartiles.
+- Value distributions and the most common values.
+- Outlier detection and correlations between numeric columns.
+## Example
+A profile of a customer file shows 18% missing `postal_code`, a `signup_date` column with dates in 1900, and an `age` column with values above 150. These findings become cleaning steps in a DataBrew recipe or Glue job and data quality rules later.
+W: DataBrew profile jobs: they are designed to summarize distributions, missing values and outliers without writing code, which is exactly the pre-pipeline analysis described.
+X: A=Route 53 health checks: they test whether endpoints respond and can drive DNS failover; they never read dataset contents.
+C=CodeDeploy deployment groups: they define which instances or functions receive an application deployment; they do not analyze data.
+D=SES email templates: they format emails sent through Amazon SES and have nothing to do with statistics about a dataset.
+T: To see distributions, missing values and outliers before building a pipeline, run a DataBrew profile job.
+
+@ Q003776 explain
+G: ## Dead-letter handling for streams
+In streaming, one malformed record must not block everything behind it. The usual pattern is a **dead-letter destination**: records that fail validation or processing are written somewhere separate, and the main flow continues.
+- Amazon Data Firehose writes records that fail Lambda transformation, or that cannot be delivered to destinations such as OpenSearch or Splunk, to an error or backup prefix in an S3 bucket.
+- AWS Lambda reading Kinesis or DynamoDB streams can limit retry attempts, split failing batches, and send details of failed batches to an on-failure destination such as an SQS queue, SNS topic or S3 bucket.
+- In Spark or Flink code, invalid rows are filtered into a side output written to an S3 prefix such as `s3://lake/errors/`.
+## Example
+A JSON event is missing its `event_id`. The processor writes it with the parse error to the error prefix, and the next 10,000 valid events are processed without delay. An alarm on the error count alerts the team if many records start failing.
+W: Dead-letter destination: it keeps every bad record (with its error) for investigation while valid records keep flowing, meeting both requirements.
+X: A=Stop the stream on any bad record: one malformed event causes a full outage and pages someone for a problem that could be handled automatically.
+B=Retry forever: an invalid record will fail every time, so infinite retries block the shard or partition and stall all records behind it.
+C=Silently drop: processing continues, but the records are gone, so there is nothing to investigate and no signal that data is being lost.
+T: Isolate bad records in a dead-letter destination; stopping, retrying forever or dropping all break either continuity or traceability.
+
+@ Q003777 explain
+G: ## Serverless SQL for small scheduled checks
+**Amazon Athena** runs SQL directly on data in S3 with no clusters to create or keep running. You pay for the data each query scans (or for reserved capacity if you choose it).
+- Partitioned tables let a query read only the newest partition, for example `WHERE dt = '2026-09-29' AND hr = '10'`, so an hourly check scans a small amount of data.
+- A schedule can come from EventBridge Scheduler calling a Step Functions state machine that uses the Athena `StartQueryExecution` integration, or a small Lambda function.
+## Example
+Every hour a state machine runs `SELECT COUNT(*), COUNT(DISTINCT order_id) FROM orders WHERE dt = current_date` against the latest partition and fails the execution if the result looks wrong. Between runs, nothing is running and nothing is billed.
+W: Scheduled Athena query: it needs no servers or clusters, reads the data where it already is in S3, and costs only for the small amount scanned each hour.
+X: A=Provisioned Redshift running continuously: it bills for nodes every hour even when idle and still needs a cluster to manage, which is far more than a quick hourly check requires.
+B=EC2 with a database: the data must first be loaded from S3 into the database, and the instance must be patched, sized and kept running.
+C=Always-on EMR cluster: a permanent cluster bills for its instances around the clock and needs capacity and software management for a query that runs briefly each hour.
+T: Light, scheduled SQL on a data lake is a serverless Athena job; always-on clusters or instances add infrastructure and idle cost.
+
+@ Q003778 explain
+G: ## Redshift federated queries
+A **federated query** lets Amazon Redshift read live rows from an operational database without copying them first. Supported sources include Amazon RDS and Aurora for PostgreSQL and MySQL.
+- You create an external schema that points to the database, with credentials stored in AWS Secrets Manager, for example `CREATE EXTERNAL SCHEMA apg FROM POSTGRES DATABASE 'orders' URI '<aurora-endpoint>' IAM_ROLE '...' SECRET_ARN '...'`.
+- Queries can then join `apg.orders` with local Redshift tables; Redshift pushes filters down to the source to reduce data transferred.
+## Example
+An analyst joins today's open orders in Aurora PostgreSQL with the historical customer dimension in Redshift in one query, seeing up-to-date operational data without a nightly ETL.
+W: Federated queries: they query Aurora PostgreSQL data in place, so analysts get current operational data joined with warehouse tables without any copy step.
+X: A=UNLOAD: it exports the results of a Redshift query to files in S3; it moves data out of Redshift and cannot read from Aurora.
+B=Snapshots: they are backups of a Redshift cluster used for restore or migration; they do not provide access to another database.
+C=COPY from S3: it loads files into Redshift tables, which means exporting Aurora data to S3 first, the copy the requirement rules out.
+T: To query Aurora or RDS data live from Redshift, use federated queries; COPY and UNLOAD move data, snapshots back it up.
+
+@ Q003779 explain
+G: ## Lambda limits for file processing
+An AWS Lambda function has a configurable timeout of up to 15 minutes and memory of up to 10,240 MB. CPU power scales with the memory setting, so more memory often makes a function run faster, not just hold more.
+- For files that finish close to the limit, raising timeout and memory, and using ephemeral `/tmp` storage when needed, is often enough.
+- For files that can take longer than 15 minutes or need distributed processing, the S3 event should start a job on a service without that limit, such as an AWS Glue job or an Amazon ECS task on AWS Fargate, often via Step Functions.
+## Example
+A function set to 60 seconds and 512 MB times out on 3 GB CSV files. Raising it to 5 minutes and 4 GB solves most cases, and files above a size threshold are handed to a Glue job.
+W: More timeout and memory, or Glue or Fargate: this gives large files the time and CPU they need, and moves work that exceeds Lambda's limits to a service designed for longer jobs.
+X: B=Disable notifications for large files: S3 event notification filters match only key prefix and suffix, not object size, and skipping large files would simply leave data unprocessed.
+C=Shorter timeout: the function would fail sooner and more often on large files; failing faster does not process any more data.
+D=Remove error handling: error handling takes negligible time, and removing it only hides failures while the function still exceeds its timeout.
+T: Fix Lambda timeouts on large files by giving the function more time and memory or moving the work to Glue or Fargate, not by skipping or hiding failures.
+
+@ Q003780 explain
+G: ## Volume monitoring
+A pipeline can "succeed" while loading only a fraction of the expected data, for example when an upstream system sends an empty or partial file. Job status alone does not catch this; **data volume** does.
+- After each load, publish the record count as a custom CloudWatch metric, for example `RecordsLoaded` with a dimension for the table.
+- Create a CloudWatch alarm with a static threshold (for example, fewer than 800,000 rows) or with **anomaly detection**, which learns the normal pattern, including weekday and weekend differences, and alerts when the value leaves the expected band.
+- Glue Data Quality `RowCount` rules or its anomaly detection are another way to check volume inside the pipeline.
+## Example
+The daily count is usually around 1.2 million rows; on one day it is 90,000. The anomaly alarm fires the same morning, and the team finds an upstream export that stopped halfway.
+W: Record-count metrics with alarms: they measure the data itself and alert automatically when volume drops, catching silent upstream failures on the day they happen.
+X: A=Monthly reviews: a problem found weeks later means weeks of incomplete reports and much harder backfills.
+C=Trust job success: a job succeeds when its code runs without error, even if it read a half-empty input, so success says nothing about completeness.
+D=Delete low-count days: deleting data hides the evidence and creates gaps, without finding or fixing the upstream cause.
+T: Monitor record counts as metrics with thresholds or anomaly detection, because a successful job can still load incomplete data.
+
+@ Q003781 explain
+G: ## EMR managed scaling
+With **Amazon EMR managed scaling**, you set minimum and maximum capacity for a cluster (in instances, vCPUs or instance fleet units), and EMR adds or removes nodes automatically based on workload metrics such as pending YARN containers and memory usage.
+- It works with instance groups and instance fleets and needs no custom scaling rules.
+- You can cap how much of the capacity is on-demand versus Spot, and limit core node growth so extra capacity goes to task nodes.
+## Example
+A cluster with a minimum of 3 and a maximum of 30 nodes runs a Spark job whose shuffle-heavy stage needs many executors. EMR scales toward 30 nodes during that stage, then scales back down when the containers are no longer needed, so you pay for peak capacity only while it is used.
+W: EMR managed scaling: it resizes the cluster automatically from observed workload, adding capacity for heavy Spark stages and removing it afterward within the limits you set.
+X: A=Security configurations: they define encryption at rest and in transit, Kerberos authentication and similar settings; they have no effect on cluster size.
+B=Bootstrap actions: they run scripts on nodes when the nodes launch, for example to install libraries; they do not decide when to add or remove nodes.
+C=Step concurrency: it lets several steps run at the same time on the existing cluster, but capacity stays the same, so heavy stages still compete for fixed resources.
+T: Automatic resizing of EMR for varying Spark load is managed scaling; bootstrap actions and step concurrency run on whatever capacity already exists.
+
+@ Q003782 explain
+G: ## Direct query versus SPICE in Quick Sight
+Amazon Quick Sight datasets can use **direct query**, where each visual sends a query to the source (here Athena) every time the dashboard is loaded or filtered, or **SPICE**, Quick Sight's in-memory calculation engine.
+- With SPICE, data is imported once and refreshed on a schedule (full or incremental refresh), and visuals are served from memory.
+- Visuals no longer wait for an Athena query to run, so dashboards typically load much faster, and Athena is no longer scanned for every view, which also reduces query cost.
+## Example
+A sales dashboard with ten visuals on direct query runs ten Athena queries per viewer. After importing the dataset into SPICE with an hourly incremental refresh, every viewer reads from memory, and Athena runs only for the refresh.
+W: SPICE with scheduled refreshes: visuals are served from Quick Sight's in-memory engine instead of querying Athena per view, which removes the per-view query latency.
+X: A=Remove filters: without filters, visuals aggregate more data, so the direct queries to Athena scan more and usually become slower.
+B=Longer Athena timeout: a timeout only decides how long a query may run before it is cancelled; it does not make any query faster.
+C=More sheets: extra sheets add more visuals and more queries; they split the dashboard but do not speed up the queries behind it.
+T: Slow direct-query dashboards on Athena are sped up by importing the data into SPICE and refreshing it on a schedule.
+
+@ Q003783 explain
+G: ## What makes a pipeline maintainable
+A maintainable pipeline is easy to change safely and easy to debug when it breaks.
+- **Version control**: job scripts, SQL, and infrastructure (for example CloudFormation, AWS CDK or Terraform) live in Git. Changes are reviewed, tested and deployed through CI/CD, and every production version can be traced and rolled back.
+- **Structured logging**: logs are written as JSON with fields such as `run_id`, `job`, `step` and `record_count`. A correlation ID that follows one run through every job lets engineers query all related events at once, for example with CloudWatch Logs Insights.
+## Example
+A failed run `run_id=2026-09-29-01` can be traced across ingestion, transform and load logs with one query, and the exact code version that ran is a Git commit tag.
+W: B=Structured logging with correlation IDs: it makes every run traceable across jobs and searchable by field, which speeds up troubleshooting.
+E=Versioned code and configuration in source control: it gives reviewed, repeatable and reversible changes, so production always matches a known version.
+X: A=Undocumented dependencies: hidden ordering between jobs means a change in one job can silently break another, and new engineers cannot see the impact.
+C=Manual console edits: production drifts from the repository, changes skip review, and there is no reliable history to roll back to.
+D=Hard-coded credentials: they leak through code and logs and must be edited in every script when rotated; IAM roles or Secrets Manager avoid this.
+T: Maintainable pipelines are versioned in source control and log in a structured, correlated way; manual edits, hidden dependencies and embedded secrets do the opposite.
+
+@ Q003784 explain
+G: ## Anomaly detection in Glue Data Quality
+Fixed rules need a known threshold for every column, which is hard when data changes with seasons or growth. **AWS Glue Data Quality anomaly detection** takes another approach.
+- In a Glue ETL job you define **analyzers**, for example `Analyzers = [ RowCount, Completeness "email", DistinctValuesCount "country" ]`, which collect statistics on every run without passing or failing.
+- Over successive runs, Glue Data Quality learns the normal pattern of each statistic, including trends and seasonality, and flags values that fall outside it.
+- Detected anomalies can be reviewed, and Glue can suggest rules based on them to turn a recurring pattern into an enforced check.
+## Example
+The completeness of `email` is normally 97 to 99%. One run shows 71%. No one wrote a threshold for that column, but the anomaly is flagged and reported to CloudWatch and EventBridge for alerting.
+W: Glue Data Quality anomaly detection: it learns expected ranges from historical data statistics and detects unusual values without a fixed threshold per column.
+X: A=S3 Storage Lens: it reports storage usage and activity metrics such as bytes stored and request counts across buckets; it never looks at the values inside datasets.
+B=Route 53 traffic flow: it builds DNS routing policies (latency, geolocation, weighted); it has no relation to data quality metrics.
+C=VPC Flow Logs: they record metadata about IP traffic in a VPC, such as source, destination and bytes; they do not measure column completeness or distributions.
+T: To catch unusual data quality statistics without writing a threshold for every column, use Glue Data Quality anomaly detection.
+
+@ Q003785 explain
+G: ## Ad hoc SQL on files in S3
+**Amazon Athena** queries files where they already are in S3. You define a table over the files, either with a Glue crawler or with DDL, and start querying; there is nothing to provision.
+- JSON is read with a JSON SerDe, for example `ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'`, and nested fields can be queried with dot notation or `UNNEST`.
+- Adding `LIMIT` or filtering on a partition keeps an exploration query small, and cost is based on data scanned.
+## Example
+An analyst points a table at `s3://raw/events/`, runs `SELECT event_type, COUNT(*) FROM events WHERE dt = '2026-09-28' GROUP BY 1 LIMIT 100`, and has results in seconds without loading anything.
+W: Athena: it is serverless, reads JSON directly in S3, and needs only a table definition, so exploration can start immediately with no infrastructure.
+X: A=EC2 with MySQL: an instance must be launched and managed, MySQL installed, and the large JSON files loaded into tables before the first query.
+B=EMR on EC2: a cluster must be created, sized and paid for while running, which is heavy for a quick look at a sample.
+D=Redshift RA3: it is a provisioned cluster that must be created first, and data must be loaded or exposed through external tables, adding setup and cost for a short exploration.
+T: Quick SQL over JSON files in S3 with no infrastructure is Athena; databases and clusters need provisioning and loading first.
+
+@ Q003786 explain
+G: ## Why a Glue job slows as data grows
+A Glue Spark job's run time depends on two things: how much parallel capacity it has, and how efficiently the input can be read.
+- **Capacity**: each worker (for example `G.1X` or `G.2X`) runs executors. More workers or larger worker types process more partitions at once. With **Glue auto scaling** (Glue 3.0 and later), you set a maximum number of workers and Glue adds or removes workers as stages need them.
+- **Data layout**: partitioning input by commonly filtered keys (such as `dt=2026-09-29/`) lets the job read only what it needs with pushdown predicates. Fewer, larger files (on the order of 128 MB or more each) avoid the overhead of opening and scheduling thousands of tiny files; Glue can also group small files when reading.
+## Example
+A job reading 40,000 files of 50 KB each is compacted into 300 Parquet files partitioned by date and run with auto scaling up to 20 workers; run time drops even though data volume keeps growing.
+W: A=More workers or auto scaling: more parallel capacity lets the job process the larger volume in similar time.
+E=Better partitioning and file sizes: the job reads less data and spends less time on per-file overhead, so each worker does useful work.
+X: B=One worker: it removes nearly all parallelism, so the job becomes much slower rather than faster.
+C=Many tiny files: each file adds listing, open and scheduling overhead, the classic small-files problem that slows Spark jobs.
+D=Remove job bookmarks: bookmarks let the job process only new data; removing them makes every run reprocess the full history, increasing run time.
+T: When a Glue job slows as data grows, add capacity (more workers or auto scaling) and fix the input layout (partitions and file sizes).
+
+@ Q003787 explain
+G: ## SQL as versioned, orchestrated code
+SQL transformations are code and should be managed like code.
+- **Repository**: SQL files live in Git with reviews, tests and history. Tools such as dbt add models, tests and templating on top.
+- **Parameters**: values that change per run, such as a date or a Region, are passed in rather than edited by hand, for example `{{ ds }}` in Amazon MWAA (Apache Airflow) templates, or named parameters in the Amazon Redshift Data API `ExecuteStatement` call.
+- **Orchestrator**: Amazon MWAA or AWS Step Functions runs the SQL in the right order, retries failures and records every run.
+## Example
+`daily_sales.sql` in Git contains `WHERE sale_date = :run_date`. Each night, Step Functions calls the Redshift Data API with `run_date = 2026-09-28`, and a change to the SQL is merged through a pull request before the next run uses it.
+W: Repository plus parameterized orchestration: the same reviewed SQL runs every time with only the parameters changing, giving version history, repeatability and automated scheduling.
+X: A=Email scripts to analysts: there is no single source of truth, copies diverge, and manual runs are neither scheduled nor auditable.
+B=Paste and edit in the console: manual edits each run invite typos and inconsistent values, and nothing records which SQL actually ran.
+D=Only in editor query history: history is per user and not a reviewed or reusable source; it provides no versioning, parameters or orchestration.
+T: Reusable SQL belongs in version control and is run by an orchestrator with parameters, not copied, emailed or retyped by hand.

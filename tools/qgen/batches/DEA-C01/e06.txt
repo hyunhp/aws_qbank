@@ -1,0 +1,366 @@
+# DEA-C01 detailed explanations, batch e06 (explanation-only rewrites; letters are the published ones)
+
+@ Q000376 explain
+G: ## Window functions and frames
+A window function computes a value for every row while still returning every row. `OVER (...)` defines which rows the function sees:
+- `PARTITION BY` splits rows into independent groups.
+- `ORDER BY` sorts the rows inside each group.
+- A **frame** such as `ROWS BETWEEN 6 PRECEDING AND CURRENT ROW` (short form `ROWS 6 PRECEDING`) limits the calculation to the current row and the 6 rows before it.
+## Example
+With one row per day, `AVG(daily_sales) OVER (ORDER BY sale_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)` returns, on 10 March, the average of 4-10 March; on 11 March the window slides to 5-11 March. The first six rows average fewer than 7 values because earlier rows do not exist.
+In Amazon Redshift, an aggregate window function that uses `ORDER BY` must also have an explicit frame clause, so the `ROWS ...` part is required, not optional.
+Note that `ROWS` counts rows, not calendar days, so it equals "7 days" only when there is exactly one row per day with no gaps.
+W: Ordered window with a 6-row frame: written in shorthand (the full form is `AVG(daily_sales) OVER (ORDER BY sale_date ROWS 6 PRECEDING)`), sorting by date and including the current row plus 6 preceding rows gives each row the average of a sliding 7-row (7-day) window, which is exactly a rolling average.
+X: A=Partition by the date: partitioning by `sale_date` puts each date in its own group, so each row averages only the rows of the same day. No earlier days are included, so nothing rolls.
+B=Plain SUM/COUNT: without `OVER` or `GROUP BY` the aggregate collapses the whole table into a single number, the overall average, not a per-row value.
+C=GROUP BY the date: `GROUP BY sale_date` returns one row per date with that date's own average. It cannot look at neighboring dates, so it gives a daily average, not a 7-day rolling one.
+T: Rolling metrics need an ordered window frame (`ORDER BY ... ROWS n PRECEDING`); `PARTITION BY` or `GROUP BY` on the date only ever looks at a single day.
+
+@ Q000377 explain
+G: ## Two engines in Athena
+Amazon Athena is serverless: you do not create or size clusters. It offers two ways to work with data in S3:
+- **Athena SQL** runs Trino-based SQL queries over tables in the AWS Glue Data Catalog. It is ideal for SQL, but not for Python logic or Spark libraries.
+- **Athena for Apache Spark** runs PySpark code in interactive notebooks and sessions. Athena starts Spark compute on demand for each session and bills for the compute that session uses, so there is no cluster to keep running.
+## Example
+An analyst queries `sales` with SQL, then opens a notebook in a Spark-enabled Athena workgroup and runs `spark.read.parquet("s3://lake/sales/")` to apply Python transformations and Spark ML functions to the same files. Both read the same S3 data and can share the same catalog tables.
+W: Athena for Apache Spark: it gives serverless, interactive PySpark notebooks over the same S3 data and catalog, so analysts get Spark libraries and Python without provisioning or managing any cluster.
+X: A=SQL UDFs only: Athena user-defined functions (backed by Lambda) let a SQL query call custom scalar logic, but they do not provide the Spark runtime, DataFrames or Spark libraries the analysts need.
+C=Redshift Spectrum: Spectrum lets SQL queries in a Redshift cluster or workgroup read S3 data. It is still SQL only, and it requires a Redshift warehouse rather than giving Python and Spark.
+D=Permanent EMR cluster: EMR can run Spark, but a long-running cluster means choosing instances, scaling and patching it and paying while it is idle, which contradicts "without managing clusters".
+T: Serverless SQL on S3 is Athena SQL; serverless interactive Python and Spark on the same data is Athena for Apache Spark, not a cluster you run yourself.
+
+@ Q000378 explain
+G: ## Provisioned versus Serverless Redshift
+- A **provisioned cluster** has a fixed number of nodes. You pay for every hour it runs, whether queries run or not. You can resize or pause it, but you have to decide when.
+- **Amazon Redshift Serverless** has no nodes to manage. Compute is measured in Redshift Processing Units (RPUs), it scales up automatically when many or heavy queries arrive, and you pay for RPU-hours only while queries run (storage is billed separately). With no queries, compute cost drops to zero.
+## Example
+A workgroup with a base capacity of 8 RPUs serves a handful of queries in a quiet week and costs little. During the two-day reporting spike it scales above the base capacity to keep queries fast, and afterwards it scales back without anyone resizing anything. A maximum RPU-hour limit can cap spend.
+W: Redshift Serverless: it scales compute automatically for the monthly spike and charges only for usage, so near-idle weeks cost little and nobody has to resize or schedule the warehouse.
+X: A=Fixed cluster sized for the peak: it handles the two-day spike, but for the rest of the month you pay for peak capacity that mostly sits idle, which is the opposite of minimizing idle cost.
+C=Pause every night: a nightly schedule ignores the actual pattern. Idle daytime hours in quiet weeks are still billed, and pausing does not add capacity for the heavy spike, so the cluster still needs manual resizing.
+D=EMR with Presto: this replaces the managed warehouse with a cluster the team must size, scale and operate, and it does not remove the idle-cost problem unless someone manages the cluster lifecycle.
+T: Spiky, unpredictable warehouse demand fits Redshift Serverless (auto-scale, pay per use); a fixed cluster sized for the peak pays for idle capacity.
+
+@ Q000379 explain
+G: ## Long versus wide data
+Data is **long** when each fact is its own row, and **wide** when related facts sit side by side as columns.
+- Long: `(widget, Jan, 100)`, `(widget, Feb, 120)`, `(gadget, Jan, 80)`
+- Wide: `product | Jan | Feb` with rows `widget | 100 | 120` and `gadget | 80 | null`
+A **pivot** turns the distinct values of one column (month) into new columns and fills them with an aggregated value (sales_amount), leaving one row per remaining key (product). An **unpivot** does the reverse.
+## How to write it
+- Amazon Redshift supports `PIVOT (SUM(sales_amount) FOR month IN ('Jan','Feb'))` in the `FROM` clause.
+- Any SQL engine can do it with conditional aggregation: `SUM(CASE WHEN month='Jan' THEN sales_amount END) AS jan ... GROUP BY product`.
+- Spark offers `groupBy("product").pivot("month").sum("sales_amount")`, and AWS Glue DataBrew has a pivot transform.
+W: Pivot: it moves each month value from rows into its own column and keeps one row per product, which is exactly the requested reshape.
+X: A=GROUP BY without aggregates: grouping by product without aggregating just deduplicates; it cannot create one column per month, and selecting non-grouped columns without an aggregate is not valid SQL.
+B=UNION ALL: `UNION ALL` stacks result sets on top of each other, adding rows. It makes the data longer, not wider.
+C=Self INNER JOIN: joining the table to itself matches rows on a key and can multiply rows. Without a separate filtered copy per month and careful handling of missing months it does not produce the per-month columns; that is a pivot done the hard way, not a join by itself.
+T: Rows-to-columns is a pivot; `UNION ALL` stacks rows and `GROUP BY` alone only collapses them.
+
+@ Q000380 explain
+G: ## Validate at the moment a file arrives
+Amazon S3 can react to new objects with **event notifications**: an `s3:ObjectCreated:*` event can invoke an AWS Lambda function directly, or go through Amazon EventBridge to Lambda or AWS Step Functions.
+A Lambda function starts within seconds, reads the object (or just its first line), checks it, and records the result so the pipeline can act on it.
+## Example
+- A file lands in `s3://ingest/incoming/orders_0929.csv`.
+- Lambda reads the header and compares it with the expected columns, then counts rows and compares with a control value (for example from a manifest).
+- On success it moves the file to `validated/` or emits a "file valid" event that starts the next stage.
+- On failure it moves the file to `quarantine/`, publishes an alert and does not trigger the next stage.
+For large files, a Step Functions workflow with a quick Lambda check as its first state is a common variation.
+W: S3-triggered Lambda: each upload invokes the check immediately, the check is small enough for Lambda, and its pass or fail result controls whether the next stage starts, so bad files never flow downstream.
+X: A=Nightly crawler: a Glue crawler infers schema and updates the Data Catalog; it does not enforce header or row-count rules, and running nightly means files wait hours instead of being checked on upload.
+B=Weekly Athena query: a scheduled query checks data days after it arrived, long after downstream stages have already consumed it, so it cannot gate the pipeline.
+C=EMR job per file: launching Spark for a header check and row count adds minutes of cluster startup and cost per file, far heavier than the task requires.
+T: Small per-file checks that must gate the next step belong in an event-triggered Lambda on upload, not in scheduled crawlers, queries or heavyweight clusters.
+
+@ Q000381 explain
+G: ## CloudTrail records who called which API
+Almost every action on AWS is an API call. AWS CloudTrail records these calls as events containing:
+- `eventName`, for example `DeleteTable` with `eventSource` `glue.amazonaws.com`
+- `userIdentity`: the IAM user or assumed role (and session) that made the call
+- `sourceIPAddress`, `eventTime`, the request parameters (database and table name) and the result
+## Where to look
+- **Event history** in the console keeps 90 days of management events for free, so a deletion two weeks ago is searchable by event name or resource name.
+- A **trail** delivers events to S3 for long-term retention, where Athena can query them with SQL.
+Example: filter event history for `DeleteTable`, open the event and read the role session name and source IP.
+W: AWS CloudTrail: deleting a Glue table is a `glue:DeleteTable` management event, and CloudTrail stores who made it, when, and from which IP, within its 90-day event history.
+X: B=Glue job bookmarks: bookmarks remember which input data a Glue job has already processed so reruns skip it; they contain no record of catalog API calls or callers.
+C=CloudWatch metrics: metrics are numeric time series (counts, durations, errors). They carry no caller identity or source IP for an individual API call.
+D=Amazon Macie: Macie discovers sensitive data such as PII in S3 objects; it does not audit who deleted Data Catalog tables.
+T: "Who did what, when and from where" on AWS is an API audit question for CloudTrail, not a metrics, data-tracking or data-classification tool.
+
+@ Q000382 explain
+G: ## Where a Glue Spark job reports what happened
+An AWS Glue Spark job runs a driver (plans the work) and executors (run tasks). Their output goes to **Amazon CloudWatch Logs**:
+- The `/aws-glue/jobs/output` and `/aws-glue/jobs/error` log groups hold driver and executor output and errors; with continuous logging, logs stream in real time during the run, by default to the `/aws-glue/jobs/logs-v2` log group.
+- The job run page in the Glue console links to these logs.
+## The Spark UI
+Spark splits a job into **stages** (separated by shuffles) and tasks. The **Spark UI** shows each stage, its tasks, durations, shuffle sizes and which stage failed. Glue writes Spark event logs (to S3) when the Spark UI option is enabled, and the UI can then be viewed from the Glue console or a Spark history server.
+Example: an error in the logs says a task failed; the Spark UI shows it was stage 7, a join shuffle where one task read far more data than the others.
+W: CloudWatch Logs plus the Spark UI: driver and executor logs land in CloudWatch Logs, and the Spark UI built from the job's event logs breaks the run down by stage and task to show where it failed.
+X: A=Console home page: the Glue console summarizes job runs and their status, but the detailed driver and executor logs and per-stage breakdown live in CloudWatch Logs and the Spark UI.
+C=CloudTrail data events: data events record API calls such as S3 `GetObject` with the caller and time; they contain no Spark stack traces, executor output or stage information.
+D=Script location in S3: that path stores the job's code (and possibly temporary files), not its runtime logs.
+T: Glue logs go to CloudWatch Logs and stage-level diagnosis comes from the Spark UI; CloudTrail and the script bucket only tell you who called what and what code ran.
+
+@ Q000383 explain
+G: ## Glue job state changes are events
+AWS Glue publishes events to Amazon EventBridge when a job run changes state. The event has `source` `aws.glue`, `detail-type` `Glue Job State Change`, and a `detail.state` such as `SUCCEEDED`, `FAILED`, `TIMEOUT` or `STOPPED`.
+## Routing an alert
+- Create an EventBridge rule with a pattern that matches `detail.state` in `["FAILED", "TIMEOUT"]` (optionally limited to certain `jobName` values).
+- Set the target to an Amazon SNS topic that has email subscriptions (each address confirms its subscription once).
+- An input transformer can turn the raw JSON into a readable message with job name, run id and error message.
+Events arrive within seconds of the state change, so the team is notified within minutes.
+W: EventBridge rule to SNS: the rule reacts to every failed or timed-out job run as it happens and SNS delivers the email, with no polling or custom schedule.
+X: A=Daily Athena query: querying job history once a day reports failures up to 24 hours late, missing the "within minutes" requirement.
+C=CloudTrail trail to S3: CloudTrail logs API calls such as `StartJobRun`; a job failing is a state change, not an API call, and S3 delivery by itself sends no email.
+D=AWS Config rule: Config evaluates whether resource configurations comply with rules (for example, security settings on a job). It does not track individual job runs or their outcomes.
+T: Job-run outcomes are EventBridge state-change events; a rule plus SNS gives near-real-time email, while CloudTrail and Config describe API calls and configuration.
+
+@ Q000384 explain
+G: ## Glue workers and memory
+An AWS Glue Spark job runs on **workers**, and each worker type has a fixed amount of memory and vCPU:
+- `G.1X`: 4 vCPU, 16 GB memory; `G.2X`: 8 vCPU, 32 GB; `G.4X` and `G.8X`: more for demanding jobs.
+- The number of workers sets how many executors share the data.
+An executor out-of-memory error means one executor was asked to hold more data than its memory allows, for example a large partition, a big shuffle or a wide aggregation. Because the job succeeds on small inputs, the logic is fine; the resources are too small for the larger volume.
+## Fixes
+- Choose a larger worker type so each executor has more memory.
+- Add workers (or enable auto scaling) so data is spread across more executors.
+- Complementary tuning: repartition into more, smaller partitions and avoid `collect()` of large data to the driver.
+W: More workers or a larger worker type: more memory per executor, and more executors to divide the data, directly address executor OOM that appears only at larger scale.
+X: B=Python shell job: a Python shell job runs plain Python on at most 1 DPU without Spark, so it has far less memory and no distributed processing for a large dataset.
+C=Shorter timeout: the timeout only limits how long the job may run; it does not change memory, so the job would still fail, just possibly sooner.
+D=AdministratorAccess role: IAM permissions control which AWS APIs the job may call. OOM is a resource problem, and granting admin rights would also violate least privilege.
+T: Executor OOM that appears only on bigger inputs is fixed with more or bigger Glue workers (plus better partitioning), not with job type, timeout or IAM changes.
+
+@ Q000385 explain
+G: ## EMR node roles and Spot
+An Amazon EMR cluster has three node types:
+- **Primary (master)** node: runs YARN ResourceManager and HDFS NameNode. Losing it ends the cluster.
+- **Core** nodes: run tasks and store HDFS data. Losing them can lose data blocks and fail jobs.
+- **Task** nodes: run tasks only, with no HDFS storage. They can disappear without data loss; YARN simply reruns their tasks elsewhere.
+Spot Instances are much cheaper but can be reclaimed with a two-minute notice, so they belong on the node type that is safe to lose.
+## Diversify capacity
+**Instance fleets** let a node group list several instance types (for example `m5.2xlarge`, `m6i.2xlarge`, `r5.2xlarge`) and Availability Zone options. With a capacity-optimized allocation strategy, EMR picks Spot pools with the most spare capacity, which lowers interruption rates and replaces lost capacity faster.
+W: Spot on task nodes with diversified fleets: interruptions then only remove stateless compute that YARN can retry, and spreading across many instance types reduces how often interruptions happen.
+X: A=HDFS on Spot task nodes: task nodes do not host HDFS by design; putting data on interruptible instances would mean data loss and more failures whenever Spot capacity is reclaimed.
+B=Disable YARN health checks: health checks detect bad nodes; disabling them would keep scheduling work onto failing nodes and hide the problem rather than reduce interruptions.
+C=Spot primary node: an interruption of the primary node terminates the whole cluster, making failures far worse than losing a task node.
+T: On EMR, put Spot only where losing a node is harmless (task nodes) and diversify instance types; primary and core nodes stay On-Demand.
+
+@ Q000386 explain
+G: ## CloudWatch Logs Insights
+CloudWatch Logs Insights runs queries directly on log groups in CloudWatch Logs. You pick one or more log groups and a time range (such as the last 24 hours), and it scans the events there; no export or extra storage is needed. You pay per GB of log data scanned.
+## Counting per time bucket
+The query language chains commands with `|`:
+- `filter @message like /ERROR/` keeps only error lines.
+- `stats count(*) by bin(5m)` groups the remaining events into 5-minute buckets and counts each.
+The result is a table of time buckets and counts that can also be shown as a line or bar chart and added to a dashboard.
+Example for a Lambda log group `/aws/lambda/ingest-fn`:
+`filter @message like /ERROR/ | stats count(*) as errors by bin(5m)`
+W: Logs Insights with `stats count() by bin(5m)`: it queries the Lambda log group in place for the chosen 24-hour range and returns error counts per 5-minute interval, with nothing exported.
+X: A=Trusted Advisor: it checks accounts against best practices (cost, security, limits); it cannot read or query application log content.
+B=Athena after copying logs to S3: Athena could count them, but it requires exporting the logs to S3 first, which the requirement explicitly rules out and which adds delay and work.
+C=X-Ray service map: the service map visualizes traced requests and latencies between services; it does not search log messages or bucket log lines by time.
+T: Ad hoc, time-bucketed analysis of logs already in CloudWatch Logs is a Logs Insights query; Athena needs the logs moved to S3 first.
+
+@ Q000387 explain
+G: ## Querying logs where they already sit
+VPC Flow Logs and ALB access logs can both be delivered to S3 as files. Amazon Athena is a serverless SQL engine: you define a table over an S3 prefix and query it, paying per data scanned, with nothing to provision.
+- Create one table for flow logs and one for ALB logs (AWS documents the DDL for both formats).
+- Add partitions (for example by date) or partition projection so queries read only the relevant days.
+- Join them with normal SQL.
+## Example
+Join ALB requests to flow log records on client IP and time window to see which source IPs made suspicious requests and what other ports they probed:
+`SELECT a.client_ip, a.request_url, f.dstport FROM alb_logs a JOIN vpc_flow_logs f ON a.client_ip = f.srcaddr WHERE a.day = '2026/09/28'`
+W: Amazon Athena: it runs ad hoc SQL, including joins across the two log tables, directly on the partitioned files in S3, and it is fully serverless.
+X: A=Trusted Advisor: it gives best-practice checks and recommendations for the account; it does not load or query log files.
+B=CloudTrail Insights: it flags unusual rates of API calls or errors in CloudTrail management events; it cannot read flow logs or ALB logs or run SQL joins.
+D=Amazon Inspector: it scans EC2 instances, container images and Lambda functions for software vulnerabilities and network exposure; it is not a log query engine.
+T: Ad hoc SQL across logs stored in S3 means Athena; the other services are assessment or anomaly tools, not query engines.
+
+@ Q000388 explain
+G: ## Search engines versus query engines
+Amazon OpenSearch Service runs OpenSearch clusters (or serverless collections) that **index** documents as they arrive:
+- An inverted index maps every word to the documents containing it, so full-text searches like `"timeout" AND service:checkout` return in milliseconds.
+- New documents become searchable within seconds of ingestion (governed by the index refresh interval).
+- **OpenSearch Dashboards** provides interactive charts, filters and log exploration on top of the index.
+## Typical pipeline
+Applications or agents send logs through Amazon Data Firehose or Amazon OpenSearch Ingestion into an index, and engineers search and visualize them almost immediately.
+Query engines over files (Athena) and relational databases are good for structured analysis but do not maintain a full-text index for interactive log search.
+W: OpenSearch Service with Dashboards: it indexes streaming logs within seconds, supports full-text search, and offers interactive visualizations out of the box.
+X: B=Athena over S3 logs: logs must first be delivered and batched into S3 files, and each query scans files rather than a text index, so it is not seconds-fresh interactive full-text search.
+C=RDS for PostgreSQL: a transactional database can store logs, but high-volume ingestion and full-text search across large log volumes are not what it is built for, and it has no built-in log visualization.
+D=Amazon Redshift: a columnar warehouse for analytical SQL; it is not designed for full-text search on log messages or second-level freshness for streaming logs.
+T: Near-real-time full-text log search and dashboards call for OpenSearch; Athena, Redshift and RDS answer structured SQL questions instead.
+
+@ Q000389 explain
+G: ## Workload management in Redshift
+Amazon Redshift runs a limited number of queries at the same time. **Workload management (WLM)** decides which queue a query goes to and how many slots and how much memory each queue gets. When all slots are busy, new queries wait, which shows up as long queue time even for simple queries.
+## Ways to reduce waiting
+- **Automatic WLM** with query priorities lets Redshift manage concurrency and memory itself.
+- Separate queues (by user group or query group) keep short ad hoc queries from waiting behind long ETL jobs.
+- **Short query acceleration (SQA)** runs short queries in a dedicated space.
+- **Concurrency scaling** adds transient cluster capacity for queued eligible queries.
+Example: route the `analysts` user group to an ad hoc queue with high priority and concurrency scaling on, while ETL runs in its own queue.
+W: Tune WLM queues: the symptom is queueing, not slow execution, so giving ad hoc work its own queue or priority (plus SQA or concurrency scaling) lets simple queries start without waiting behind heavy ones.
+X: A=S3 bucket versioning: versioning keeps old object versions in S3; it has no effect on how Redshift schedules or admits queries.
+B=Stored procedures: wrapping queries in procedures changes how SQL is packaged, not how many queries can run at once, so they would still queue.
+C=Read replicas: Redshift has no read replicas (that is an RDS and Aurora feature); extra read capacity in Redshift comes from concurrency scaling or data sharing.
+T: Slow start with many queued queries is a concurrency problem solved with WLM queues, priorities, SQA or concurrency scaling, not with RDS-style read replicas.
+
+@ Q000390 explain
+G: ## From job events to metrics and alarms
+Every AWS Glue job run emits a `Glue Job State Change` event to Amazon EventBridge with a final state such as `SUCCEEDED`, `FAILED` or `TIMEOUT`.
+To trend and alarm on outcomes, turn those events into CloudWatch metrics:
+- An EventBridge rule sends each state change to a small Lambda function that calls `PutMetricData` (for example a custom `JobRuns` metric with a `State` dimension).
+- A CloudWatch dashboard graphs the daily or monthly counts of successes versus failures.
+- A CloudWatch alarm on the failure metric, using a `Sum` over a 1-hour period with threshold `> 5`, notifies an SNS topic.
+Metrics in CloudWatch are retained for up to 15 months, enough for monthly trends.
+W: Job-state events as metrics with an alarm: the events capture every run's outcome, metrics give counts over time for trends, and an alarm on the hourly failure sum enforces the "more than 5 in an hour" rule.
+X: B=Config compliance history: AWS Config records changes to resource configuration and rule compliance; a job run failing does not change the job's configuration, so no run outcomes appear there.
+C=S3 access logs on the script bucket: they only show requests for the script object, such as Glue reading it at start, and say nothing about whether a run succeeded.
+D=VPC Flow Logs from Glue ENIs: they record network flows (IPs, ports, bytes), not job success or failure.
+T: Run outcomes come from Glue state-change events; convert them to CloudWatch metrics for trends and alarms, since Config, S3 logs and flow logs never see run results.
+
+@ Q000391 explain
+G: ## Glue Data Quality and DQDL
+AWS Glue Data Quality evaluates rules written in **DQDL** (Data Quality Definition Language) against data, either in the Data Catalog or inside an ETL job using the Evaluate Data Quality transform.
+- `Completeness "customer_id" >= 0.98` passes when at least 98% of `customer_id` values are non-null, meaning at most 2% are null.
+- `IsComplete "customer_id"` would require 100%.
+## Stopping the job
+In the ETL job, the Evaluate Data Quality transform has an action option to fail the job when rules fail, either before data is written or after. Results are also published to CloudWatch and EventBridge for alerting.
+Example: a job reads raw customers, evaluates the ruleset, and if only 96% of `customer_id` values are present the rule fails and the job stops before loading the curated table.
+W: DQDL completeness rule that fails the job: a threshold of 0.98 on completeness encodes the 2% null limit exactly, and the transform's fail-job option stops the pipeline automatically.
+X: A=Redshift CHECK constraint: Amazon Redshift does not support `CHECK` constraints, and a per-row constraint could not express a percentage threshold across the dataset anyway.
+B=Crawler rejects rows: Glue crawlers only infer schema and partitions for the Data Catalog; they never filter or reject individual rows.
+D=Manual Athena inspection: sampling rows by hand after each run is not automatic, happens after bad data is already written, and a sample cannot reliably measure a 2% rate.
+T: Percentage-based quality gates in Glue ETL are DQDL rules (such as `Completeness >= 0.98`) with a fail-job action, not table constraints, crawlers or manual checks.
+
+@ Q000392 explain
+G: ## Profiling before cleaning
+AWS Glue DataBrew is a visual data preparation tool. A **profile job** scans a dataset (or a sample) and produces statistics for each column:
+- data type, count of missing and distinct values
+- the most frequent values and their counts
+- a value distribution, outliers, and optional data quality checks
+## Example
+Profiling a `state` column might show top values like `CA`, `NY`, `TX`, but also `California`, `new york` and `Txe`. The count of distinct values (for example 74 instead of about 50) already signals a problem. With that evidence, the engineer can design cleaning steps such as mapping full names to abbreviations, upper-casing, and flagging unknown values, instead of guessing.
+W: DataBrew profile job: it shows the distinct and most frequent values of the column, making mixed full names, abbreviations and typos visible so the right cleaning rules can be chosen.
+X: B=Delete the column: this destroys the data before understanding it; the column is presumably needed, and the issue is fixable by standardizing values.
+C=Larger sample, no review: changing the sample size only changes how many rows the project loads; without looking at a profile or the values, it reveals nothing about inconsistencies.
+D=Export unmodified to Redshift: this moves the dirty data into the warehouse without any investigation, spreading the problem instead of diagnosing it.
+T: Investigate data quality with a DataBrew profile job first; cleaning, deleting or exporting comes only after the profile shows what is actually in the column.
+
+@ Q000393 explain
+G: ## Why the way you sample matters
+Profiling a sample is much cheaper than profiling 500 GB, but the sample must look like the full dataset.
+- **First N rows** reflect however the file happens to be ordered, often by date or source, so some categories may be missing entirely.
+- **Random sampling** is unbiased on average, but with a rare category (say 0.5% of rows) a small random sample may contain only a handful of its rows.
+- **Stratified sampling** first splits data by a column (the strata, here `customer_segment`) and then samples within each group in proportion to its share, so every segment appears at its true ratio.
+## In practice
+DataBrew's built-in sample options are row-based (a project samples the first, last or random N rows, 500 first rows by default; a profile job runs on the full dataset or a custom row count), with no stratified option, so a stratified sample is usually prepared upstream, for example with Spark's `sampleBy("customer_segment", fractions)` in a Glue job, and then profiled.
+W: Stratified sampling: sampling within each `customer_segment` in proportion to its size keeps the imbalanced category proportions intact, so the profile is representative without scanning all 500 GB.
+X: B=Last 24 hours only: a time slice reflects only recent activity and ignores the category mix; segments that were quiet that day would be missing or under-represented.
+C=Full dataset every run: profiling all 500 GB each time is accurate but slow and costly, which is exactly what sampling is meant to avoid.
+D=First 500 rows: sequential sampling depends on file order, and 500 rows from the top may come from a single segment, badly misrepresenting an imbalanced column.
+T: When groups are imbalanced, stratified sampling preserves their proportions; taking the first N rows or a time slice gives a biased profile.
+
+@ Q000394 explain
+G: ## What data skew looks like
+In a Spark join, rows with the same key are shuffled to the same partition, and one task processes each partition. If one `customer_id` holds 40% of the rows, the task for that key gets 40% of the data while the rest share the remainder. The stage cannot finish until that one straggler task does, which is exactly the "one task runs 2 hours, others minutes" pattern shown in the Spark UI.
+## Remedies
+- **Adaptive Query Execution (AQE) skew join**: with `spark.sql.adaptive.enabled` and `spark.sql.adaptive.skewJoin.enabled`, Spark 3 detects oversized partitions at runtime and splits them into smaller tasks.
+- **Salting**: append a random suffix (0-9) to the hot key on the large side and replicate the other side's matching rows for each suffix, so the hot key is spread over 10 tasks.
+- **Broadcast join**: if the other table is small, broadcasting it avoids shuffling the large side at all.
+W: Data skew; salt the key or use AQE skew join: one hot key concentrates the work in a single task, and both techniques split that key's rows across many tasks so they run in parallel.
+X: A=Too many executors: the number of executors is not the problem; one task is processing too much data. Fewer executors would only reduce parallelism for everything else.
+C=Network timeouts: raising timeouts might keep the straggler alive longer but does nothing to shorten it; the cause is uneven data, not the network.
+D=Too few partitions; merge files: merging small files helps with many tiny files, but repartitioning or file layout does not split a single key, because all rows of that key still hash to the same partition.
+T: One straggler task on a join with a hot key is skew; fix it with salting or AQE skew-join splitting, not by changing executors, timeouts or file sizes.
+
+@ Q000395 explain
+G: ## Salting a skewed key
+Spark sends all rows with the same key to the same partition during `groupByKey` or a join. If a few power users own a large share of records, their partitions become huge and a few tasks run far longer than the rest.
+**Salting** changes the key so one hot value becomes several:
+- Add a random salt, for example `customer_id || '_' || floor(rand()*10)`, turning `C42` into `C42_0` ... `C42_9`.
+- For a join, replicate each row of the other table 10 times with salts 0-9 so every salted key still finds its match.
+- For aggregations, aggregate on the salted key first, then strip the salt and aggregate again.
+The work for `C42` is now spread over 10 tasks instead of one. On Spark 3, Adaptive Query Execution can also split skewed join partitions automatically.
+W: Salt the skewed key: spreading each hot key across several salted keys distributes its records over many partitions and tasks, removing the stragglers that stall the job.
+X: B=Single partition: one partition means one task does all the work, eliminating parallelism; it is perfectly "even" only because nothing runs in parallel.
+C=Disable speculative execution: speculation launches duplicate copies of slow tasks; turning it off does not change how data is distributed, so the skewed tasks stay just as large.
+D=Fewer executors: reducing executors makes the non-skewed work slower and leaves the oversized partitions exactly as big as before.
+T: Key skew is fixed by redistributing the hot keys (salting or AQE skew handling), not by shrinking parallelism or toggling speculation.
+
+@ Q000396 explain
+G: ## How DataBrew data quality rules evaluate
+In AWS Glue DataBrew, a **ruleset** contains rules attached to a dataset and is evaluated by a profile job. A rule has:
+- a **check**, for example that `email` matches a regular expression pattern for valid addresses
+- a **threshold**, for example "at least 95% of rows must satisfy the check"
+When the job runs, DataBrew computes the share of rows that pass and compares it with the threshold. The rule's status is pass or fail, and the results appear in the data quality report (and can trigger EventBridge-based alerts).
+## Example
+10,000 rows, 9,200 valid emails: pass rate 92%. The threshold is 95%, so 92 < 95 and the rule fails. Had 9,500 rows been valid, it would pass. Other rules in the ruleset are still evaluated independently.
+W: The rule fails: 92% passing is below the configured 95% minimum, and DataBrew simply compares the measured pass rate with the threshold.
+X: A=Rounds up and passes: DataBrew does not round thresholds; a threshold exists precisely so that a pass rate below it is reported as a failure.
+B=Ruleset is skipped: the ruleset is evaluated as configured; not meeting a threshold produces a failed rule result, not a skipped evaluation.
+C=Account-wide halt: a failed rule only marks that rule as failed in the report; it has no effect on other jobs or data quality monitoring elsewhere in the account.
+T: A DataBrew quality rule passes only when the measured pass rate meets its threshold; below it the rule fails, nothing is rounded or skipped.
+
+@ Q000397 explain
+G: ## Execution roles and least privilege
+Every AWS Lambda function has an **execution role**. Lambda assumes it and gives the function temporary credentials that rotate automatically, so no access keys are stored anywhere.
+**Least privilege** means the role policy allows only the actions and resources the function needs:
+- `s3:GetObject` on `arn:aws:s3:::raw/*`
+- `s3:PutObject` on `arn:aws:s3:::curated/*`
+- plus basic logging permissions for CloudWatch Logs
+If the function lists objects, add `s3:ListBucket` on `arn:aws:s3:::raw` only. If the buckets use SSE-KMS, add `kms:Decrypt` (for reads) and `kms:GenerateDataKey` (for writes) on the specific keys.
+Nothing else is allowed, so if the function were compromised it could not read other buckets or delete data.
+W: Scoped execution role: the role supplies short-lived credentials automatically, and a policy limited to Get on the raw prefix and Put on the curated prefix grants exactly what the function needs and nothing more.
+X: A=IAM user keys in environment variables: these are long-term credentials that do not rotate by themselves and can leak through configuration or logs, violating the no-long-term-keys requirement.
+C=AmazonS3FullAccess: the managed policy allows every S3 action on every bucket in the account, including deletes, which is the opposite of least privilege.
+D=Public bucket policies: making buckets public exposes the data to anyone on the internet, and S3 Block Public Access is designed to prevent exactly this.
+T: Lambda should use its execution role (temporary credentials) with actions and resources scoped to the exact buckets and prefixes, never stored keys or broad or public access.
+
+@ Q000398 explain
+G: ## Rotating database credentials without code changes
+AWS Secrets Manager stores a secret such as `{"username":"admin","password":"...","host":"..."}` and can **rotate** it automatically on a schedule, for example every 30 days:
+- A rotation Lambda function (AWS provides templates for Amazon Redshift) creates a new password, sets it on the cluster, tests it, and marks the new version `AWSCURRENT`.
+- Redshift can also let Secrets Manager manage the admin password directly, with rotation built in.
+## Why apps keep working
+Applications do not hard-code the password; they call `GetSecretValue` (often through a Secrets Manager caching client or JDBC wrapper) when connecting. After rotation they simply receive the new value, so no code change or redeploy is needed.
+W: Secrets Manager automatic rotation: it changes the Redshift password every 30 days without human action, and applications that fetch the secret at connect time pick up the new password automatically.
+X: A=Calendar reminder: manual changes depend on people remembering, and every app that holds the old password breaks until it is updated, which violates the no-code-change requirement.
+C=Parameter Store without rotation: a SecureString parameter can store the password, but Parameter Store has no built-in rotation, so nothing would change it every 30 days.
+D=KMS automatic key rotation: this rotates the key material used for encryption at rest; it never changes the database admin password.
+T: Scheduled password rotation with apps fetching the current value is Secrets Manager; KMS rotation changes encryption keys, not login credentials.
+
+@ Q000399 explain
+G: ## Private access to S3 from a VPC
+By default, traffic from EC2 to S3 goes to S3's public endpoints, typically through an internet gateway or NAT gateway. A **gateway VPC endpoint** for S3 changes that:
+- You create the endpoint and associate it with the subnets' route tables; AWS adds a route to the S3 prefix list (`pl-xxxxxxxx`) that targets the endpoint.
+- Traffic to S3 in that Region stays on the AWS network and never needs an internet gateway or NAT.
+- There is no additional charge for gateway endpoints.
+## Two layers of control
+- The **endpoint policy** is a resource policy on the endpoint, for example allowing `s3:PutObject` only on `arn:aws:s3:::etl-output/*`.
+- IAM permissions on the instance role still apply, and the bucket policy can require `aws:SourceVpce` to accept requests only through this endpoint.
+W: S3 gateway endpoint with a bucket-scoped policy: it routes S3 traffic privately inside AWS and adds an endpoint policy that restricts which buckets and actions can be used, on top of IAM.
+X: A=Internet gateway: this gives the subnet a path to the public internet, which the requirement forbids, and provides no endpoint policy.
+B=NAT gateway: a NAT gateway still sends S3 requests out to public S3 endpoints via the internet gateway, adds processing charges, and has no resource policy to scope access.
+D=Inbound security group rule: S3 does not connect into the instance, and security groups are stateful, so an inbound rule is irrelevant; traffic would still take the public path.
+T: Private, policy-controlled S3 access from a VPC is a gateway endpoint with an endpoint policy; NAT and internet gateways still route through public endpoints.
+
+@ Q000400 explain
+G: ## Resource-based policies on Lambda
+Lambda has two kinds of permissions:
+- The **execution role** says what the function itself can call.
+- The **resource-based policy** says who may invoke the function.
+For another AWS service to call a function, you add a statement to the function's resource-based policy, for example with the `lambda:AddPermission` API (`aws lambda add-permission`):
+- principal `apigateway.amazonaws.com`
+- action `lambda:InvokeFunction`
+- `SourceArn` set to the API's ARN, such as `arn:aws:execute-api:us-east-1:111122223333:abc123/*/POST/ingest`
+The `SourceArn` condition makes sure only that specific API, stage or method can invoke the function. When you add a Lambda integration in the API Gateway console, it creates this permission for you.
+W: Resource-based permission for API Gateway: allowing `apigateway.amazonaws.com` to perform `lambda:InvokeFunction`, scoped by source ARN, is the standard, credential-free way for the API to invoke the function.
+X: A=Remove all resource policies: with no resource-based policy, API Gateway has no permission to invoke the function at all; Lambda has no "public" mode that works by deleting policies, and opening it broadly would be insecure.
+B=IAM user keys in Lambda: API Gateway does not use access keys stored in the target function, and long-term keys add leakage risk without granting API Gateway any invoke permission.
+C=VPC peering: API Gateway and Lambda are regional AWS services invoked through AWS APIs, not VPCs to be peered; network connectivity is not the issue, authorization is.
+T: A service invoking Lambda needs a resource-based permission on the function (principal plus source ARN), not keys, peering or removed policies.

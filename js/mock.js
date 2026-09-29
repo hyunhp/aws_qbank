@@ -198,9 +198,8 @@ export async function open(opts) {
     setupExam = (opts.exam && specs[opts.exam]) ? opts.exam : (active && active.exam) || "SAA-C03";
     if (active) { state = active; view = "exam"; await startTicking(); }
   } catch (err) {
-    if (!specs) { showError(new Error("Could not load exam settings. Check your connection and reload. (" + (err && err.message) + ")")); return; }
-    drop(KEY_ACTIVE); state = null; view = "setup";
-    setupExam = (opts.exam && specs[opts.exam]) ? opts.exam : "SAA-C03";
+    showError(specs ? err : new Error("Could not load exam settings. Check your connection and reload. (" + (err && err.message) + ")"));
+    return;
   }
   await render();
 }
@@ -211,6 +210,9 @@ async function validActive(active) {
   if (!active || active.submitted || typeof active !== "object") return null;
   if (!specs[active.exam] || !Array.isArray(active.ids)) { drop(KEY_ACTIVE); return null; }
   const docs = await docsFor(active.exam);
+  // No questions usually means the download failed (offline, reload mid-request): keep the saved
+  // exam untouched and report the problem instead of discarding the user's progress.
+  if (!docs.length) throw new Error(`Could not load ${active.exam} questions. Check your connection and reload.`);
   const byId = new Map(docs.map(q => [q.id, q]));
   const ids = active.ids.filter(id => byId.has(id));
   if (!ids.length) { drop(KEY_ACTIVE); return null; }

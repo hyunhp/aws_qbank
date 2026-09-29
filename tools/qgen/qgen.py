@@ -393,6 +393,10 @@ def ingest(items, state):
     (DATA / "exam-domains.json").write_text(json.dumps(dict(sorted(dmap.items())), indent=1) + "\n")
     STATE.write_text(json.dumps(state, indent=1, sort_keys=True) + "\n")
     print(f"ingested: {added} new, {updated} updated")
+    # keep the site's download index (counts + cache-busting hashes) in step with data/
+    sys.path.insert(0, str(ROOT / "tools"))
+    import build_data_index
+    build_data_index.build()
 
 
 def report():

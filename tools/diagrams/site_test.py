@@ -2,6 +2,7 @@
 and check the diagram renders with no page errors and no horizontal overflow at 390 px.
     python3 tools/diagrams/site_test.py
 """
+import re
 import functools, http.server, threading, json, glob
 from playwright.sync_api import sync_playwright
 import pathlib
@@ -13,7 +14,7 @@ threading.Thread(target=srv.serve_forever,daemon=True).start()
 BASE=f"http://127.0.0.1:{srv.server_address[1]}/"
 ids=set(json.load(open(f"{ROOT}/diagrams/index.json"))["ids"])
 exams={}
-for f in sorted(g for g in glob.glob(f"{ROOT}/data/*.json") if not pathlib.Path(g).name.startswith(("_", "exam-"))):
+for f in sorted(g for g in glob.glob(f"{ROOT}/data/*.json") if re.fullmatch(r"[A-Z]{3}-C\d{2}\.json", pathlib.Path(g).name)):
     if f.endswith("_manifest.json"): continue
     code=f.split("/")[-1][:-5]
     qs=json.load(open(f))

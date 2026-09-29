@@ -121,8 +121,12 @@ header.top p.sub{margin:0;color:var(--muted);font-size:.92rem}
 .reveal-link:hover,.retry-btn:hover{color:var(--accent)}
 .retry-btn{border:1px solid var(--line);text-decoration:none;padding:5px 10px;border-radius:7px;background:var(--surface)}
 
-.explain{max-height:0;overflow:hidden;opacity:0;transition:max-height .35s ease,opacity .3s ease,padding .35s ease,margin .35s ease;border-radius:8px;font-size:.87rem;line-height:1.55;border:1px solid transparent}
-.explain.show{max-height:4000px;opacity:1;padding:12px 14px;margin-bottom:10px;background:var(--good-bg);border-color:var(--good-line)}
+.explain{display:none;border-radius:8px;font-size:.87rem;line-height:1.55;border:1px solid transparent}
+.explain.show{display:block;padding:12px 14px;margin-bottom:10px;background:var(--good-bg);border-color:var(--good-line);animation:explainIn .16s ease-out}
+@keyframes explainIn{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion: reduce){.explain.show{animation:none}}
+/* Off-screen cards skip layout and paint until they scroll near the viewport. */
+.qcard{content-visibility:auto;contain-intrinsic-size:auto 380px}
 .explain.show.wrong{background:var(--bad-bg);border-color:var(--bad-line)}
 .explain.show.neutral{background:var(--surface-2);border-color:var(--line)}
 .explain .result-line{font-weight:700;margin-bottom:6px;font-size:.9rem}
@@ -334,19 +338,42 @@ function shuffle(arr){
   return a;
 }
 
-async function loadExam(code){
-  if (cache[code] !== undefined) return cache[code];
-  try {
-    const res = await fetch(`./data/${code}.json`, { cache: "no-store" });
-    if (!res.ok) { cache[code] = []; return cache[code]; }
-    const docs = await res.json();
-    cache[code] = docs;
-    return docs;
-  } catch (e) {
-    cache[code] = [];
-    return cache[code];
+// data/exams-index.json is tiny and always revalidated; it carries a content hash per exam file.
+// Exam files are then requested as data/<EXAM>.json?v=<hash>, so the browser can reuse its
+// cached copy until the file actually changes, and only the exams you open are downloaded.
+let dataIndex = null;
+function loadDataIndex(){
+  if (!dataIndex) {
+    dataIndex = fetch("./data/exams-index.json", { cache: "no-cache" })
+      .then(r => { if (!r.ok) throw new Error("index " + r.status); return r.json(); })
+      .catch(e => { console.warn("Data index unavailable, falling back to direct loads", e); return null; });
   }
+  return dataIndex;
 }
+const examLoads = {};
+function loadExam(code){
+  if (cache[code] !== undefined) return Promise.resolve(cache[code]);
+  if (!examLoads[code]) {
+    examLoads[code] = (async () => {
+      try {
+        const idx = await loadDataIndex();
+        const v = idx && idx.exams && idx.exams[code] ? idx.exams[code].v : "";
+        const res = await fetch(`./data/${code}.json${v ? "?v=" + v : ""}`, v ? {} : { cache: "no-cache" });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        cache[code] = await res.json();
+      } catch (e) {
+        // Do not cache the failure: the next call retries the download.
+        delete examLoads[code];
+        console.warn("Could not load", code, e);
+        return [];
+      }
+      delete examLoads[code];
+      return cache[code];
+    })();
+  }
+  return examLoads[code];
+}
+function loadAllExams(){ return Promise.all(EXAMS.map(([code]) => loadExam(code))); }
 
 function renderChips(){
   const row = document.getElementById("chipRow");
@@ -463,6 +490,24 @@ async function attachDiagram(qid, explainEl){
   }
 }
 
+// Warm up the diagram renderer and icon sprite while the browser is idle, so the first
+// explanation with a diagram opens without a pause. Runs once, only if the exam has diagrams.
+let diagramWarm = false;
+function warmDiagrams(docs){
+  if (diagramWarm) return;
+  const idle = window.requestIdleCallback || ((f) => setTimeout(f, 1200));
+  idle(async () => {
+    try {
+      const m = await getDiagramManifest();
+      if (!m || !docs.some(d => m.ids.has(d.id)) || diagramWarm) return;
+      diagramWarm = true;
+      const v = encodeURIComponent(m.version);
+      const mod = await import(`./js/diagram.js?v=${v}`);
+      await mod.loadSprite(`assets/aws-icons.svg?v=${v}`);
+    } catch (e) { diagramWarm = false; }
+  });
+}
+
 function revealCard(qid, opts){
   const counted = opts && opts.counted;
   const q = currentQMap.get(qid);
@@ -563,6 +608,10 @@ async function renderList(opts){
   const area = document.getElementById("listArea");
   if (!selectedExam){ area.innerHTML = '<div class="empty">Select a certification code above.</div>'; renderScorePill(); renderListControls(); return; }
   area.innerHTML = '<div class="loading">Loading…</div>';
+  if (selectedExam === BOOKMARKS_CODE && bookmarks.size) {
+    const pending = EXAMS.some(([c]) => cache[c] === undefined);
+    if (pending) { area.innerHTML = '<div class="loading">Loading bookmarked questions…</div>'; await loadAllExams(); }
+  }
   const docs = selectedExam === BOOKMARKS_CODE ? getBookmarkedDocs() : await loadExam(selectedExam);
   if (!docs.length){
     shuffledOrder[selectedExam] = [];
@@ -576,6 +625,7 @@ async function renderList(opts){
   const displayDocs = shuffledOrder[selectedExam];
   currentQMap = new Map(displayDocs.map(d => [d.id, d]));
   area.innerHTML = `<div class="qlist">${displayDocs.map(questionCard).join("")}</div>`;
+  warmDiagrams(displayDocs);
   renderScorePill();
   renderListControls();
 }
@@ -700,15 +750,19 @@ async function boot(){
   initBookmarkTools();
   restoreFromLink();
   renderChips();
-  await Promise.all(EXAMS.map(async ([code]) => {
-    const docs = await loadExam(code);
-    counts[code] = docs.length;
-  }));
-  const allDocsFlat = Object.values(cache).flat();
-  document.getElementById("statTotal").textContent = allDocsFlat.length;
+  const idx = await loadDataIndex();
+  if (idx && idx.exams) {
+    EXAMS.forEach(([code]) => { counts[code] = (idx.exams[code] || {}).count || 0; });
+  } else {
+    // index missing: fall back to loading every exam file (old behaviour)
+    await loadAllExams();
+    EXAMS.forEach(([code]) => { counts[code] = (cache[code] || []).length; });
+  }
+  const flat = Object.values(cache).flat();
+  document.getElementById("statTotal").textContent = idx ? idx.totalUnique : new Set(flat.map(d => d.id)).size;
   const examsCovered = EXAMS.filter(([c]) => (counts[c] || 0) > 0).length;
   document.getElementById("statExams").textContent = examsCovered + " / " + EXAMS.length;
-  document.getElementById("statShared").textContent = allDocsFlat.filter(d => (d.examCodes || []).length > 1).length;
+  document.getElementById("statShared").textContent = idx ? idx.sharedUnique : new Set(flat.filter(d => (d.examCodes || []).length > 1).map(d => d.id)).size;
 
   const linked = examFromLink();
   selectedExam = linked === BOOKMARKS_CODE
@@ -728,7 +782,7 @@ window.addEventListener("hashchange", () => {
 });
 
 // --- Mock exam mode (js/mock.js, loaded on demand) ---
-const MOCK_VERSION = "e9be72ba44"; // stamped by tools/stamp_version.py
+const MOCK_VERSION = "211c0ca7db"; // stamped by tools/stamp_version.py
 function toggleBookmark(qid){
   const on = !bookmarks.has(qid);
   if (on) { bookmarks.add(qid); requestPersistentStorage(); } else bookmarks.delete(qid);

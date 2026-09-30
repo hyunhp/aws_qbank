@@ -1,0 +1,317 @@
+# SOA-C03 detailed explanations, batch e04 (explanation-only rewrites; letters are the published ones)
+
+@ Q000821 explain
+G: ## How CloudTrail proves a log file was not changed
+CloudTrail delivers log files to an S3 bucket. Anyone with enough S3 permissions could later edit or delete an object, so encryption alone cannot tell you whether a file is still the one CloudTrail wrote.
+With **log file integrity validation** turned on, CloudTrail also writes a **digest file** every hour. The digest lists a SHA-256 hash of each log file delivered in that hour and is signed with a CloudTrail private key. Each digest also references the previous digest, forming a chain.
+- Run `aws cloudtrail validate-logs --trail-arn <arn> --start-time <time>` to recompute hashes and verify signatures.
+- A file whose hash no longer matches is reported as modified; a file listed in a digest but missing from the bucket is reported as deleted; a missing digest breaks the chain and is reported too.
+- Validation is a setting on the trail; combine it with S3 Object Lock or restrictive bucket policies to also prevent tampering.
+W: Log file integrity validation: signed hourly digest files let the engineer prove whether each delivered log file was modified or deleted after delivery, which is exactly the question being asked.
+X: B=CloudTrail Lake: an event data store for SQL queries over events (and closed to new customers since 2026-05-31); it does not check the integrity of log files already sitting in the S3 bucket.
+C=SSE-KMS on the trail: encrypts log files at rest and controls who can decrypt them, but a principal with write access can still overwrite or delete objects and nothing records that the content changed.
+D=CloudTrail Insights: detects unusual API call rates or error rates in the account; it analyzes event volume, not whether stored log files were altered.
+T: Encryption protects confidentiality; only integrity validation's signed digest files detect that a delivered CloudTrail log file was changed or removed.
+
+@ Q000822 explain
+G: ## What IAM Access Analyzer checks
+Many AWS resources carry a **resource-based policy**: an S3 bucket policy, a KMS key policy, an IAM role trust policy, and others such as SQS queues, Lambda functions and Secrets Manager secrets. Such a policy can grant access to another account, even one outside your company.
+**IAM Access Analyzer** (external access analyzer) uses automated reasoning to read these policies and work out who can reach each resource. You choose a **zone of trust**: your account or your whole AWS Organization.
+- Any access granted to a principal outside the zone of trust becomes a finding, for example a role trust policy that lets `arn:aws:iam::999999999999:root` assume it.
+- Analysis is continuous: when a policy changes, the resource is re-analyzed and findings are created or resolved.
+- Findings you expect can be archived with archive rules; findings also flow to EventBridge for automation.
+W: IAM Access Analyzer with the organization as the zone of trust: it analyzes S3 bucket, KMS key and IAM role policies (and more) and continuously reports every resource shared with principals outside the organization.
+X: A=GuardDuty unusual S3 API findings: GuardDuty watches activity such as anomalous data access; it does not read policies, and it has no view of who a KMS key policy or role trust policy allows.
+B=Macie public-bucket findings: Macie discovers sensitive data in S3 and summarizes bucket posture, but it covers S3 only and does not evaluate KMS keys or IAM role trust policies against an organization boundary.
+D=Trusted Advisor S3 permissions check: flags buckets with open (public) access; it does not cover KMS keys or IAM roles and does not distinguish access by specific external accounts from access inside the organization.
+T: "Who outside my organization can access this resource?" is answered from policies by Access Analyzer, not from activity by GuardDuty or from data scans by Macie.
+
+@ Q000823 explain
+G: ## Testing permissions without changing anything
+An IAM request is allowed only if some policy allows it and nothing denies it. The effective result can depend on several layers: identity-based policies attached to the role, a permissions boundary, session policies, and organization guardrails. Reading JSON by eye often misses a detail.
+The **IAM Policy Simulator** lets you pick a principal (such as the role), choose actions like `ec2:DescribeInstances`, and run a simulation. It shows **allowed** or **denied** for each action and which statement caused the result, without calling the real API.
+- Example: a policy allows `ec2:DescribeInstances` but limits `Resource` to one instance ARN. `DescribeInstances` does not support resource-level permissions, so it needs `"Resource": "*"`; the simulator shows the implicit deny.
+- You can also edit a draft policy in the simulator to confirm a fix before applying it.
+W: IAM Policy Simulator: it evaluates the role's policies for that exact action and explains why it is allowed or denied, so the engineer can test effective permissions before changing anything.
+X: A=CloudTrail Lake query: shows past API calls and their error codes (for example `AccessDenied`), but it does not evaluate policies or tell which statement blocks the action; it has also been closed to new customers since 2026-05-31.
+C=Config rule evaluation history: records whether resource configurations were compliant over time; it does not simulate an IAM principal calling an API action.
+D=Inspector network reachability: finds network paths to EC2 instances from outside; an IAM permission failure has nothing to do with network paths.
+T: For "why is this role denied this action?", simulate it with the Policy Simulator instead of reading call history or configuration records.
+
+@ Q000824 explain
+G: ## OUs and SCPs in AWS Organizations
+An AWS Organization groups accounts under one management account, which gives **consolidated billing** and lets you create an **organization trail** that logs CloudTrail events for every member account into one bucket.
+Inside the organization, **organizational units (OUs)** group accounts into a tree, for example `Root > Production` and `Root > Development`.
+**Service control policies (SCPs)** attached to an OU set the maximum permissions for every IAM user and role in the accounts beneath it (they do not apply to the management account).
+- Example: an SCP on `Production` denies `cloudtrail:StopLogging` and restricts allowed Regions; a looser SCP on `Development` allows experimentation.
+- Moving an account between OUs changes which guardrails apply, while billing and the organization trail stay the same.
+W: Separate OUs with different SCPs: each environment gets its own guardrails, and because all accounts stay in one organization, consolidated billing and a single organization trail continue to work.
+X: A=Identity Center permission sets instead: permission sets control what workforce users can do when they sign in, not the ceiling for every role and user in an account (such as application roles), so they are not account-wide guardrails.
+B=Two separate organizations: splits billing and logging into two management accounts, which defeats the requirement for centralized billing and one consolidated CloudTrail setup.
+C=All accounts under root with one SCP: every account gets the same guardrails, so production and development cannot be treated differently.
+T: Different guardrails per environment in one organization means OUs plus SCPs; separate organizations break centralized billing and logging.
+
+@ Q000825 explain
+G: ## What a permission set becomes
+In **IAM Identity Center**, a **permission set** is a template: AWS managed policies, customer managed policy references, an inline policy, an optional permissions boundary and a session duration.
+When you assign a permission set to a user or group for an account, Identity Center **provisions an IAM role** in that account, named like `AWSReservedSSO_ReadOnlyOps_<suffix>`, with a trust policy for the Identity Center SAML provider.
+- Assigning `ReadOnlyOps` to a group for 30 accounts creates that role in each of the 30 accounts.
+- Users sign in to the **AWS access portal**, pick an account and role, and receive short-lived credentials for console or CLI (`aws sso login`).
+- After you edit the permission set, re-provisioning it updates the role in every assigned account.
+W: An IAM role per account, used through the access portal: the permission set is provisioned as a role in each of the 30 accounts, and group members assume it with temporary credentials after signing in.
+X: A=Resource policies on every resource: permission sets define identity-side permissions in a role; Identity Center never edits bucket, key or queue policies.
+C=An SCP per account: SCPs are an AWS Organizations guardrail that only limit permissions and never grant access; permission sets are not converted into SCPs.
+D=IAM users with long-term keys: the whole point of Identity Center is to avoid per-account IAM users and static access keys; users get temporary role credentials instead.
+T: Permission set assignment = one Identity Center-managed IAM role per account, assumed through the access portal with short-lived credentials.
+
+@ Q000826 explain
+G: ## Trusted Advisor security checks
+**AWS Trusted Advisor** inspects your account against best-practice checks in categories such as security, cost, fault tolerance, performance and service limits. Security checks include:
+- **MFA on root account**: warns if the root user has no MFA device.
+- **Security groups - specific ports unrestricted**: flags rules that allow `0.0.0.0/0` to sensitive ports such as 22 or 3389.
+- **Exposed access keys**: flags access keys found in public code repositories.
+A small core set of checks is available to all accounts; the full set depends on the account's support plan. Trusted Advisor refreshes results automatically and can send weekly notification emails.
+**Organizational view** lets the management account build a report that aggregates check results from all member accounts, so one place shows every account's findings.
+W: Trusted Advisor with organizational view: its built-in security checks cover root MFA, world-open security groups and exposed keys, and organizational view rolls up the results of all accounts on a recurring basis.
+X: A=Inspector network reachability: finds network exposure of EC2 instances and software vulnerabilities; it does not check root MFA or exposed access keys.
+C=Amazon Detective: helps investigate the root cause of existing security findings using graphs of activity; it does not run baseline checks.
+D=AWS Config manual rules: each check would have to be built, deployed to every account and scheduled by hand, and a manual (on-demand) rule does not run by itself weekly.
+T: Ready-made account hygiene checks (root MFA, open ports, leaked keys) across accounts come from Trusted Advisor, not from vulnerability scanners or investigation tools.
+
+@ Q000827 explain
+G: ## Conformance packs in AWS Config
+An **AWS Config rule** checks one aspect of resource configuration, for example `s3-bucket-server-side-encryption-enabled` or `restricted-ssh`. A security baseline usually needs dozens of such rules.
+A **conformance pack** is a YAML template that bundles many Config rules and optional remediation actions into one unit that is deployed, updated and reported on together.
+- AWS provides sample packs (for example operational best practices mapped to common frameworks) that you can customize.
+- From the management account or a delegated administrator you can deploy an **organization conformance pack** to all member accounts.
+- Each pack shows a compliance score, so you can show auditors how each account meets the baseline.
+W: A conformance pack: it groups related Config rules and remediations into one baseline and can be deployed consistently to every account in the organization.
+X: B=One custom rule with many Lambda triggers: a single rule reports one compliance result and would require custom code for every check; it is not a managed way to group and deploy a baseline.
+C=Recorder with multiple delivery channels: Config supports only one delivery channel per Region per account, and delivery channels only send configuration data to S3 and SNS; they do not evaluate compliance.
+D=Aggregator authorization: lets an aggregator account collect Config data from a source account; it centralizes viewing but does not deploy any rules.
+T: Many rules deployed and reported as one compliance baseline across accounts = conformance pack; aggregators only collect results.
+
+@ Q000828 explain
+G: ## Single-Region vs multi-Region trails
+A **CloudTrail trail** delivers events to an S3 bucket (and optionally CloudWatch Logs). A trail can be:
+- **Single-Region**: logs events only from the Region where it was created.
+- **Multi-Region**: created once, it logs events from every Region in the partition and **automatically includes Regions enabled later**. All files go to the one bucket you choose, organized by account and Region in the key path, for example `AWSLogs/<account>/CloudTrail/eu-west-1/...`.
+Trails created in the console are multi-Region by default. Global service events (such as IAM and STS calls) are captured by a multi-Region trail as well. For many accounts, an organization trail can apply this across the organization.
+W: A single multi-Region trail: one configuration captures management events from all current and future Regions into one S3 bucket, with no per-Region setup.
+X: A=Config aggregators per Region: aggregators collect AWS Config configuration and compliance data; they do not record CloudTrail API events.
+B=A trail per Region with separate buckets: the opposite of what is asked; it multiplies configuration, splits logs across buckets, and new Regions are missed unless someone adds a trail.
+D=Insights with no trail: Insights is enabled on a trail (or event data store) and analyzes the events it already logs for unusual activity; it does not replace the trail or deliver events to S3 on its own.
+T: "All Regions, including future ones, into one bucket" is the definition of a multi-Region trail.
+
+@ Q000829 explain
+G: ## Data classification as tags
+A classification only helps operations if tools can act on it. **Tags** are key-value pairs stored on the resource itself, for example `data-classification = confidential` on an S3 bucket.
+Because tags are machine-readable, many controls can key off them:
+- **AWS Backup** backup plans can select resources by tag, so every bucket tagged confidential is enrolled in the stricter plan automatically.
+- IAM conditions such as `aws:ResourceTag` (where the service supports them), AWS Config rules and Lambda automation can check the tag and enforce encryption, access or alerting.
+- Tag policies in AWS Organizations can standardize allowed tag keys and values, and Resource Groups or Tag Editor show at a glance which resources carry each classification.
+W: Classification tags: the label lives on the bucket, is visible in the console, APIs and tag-based tools, and policies, backups and automation can select resources by it without manual lists.
+X: A=External spreadsheet: nothing in AWS can read it, so policies and backups cannot follow it, and it drifts out of date as buckets are created.
+C=Classification in bucket names: S3 bucket names cannot be changed after creation, so reclassifying means creating a new bucket and moving data; names are also a weak basis for policies and backup selection.
+D=Storage class per sensitivity: storage classes decide cost, availability and retrieval behavior of objects; they say nothing about how confidential the data is and do not drive access policies.
+T: Put classification where tools can read it, as resource tags, so access policies, backups and automation follow it automatically.
+
+@ Q000830 explain
+G: ## How ACM DNS validation works
+Before AWS Certificate Manager issues a public certificate, it must confirm you control the domain. With **DNS validation**, ACM gives you a unique **CNAME record** per domain name, for example `_a1b2c3.www.example.com` pointing to a value under `acm-validations.aws`.
+- You create that record at whatever DNS provider hosts the zone; ACM checks for it and then issues the certificate. If the record never appears, the request stays **Pending validation** and eventually times out.
+- If the zone is in Route 53, the console can add the record for you, but any DNS host works.
+- **Leave the record in place.** ACM checks it again before expiry and renews the certificate automatically as long as the record resolves and the certificate is in use.
+W: Add ACM's CNAME at the third-party DNS host and keep it: creating the record completes validation, and keeping it lets ACM keep renewing the certificate automatically.
+X: B=Move DNS to Route 53: convenient because ACM can create the record for you, but it is not required; the same CNAME works at any DNS provider.
+C=Approve an email: that is the email validation method, chosen when the certificate is requested (and ACM no longer emails WHOIS contacts, only addresses such as admin@ or webmaster@ at the domain); a certificate requested with DNS validation is completed by the DNS record, not by an email.
+D=Upload a private key from another CA: that describes importing an externally issued certificate; imported certificates are not renewed by ACM, and it does not complete this request.
+T: DNS validation is completed by the CNAME record at the zone's DNS host, and keeping that record is what makes ACM renewals automatic.
+
+@ Q000831 explain
+G: ## What happens during Secrets Manager rotation
+Rotation for a database secret is done by a **rotation function** (a Lambda function, or managed rotation for supported services). It runs four steps:
+- `createSecret`: generate a new password and store it as the `AWSPENDING` version.
+- `setSecret`: log in to the database and change the user's password.
+- `testSecret`: connect with the new password.
+- `finishSecret`: move the `AWSCURRENT` label to the new version.
+To work, the function needs a network path to the **Secrets Manager endpoint** (for example an interface VPC endpoint or NAT gateway when it runs in a VPC) and to the **database**, plus permissions to read and update the secret and decrypt with its KMS key. If one step fails, the stored secret and the real database password can end up out of sync, and applications fail to authenticate right after each rotation.
+W: Rotation function cannot reach or update the secret and database: connectivity or permission gaps leave the secret and the database password mismatched, which produces authentication failures exactly at rotation time.
+X: A=KMS rotation on the aws/secretsmanager key: AWS rotates AWS managed keys automatically, and key rotation keeps old key material for decryption, so it never changes the database password.
+C=Application uses an IAM role: using IAM database authentication would avoid passwords altogether; it would not cause failures that line up with each Secrets Manager rotation.
+D=No rotation for database credentials: Secrets Manager supports rotation for Amazon RDS, Aurora, Redshift, DocumentDB and other databases through templates or managed rotation.
+T: Failures right after each rotation point to a rotation function that cannot reach or update both the secret and the database, not to KMS or the app's auth method.
+
+@ Q000832 explain
+G: ## Reading a GuardDuty finding type
+GuardDuty finding types follow `ThreatPurpose:ResourceType/ThreatFamilyName`. `UnauthorizedAccess:EC2/SSHBruteForce` means GuardDuty saw, in VPC Flow Logs, a pattern of **repeated SSH login attempts** involving the instance.
+- If the instance's resource role is **TARGET**, someone is trying to guess SSH credentials on it, usually because port 22 is open to the internet.
+- If the role is **ACTOR**, the instance itself is attacking others and may already be compromised.
+First response for a target:
+- Restrict or remove inbound port 22 in the security group (allow only known admin ranges), or block the source with a network ACL deny.
+- Prefer Session Manager so no inbound SSH is needed, disable password authentication, and review logs for any successful logins.
+W: Repeated failed SSH logins, tighten security groups: the finding reports brute-force SSH attempts, and cutting exposure of port 22 is the right first containment step.
+X: B=Excessive role permissions: GuardDuty does not grade how broad an instance role's policy is; over-permissive policies are found with Access Analyzer or policy reviews.
+C=Missing conformance pack: conformance packs belong to AWS Config compliance, and GuardDuty threat findings never report a missing Config artifact.
+D=Unencrypted root volume: encryption status is a configuration check (Config rules or Security Hub CSPM controls), not a GuardDuty threat finding about SSH traffic.
+E=CloudTrail logging stopped: GuardDuty reports that with a separate `Stealth` finding type about disabled logging, not with an SSH brute force finding.
+T: SSHBruteForce is about SSH exposure on the instance, so the first move is to close or restrict port 22, not to change IAM, Config or encryption settings.
+
+@ Q000833 explain
+G: ## One place for security findings
+**AWS Security Hub CSPM** (the original Security Hub) collects findings from AWS services such as GuardDuty, Inspector, Macie, IAM Access Analyzer and Config, plus partner tools, and converts them into one format, the **AWS Security Finding Format (ASFF)**.
+It also runs **security standards** as automated controls, such as **AWS Foundational Security Best Practices (FSBP)** and CIS AWS Foundations, and shows a **security score** per standard.
+- With AWS Organizations, a delegated administrator account enables it for all members and sees their findings centrally.
+- Cross-Region aggregation brings findings from several Regions into one home Region.
+- Findings can trigger EventBridge rules for automated response.
+W: AWS Security Hub: it normalizes GuardDuty, Inspector and Config findings from all 20 accounts into one view and scores them against FSBP.
+X: A=Amazon Detective: used after a finding exists, to investigate its root cause with graphs of related activity; it does not score accounts against a standard.
+B=AWS Audit Manager: collects evidence and maps it to frameworks to prepare audit reports (closed to new customers since 2026-04-30; AWS points to Config conformance packs instead); it is not an operational dashboard that normalizes and triages security findings.
+D=Amazon Security Lake: centralizes security logs and events in an S3-based data lake in the OCSF format for analytics; it does not run FSBP controls or give security scores.
+T: Normalized findings plus FSBP scores across accounts = Security Hub CSPM; Detective investigates, Security Lake stores, Audit Manager gathers audit evidence.
+
+@ Q000834 explain
+G: ## Prioritizing vulnerabilities by exposure
+**Amazon Inspector** continuously scans EC2 instances (and container images and Lambda functions) for software vulnerabilities (CVEs) and, for EC2, for **network reachability**: open paths from outside the VPC to ports on the instance, based on security groups, network ACLs, route tables and gateways.
+Inspector combines these into an **Inspector score** for each finding. A critical, network-exploitable CVE on an instance with an open path from the internet is scored higher than the same CVE on an isolated instance.
+- Example: two instances share a critical OpenSSL CVE; only the one behind a security group open to `0.0.0.0/0` on port 443 is internet-reachable, so it rises to the top of the list.
+- Findings can be filtered by severity and by network exposure to build a fix-first list.
+W: Amazon Inspector with network reachability: it finds critical CVEs and, for EC2, which instances are reachable from the internet, and adjusts risk so exposed vulnerable instances are fixed first.
+X: A=Amazon GuardDuty: detects threats from activity (flow logs, DNS logs, CloudTrail); it does not inventory installed software or report CVEs.
+B=VPC Flow Logs analysis: shows traffic that actually flowed, not which software is vulnerable or which paths are possible; correlating it with CVEs would be a manual project.
+D=AWS Trusted Advisor: can flag security groups with unrestricted ports, but has no CVE scanning, so it cannot tell which exposed instances are also vulnerable.
+T: Vulnerability plus exposure in one score is Inspector; GuardDuty detects attacks and Trusted Advisor checks configuration, neither lists CVEs.
+
+@ Q000836 explain
+G: ## Blocking domains at the VPC resolver
+Instances in a VPC normally resolve names through the **Route 53 Resolver** (the `.2` address of the VPC CIDR). **Route 53 Resolver DNS Firewall** filters those queries before they are answered.
+- A **rule group** contains rules that reference **domain lists** and take an action: `ALLOW`, `BLOCK` (answer with NODATA, NXDOMAIN or a custom override) or `ALERT`.
+- **AWS managed domain lists** cover known malware, botnet command-and-control and similar threats, and AWS keeps them updated.
+- Rule groups are associated with VPCs, and Firewall Manager can apply them across accounts.
+**Resolver query logging** records each query to CloudWatch Logs, S3 or Firehose, including the firewall rule action applied, so blocked lookups are visible.
+W: Route 53 Resolver DNS Firewall with query logging: managed malware domain lists block lookups at the resolver, and query logs record which instance tried to resolve what.
+X: A=Security groups denying port 53: security groups have only allow rules, and cutting DNS entirely would break every lookup, not just malicious domains.
+C=Private hosted zone per bad domain: needs one zone per domain, must be maintained by hand against a changing threat list, and gives no managed list or block logging.
+D=GuardDuty as the blocking control: GuardDuty detects DNS queries to known bad domains and raises findings, but it does not stop the query.
+T: To block malicious domains for a VPC, filter at the resolver with DNS Firewall; GuardDuty only detects them after the fact.
+
+@ Q000837 explain
+G: ## Inspecting traffic inside the VPC path
+Security groups and network ACLs filter by IP, port and protocol only. They cannot look into payloads or match attack signatures.
+**AWS Network Firewall** is a managed, stateful firewall and intrusion prevention service that you place in the traffic path:
+- You create firewall endpoints in dedicated subnets and change route tables so traffic between workload subnets and the internet gateway flows through them.
+- **Stateless rules** handle simple packet filtering; **stateful rules** track connections and support **Suricata-compatible IPS rules**, domain allow/deny lists and TLS inspection.
+- AWS managed threat signature rule groups detect known exploits and can drop matching traffic.
+- Logs go to S3, CloudWatch Logs or Firehose.
+W: AWS Network Firewall: it inspects VPC-to-internet traffic in depth and blocks threats with signature-based IPS rules, beyond what security groups and NACLs can do.
+X: A=Shield Standard: automatic protection against common network and transport layer DDoS attacks; it does not inspect payloads or apply intrusion signatures.
+B=Amazon GuardDuty: analyzes logs to detect threats and raise findings; it is not inline in the traffic path and cannot drop packets.
+D=AWS WAF: filters HTTP and HTTPS requests at CloudFront, ALB, API Gateway and similar front doors; it does not inspect all protocols flowing between a VPC and the internet.
+T: Inline deep packet inspection and IPS for VPC traffic is Network Firewall; WAF is HTTP-only and GuardDuty only detects.
+
+@ Q000838 explain
+G: ## Weighted routing for traffic splits
+With **weighted routing**, you create several records with the same name and type, each with a **weight**. Route 53 answers each query with one record, chosen with probability weight divided by the sum of weights.
+- Example: record `blue` weight `70`, record `green` weight `30`; about 70% of DNS answers point to blue and 30% to green.
+- Attach a **health check** to each record. If a record's endpoint is unhealthy, Route 53 leaves it out of answers and spreads queries across the healthy ones.
+- Setting a weight to `0` stops traffic to that record, which is handy for rollbacks.
+Because clients and resolvers cache answers for the TTL, the split is approximate, but it holds well over many users.
+W: Weighted records (70/30) with health checks: weights set the 70/30 proportion of answers, and health checks remove a failing endpoint from answers automatically.
+X: A=Multivalue answer records: return up to eight healthy records in random order, so there is no way to set a 70/30 proportion.
+B=Latency records: send each user to the Region with the lowest latency, so the split depends on where users are, not on a chosen percentage; both endpoints may be in the same Region.
+C=Failover records: active-passive; the secondary gets traffic only when the primary is unhealthy, so it would receive 0% most of the time instead of 30%.
+T: A fixed percentage split in DNS is weighted routing; health checks keep failed endpoints out of the rotation.
+
+@ Q000839 explain
+G: ## Latency-based routing
+With **latency-based routing**, you create one record per Region with the same name, each tagged with the AWS Region where the endpoint runs, for example `us-east-1`, `eu-west-1` and `ap-southeast-1`.
+When a query arrives, Route 53 uses its measurements of network latency between the user's location (derived from the DNS resolver or EDNS client subnet) and each AWS Region, and answers with the record for the Region with the lowest latency.
+- Latency measurements are updated over time, so if network conditions change, users can be sent to a different Region.
+- Add health checks so an unhealthy Region is skipped and the next-lowest-latency Region answers.
+- Example: a user in Singapore normally gets `ap-southeast-1`; if it fails its health check, the user gets the next-best Region.
+W: Latency-based routing across the three Regions: each user is answered with the Region that currently has the lowest measured latency, and the choice adapts as measurements change.
+X: A=Geolocation by country: routes by the user's location as a fixed mapping, regardless of which Region is actually fastest at the moment.
+C=Multivalue answer: returns several healthy records in random order, with no notion of which endpoint is fastest for the user.
+D=Simple record with three IPs: returns all values in random order and cannot use health checks, so users may pick a distant or failed Region.
+T: "Fastest Region for each user, adapting to conditions" is latency routing; geolocation is a fixed location rule.
+
+@ Q000840 explain
+G: ## Geolocation routing for data residency
+With **geolocation routing**, Route 53 answers based on where the query comes from: a continent, a country, or a subdivision such as a US state. You create records for the locations you care about and a **default** record for everyone else.
+- Example: a record for Germany pointing to the `eu-central-1` endpoint and a default record pointing elsewhere. Users located in Germany always get the German endpoint, even if another Region would be faster.
+- The most specific matching location wins (subdivision over country over continent).
+- Users whose location cannot be determined get the default record; without a default, they get no answer.
+This makes geolocation the right tool for compliance, content licensing and localization, where the rule is "these users must go there", not "go to the fastest place".
+W: Geolocation routing: it maps users in the specified country to the approved regional endpoint every time, independent of latency.
+X: A=Latency-based routing: sends users to the Region with the lowest latency, which could be outside the approved country and would violate the residency rule.
+B=Multivalue answer routing: returns several healthy records at random, so users could reach any endpoint.
+D=Weighted routing: splits traffic by percentage across endpoints, with no link between the user's location and the endpoint.
+T: A must-go-here rule based on where users are is geolocation; latency routing optimizes speed and may cross borders.
+
+@ Q000841 explain
+G: ## Where DNS lookups are recorded
+When an instance resolves a name, the query goes to the **Route 53 Resolver** in the VPC. **Resolver query logging** can record every such query to CloudWatch Logs, S3 or Firehose.
+Each log entry includes:
+- the query name and type (for example `bad-domain.example`, `A`),
+- the **source IP** and, where available, the **instance ID** of the requester,
+- the **response code** (such as `NOERROR` or `NXDOMAIN`) and the answers returned,
+- the VPC ID and timestamp, plus any DNS Firewall action.
+With logging enabled before the incident, a CloudWatch Logs Insights query filtering on the domain name lists every instance that looked it up last week and what it was told.
+W: Route 53 Resolver query logs: they record which source IP or instance asked for which domain and the response it received, exactly what the investigation needs.
+X: B=CloudTrail management events: record AWS API calls such as `RunInstances`; DNS lookups made by instances are not API calls and never appear there.
+C=VPC Flow Logs: record IP-level traffic metadata, not domain names, and traffic to the Amazon-provided DNS resolver is not captured at all.
+D=ALB access logs: record HTTP requests received by a load balancer; outbound DNS lookups from instances do not pass through it.
+T: "Who resolved which domain and what answer came back" is only in Resolver query logs; flow logs and CloudTrail do not see DNS queries.
+
+@ Q000842 explain
+G: ## Hybrid DNS with Resolver endpoints
+The Route 53 Resolver answers queries from inside a VPC, but it cannot see on-premises DNS zones, and on-premises servers cannot query it directly. **Resolver endpoints** bridge the two directions:
+- An **outbound endpoint** sends queries from the VPC to on-premises DNS servers. You create a **forwarding rule**, for example "forward `corp.example.internal` to `192.168.10.10`", and associate the rule with the VPC.
+- An **inbound endpoint** creates network interfaces with IPs in your VPC subnets. On-premises DNS servers use conditional forwarders to send queries for the private hosted zone (such as `aws.example.internal`) to those IPs.
+Traffic flows privately over Direct Connect or VPN. Each endpoint needs at least two IP addresses, ideally in different Availability Zones.
+W: Outbound endpoint with forwarding rules plus inbound endpoint: the outbound side lets VPC resources resolve on-premises names, and the inbound side lets on-premises servers resolve the private hosted zone.
+X: B=Public hosted zone over the internet: publishes internal names to the whole internet and does not help VPC resources resolve names that live only on on-premises servers.
+C=Only an outbound endpoint: covers VPC-to-on-premises queries only; on-premises servers still have no address to send queries for the private hosted zone.
+D=Direct Connect handles DNS itself: Direct Connect provides a private network path, not name resolution; resolvers on each side still need endpoints and forwarding to reach each other.
+T: Hybrid DNS needs both directions: outbound endpoint plus forwarding rules for on-premises names, inbound endpoint for AWS private names.
+
+@ Q000843 explain
+G: ## CloudFront origin failover
+A CloudFront **origin group** contains a **primary** and a **secondary** origin. You choose failover criteria: specific HTTP status codes (such as 500, 502, 503, 504, 403 or 404) returned by the primary, or a connection failure or timeout.
+- When a request to the primary meets the criteria, CloudFront retries **that same request** against the secondary origin, so the viewer still gets a response.
+- The cache behavior points to the origin group instead of a single origin.
+- Failover applies to `GET`, `HEAD` and `OPTIONS` requests.
+- Example: primary = ALB in `us-east-1`, secondary = ALB in `us-west-2`. If the primary returns 503, CloudFront serves the request from `us-west-2`.
+Because the switch happens inside CloudFront, the DNS name and records stay unchanged and no DNS TTL has to expire.
+W: Origin group with status-code-based failover: CloudFront automatically retries failed requests against the secondary Region's origin without any DNS change.
+X: B=Route 53 failover straight to the ALB: removes CloudFront from the path (losing caching and edge features) and relies on a DNS change, which the requirement rules out.
+C=Custom error page redirecting to another Region: sends users an error page or redirect instead of CloudFront fetching the real content from another origin; it is not automatic origin failover.
+D=Two distributions behind weighted Route 53 records: splits traffic by percentage rather than failing over, and any change still depends on DNS answers and caching.
+T: Failover between origins inside CloudFront is an origin group; Route 53 approaches depend on DNS changes.
+
+@ Q000844 explain
+G: ## Why the zone apex needs an alias
+The **zone apex** is the domain itself, `example.com`. DNS rules require the apex to hold SOA and NS records, and a CNAME cannot coexist with any other record at the same name, so a CNAME is not allowed at the apex.
+A Route 53 **alias record** is a Route 53 extension that looks like an `A` or `AAAA` record to clients but points at an AWS resource, such as a CloudFront distribution (`d111111abcdef8.cloudfront.net`).
+- Route 53 resolves the target itself and returns the current IP addresses, so changes in CloudFront's IPs are followed automatically.
+- Queries to alias records that point to AWS resources such as CloudFront are not charged.
+- Create an `A` alias for IPv4 and an `AAAA` alias for IPv6 if the distribution has IPv6 enabled.
+W: Route 53 alias A/AAAA records to the distribution: allowed at the apex, they track CloudFront's IPs automatically, and alias queries to CloudFront are free.
+X: A=A records with CloudFront IPs: CloudFront serves from many edge IPs that change over time, so hardcoded addresses break and bypass CloudFront's routing to nearby edges.
+B=MX record: MX records tell mail servers where to deliver email for the domain; browsers never use them to find a website.
+C=CNAME at the apex: forbidden by DNS rules because the apex must hold SOA and NS records and a CNAME cannot share its name with other records.
+T: Apex name pointing to an AWS resource = Route 53 alias record; a CNAME is not allowed there and fixed IPs go stale.
+
+@ Q000845 explain
+G: ## How a Resolver forwarding rule takes effect
+Route 53 Resolver outbound forwarding needs three pieces:
+- An **outbound endpoint** with network interfaces in the VPC that send queries to on-premises DNS.
+- A **forwarding rule** that says "queries for `corp.example.internal` go to `10.50.0.10`" via that endpoint.
+- An **association between the rule and each VPC** whose instances should use it.
+A rule that exists but is **not associated** with the instances' VPC is simply ignored for that VPC: the Resolver handles the query normally and cannot find the private domain, so lookups fail even though security groups and connectivity are correct.
+Rules can be shared with other accounts through AWS RAM, but each consuming VPC still needs its own association.
+W: Check the rule's association with the instances' VPC: forwarding rules apply only to associated VPCs, so an unassociated rule explains failures when the rule, endpoint and security groups are otherwise fine.
+X: A=Public hosted zone for the domain: the domain lives on on-premises DNS, and a public zone would publish it to the internet instead of forwarding queries privately.
+B=Public IPs on the instances: instances query the VPC resolver at its internal address; public IPs play no part in Resolver forwarding over Direct Connect.
+C=CloudFront for the domain: CloudFront is a content delivery network for HTTP traffic; it has no role in resolving private domain names.
+T: A Resolver rule only works in VPCs it is associated with; check the association before debugging anything else.

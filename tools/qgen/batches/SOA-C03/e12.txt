@@ -1,0 +1,282 @@
+# SOA-C03 detailed explanations, e12 (explanation-only rewrites; letters are the published ones)
+
+@ Q002798 explain
+G: ## How a root sign-in becomes an alert
+AWS CloudTrail records every AWS Management Console sign-in as a `ConsoleLogin` event. For the root user the event carries `userIdentity.type` = `Root`.
+CloudTrail management events are also delivered to Amazon EventBridge, where the sign-in shows up with the detail type `AWS Console Sign In via CloudTrail`. An EventBridge rule can match only root sign-ins and send them to a target such as an Amazon SNS topic that emails or pages the security team.
+- Example event pattern: `source` = `aws.signin`, `detail.userIdentity.type` = `Root`.
+- Console sign-in events are commonly recorded in `us-east-1`, so the rule is usually created in that Region (or events are forwarded there).
+- To cover every account, deploy the rule to each account (for example with StackSets) or forward events to a central security account.
+The alert fires within minutes of the sign-in, which is what "detect and alert" requires.
+W: EventBridge rule on root sign-ins with SNS: CloudTrail captures the root `ConsoleLogin` event, the rule filters on `userIdentity.type` = `Root`, and SNS notifies people in near real time.
+X: A=Dashboard of IAM user counts: a count of IAM users says nothing about who signed in, and the root user is not an IAM user at all. A dashboard also needs someone watching it; it raises no alert.
+B=Monthly credential report review: the credential report shows when the root password was last used, but only after the fact. A monthly look can miss a compromise by weeks, which is not detection or alerting.
+D=Config rule on S3 encryption: this checks bucket configuration once a day. It does not observe sign-in activity, so a root login would never be noticed.
+T: Real-time detection of an API or console event means CloudTrail event → EventBridge rule → SNS, not periodic reviews or configuration checks.
+
+@ Q002799 explain
+G: ## S3 encryption options and who controls the key
+Since January 2023, S3 encrypts every new object by default with **SSE-S3**. The choice is really about who controls the key and whether key use is visible.
+- **SSE-S3**: S3 owns and manages the keys. You cannot set a key policy, disable the key, or see per-request key use.
+- **SSE-KMS with an AWS managed key** (`aws/s3`): KMS logs its use, but you cannot edit its key policy.
+- **SSE-KMS with a customer managed key**: you create the key, write its key policy, can enable rotation, disable or schedule deletion, and every `GenerateDataKey` and `Decrypt` call S3 makes on your behalf is logged in AWS CloudTrail.
+Example: a bucket default encryption set to `aws:kms` with key `arn:aws:kms:eu-west-1:111122223333:key/...`; an auditor can search CloudTrail for `Decrypt` events on that key ARN to see which principal read data and when. Enabling S3 Bucket Keys reduces KMS request cost but also reduces how many KMS calls appear in the log.
+W: SSE-KMS with a customer managed key: the company owns the key policy and lifecycle (control), and KMS records each use of the key in CloudTrail (audit).
+X: A=No encryption, versioning: versioning keeps old object versions for recovery; it is not encryption and gives no key control. (S3 would still apply SSE-S3, which does not meet the requirement either.)
+B=SSE-S3: data is encrypted, but S3 manages the keys, so the company cannot control their policy or lifecycle and there is no per-use key audit trail.
+C=Client-side encryption without key logs: encryption happens outside AWS, and with no logging of key use there is no evidence for the audit requirement.
+T: "Keys we control" plus "audit every use" points to SSE-KMS with a customer managed key; SSE-S3 encrypts but hides the key from you.
+
+@ Q002800 explain
+G: ## Shield Standard versus Shield Advanced
+**AWS Shield Standard** is automatic and free for all AWS customers. It defends against common network and transport layer (layer 3/4) DDoS attacks on services such as CloudFront, Route 53 and Elastic Load Balancing.
+**AWS Shield Advanced** is a paid subscription that you apply to specific resources (CloudFront distributions, Route 53 hosted zones, Global Accelerator accelerators, Application and Classic Load Balancers, Elastic IP addresses). It adds:
+- Enhanced detection and mitigation, including application layer (layer 7) help together with AWS WAF.
+- Access to the **Shield Response Team (SRT)**, which can help analyze an attack and write mitigations.
+- **Cost protection**: credits for scaling charges (for example extra CloudFront or EC2 usage) caused by a DDoS attack.
+- Attack visibility, metrics and diagnostics, and proactive engagement options.
+Example: an e-commerce site behind CloudFront and an ALB subscribes to Shield Advanced, adds both resources as protected resources, and associates a WAF web ACL for layer 7 rules.
+W: Shield Advanced: it is the only choice that includes response-team access and DDoS cost protection on top of stronger detection and mitigation for large attacks.
+X: B=Shield Standard: it gives baseline layer 3/4 protection at no cost, but it includes neither SRT access nor cost protection, which the requirement asks for.
+C=Network ACLs only: NACLs are stateless subnet filters with a limited number of rules. A volumetric attack can overwhelm resources before any rule helps, and they add no response team or cost protection.
+D=Security groups only: security groups allow traffic to instances; they cannot absorb a flood of traffic from many sources or provide DDoS expertise or cost credits.
+T: Free baseline DDoS defense is Shield Standard; response team plus cost protection means Shield Advanced.
+
+@ Q002801 explain
+G: ## How ACM manages certificates for load balancers
+AWS Certificate Manager (ACM) issues public TLS certificates that browsers trust, at no charge for use with integrated services such as Application Load Balancers, CloudFront and API Gateway.
+- You request a certificate for names like `www.example.com` and prove domain ownership, preferably with **DNS validation** (a CNAME record, which Route 53 can create for you).
+- You attach the certificate to the ALB's HTTPS listener by its ARN, for example `arn:aws:acm:us-east-1:111122223333:certificate/...`.
+- **Managed renewal**: ACM renews its certificates before they expire and redeploys the new certificate to the integrated services automatically. With DNS validation and the CNAME still in place, no action is needed.
+Certificates you **import** into ACM (issued elsewhere) are not renewed automatically; you must reimport them. ACM emits EventBridge events and a `DaysToExpiry` metric so you can alarm on certificates nearing expiry.
+W: ACM public certificates: ACM issues trusted certificates, integrates directly with ALB listeners, and renews and redeploys them automatically.
+X: A=Secrets Manager rotation: Secrets Manager can store and rotate secret values with a Lambda function, but it is not a certificate authority and does not plug certificates into ALB listeners. You would still have to obtain and install certificates yourself.
+C=Certificates in S3: S3 is only storage. Someone must renew each certificate and upload it to the load balancer by hand, which is exactly what should be avoided.
+D=Self-signed certificates on instances: browsers do not trust self-signed certificates, they have no renewal process, and TLS configured on instances does not provide the ALB's HTTPS listener with a certificate.
+T: For ALB certificates that renew themselves, use ACM-issued certificates with DNS validation; imported or hand-managed certificates need manual renewal.
+
+@ Q002802 explain
+G: ## Layered protection for a web tier
+A common pattern puts an internet-facing Application Load Balancer in public subnets and the EC2 instances in **private subnets** with no public IP addresses.
+- Only the load balancer is reachable from the internet; the instances cannot be addressed directly.
+- The instances' **security group** allows the application port only from the ALB's security group, for example: inbound TCP `8080`, source `sg-alb123`. Nothing else is allowed inbound.
+- Administration uses Systems Manager Session Manager instead of opening SSH, so no port 22 rule is needed.
+- Outbound access for updates goes through a NAT gateway or VPC endpoints.
+This reduces the attack surface in two independent ways: network placement (no route from the internet to the instance) and a stateful allow-list (only the ALB may connect).
+W: C=Tight security groups from the ALB: referencing the ALB's security group as the only source on the required port means clients must pass through the load balancer, and every other port is closed.
+E=Private subnets behind the ALB: instances with no public IP and no internet route cannot be scanned or attacked directly from the internet.
+X: A=Public IPs and open SSH: this exposes every instance to internet-wide scanning and SSH brute-force attempts, the opposite of reducing exposure.
+B=Disabling OS patching: known vulnerabilities stay unfixed and exploitable; Patch Manager maintenance windows are the safe way to patch on a schedule.
+D=Shared access keys on disk: long-lived keys stored on instances can leak and are hard to rotate or trace; instances should use an IAM role through an instance profile, which supplies temporary credentials.
+T: Protect a web tier by hiding instances in private subnets and letting only the ALB's security group reach the app port.
+
+@ Q002803 explain
+G: ## Deploying and locking a baseline across an organization
+AWS Config needs a **configuration recorder** and a **delivery channel** in every account and every Region you want to track; it is a Regional service.
+- **CloudFormation StackSets** with service-managed permissions deploy one template to all accounts in an organization or OU and every chosen Region. With automatic deployment enabled, new accounts receive the stack when they join.
+- **Service control policies (SCPs)** set the maximum permissions in member accounts. An SCP that denies `config:StopConfigurationRecorder`, `config:DeleteConfigurationRecorder` and `config:DeleteDeliveryChannel` stops even account administrators from turning recording off. An exception can be made for the deployment role.
+- Config data is delivered to a central, private S3 bucket, often in a log archive account.
+Example: a stack set targets the root OU in all enabled Regions; the SCP is attached to the root OU so it applies to every member account (SCPs do not affect the management account).
+W: StackSets plus an SCP: StackSets ensure recording is turned on everywhere, including new accounts, and the SCP prevents anyone in member accounts from stopping or deleting it.
+X: B=Yearly checks by owners: a manual annual check is not enforcement; recording could be off for months before anyone notices.
+C=Config only in one account and Region: Config records resources only in the account and Region where the recorder runs, so every other account and Region would go unrecorded.
+D=Public S3 bucket: this exposes detailed configuration data of the whole organization and does nothing to keep the recorder running.
+T: "Enabled everywhere and can't be turned off" means deploy with StackSets and block the stop and delete actions with an SCP.
+
+@ Q002804 explain
+G: ## How KMS key rotation works
+A KMS key has **key material**, the secret used to encrypt data. Rotation creates new key material while the key ID, ARN and aliases stay the same.
+- **Automatic rotation** can be enabled on symmetric encryption customer managed keys. The default period is one year (365 days), and you can set a custom period from 90 to 2,560 days. You can also rotate a key on demand with `RotateKeyOnDemand`.
+- Old key material is kept, so data encrypted earlier can still be decrypted; new encryptions use the newest material. No application change is needed.
+- AWS managed keys are rotated by AWS automatically. Asymmetric, HMAC and imported-material keys do not support automatic rotation.
+Evidence for an auditor:
+- `GetKeyRotationStatus` shows whether rotation is enabled and its period.
+- The AWS Config managed rule `cmk-backing-key-rotation-enabled` reports whether automatic rotation is enabled on your customer managed keys.
+- CloudTrail logs the `RotateKey` event each time rotation happens.
+W: Automatic rotation for customer managed keys: KMS rotates the key material on a schedule without breaking decryption, and rotation status, Config compliance and CloudTrail events give the auditor proof.
+X: A=Deleting keys every 30 days: deleting a KMS key (after a 7 to 30 day waiting period) makes all data encrypted under it permanently unreadable. Deletion is destruction, not rotation.
+B=Disabling CloudTrail for KMS: this removes the audit trail the auditor needs and would itself be a security finding; it does not rotate anything.
+C=Sharing keys with all accounts: widening the key policy increases who can use the key and has nothing to do with rotating its material.
+T: Rotation replaces key material behind the same key ID; turn on automatic rotation and show its status, rather than deleting or sharing keys.
+
+@ Q002805 explain
+G: ## What Amazon Detective adds after a finding
+Amazon GuardDuty tells you that something suspicious happened, for example an unusual API call from a known malicious IP address. Working out what led up to it and what happened next is the job of **Amazon Detective**.
+- Detective automatically ingests sources such as CloudTrail management events, VPC Flow Logs and GuardDuty findings (and optionally EKS audit logs and other security findings).
+- It builds a **behavior graph** linking entities such as IAM roles, users, EC2 instances and IP addresses, and keeps up to a year of history.
+- Visualizations show activity over time, baselines and unusual spikes, and finding groups that cluster related findings into one potential incident.
+Example: from a GuardDuty finding about an instance calling out to a crypto-mining domain, the analyst pivots into Detective, sees which role launched the instance, which IP first used that role, and what other API calls it made in the same hour.
+W: Amazon Detective: it is built to investigate security findings by correlating related logs over time into a behavior graph, with direct pivots from GuardDuty.
+X: B=AWS DataSync: DataSync moves files and objects between storage systems (on-premises, S3, EFS, FSx); it does not analyze logs or security findings.
+C=Amazon Polly: Polly converts text into speech audio and has no role in security investigation.
+D=Amazon Lightsail: Lightsail offers simple virtual servers and bundled hosting; it provides no security analytics.
+T: GuardDuty detects; Detective investigates the who, what and when behind a finding.
+
+@ Q002806 explain
+G: ## Central security policy with Firewall Manager
+**AWS Firewall Manager** applies security policies across all accounts in an AWS Organizations organization from one administrator account.
+Supported policy types include:
+- AWS WAF web ACLs on CloudFront distributions, ALBs, API Gateway stages and more.
+- AWS Shield Advanced protections for eligible resources.
+- VPC security group policies (common, content audit, usage audit).
+- AWS Network Firewall and Route 53 Resolver DNS Firewall.
+How it works: you designate a Firewall Manager administrator account, AWS Config must be enabled in member accounts, and each policy defines a scope (accounts, OUs, resource types, tags). Firewall Manager applies the policy to existing matching resources and to new ones as they are created, and reports non-compliant resources.
+Example: one WAF policy applies a managed rule group to every ALB tagged `env=prod` across 200 accounts; a newly created ALB is protected automatically.
+W: AWS Firewall Manager: it centrally deploys and enforces WAF rules and Shield Advanced protections across all accounts in the organization, including new resources.
+X: A=AWS Resource Groups: it groups resources by tags or stacks for viewing and bulk operations; it cannot create or enforce WAF rules or Shield protections.
+C=AWS Cloud Map: Cloud Map is a service discovery registry that maps service names to endpoints; it has no firewall or DDoS features.
+D=AWS Health Dashboard: it shows AWS service events and scheduled changes affecting your accounts; it does not configure any protection.
+T: Organization-wide WAF, Shield Advanced and security group policies are managed with Firewall Manager.
+
+@ Q002807 explain
+G: ## Two core practices for human access
+**Multi-factor authentication (MFA)** requires a second factor in addition to a password, such as a passkey, a FIDO security key or an authenticator app code. A stolen password alone is then not enough to sign in.
+**Temporary credentials** replace long-lived access keys. People sign in through IAM Identity Center or a federated identity provider and assume an IAM role. AWS STS issues credentials that expire automatically, usually within hours.
+- A leaked temporary credential stops working on its own; a leaked access key works until someone notices and deactivates it.
+- CloudTrail records the role session with the individual's identity, so actions remain traceable to a person.
+Example: developers run `aws sso login`, pick a permission set such as `ReadOnlyAccess` for the production account, and receive short-lived credentials; no IAM user or access key exists for them.
+W: C=MFA for console sign-in: it blocks sign-ins that rely on a stolen or guessed password.
+E=Temporary credentials through roles: short-lived credentials expire on their own, removing the risk of long-lived keys, and each session is tied to a person.
+X: A=Unused keys left active: an unused key serves no purpose but can still be leaked and used; unused keys should be deactivated and deleted (IAM Access Analyzer and credential reports help find them).
+B=Shared admin user: sharing one user removes accountability, since CloudTrail cannot show which person acted, and the password must be changed whenever someone leaves.
+D=AdministratorAccess for everyone: this violates least privilege; any compromised user or mistake can affect every resource in the account.
+T: Protect human users with MFA and short-lived role credentials instead of shared users, broad permissions or long-lived keys.
+
+@ Q002808 explain
+G: ## Direct Connect versus VPN
+**AWS Direct Connect** is a private network connection from your data center or colocation facility to an AWS Direct Connect location. Traffic does not cross the public internet.
+- **Dedicated connections** are a physical port reserved for you at 1, 10 or 100 Gbps (400 Gbps at select locations); **hosted connections** are provided through AWS Direct Connect Partners at smaller or custom speeds.
+- You create virtual interfaces: a private VIF to reach VPCs (through a virtual private gateway or a Direct Connect gateway), a transit VIF for transit gateways, or a public VIF for AWS public endpoints.
+- Because the path is dedicated, bandwidth and latency stay consistent, and data transfer out over Direct Connect is priced lower than over the internet.
+- Traffic is not encrypted by default; use MACsec on supported connections or run a VPN over the link when encryption is required.
+**Site-to-Site VPN** builds IPsec tunnels over the internet. It is quick to set up but its performance varies with internet conditions.
+W: AWS Direct Connect: it provides a dedicated private link from the data center to AWS with predictable bandwidth and latency, which is exactly what the requirement describes.
+X: A=Amazon CloudFront: CloudFront is a content delivery network that caches content for internet users at edge locations; it does not connect a data center network to a VPC.
+B=AWS Client VPN: Client VPN connects individual users' devices through a VPN client; it is not a site-level link and runs over the internet.
+C=AWS Site-to-Site VPN: it is private in the sense of encrypted, but it travels over the public internet, so bandwidth and latency are not consistent or dedicated.
+T: Dedicated, consistent bandwidth means Direct Connect; Site-to-Site VPN is encrypted but internet-dependent.
+
+@ Q002809 explain
+G: ## Backing up a Direct Connect link
+A single Direct Connect connection is a single point of failure: a fiber cut or device failure takes the path down. The most resilient option is a second Direct Connect connection at another location, but that costs a second port and circuit.
+A **Site-to-Site VPN** is the low-cost backup:
+- It uses IPsec tunnels over the existing internet connection and is billed per connection-hour plus data transfer.
+- Terminate it on the same virtual private gateway or transit gateway as the Direct Connect path.
+- With BGP on both paths, AWS prefers the Direct Connect route when both advertise the same prefix, so traffic uses the VPN only when Direct Connect fails. On-premises, set routing preferences (for example local preference or AS path) to match.
+Trade-off: during failover you get internet-dependent bandwidth and latency, which is acceptable for many workloads as a backup.
+W: Site-to-Site VPN backup: it gives an automatic, encrypted fallback path over the internet at far lower cost than a second Direct Connect connection.
+X: A=CloudFront distribution: CloudFront serves content to internet viewers; it provides no network path between on-premises systems and a VPC.
+B=Second VPC without hybrid connectivity: another VPC has no link to the data center either, so it adds nothing to the failed connection.
+C=Internet gateway on-premises: an internet gateway is a VPC component that cannot be deployed in a data center, and it provides no private path to the VPC.
+T: The standard low-cost Direct Connect backup is a Site-to-Site VPN on the same gateway, with BGP preferring Direct Connect.
+
+@ Q002810 explain
+G: ## Remote-access VPN with AWS Client VPN
+**AWS Client VPN** is a managed, OpenVPN-based remote-access VPN. Each user runs a VPN client on their laptop and connects to a Client VPN endpoint.
+- The endpoint is associated with one or more subnets in a VPC; connected users get an IP from a client CIDR range you choose, for example `10.100.0.0/22`.
+- Authentication options: mutual certificate authentication, Active Directory, or SAML federation with an identity provider.
+- **Authorization rules** decide which networks each user group may reach, and the endpoint route table controls where traffic goes (the VPC, peered VPCs, on-premises, or the internet).
+- Connection logs can be sent to CloudWatch Logs.
+The service scales automatically, so there are no VPN servers to patch or size.
+W: AWS Client VPN: it is designed to let individual users on laptops connect securely to VPC resources, with managed authentication and per-group access rules.
+X: A=VPC peering: peering connects two VPCs; a laptop is not a VPC, so users gain no access.
+B=AWS Direct Connect: Direct Connect links a data center or colocation facility to AWS with physical circuits; it cannot serve individual remote laptops.
+D=NAT gateways only: a NAT gateway lets private instances start outbound connections to the internet; it does not accept inbound connections from remote users.
+T: Individual users to a VPC means Client VPN; site-to-site links and peering connect networks, not people.
+
+@ Q002811 explain
+G: ## Route 53 routing policies
+Route 53 answers DNS queries according to a routing policy on the record set:
+- **Weighted**: several records with the same name each get a weight from 0 to 255. Each record receives its weight divided by the total. Example: `app.example.com` → old ALB weight `90`, new ALB weight `10`, so about 10 percent of DNS answers point to the new version.
+- **Failover**: primary and secondary records; the secondary is returned only when the primary's health check fails.
+- **Geolocation**: answers based on the user's country or continent.
+- **Latency**: answers with the Region that gives the user the lowest latency.
+Weighted records can have health checks so an unhealthy version stops receiving traffic. Setting a weight to `0` stops sending traffic to that record, which makes rollback easy. The split is approximate because resolvers cache answers for the record's TTL.
+W: Weighted routing: it splits DNS answers in proportion to weights you assign, so weights 90 and 10 give the requested 90/10 split between versions.
+X: B=Failover routing: it sends all traffic to the primary and switches to the secondary only on failure; it cannot split traffic by percentage.
+C=Geolocation routing: it chooses records by where the user is, so the split would depend on user location, not on a set percentage.
+D=Latency routing: it picks the lowest-latency Region for each user; both versions in the same Region would not be split by any fixed ratio.
+T: Percentage-based traffic shifting in DNS is weighted routing; failover, geolocation and latency choose by health, location or speed.
+
+@ Q002812 explain
+G: ## Cache behaviors in CloudFront
+A CloudFront distribution has one or more **cache behaviors**. Each behavior has a **path pattern** and its own settings: origin, cache policy (TTL and cache key), origin request policy (which headers, cookies and query strings are forwarded), allowed HTTP methods, and more.
+- Behaviors are evaluated in order; the first matching path pattern wins, and the default behavior (`*`) catches everything else.
+- Example: `/api/*` → API origin with the managed `CachingDisabled` cache policy and an origin request policy that forwards the cookies and query strings the API needs; default `*` → S3 origin with the `CachingOptimized` policy and long TTLs for images, CSS and JavaScript.
+This keeps personalized responses from being cached and served to the wrong user, while static assets still come from edge caches, all under one domain name such as `www.example.com`.
+W: Path-based cache behaviors: separate behaviors let API paths skip caching and forward user-specific data, while static paths are cached with long TTLs on the same distribution and domain.
+X: A=One behavior with a 24-hour TTL: personalized API responses would be cached and could be served to other users for up to a day, a data exposure and correctness problem.
+C=Disable caching for everything: API requests stay correct, but static assets lose edge caching, so every request goes to the origin with higher latency and cost.
+D=A distribution per user: distributions are account-level resources with quotas and take time to deploy; creating one per user is unmanageable and still needs different caching per path.
+T: Mixed static and dynamic content under one domain is handled with multiple path-based cache behaviors, each with its own cache policy.
+
+@ Q002813 explain
+G: ## The NAT gateway path to the internet
+A private instance reaches the internet in two routing steps:
+- **Private subnet route table**: `0.0.0.0/0` → `nat-0abc...`. Without this route, traffic has nowhere to go.
+- **NAT gateway placement**: a public NAT gateway in the usual zonal mode lives in a **public subnet** whose route table has `0.0.0.0/0` → `igw-...`. The NAT gateway has an Elastic IP address and forwards translated traffic to the internet gateway.
+If the NAT gateway is placed in a private subnet by mistake, or the internet gateway route is missing, packets reach the NAT gateway but cannot leave the VPC. NAT gateways also offer a newer regional availability mode that is not placed in a single subnet; this question tests the classic zonal setup.
+Other things to check when both routes are right: network ACLs on both subnets (including ephemeral return ports), and security group outbound rules on the instances.
+W: B=Default route to the NAT gateway: the private subnet's route table must send `0.0.0.0/0` to the NAT gateway, or internet-bound traffic is dropped.
+E=NAT gateway in a public subnet with an IGW route: the NAT gateway itself needs a route to the internet gateway to forward traffic out.
+X: A=Encrypted EBS root volume: disk encryption affects data at rest only and has no effect on network routing.
+C=Private hosted zone: a private hosted zone affects DNS names inside the VPC; it does not provide or block internet routing.
+D=Elastic IPs on the instances: private instances do not need public addresses when using NAT; the NAT gateway's own Elastic IP provides the public source address. An Elastic IP on an instance in a subnet without an IGW route would not help anyway.
+T: For NAT internet access check both hops: private route table → NAT gateway, and NAT gateway's subnet route table → internet gateway.
+
+@ Q002814 explain
+G: ## Resolving private hosted zones from on-premises
+A Route 53 **private hosted zone** is answered only by the Route 53 Resolver inside the VPCs associated with it (the `.2` address, such as `10.0.0.2`). On-premises DNS servers cannot query that address directly, even over Direct Connect.
+**Route 53 Resolver endpoints** bridge this gap:
+- An **inbound endpoint** creates network interfaces with IP addresses in your VPC subnets (use at least two Availability Zones). On-premises DNS servers set a **conditional forwarder** for the zone, for example `corp.internal` → the inbound endpoint IPs.
+- Queries travel over Direct Connect or VPN to the endpoint, and Route 53 Resolver answers from the private hosted zone.
+- An **outbound endpoint** with forwarding rules is the reverse direction: VPC resources resolving on-premises names.
+Security groups on the inbound endpoint must allow DNS on TCP and UDP port 53 from the on-premises resolvers.
+W: Resolver inbound endpoint with forwarding: on-premises DNS forwards the private zone's queries to the endpoint IPs in the VPC, and Route 53 Resolver returns the private records.
+X: A=Public hosted zone copy: publishing internal records to the internet exposes internal names and IP addresses, and the two zones would need to be kept in sync by hand.
+B=CloudFront in front of the zone: CloudFront is a content delivery network for HTTP(S) traffic; it does not answer DNS queries or front a hosted zone.
+D=NAT gateway for DNS: a NAT gateway translates outbound connections from private subnets to the internet; it accepts no inbound queries from on-premises and does not resolve names.
+T: On-premises to private hosted zone uses a Resolver inbound endpoint; VPC to on-premises DNS uses an outbound endpoint.
+
+@ Q002815 explain
+G: ## Idle timeouts and keep-alive between ALB and targets
+An Application Load Balancer keeps connections to its targets open and reuses them for later requests. Two timers matter:
+- The ALB **idle timeout** (default 60 seconds) is how long the ALB keeps an unused connection open.
+- The application's **keep-alive timeout** (for example Apache `KeepAliveTimeout` or Node.js `server.keepAliveTimeout`) is how long the target keeps an idle connection open.
+If the target's timeout is shorter, the target closes the connection while the ALB still thinks it is usable. When the ALB sends the next request on it, the target answers with a TCP reset or FIN, and the ALB returns **HTTP 502 Bad Gateway** to the client.
+Health checks still pass because each health check uses its own fresh request, so the problem shows up as intermittent 502s on healthy targets. The `HTTPCode_ELB_502_Count` metric and access logs help confirm it.
+Fix: set the target keep-alive timeout longer than the ALB idle timeout, for example 65 seconds or more against the default 60.
+W: Keep-alive shorter than the ALB idle timeout: the target closes idle connections first, the ALB reuses a closed connection, and the request fails with 502 even though health checks pass.
+X: B=Targets in several Availability Zones: spreading targets across AZs is the recommended design for availability and does not cause 502 errors.
+C=Short Route 53 TTL: a TTL only controls how long resolvers cache the ALB's addresses; a short TTL causes more DNS lookups, not bad gateway responses from the ALB.
+D=Versioning on the log bucket: access log storage settings have no effect on how the ALB handles requests to targets.
+T: Intermittent 502s with healthy targets often mean the application's keep-alive timeout is shorter than the ALB idle timeout.
+
+@ Q002816 explain
+G: ## Restricting CloudFront by country
+**CloudFront geographic restrictions** (geo restriction) let a distribution serve or refuse viewers based on their country.
+- Choose an **allow list** (only listed countries may access) or a **block list** (listed countries are refused).
+- CloudFront determines the viewer's country from the request's IP address using a geolocation database.
+- Refused viewers receive HTTP `403 Forbidden`, and you can configure a custom error page.
+- The setting applies to the whole distribution.
+For finer control, such as blocking countries only on certain paths or combining country with other conditions, attach an AWS WAF web ACL with a geo match rule.
+Example: a media company licensed to stream only in some countries sets an allow list of those country codes; everyone else gets 403 at the edge, before any request reaches the origin.
+W: CloudFront geographic restrictions: it is the built-in CloudFront feature for allowing or blocking viewers by country at the edge.
+X: A=Route 53 latency routing: it chooses the endpoint with the lowest latency for each user; it never refuses a user, and users could still reach CloudFront directly.
+B=S3 versioning: versioning keeps previous versions of objects for recovery; it has nothing to do with viewer location or access control.
+C=EC2 security group outbound rules: security groups filter traffic of EC2 network interfaces, not requests from viewers to CloudFront edge locations, and they have no country-based matching.
+T: Country-based blocking of CloudFront content is done with geo restriction (or a WAF geo match rule for finer control), not with DNS routing or security groups.
+
+@ Q002817 explain
+G: ## Stack-level tags in CloudFormation
+When you create or update a CloudFormation stack you can specify **stack-level tags**, for example `CostCenter=1234` and `Owner=payments`.
+- CloudFormation propagates these tags to the resources in the stack that support tagging through CloudFormation.
+- CloudFormation also adds its own tags automatically, such as `aws:cloudformation:stack-name` and `aws:cloudformation:logical-id`.
+- Tags set directly on a resource in the template can add to the stack tags; stack tags make sure a common set is applied everywhere without repeating it in every resource.
+Example: `aws cloudformation create-stack --stack-name web --template-body file://web.yaml --tags Key=CostCenter,Value=1234`. Every taggable instance, bucket and security group created by the stack receives `CostCenter=1234`.
+Updating the stack's tags updates them on the resources, so tag changes stay consistent with the stack. A few resource types do not support tag propagation, so check the ones you rely on for cost allocation.
+W: Stack-level tags: they are applied automatically to supported resources created by the stack, at creation and on updates, with no per-resource work.
+X: A=CloudWatch alarm for untagged resources: an alarm can notify but cannot apply tags, and CloudWatch has no built-in "untagged resource" metric.
+B=Manual tagging after deployment: it is slow and error-prone, is easily forgotten for new resources, and drifts from the stack definition.
+D=S3 lifecycle rule: lifecycle rules transition or expire objects inside a bucket; they cannot tag EC2, RDS or other resources.
+T: To tag everything a stack creates, pass tags at the stack level; CloudFormation propagates them to supported resources.

@@ -1,0 +1,338 @@
+# SOA-C03 detailed explanations, e02 (explanation-only rewrites; letters are the published ones)
+
+@ Q000771 explain
+G: ## How burstable (T-family) instances work
+T2, T3, T3a and T4g instances run at a **baseline** CPU level and earn **CPU credits** at a fixed rate, which accumulate while usage stays below baseline. One credit equals one vCPU at 100% for one minute. A `t3.medium` has 2 vCPUs and a baseline of 20% per vCPU.
+- When load rises above baseline, the instance spends credits from its `CPUCreditBalance`.
+- In **standard** mode, once the balance hits zero the instance is held to its baseline, so the app slows down until load drops and credits build up again.
+- In **unlimited** mode, the instance keeps bursting after the balance is gone; if average usage stays above baseline, the surplus credits are billed.
+- T3, T3a and T4g launch in unlimited mode by default (T2 in standard), so an instance that is held back when its balance reaches zero has been set to standard mode.
+## Reading the metrics
+`CPUUtilization` spiking while `CPUCreditBalance` falls to 0, with recovery afterwards, is the classic fingerprint of credit exhaustion. Other useful metrics are `CPUCreditUsage` and, for unlimited mode, `CPUSurplusCreditBalance`.
+W: CPU credit exhaustion: the credit balance reaching zero exactly when performance drops means the instance is being held to baseline. Unlimited mode allows bursting beyond the balance; if the load is regularly high, a larger or non-burstable type (for example M or C family) is more economical.
+X: A=Cluster placement group: placement groups control how instances are placed on hardware for low network latency; they do not change CPU capacity or credit behavior on a single instance.
+B=Route table misconfiguration: a bad route causes unreachable destinations or consistent packet loss, not a CPU spike tied to a draining credit balance that recovers on its own.
+C=Undersized EBS volume: storage pressure shows up as disk metrics (queue length, burst balance, full disk), not as `CPUCreditBalance` falling to zero.
+T: On a T-family instance, CPU slowdowns that line up with `CPUCreditBalance` hitting zero mean credit exhaustion: switch to unlimited mode or move to a larger or non-burstable type.
+
+@ Q000772 explain
+G: ## Auto Scaling groups and target tracking
+An **Auto Scaling group** (ASG) keeps a number of EC2 instances between a minimum and maximum, launches them from a launch template, and spreads them across the subnets (Availability Zones) you choose. Attached to an ALB target group, new instances register automatically and receive traffic once healthy.
+A **target tracking** policy works like a thermostat: you pick a metric and a target value, and the ASG adds or removes instances to keep the metric near it.
+- Example: `ALBRequestCountPerTarget` at 1,000, or average `CPUUtilization` at 50%.
+- During a surge the metric rises above target, so the ASG scales out; at night it falls below target, so the ASG scales in toward the minimum.
+- The ASG also replaces instances that fail health checks and rebalances across AZs.
+W: ASG with target tracking: capacity follows the actual load in both directions without anyone acting, which fits unpredictable surges and idle nights, and the group spans multiple AZs behind the ALB.
+X: A=Email alarm to add instances: a person must read the email and launch instances by hand, which is slow during a surge and never removes idle capacity at night.
+C=Scheduled resizing to a larger type: changing an instance type requires stopping the instance, and a schedule cannot follow surges that are unpredictable; it also scales up, not out across AZs.
+D=Fixed fleet for historical peak: it handles peaks but wastes money on idle instances every night, and a surge above the historical peak still overloads it.
+T: Elastic, automatic capacity for EC2 behind an ALB means an Auto Scaling group with target tracking, not alarms that notify people or fixed and scheduled sizes.
+
+@ Q000773 explain
+G: ## DynamoDB capacity modes
+- **Provisioned** mode: you set read capacity units (RCUs) and write capacity units (WCUs); requests above them can be throttled.
+- **On-demand** mode: pay per request with no capacity planning.
+## DynamoDB auto scaling
+In provisioned mode, **DynamoDB auto scaling** is powered by **Application Auto Scaling**. You register the table (and any global secondary indexes) as a scalable target with a minimum and maximum, and a target tracking policy keeps consumed capacity near a target utilization, for example 70%.
+- When consumed capacity rises above the target, provisioned capacity is raised; when traffic drops, it is lowered (DynamoDB limits how many capacity decreases a table can have per day).
+- For a known daily pattern you can also add a **scheduled action** in Application Auto Scaling that raises the minimum just before the morning spike.
+W: DynamoDB auto scaling via Application Auto Scaling: it adjusts RCUs and WCUs from actual utilization while the table stays in provisioned mode, and scheduled actions can pre-warm capacity for the predictable morning peak.
+X: B=Scheduled script on EC2: it only changes capacity at fixed times rather than reacting to real utilization, and adds a server and custom code to maintain.
+C=Switch to Amazon RDS: moving to a relational database is a re-architecture, not a capacity setting, and it drops the requirement to keep the DynamoDB table.
+D=DynamoDB Accelerator (DAX): DAX is an in-memory cache for eventually consistent reads; it does not change provisioned capacity and does nothing for writes.
+T: To scale a provisioned DynamoDB table automatically, use auto scaling through Application Auto Scaling; DAX caches reads and does not manage capacity.
+
+@ Q000774 explain
+G: ## What CloudFront does for static and dynamic content
+Amazon CloudFront has edge locations worldwide. Viewers connect to the nearest one, and CloudFront fetches from your origin when needed.
+- **Static assets** (images, CSS, JS) are cached at the edge, so an Asian user gets them from a nearby location instead of from `us-east-1`.
+- **Dynamic, personalized API calls** can go through CloudFront too, with caching disabled (for example the managed `CachingDisabled` cache policy on an `/api/*` behavior). CloudFront still helps: TCP and TLS are terminated close to the viewer, CloudFront reuses persistent connections to the origin, and the long leg travels over the AWS global network instead of the public internet.
+Example: `/static/*` uses a long-TTL cache policy; `/api/*` forwards the needed headers and cookies to the origin and caches nothing.
+W: Cache static, proxy the API through CloudFront: static files are served from the edge and API responses stay per-user, but both paths gain faster connection setup near the user and an optimized path back to the origin.
+X: A=Replicate the bucket to Asia: this helps only static files, adds a second copy to manage, and leaves API calls crossing the public internet to `us-east-1`.
+C=CloudFront only for static assets: static content improves, but API calls still suffer the full round trips for TCP and TLS handshakes across the internet.
+D=Cache everything for 24 hours: personalized responses would be served to the wrong users and would be up to a day out of date, a correctness and privacy problem.
+T: CloudFront speeds up both halves: cache what is static, and pass personalized API calls through uncached to benefit from edge termination and the AWS network.
+
+@ Q000775 explain
+G: ## Why CloudFront keeps serving the old file
+CloudFront caches an object under its cache key (mainly the path) until its TTL expires. If you overwrite `logo.png` in S3 with new content under the same key, edge locations keep returning the cached copy until the TTL runs out or you create an **invalidation**.
+- Invalidations work, but they are a manual or scripted step for every release, and paths beyond the monthly free allowance are charged.
+## Versioned object names (cache busting)
+Instead, publish each new version under a new key, such as `logo.v2.png` or `logo.3f9a1c.png` (a content hash), and update the HTML or manifest that references it.
+- The new key has never been cached, so every edge fetches it from the origin on first request.
+- Old versions can keep long TTLs because they never change.
+W: Versioned object keys: a new name gives a new cache key, so users get the updated file immediately, no invalidations are needed, and long cache TTLs can stay in place.
+X: A=Higher price class: price class only chooses which set of edge locations serves the distribution; it has no effect on how long objects stay cached.
+B=Shorter versioning retention: S3 Versioning keeps object versions inside the bucket (removed with lifecycle rules); it has nothing to do with what CloudFront has cached at the edge.
+C=Disable caching: every request would go back to S3, losing the latency and origin-offload benefits that are the reason to use CloudFront.
+T: To publish updates through CloudFront without invalidations, change the object name (versioned keys) rather than overwriting the same key.
+
+@ Q000776 explain
+G: ## Aurora Replicas and Aurora Auto Scaling
+An Aurora cluster has one writer instance and up to 15 **Aurora Replicas**. Replicas share the cluster's storage volume, so a new one does not have to copy the data and is ready fairly quickly. Applications send reads to the cluster **reader endpoint**, which spreads connections across the replicas.
+**Aurora Auto Scaling** uses Application Auto Scaling to change the number of replicas:
+- You set a minimum and maximum number of replicas.
+- A target tracking policy uses a metric such as average CPU utilization of the replicas or average number of connections, for example CPU at 60%.
+- During peak hours replicas are added; off-peak, the extra ones are removed. The reader endpoint includes new replicas automatically.
+W: Aurora Auto Scaling for replicas: it adds and removes Aurora Replicas based on CPU (or connections), which matches read traffic that rises and falls during the day.
+X: B=RDS Proxy: it pools and shares database connections to reduce connection overhead and speed up failover, but it does not add read capacity.
+C=Multi-AZ with two readable standbys: this is an RDS Multi-AZ DB cluster deployment with a fixed number of standbys, not an Aurora feature, and it cannot grow or shrink with load.
+D=Aurora Global Database: it replicates to secondary Regions for disaster recovery and local reads there; it does not automatically change the number of replicas in the primary Region.
+T: Variable read load on Aurora calls for Aurora Auto Scaling of replicas behind the reader endpoint; RDS Proxy manages connections and Global Database adds Regions.
+
+@ Q000777 explain
+G: ## Reactive versus predictive scaling in EC2 Auto Scaling
+- **Target tracking** and **step/simple scaling** are reactive: they act after a CloudWatch metric has already crossed a threshold. New instances then need time to launch and warm up, so the start of every spike is under-provisioned.
+- **Scheduled scaling** changes capacity at times you define by hand.
+- **Predictive scaling** analyzes the group's historical load (it needs at least a day of history and uses up to two weeks), finds daily and weekly patterns, forecasts the coming hours, and launches instances **before** the forecasted increase.
+Predictive scaling can first run in forecast-only mode so you can compare the forecast with real traffic, and it is often combined with target tracking, which handles anything the forecast misses.
+W: Predictive scaling: it is built for exactly this case, a reliable daily ramp, and it provisions capacity ahead of the forecasted load instead of reacting after the spike has started.
+X: A=Scheduled scaling: it can launch capacity before a known time, but you must set and maintain the times and sizes yourself; it does not learn from historical load patterns.
+C=Simple scaling with cooldown: it is reactive and the cooldown adds more waiting between scaling actions, making the lag worse.
+D=Target tracking: it follows the metric after it changes, so it produces the very lag the team is seeing.
+T: When load patterns repeat and reactive scaling is too late, predictive scaling forecasts from history and adds capacity in advance.
+
+@ Q000778 explain
+G: ## Scaling ElastiCache for Redis OSS
+A Redis cache is organized in **shards** (node groups). Each shard has one primary node that takes writes and up to several replica nodes that serve reads and provide failover.
+- **Cluster mode disabled**: exactly one shard. You can add replicas for reads or move to a larger node type (scale up), but all data and all writes stay on one primary.
+- **Cluster mode enabled**: data is split across many shards by hash slot (16,384 slots divided among the shards). Each shard has its own primary, so memory and write throughput grow as you add shards, and shards can be added online (resharding).
+Example: 3 shards each hold about one third of the session keys, and each primary handles about one third of the writes.
+W: Cluster mode enabled with multiple shards: it scales out horizontally by partitioning data across several primaries, raising both memory capacity and write throughput beyond one node.
+X: A=Multi-AZ with automatic failover on one shard: it improves availability by promoting a replica if the primary fails, but there is still one primary holding all data and taking all writes.
+B=Longer TTL: keys live longer, which increases memory use and does nothing to add capacity.
+C=Larger node, cluster mode disabled: this is vertical scaling with a ceiling at the largest node type, and it still does not distribute data across nodes.
+T: To scale Redis out, enable cluster mode and add shards; replicas and Multi-AZ add read capacity and availability, not write or memory capacity.
+
+@ Q000779 explain
+G: ## What an ALB health check really tests
+An Application Load Balancer sends periodic HTTP or HTTPS requests to each target's health check path. Targets that return the expected status codes stay in rotation; targets that fail enough checks in a row (the **unhealthy threshold**) stop receiving requests.
+If `/health` only proves the web process is up, a target that cannot reach its database still looks healthy and keeps receiving requests it will fail.
+## Deep health checks, used carefully
+A better endpoint checks what the instance needs to serve a request, such as opening a database connection or running a trivial query, and returns an error code when that fails.
+- Keep it fast and cheap so the check itself does not overload the database.
+- If a **shared** dependency fails, every target fails together. When all targets are unhealthy, the ALB fails open and sends traffic to all of them anyway, so also alarm on the dependency itself.
+W: Health endpoint that checks critical dependencies: the check then reflects whether the target can actually serve requests, so the ALB removes targets that cannot reach the database.
+X: A=Higher unhealthy threshold: it makes the ALB wait longer before acting, which is slower detection of a signal that never turns unhealthy anyway.
+B=TCP health checks: ALB target groups use HTTP or HTTPS health checks; a TCP-level check would only prove a port is open, which tells even less about the database.
+C=Shorter interval: checking the same meaningless endpoint more often still always returns 200 while the database is down.
+T: A health check is only as good as what it tests: make it verify the dependencies a request needs, rather than tuning timing on a check that always passes.
+
+@ Q000780 explain
+G: ## Two different jobs: availability versus read scaling
+- **Multi-AZ DB instance deployment**: RDS keeps a standby in another Availability Zone and replicates to it **synchronously**, so every committed write exists in both. If the primary fails, RDS fails over automatically and repoints the DNS endpoint to the standby. The standby does **not** serve reads.
+- **Read replicas**: copies that receive changes **asynchronously**, so they can lag slightly. Applications connect to each replica's own endpoint to offload reads. A replica can be in the same Region or another Region, and it can be **promoted manually** to a standalone database, but promotion is not automatic failover.
+(A newer option, the Multi-AZ DB cluster deployment, has two readable standbys; it is a separate deployment type, which is why the distinction here is about Multi-AZ DB instances.)
+W: Asynchronous readable replicas versus synchronous non-readable standby: that is exactly the design difference, read replicas scale reads, Multi-AZ standby provides durability and automatic failover.
+X: A=Same feature under different names: they use different replication types, have different endpoints and serve different goals.
+B=Read replicas fail over automatically: a standard RDS read replica must be promoted by you (or your automation), and asynchronous replication can lose the last writes.
+C=Standbys serve reads, replicas cannot: this reverses reality; read replicas exist to serve reads, and the Multi-AZ DB instance standby does not serve them.
+T: Read replicas (asynchronous, readable) scale reads; the Multi-AZ standby (synchronous, not readable) protects availability with automatic failover.
+
+@ Q000781 explain
+G: ## Where Route 53 health checkers run
+Standard Route 53 health checks are performed by health checkers in several AWS locations on the **public internet**. They need to reach the endpoint through a public IP address or a publicly resolvable domain name.
+An **internal** Application Load Balancer has only private IPs inside the VPC, so those checkers can never connect, and the check reports unhealthy even though the app works from inside the VPC.
+## Checking private resources
+Use a **CloudWatch alarm-based health check**:
+- Monitor the private resource with a CloudWatch metric (for example the ALB's `HealthyHostCount`, or a custom metric from a Lambda function in the VPC that probes the endpoint).
+- Create an alarm on that metric, then a Route 53 health check whose status follows the alarm.
+W: Health checkers run outside the VPC: they cannot route to a private-only endpoint, so the health check fails regardless of the application's real state.
+X: B=Interval too short for HTTPS: Route 53 supports standard and fast intervals for HTTPS endpoints; the interval does not make a reachable endpoint appear permanently unhealthy.
+C=ALBs never supported: Route 53 can health check internet-facing ALBs by their DNS name; the problem is that this ALB is internal.
+D=Disabled after 24 hours: Route 53 has no such behavior; health checks keep running until you delete or disable them.
+T: Route 53 health checkers probe from the internet, so for private resources base the health check on a CloudWatch alarm instead.
+
+@ Q000782 explain
+G: ## How an ALB splits traffic across zones
+A load balancer has a node in each enabled Availability Zone, and clients are spread across those nodes by DNS.
+- **Without cross-zone load balancing**, each node sends traffic only to targets in its own AZ. With 2 targets in AZ-a and 8 in AZ-b, each AZ gets about half the traffic, so each AZ-a target handles about 25% while each AZ-b target handles about 6%.
+- **With cross-zone load balancing**, each node can send to targets in every enabled AZ, so all 10 targets get about 10% each.
+For Application Load Balancers cross-zone is on at the load balancer level and can be turned off per target group; for Network Load Balancers it is off by default.
+W: Cross-zone load balancing: it distributes requests across all registered targets in all enabled AZs, so each instance gets an even share even when AZs have different instance counts.
+X: B=Deregistration delay: it lets in-flight requests finish before a target is removed; it does not change how new traffic is shared among targets.
+C=Sticky sessions: they pin a client to the same target, which usually makes the distribution less even, not more.
+D=Slow start: it gradually ramps traffic to a newly registered target so it can warm up; it does not balance load across zones.
+T: Uneven target counts per AZ are fixed by cross-zone load balancing, which balances per target instead of per zone.
+
+@ Q000783 explain
+G: ## Route 53 routing policies with health checks
+- **Weighted**: several records with the same name, each with a weight. Traffic is split in proportion, for example 50/50 or 70/30.
+- **Failover**: one primary and one secondary; the secondary is used only when the primary is unhealthy (active-passive).
+- **Latency**: answers with the Region that has the lowest latency for the user.
+- **Geoproximity**: routes by distance, adjusted by a bias.
+- **Simple**: one record, possibly with several values, and no health checks.
+When a **health check** is associated with a weighted record and it fails, Route 53 stops returning that record and the remaining healthy records receive all the traffic.
+Example: `app.example.com` has a weighted record for each Region, weight 50 each, each linked to a health check; if one Region fails its check, 100% of answers point to the other.
+W: Weighted routing with health checks: it gives an active-active split during normal operation, and the health checks remove a failed stack so all traffic goes to the healthy one.
+X: B=Geoproximity with bias zero: it routes each user to the geographically closest resource, not a controlled split, and it only fails over if health checks are also configured.
+C=Latency routing without health checks: it routes by latency rather than a deliberate split, and without health checks Route 53 keeps returning a failed Region.
+D=Simple routing with two A records: Route 53 returns both values in random order and cannot attach health checks, so clients keep getting the failed stack's address.
+T: For an active-active split that fails over automatically, use weighted records with health checks; simple routing has no health awareness.
+
+@ Q000784 explain
+G: ## Availability Zones and fault isolation
+An Availability Zone is one or more data centers with independent power, cooling and networking, connected to the other AZs in the Region by high-bandwidth, low-latency links.
+- An Auto Scaling group spread across **three AZs** keeps running if one AZ has a problem; the ASG launches replacements in the remaining AZs.
+- A **single-AZ** group is simpler, but one AZ outage takes the whole application down.
+## The costs of going multi-AZ
+- **Data transfer**: traffic between instances in different AZs of the same Region is charged per GB in each direction, while traffic within one AZ over private IPs is not.
+- **Latency**: cross-AZ calls add a small amount of network latency (typically low single-digit milliseconds), which matters for chatty tiers.
+Most production designs accept these costs for resilience.
+W: Survives AZ outages, at the cost of cross-AZ transfer and latency: that is the real tradeoff, higher availability against extra data transfer charges and slightly higher inter-instance latency.
+X: A=Single-AZ is more fault tolerant: a single AZ is a single point of failure; losing it stops the whole group.
+C=Multi-AZ removes transfer costs: it does the opposite, adding charges for data that crosses AZ boundaries.
+D=Zero downtime guaranteed: multi-AZ reduces the impact of an AZ failure but cannot prevent every outage, such as application bugs, bad deployments or Regional events.
+T: Spreading across AZs buys resilience against an AZ failure in exchange for cross-AZ data charges and a little latency; it is not free and not a zero-downtime guarantee.
+
+@ Q000785 explain
+G: ## How an RDS Multi-AZ failover redirects clients
+Applications connect to an RDS instance through a DNS endpoint such as `mydb.abc123.us-east-1.rds.amazonaws.com`, not a fixed IP. During a Multi-AZ failover RDS promotes the standby and updates that DNS record to point to the new primary's IP. The record has a short TTL so clients pick up the change quickly.
+Problems appear when the client does not re-resolve:
+- The application or connection pool resolved the name once and keeps using the old IP.
+- The runtime caches DNS results for a long time or forever (a classic example is JVM DNS caching settings).
+- Long-lived pooled connections are never recycled.
+Fix: respect the DNS TTL (for example set a short JVM DNS cache TTL), reconnect on errors, or use RDS Proxy or the AWS drivers designed for fast failover.
+W: App caches the old IP beyond the TTL: RDS has already updated the endpoint, so servers that keep a stale resolution keep hitting the old primary until they resolve the name again.
+X: A=RDS does not update DNS: updating the endpoint's DNS record is exactly how Multi-AZ failover redirects clients.
+B=Failover takes up to 24 hours: Multi-AZ failovers typically complete within minutes, and the stem says it already completed.
+D=Standby in the same AZ: a Multi-AZ standby is always placed in a different Availability Zone, and its location would not explain clients using a stale IP.
+T: After a Multi-AZ failover, always connect by the DNS endpoint and honor its TTL; clients that cache the old IP keep failing.
+
+@ Q000786 explain
+G: ## Two kinds of RDS backups
+- **Automated backups**: RDS takes a daily snapshot during the backup window and also saves the **transaction logs** continuously. With a retention period of 1 to 35 days, you can do a **point-in-time restore (PITR)** to any second between the start of retention and the latest restorable time (usually within the last few minutes).
+- **Manual DB snapshots**: you create them yourself; each one captures the database at the moment it was taken and is kept until you delete it. Restoring one returns exactly that moment, nothing in between.
+Example: data was deleted at 14:32:10 five days ago. With 7-day retention you restore to 14:32:09 on that day. A restore always creates a **new** DB instance with a new endpoint; you then repoint the app or copy the missing data back.
+W: Automated backups with PITR: the daily snapshot plus stored transaction logs lets RDS rebuild the database to any second within the retention period, which a manual snapshot cannot do.
+X: A=Identical for point-in-time restore: manual snapshots restore only to the moment they were taken, so they are not interchangeable with PITR.
+B=PITR only for Aurora: standard RDS engines support point-in-time restore from automated backups.
+C=Manual snapshots restore to any second: this reverses the two; any-second restore comes from automated backups with transaction logs.
+T: For a restore to an exact second, use automated backups with point-in-time recovery; manual snapshots restore only to the moment they were created.
+
+@ Q000787 explain
+G: ## How EBS snapshots store data
+EBS snapshots are **incremental**: the first snapshot of a volume stores all blocks that contain data, and each later snapshot stores only the blocks that changed since the previous one. With about 5 GB of daily change on a 1 TB volume, later snapshots add roughly 5 GB each.
+Each snapshot is still **complete on its own for restore**: it references every block it needs, whether that block was saved in this snapshot or an earlier one.
+## What deleting a snapshot does
+When you delete a snapshot, EBS removes only the data that **no other snapshot references**. Blocks still needed by later snapshots are kept.
+- Deleting the first snapshot therefore does not break later snapshots.
+- It may also save little storage, because most of its blocks are still referenced by newer snapshots.
+W: Later snapshots stay restorable: EBS tracks block references, so only data unique to the deleted snapshot is removed and every remaining snapshot can still restore the full volume.
+X: B=Each snapshot is a full 1 TB copy: snapshots are incremental, so deleting one frees only its unreferenced blocks, not 1 TB.
+C=Snapshots hold only metadata: snapshots store actual volume data blocks, and deleting one can free storage for blocks no other snapshot uses.
+D=Later snapshots break: EBS keeps any block a remaining snapshot needs, so there is no fragile chain to break.
+T: EBS snapshots are stored incrementally but restored independently; deleting one never breaks the others, it only frees blocks nobody else needs.
+
+@ Q000788 explain
+G: ## S3 Versioning
+With **Versioning** enabled, S3 keeps every version of an object.
+- An overwrite creates a new version; the older one stays and can be restored.
+- A simple delete (without a version ID) only adds a **delete marker**; the data is still there, and removing the marker brings the object back.
+- Permanent removal happens only when someone deletes a specific **version ID**.
+## MFA Delete
+**MFA Delete** adds a second factor to the two dangerous operations: permanently deleting an object version and changing the bucket's versioning state (for example suspending it). It can be enabled only by the bucket owner's **root user**, through the AWS CLI or API, and requires the MFA code with each such request.
+Related: **S3 Object Lock** (write-once-read-many) is another way to block deletion for a fixed retention period.
+W: Versioning with MFA Delete: Versioning makes overwrites and deletes recoverable, and MFA Delete prevents a version from being permanently deleted, or versioning suspended, without an MFA code.
+X: A=S3 Object Lambda: it transforms data as it is returned to a caller (for example redacting fields); it does not preserve old versions or block deletes.
+B=S3 Transfer Acceleration: it speeds up long-distance uploads and downloads through edge locations; it offers no recovery of overwritten or deleted objects.
+D=S3 Intelligent-Tiering alone: it moves objects between access tiers to save cost; an overwrite or permanent delete is just as final there.
+T: Recoverable overwrites and deletes come from Versioning, and MFA Delete (or Object Lock) protects those versions from permanent deletion; the other S3 features address speed, cost or data transformation.
+
+@ Q000789 explain
+G: ## Versioning: protection inside one bucket
+**S3 Versioning** keeps prior versions when objects are overwritten and adds a delete marker when they are deleted, so you can recover from mistakes and bad writes. All versions live in the same bucket in the same Region.
+## Cross-Region Replication: a copy in another Region
+**CRR** copies new objects asynchronously to a bucket in a different Region.
+- It **requires Versioning on both** the source and destination buckets.
+- It protects against losing access to data in the source Region, and can also meet data-residency or latency needs.
+- Deleting a specific version in the source is not replicated, and delete markers are replicated only if you enable that, so the copy can also help after some deletes, but that is not its main purpose.
+Used together: Versioning handles "someone overwrote or deleted it", and CRR handles "the whole Region is unavailable".
+W: Versioning guards overwrites and deletes; CRR adds a copy in another Region: the two protect against different failures and are designed to be combined.
+X: A=CRR removes the need for versioning: CRR cannot be configured unless versioning is enabled on both buckets.
+C=Identical protection in all scenarios: versioning alone offers no second Region, and CRR without versioning cannot exist, so their protection clearly differs.
+D=CRR protects deletion, versioning protects Regional failure: this reverses the roles; versions stay in the same Region, and it is replication that provides the cross-Region copy.
+T: Versioning is for recovering from overwrites and deletes; Cross-Region Replication, which needs versioning, adds an out-of-Region copy for disaster recovery.
+
+@ Q000790 explain
+G: ## Backups for Amazon FSx for Windows File Server
+FSx for Windows File Server is a fully managed file system; you do not see or manage the underlying disks. It has built-in backup options:
+- **Automatic daily backups**: taken during a daily backup window you choose and kept for a retention period you set (up to 90 days).
+- **User-initiated backups**: taken on demand and kept until you delete them.
+- **AWS Backup**: central backup plans with schedules, retention rules, lifecycle, cross-Region and cross-account copies, shared with EC2, EBS, RDS and other services.
+Backups are file-system-consistent, incremental after the first, and stored durably by AWS. Restoring creates a new file system from the backup.
+W: AWS Backup or FSx automatic backups: both are managed, scheduled, consistent backups with defined retention, which is exactly what the team needs.
+X: A=Snapshots of underlying EBS volumes: FSx does not expose its storage volumes to you, so there are no volumes you could snapshot.
+B=S3 Versioning on FSx: Versioning is a setting of an S3 bucket; an FSx file system is not an S3 bucket and has no such option.
+D=Scheduled CLI copies to S3: it is custom tooling that must be maintained, is not file-system consistent, and loses Windows metadata such as ACLs unless handled specially.
+T: Back up FSx for Windows with its built-in automatic backups or AWS Backup; you cannot snapshot its disks or version it like a bucket.
+
+@ Q000791 explain
+G: ## The four common DR strategies
+Ordered from cheapest and slowest to most expensive and fastest recovery:
+- **Backup and restore**: only backups exist in the recovery Region; recovery takes hours because everything is rebuilt.
+- **Pilot light**: data is replicated and core infrastructure is defined, but compute is off or minimal; servers are started and scaled at failover.
+- **Warm standby**: a **fully working but scaled-down** copy runs all the time; at failover it is scaled up and traffic is shifted, so recovery is typically minutes.
+- **Multi-site active-active**: full capacity runs in more than one Region and all serve traffic; recovery is close to immediate, and cost is highest because everything runs twice.
+Example: warm standby may run 2 small instances against production's 20, ready to scale out.
+W: Warm standby is a scaled-down running copy: it recovers faster than pilot light because it already works, and costs less than active-active because it is not at full size, although it recovers more slowly than active-active.
+X: A=Warm standby runs no compute: that describes backup and restore or pilot light; warm standby's defining feature is a small working environment that is always running.
+B=Active-active recovers more slowly: active-active already serves traffic at full scale in several sites, so it recovers fastest of all the strategies.
+D=Identical recovery times and costs: warm standby needs a scale-up at failover, while active-active runs full capacity everywhere, so both time and cost differ.
+T: DR strategies trade cost for recovery speed: warm standby is a running scaled-down copy, cheaper but slower to recover than active-active.
+
+@ Q000792 explain
+G: ## How AWS Backup gets permission to back things up
+A backup plan assigns resources to a schedule, and each job runs using the **IAM role** chosen in the resource assignment (often `AWSBackupDefaultServiceRole` with the `AWSBackupServiceRolePolicyForBackup` managed policy). AWS Backup calls each service's APIs as that role.
+- EBS backups need EC2 snapshot permissions.
+- RDS backups need RDS permissions, such as creating and describing DB snapshots and adding tags.
+- Encrypted resources may also need permission on the **KMS key**.
+If the role (or a permission boundary or SCP) is missing the actions for one service, only that service's jobs fail with an access-denied error, while other types in the same plan succeed.
+W: Backup role lacks RDS permissions: the per-resource-type failure with access denied points to IAM permissions for RDS actions; attach the AWS Backup managed policy or add the missing RDS (and KMS) permissions.
+X: A=Different VPC: AWS Backup works through service APIs, not over the VPC network, so VPC placement does not affect backups.
+B=One resource type per plan: a single backup plan can cover many resource types, such as EBS, RDS, DynamoDB and EFS together.
+C=RDS not supported: Amazon RDS is a supported AWS Backup resource type, and the error is access denied, not unsupported.
+T: When AWS Backup jobs fail with access denied for one resource type only, check that the backup IAM role (and any KMS key policy) allows that service's actions.
+
+@ Q000793 explain
+G: ## EC2 Image Builder
+EC2 Image Builder automates the "golden AMI" lifecycle with managed pipelines:
+- **Image recipe**: a base image plus **build components** (for example install updates, apply CIS hardening, install agents).
+- **Test components**: launched automatically against the new image; if they fail, the image is not distributed.
+- **Infrastructure configuration**: instance type, subnet and IAM role used for the build.
+- **Distribution settings**: copy the AMI to Regions, share it with other AWS accounts or an organization, and **update launch templates** to reference the new AMI.
+- **Schedule**: run the pipeline on a cron schedule (such as monthly) or when dependency updates are available.
+Example: a monthly pipeline patches Amazon Linux, runs CIS hardening and tests, shares the AMI with 15 accounts and updates the ASG launch templates.
+W: EC2 Image Builder: one managed pipeline covers every requirement, building, hardening, testing, sharing with other accounts and updating launch templates on a schedule.
+X: A=Patch Manager on running instances: it patches existing instances in place; it does not produce, test or distribute new AMIs.
+B=CodeBuild calling CreateImage: it could snapshot an instance into an AMI, but hardening, testing, cross-account sharing and launch template updates would all be custom scripting.
+D=AWS Backup AMI copies: AWS Backup protects and copies existing instances or images for recovery; it does not patch, harden or test an image.
+T: For scheduled, tested, shared golden AMIs that update launch templates, use EC2 Image Builder rather than patching live instances or scripting builds.
+
+@ Q000794 explain
+G: ## Image Builder for container images
+EC2 Image Builder supports **container recipes** as well as AMI recipes. A container recipe defines:
+- A **base (parent) image**, such as an Amazon Linux or Ubuntu image.
+- **Build components** that apply patches, hardening and security agents.
+- **Test components** that validate the image before it is published.
+- A **target Amazon ECR repository**, set through distribution settings (it can also distribute to repositories in other Regions).
+The pipeline can run on a schedule or be configured to run only when dependency updates are available, such as an updated base image or component version, so patches trigger rebuilds without anyone watching for them. Image Builder launches and terminates the build and test instances itself, so no custom build servers are needed.
+W: Image Builder container pipeline with tests, output to ECR: it rebuilds the hardened image automatically, blocks publishing if tests fail, and pushes to ECR with managed tooling rather than custom scripts.
+X: A=CodeDeploy scheduled redeploys: CodeDeploy deploys an existing application revision; it does not rebuild or patch a container image.
+B=Manual workstation rebuilds: they depend on a person noticing each patch, are inconsistent between builds, and run no standard automated tests.
+C=S3 lifecycle rule: lifecycle rules transition or expire S3 objects; they cannot trigger a container build.
+T: To keep a hardened container image patched and tested in ECR with minimal tooling, use an EC2 Image Builder container pipeline.
+
+@ Q000795 explain
+G: ## Infrastructure as code with CloudFormation
+An AWS CloudFormation **template** (YAML or JSON) declares resources such as a VPC, load balancer, Auto Scaling group and database. Deploying it creates a **stack**, which CloudFormation tracks as one unit.
+- **Same environment everywhere**: deploy the same template as `dev`, `test` and `prod` stacks, with **parameters** for differences such as instance size. StackSets can deploy it across accounts and Regions.
+- **Preview updates**: a **change set** lists what will be added, modified or replaced before you execute it, so replacements of stateful resources are visible in advance.
+- **Clean teardown**: deleting the stack deletes the resources it created (with `DeletionPolicy: Retain` or `Snapshot` for resources you want to keep).
+- **Drift detection** shows resources changed outside CloudFormation.
+W: CloudFormation stacks with change sets: templates create identical environments, change sets preview each update, and stack deletion removes everything cleanly.
+X: A=AWS Config rules: Config records and evaluates resource configurations for compliance; remediation actions can fix settings but it is not a way to provision a complete environment or preview changes.
+B=AMI copies: an AMI captures only an instance's disk; it does not create the network, load balancers, databases or permissions of a three-tier environment.
+C=Manual console creation from a runbook: it is slow and error prone, environments drift apart, there is no preview of changes, and teardown is manual.
+T: Identical, previewable and cleanly removable environments come from infrastructure as code: CloudFormation templates as stacks, with change sets for updates.

@@ -1,0 +1,335 @@
+# SOA-C03 detailed explanations, e09 (explanation-only rewrites; letters are the published ones)
+
+@ Q002723 explain
+G: ## Checking a path without sending packets
+**VPC Reachability Analyzer** is a configuration analysis tool. You choose a source and a destination (for example two network interfaces, an instance and an internet gateway, or an endpoint behind a transit gateway), plus optional protocol and port, and it builds a model of the network from your settings.
+- It walks every hop: route tables, security groups, network ACLs, peering or transit gateway attachments, load balancers and gateways.
+- If a path exists, it shows each hop. If not, it names the blocking component, such as a missing route or a security group without a matching rule.
+- No traffic is sent, so it works for paths that are not live yet and does not depend on the application.
+Example: source `eni-aaa` in `10.1.0.0/16`, destination `eni-bbb` in `10.2.0.0/16` on TCP 5432. The analysis reports "not reachable" and points to the transit gateway route table that lacks `10.2.0.0/16`.
+W: Reachability Analyzer: it reasons over the actual configuration hop by hop and reports whether a path exists and which component blocks it, all without sending a single packet.
+X: A=Trusted Advisor: it runs best-practice checks (cost, security, limits) and does not trace a path between two specific network interfaces.
+C=Flow Logs queries: flow logs only record traffic that was actually attempted, so they need packets to flow and cannot say why a path is missing.
+D=CloudWatch Synthetics: canaries send real requests to an endpoint on a schedule; that is active testing with traffic, the opposite of what is asked.
+T: To prove a path exists (or find what blocks it) from configuration alone, use Reachability Analyzer; flow logs and canaries depend on real traffic.
+
+@ Q002724 explain
+G: ## What VPC Flow Logs record
+Flow logs capture IP traffic metadata for a VPC, a subnet or a single network interface and publish it to CloudWatch Logs, S3 or Data Firehose. Each record summarizes one flow over an aggregation interval.
+- Default fields include `srcaddr`, `dstaddr`, `srcport`, `dstport`, `protocol`, `packets`, `bytes` and `action`.
+- `action` is `ACCEPT` or `REJECT`, reflecting security group and network ACL decisions.
+- Flow logs do not capture packet contents and are not delivered instantly; records arrive after a short delay.
+Example: filter the interface's log group for `srcaddr = 203.0.113.25`. A record for port 443 whose `action` field is `REJECT` shows that a security group or network ACL dropped the traffic; `ACCEPT` means it was allowed through.
+W: VPC Flow Logs on the interface: they record the source IP, destination port and an ACCEPT or REJECT action for each flow, which answers exactly whether that IP's traffic was allowed.
+X: A=CloudTrail management events: they log API calls such as `AuthorizeSecurityGroupIngress`, not the packets that arrive at an instance.
+B=S3 server access logs: they record requests made to an S3 bucket, not network traffic reaching an EC2 network interface.
+C=Config configuration history: it shows how security groups and other resources changed over time, not whether a specific connection was accepted.
+T: Accepted versus rejected packets from a given IP live in VPC Flow Logs; CloudTrail and Config describe API calls and configuration, not traffic.
+
+@ Q002725 explain
+G: ## What a VPC peering connection needs
+A peering connection links two VPCs privately, but it only works when several pieces line up:
+- **Non-overlapping CIDRs**: every address must belong to exactly one side. AWS rejects a peering request between VPCs with matching or overlapping ranges, so the ranges are a prerequisite to confirm.
+- **Routes on both sides**: after the connection is accepted, each VPC's route table needs a route to the other VPC's CIDR with the `pcx-...` connection as the target. A route on only one side means replies have no way back.
+- **Filtering**: security groups (already fine here) and network ACLs must allow the traffic.
+- Peering is not transitive and does not use an internet gateway.
+Example: VPC A `10.0.0.0/16` needs `10.1.0.0/16 -> pcx-123` in the subnets' route tables, and VPC B needs `10.0.0.0/16 -> pcx-123`.
+W: A=Routes to the peer CIDR in both VPCs: without a route pointing to the peering connection on each side, packets or their replies are sent elsewhere, so instances cannot talk even with open security groups.
+E=Non-overlapping CIDR blocks: peering needs every address to be unique across the two VPCs; overlapping ranges cannot be peered and routed.
+X: B=Internet gateways: peered traffic stays on the AWS private network and never uses an internet gateway, so attaching one does not help.
+C=CloudFront: a CDN in front of web content has nothing to do with instance-to-instance traffic over peering.
+D=Same subnet count: the number of subnets in each VPC is irrelevant to routing across the peering connection.
+T: Peering works only with non-overlapping CIDRs and a route to the peer on both sides; gateways and CDNs play no role.
+
+@ Q002726 explain
+G: ## Public versus private hosted zones
+Route 53 hosts DNS records in **hosted zones**.
+- A **public hosted zone** answers queries from anywhere on the internet.
+- A **private hosted zone** answers only queries that come from VPCs associated with it, through the Route 53 Resolver at the VPC's `+2` address.
+The VPCs need `enableDnsSupport` and `enableDnsHostnames` turned on. You can associate one private zone with many VPCs, including VPCs in other accounts after an authorization step. The same domain name can also exist as a public zone with different answers (split-view DNS).
+Example: create the private zone `corp.internal`, associate it with the production and shared-services VPCs, and add `db.corp.internal` pointing to `10.0.4.15`. Instances in those VPCs resolve it; nobody on the internet can.
+W: Private hosted zone associated with the VPCs: Route 53 answers its records only for queries from those VPCs, which keeps the internal domain invisible outside them.
+X: A=Health checks: they monitor endpoint availability for failover routing and do not restrict who can resolve a record.
+B=Public zone with long TTL: a public zone is answered on the internet, and TTL only controls how long resolvers cache answers, not who can see them.
+D=Geolocation record: it varies answers by the requester's location but still serves them publicly; it does not limit resolution to VPCs.
+T: Internal-only DNS means a private hosted zone associated with the VPCs; public zones, TTLs and routing policies do not limit visibility.
+
+@ Q002727 explain
+G: ## Hybrid connectivity options
+Two AWS services create network links between an on-premises site and a VPC:
+- **AWS Site-to-Site VPN**: IPsec tunnels over the internet from your customer gateway device to a virtual private gateway or transit gateway. Each connection has two tunnels for redundancy, is quick to set up, and is encrypted by design.
+- **AWS Direct Connect**: a dedicated private connection from your network to AWS at a Direct Connect location. It gives more consistent latency and bandwidth. It is not encrypted by IPsec by default; you can add MACsec on supported connections or run a VPN over it.
+Example: a company starts with a Site-to-Site VPN in days, then orders Direct Connect for steady bulk traffic and keeps the VPN as backup.
+W: D=Site-to-Site VPN: it builds encrypted IPsec tunnels between the data center's router and the VPC's gateway, giving private routing to the VPC.
+E=Direct Connect: it provides a dedicated physical link into AWS, with virtual interfaces that reach the VPC privately.
+X: A=Global Accelerator: it gives internet users static anycast IPs to reach AWS endpoints; it does not create a routed link from a data center into a VPC.
+B=CloudFront: a CDN caches and delivers content to viewers at edge locations; it does not connect a private network to a VPC.
+C=Route 53: it provides DNS resolution and routing of names; DNS does not carry network traffic between sites.
+T: On-premises to VPC means Site-to-Site VPN or Direct Connect; Global Accelerator, CloudFront and Route 53 serve users on the internet or names, not network links.
+
+@ Q002728 explain
+G: ## How ALB timeouts produce 504s
+An Application Load Balancer keeps a front-end connection with the client and a back-end connection with the target. The **idle timeout** (default 60 seconds) closes a connection if no data is sent in either direction for that long.
+- If the target has not responded before the idle timeout expires, the ALB gives up and returns **HTTP 504 Gateway Timeout** to the client.
+- Health checks can still pass, because they call a fast path such as `/health`.
+- Fixes: speed up the slow request, return data periodically, raise the idle timeout (it can be set as high as 4,000 seconds), or move long jobs to an asynchronous pattern.
+Example: a report endpoint that takes 75 seconds fails with 504 every time, while other pages work. Setting `idle_timeout.timeout_seconds` to 120 or making the report asynchronous removes the errors.
+W: Idle timeout exceeded: requests slower than the 60-second default leave the connection idle until the ALB closes it and returns 504, which matches healthy targets with only some slow requests failing.
+X: A=Missing outbound rule to the internet: the ALB talks to targets inside the VPC; a missing rule toward targets would break all requests and health checks, not only the slow ones.
+C=HTTP health checks: the health check protocol only decides target health; targets are healthy, and it does not affect the timeout of normal requests.
+D=Long Route 53 TTL: DNS caching affects which IPs clients resolve, not whether a request that already reached the ALB times out.
+T: ALB 504 with healthy targets and long requests means the idle timeout expired before the target answered; raise the timeout or speed up the backend.
+
+@ Q002729 explain
+G: ## What Global Accelerator does
+**AWS Global Accelerator** gives an application two static anycast IPv4 addresses announced from AWS edge locations worldwide. Clients connect to the nearest edge, and traffic then travels over the AWS global network to an endpoint group in a Region.
+- Works at layer 4 for **TCP and UDP**, so it suits games, VoIP and other non-HTTP protocols.
+- Health checks detect unhealthy endpoints, and traffic shifts to healthy Regions within seconds; clients keep the same IPs, so there is no waiting for DNS caches to expire.
+- Endpoints can be NLBs, ALBs, EC2 instances or Elastic IPs; traffic dials and weights control the split between Regions.
+Example: a game uses NLBs in `us-east-1` and `eu-west-1`. Players connect to the two static IPs; if the US endpoint fails, their UDP traffic moves to Europe without a client change.
+W: Global Accelerator: it provides static anycast IPs, carries both TCP and UDP, and fails over between Regional endpoints quickly without relying on DNS changes.
+X: B=NLB in one Region: an NLB supports TCP and UDP but lives in one Region, so there is no failover to another Region.
+C=Route 53 simple routing: simple routing returns fixed records with no health-based failover, and any DNS approach is delayed by client caching and gives no static anycast IPs.
+D=CloudFront: it is designed for HTTP and HTTPS content delivery and does not accelerate arbitrary UDP game traffic.
+T: Static anycast IPs plus fast multi-Region failover for TCP/UDP is Global Accelerator; DNS or single-Region load balancers cannot give both.
+
+@ Q002730 explain
+G: ## Standard versus high-resolution metrics
+CloudWatch metrics have a **storage resolution**:
+- **Standard resolution**: one-minute granularity (AWS service metrics often arrive every one or five minutes).
+- **High resolution**: one-second granularity, available for custom metrics. You set `StorageResolution=1` in `PutMetricData`, or configure the CloudWatch agent or embedded metric format to do so.
+Alarms on high-resolution metrics can use periods of 10, 20 or 30 seconds (or any multiple of 60), so a short spike can trigger an alarm before a one-minute average smooths it away. High-resolution alarms cost more than standard-resolution alarms, and one-second data points are rolled up to coarser resolution as they age (kept at one-second detail for 3 hours).
+Example: a queue-processing app publishes `InFlightJobs` every second with `StorageResolution=1`; an alarm with a 10-second period and 2 of 3 datapoints catches a 20-second burst.
+W: High-resolution custom metrics with a 10-second alarm: they keep one-second data points and allow sub-minute alarm periods, so brief spikes are evaluated instead of being averaged away.
+X: A=Five-minute standard metrics: aggregating to five minutes hides spikes that last only seconds, the exact problem to avoid.
+C=VPC Flow Logs: they record network flow metadata, not application custom metrics, and one-minute aggregation is still too coarse.
+D=CloudTrail data events: they log API calls for auditing, not a numeric metric that alarms can evaluate every second.
+T: For second-level spikes, publish high-resolution custom metrics and alarm on a sub-minute period; standard-resolution data averages spikes away.
+
+@ Q002731 explain
+G: ## CloudWatch anomaly detection
+A static threshold alarm compares a metric to one fixed number. Many metrics follow patterns, such as low latency at night and higher latency at lunchtime, so one number either fires too often or misses real problems.
+**Anomaly detection** trains a model on the metric's history, including hourly, daily and weekly patterns, and draws an expected **band** around the metric.
+- An alarm uses the `ANOMALY_DETECTION_BAND` function and fires when the value goes above, below, or outside the band.
+- The band width is set in standard deviations (default 2); a wider band means fewer alerts.
+- The model keeps updating as new data arrives.
+Example: latency is normally 80 ms at 03:00 and 200 ms at 12:00. An anomaly detection alarm fires for 180 ms at 03:00, which a 250 ms static threshold would never catch.
+W: Anomaly detection alarm: it learns the metric's normal daily pattern and alarms when latency leaves the expected band, which is exactly "deviates from its usual pattern".
+X: A=Dashboard: it displays data for people to look at but sends no notification when behavior changes.
+B=Metric math sum: adding two metrics creates a new series but does not learn a pattern or define what "unusual" means.
+D=Static threshold at the average: one fixed number ignores the daily cycle, causing false alarms at busy times or missed anomalies at quiet times.
+T: Alerting on deviation from normal patterns means anomaly detection bands; static thresholds cannot follow a daily cycle.
+
+@ Q002732 explain
+G: ## Log group retention
+Every CloudWatch Logs log group has a **retention setting**. By default it is "Never expire", so logs are kept (and billed) forever.
+- You can choose a value from 1 day up to 10 years, including 90 days.
+- CloudWatch Logs deletes log events older than the setting automatically; there is no job to maintain.
+- Set it in the console, with the `PutRetentionPolicy` API (`aws logs put-retention-policy --log-group-name app --retention-in-days 90`), or in CloudFormation with `RetentionInDays`.
+If logs must be kept longer for compliance, export or stream them to S3 and apply S3 lifecycle rules there.
+Example: `/app/web` set to 90 days keeps events from the last three months and removes older events without further action.
+W: 90-day retention on the log group: it is a built-in setting that automatically expires log events older than 90 days with no code or schedule to run.
+X: A=Metric filter: metric filters turn matching log text into metric values; they cannot delete log events.
+B=Hourly Lambda: custom deletion code is extra work and cost to maintain when a native retention setting already does the job.
+C=S3 lifecycle rule: lifecycle rules act on objects in S3 buckets and cannot be attached to a CloudWatch Logs log group.
+T: Automatic expiry of CloudWatch logs is the log group's retention setting; lifecycle rules belong to S3.
+
+@ Q002733 explain
+G: ## CloudWatch cross-account observability
+Cross-account observability lets one **monitoring account** view telemetry from many **source accounts** without copying it.
+- In the monitoring account you create a **sink**; each source account creates a **link** to it and chooses which data to share, such as metrics, log groups, traces and Application Signals data.
+- With AWS Organizations you can link all accounts in an organization or OU at once.
+- From the monitoring account you can build dashboards, run Logs Insights queries, and create alarms on metrics from source accounts; the data stays in the source accounts.
+Example: a platform team links 20 workload accounts to its monitoring account and runs one Logs Insights query across all their `/app/api` log groups.
+W: CloudWatch cross-account observability: source accounts link to a central monitoring account that queries their metrics, logs and traces in place, so nothing is copied.
+X: A=Separate dashboards per account: each dashboard sees only its own account, so the team would still switch between 20 accounts.
+B=Shared IAM user: shared long-term credentials break security and auditing, and still show one account at a time instead of a combined view.
+D=Daily exports to S3: exporting copies the data, adds up to a day of delay, and loses the native CloudWatch metrics and alarm experience.
+T: Central viewing of many accounts' telemetry without copying is cross-account observability; exports copy data and shared users are insecure.
+
+@ Q002734 explain
+G: ## Metric math
+**Metric math** lets you compute new time series from existing metrics with expressions, and alarm on the result.
+- Each input metric gets an id such as `m1` and `m2`; an expression such as `100*(m1/m2)` returns a new series.
+- Functions such as `SUM`, `RATE`, `FILL` and `IF` handle gaps and conditions.
+- An alarm can evaluate the expression just like a single metric.
+Example for an ALB: `m1 = HTTPCode_Target_5XX_Count`, `m2 = RequestCount`, both `Sum` over 1 minute. The expression `e1 = 100*(m1/m2)` gives the error percentage, and an alarm fires when `e1 > 5` for 3 of 5 periods. A raw count alarm would fire during high traffic even when the error rate is low.
+W: Metric math in an alarm: it divides the 5XX count by total requests to create an error-rate series, and the alarm evaluates that computed ratio directly.
+X: A=Subscription filter: it streams log events to destinations like Lambda or Kinesis; it does not compute a ratio of two metrics for an alarm.
+C=CloudTrail Insights: it detects unusual API call volume or API error rates in CloudTrail events, not application request metrics.
+D=Composite alarm: it combines the states (OK or ALARM) of other alarms with AND and OR; it cannot divide one metric value by another.
+T: Ratios such as error rate are metric math expressions; composite alarms combine alarm states, not metric values.
+
+@ Q002735 explain
+G: ## CPU credits on burstable instances
+T-family instances (such as `t3.medium`) earn CPU credits while running below a **baseline** and spend them to burst above it.
+- **Standard mode**: when the credit balance reaches zero, the instance is held at its baseline CPU, so performance drops.
+- **Unlimited mode**: the instance can keep bursting after credits run out; extra usage is billed as surplus credits. T3, T3a and T4g launch in unlimited mode by default, so this instance was explicitly set to standard.
+- If CPU stays high for long periods, a fixed-performance type (for example M or C family) is often cheaper than paying for constant surplus.
+Watch `CPUCreditBalance` and `CPUSurplusCreditBalance` in CloudWatch.
+Example: a `t3.medium` has a 20 percent baseline per vCPU; a daily batch at 80 percent drains its credits by mid-afternoon and the job slows down.
+W: Unlimited mode or a fixed-performance type: unlimited mode lets the instance keep bursting past a zero credit balance, and a non-burstable type provides full CPU all the time with no credits.
+X: B=Larger root EBS volume: disk size affects storage (and gp2 I/O), not CPU credits or the CPU baseline.
+C=Elastic IP: it only gives the instance a static public IP address; it has no effect on compute performance.
+D=Detailed monitoring: it publishes metrics every minute for visibility but does not add CPU or credits.
+T: Burstable instances throttled at zero credits need unlimited mode or a fixed-performance type; storage, IPs and monitoring do not add CPU.
+
+@ Q002736 explain
+G: ## Scheduled stop of instances
+Two services combine for time-based operations:
+- **Amazon EventBridge Scheduler** runs a one-time or recurring schedule, such as the cron expression `cron(0 20 * * ? *)` with a time zone, and can call many AWS APIs directly as its target.
+- **Systems Manager Automation** runs runbooks such as `AWS-StopEC2Instance`. Automation can target instances by tag (for example `Environment=dev`) with rate controls and records every execution.
+Schedule, target, and IAM role together make a hands-off job: every night at 20:00 the schedule starts the automation, which stops each tagged instance. A matching morning schedule can start them again.
+Stopped EBS-backed instances do not incur instance-hour charges (EBS volumes are still billed).
+W: EventBridge Scheduler plus SSM Automation: the schedule fires at 20:00 every night, and the runbook stops exactly the instances carrying the dev tag, with an auditable execution history.
+X: A=CPU alarm that terminates: termination deletes instances rather than stopping them, low CPU is not the same as "after 20:00", and busy dev instances would never be stopped.
+B=S3 lifecycle rule: lifecycle rules transition or expire S3 objects; they cannot act on EC2 instances.
+C=IAM deny after 20:00: a deny only blocks API calls by users; it does not stop running instances, which keep running and costing money.
+T: Time-based stop of tagged instances is a schedule (EventBridge Scheduler) driving an action (SSM Automation); IAM denies and alarms do not stop instances on a clock.
+
+@ Q002737 explain
+G: ## Lambda timeout and memory
+Each Lambda function has two key settings:
+- **Timeout**: the maximum run time per invocation (up to 900 seconds). If the function is still running, Lambda stops it and records a timeout.
+- **Memory**: from 128 MB up to 10,240 MB. Lambda allocates CPU in proportion to memory, so more memory also makes CPU-bound code (such as image resizing or parsing large files) run faster.
+Each invocation writes a `REPORT` line to CloudWatch Logs with `Duration`, `Billed Duration`, `Memory Size` and `Max Memory Used`, and the `Duration` metric shows the trend.
+Example: timeout 30 seconds, and large uploads take 28-35 seconds. Raising memory from 512 MB to 1,536 MB cuts duration to 12 seconds; raising the timeout adds headroom.
+W: Timeout and memory versus actual duration: runs close to the limit mean the function either needs a longer timeout or more memory (and therefore more CPU) to finish in time.
+X: A=CloudFront cache behavior: S3 event notifications invoke the function directly, so a CDN in front of files plays no part in processing time.
+B=S3 storage class of older objects: new uploads are in the class they were written to, and storage class of old objects does not make the function slow; archive classes would give access errors, not timeouts.
+D=Route 53 hosted zone: DNS for an API endpoint is not involved when S3 invokes the function, and it does not explain durations near the limit.
+T: Lambda runs that end near the configured limit call for tuning timeout and memory (which scales CPU), not for changes to unrelated services.
+
+@ Q002738 explain
+G: ## Distributed tracing with X-Ray
+**AWS X-Ray** follows one request through several services.
+- Each service records a **segment**; calls it makes, such as a DynamoDB `GetItem`, become **subsegments** with their own timing.
+- A **trace ID** passed in the `X-Amzn-Trace-Id` header ties the pieces together.
+- The **trace map** (service map) shows each node with average latency and error rate, and single traces show a timeline of where time was spent.
+To set it up, enable active tracing on the API Gateway stage and the Lambda function, and instrument the AWS SDK in the function (X-Ray SDK or OpenTelemetry) so DynamoDB calls appear. Traces are viewed in the CloudWatch console.
+Example: a 900 ms request shows 20 ms in API Gateway, 80 ms of Lambda code, and 780 ms in a DynamoDB `Scan` subsegment, which points directly to the fix.
+W: AWS X-Ray: it traces a request across API Gateway, Lambda and DynamoDB and breaks the latency into segments, showing which hop is slow.
+X: B=AWS Batch: it schedules and runs batch computing jobs; it provides no request tracing.
+C=AWS Config: it records resource configurations and compliance, not per-request timing.
+D=Amazon Macie: it discovers sensitive data such as PII in S3 and has nothing to do with latency.
+T: Finding which service in a request chain adds latency is distributed tracing, which is AWS X-Ray.
+
+@ Q002739 explain
+G: ## S3 request rates scale per prefix
+A **prefix** is the part of an object key before the object name, such as `logs/2026/09/` in `logs/2026/09/app.gz`. S3 supports at least **3,500 PUT/COPY/POST/DELETE** and **5,500 GET/HEAD requests per second per partitioned prefix**.
+- There is no limit on the number of prefixes, so spreading keys across more prefixes raises total throughput.
+- When one prefix receives traffic faster than S3 can scale, it returns `503 Slow Down`. S3 scales automatically over time, and clients should retry with exponential backoff.
+Example: all images go to `img/`. Writing them as `img/a1/`, `img/b7/` and so on (for example by a hash) lets reads run across many prefixes in parallel.
+W: More prefixes: request limits apply per prefix, so distributing objects across many prefixes multiplies the request rate the application can reach and removes the 503 throttling.
+X: A=Object Lock in compliance mode: it makes objects immutable for retention; it does not change request limits and would block deletes.
+C=Disable versioning: versioning cannot be disabled once enabled (only suspended), and the number of versions does not set the per-prefix request rate.
+D=Glacier Deep Archive: objects there must be restored (taking hours) before reading, which would break an application serving live requests.
+T: S3 throughput scales with the number of prefixes; spread keys and retry with backoff instead of changing storage features.
+
+@ Q002740 explain
+G: ## Why Lambda overwhelms database connections
+Each concurrent Lambda execution environment opens its own database connection. A burst to 500 concurrent invocations can mean 500 connections, and PostgreSQL's `max_connections` is sized by instance memory, so the database refuses new clients or spends memory on idle ones.
+**Amazon RDS Proxy** sits between the application and the database:
+- It keeps a **pool** of connections to the database and shares them among many client connections.
+- It queues or limits clients when the pool is busy, protecting the database.
+- It can use IAM authentication and Secrets Manager for credentials, and it speeds up failover by keeping client connections open.
+Example: 500 Lambda environments connect to the proxy endpoint, while the proxy opens far fewer real database connections, capped by `MaxConnectionsPercent` (a percentage of the database's `max_connections`).
+W: RDS Proxy: it pools and reuses database connections, so many short-lived Lambda clients share a small number of real connections and the limit is no longer reached.
+X: A=SQS FIFO: a queue could buffer work, but it does not pool database connections for functions that query the database directly.
+B=Glue crawlers: they scan data stores to build the Glue Data Catalog; they do nothing about live connection counts.
+C=S3 Select: it filters data inside S3 objects (and is closed to new customers since July 2024); it does not relate to RDS connections.
+T: Connection storms from Lambda to RDS are solved by pooling with RDS Proxy, not by queuing or data tools.
+
+@ Q002741 explain
+G: ## Read replicas versus Multi-AZ
+RDS offers two features that are often confused:
+- **Read replicas** copy data from the primary with asynchronous replication. Each replica has its own endpoint that accepts read-only queries, so reporting and analytics can run there without loading the primary. Replicas can be in the same or another Region.
+- **Multi-AZ DB instance** deployments keep a synchronous standby in another AZ for failover only; the standby cannot accept connections. (A Multi-AZ DB cluster, a separate deployment type, does have two readable standbys; the standby of a Multi-AZ DB instance does not.)
+Because replication is asynchronous, replicas can lag slightly, which is usually acceptable for reports.
+Example: create a read replica of `orders-db`, then point the reporting tool at `orders-db-replica...rds.amazonaws.com`; primary CPU drops while reports keep running.
+W: Read replicas for reporting: replicas serve read-only queries through their own endpoints, moving the heavy report queries off the primary.
+X: B=Multi-AZ standby: a Multi-AZ DB instance standby exists only for failover and does not accept reads, so reports cannot be sent there.
+C=35-day backup retention: longer retention keeps more automated backups but does nothing to reduce query load.
+D=Enhanced Monitoring: it gives OS-level metrics to diagnose load, but it does not move any work off the primary.
+T: Offload reads with read replicas; a Multi-AZ instance standby is for availability, not for serving queries.
+
+@ Q002742 explain
+G: ## Instance store versus EBS
+**Instance store** is disk storage physically attached to the host computer. On current instance types it is NVMe SSD, which gives very high random IOPS and very low latency because I/O does not cross the network.
+- Data survives a reboot but is lost when the instance is stopped, hibernated or terminated, or if the underlying disk fails.
+- Size and count are fixed by the instance type (for example `i4i` or the `d` variants such as `m6id`).
+**EBS** volumes are network-attached and persist independently of the instance. HDD types such as `st1` and `sc1` are built for large sequential reads, not small random I/O.
+Example: a cache or a database replica that can be rebuilt from another source runs on the instance store of an `i4i` instance for maximum IOPS.
+W: Instance store NVMe: local NVMe gives the highest random I/O with sub-millisecond latency, and its ephemeral nature is acceptable because the data can be rebuilt.
+X: A=S3 Standard: S3 is object storage reached over HTTP APIs, not a block device with sub-millisecond random I/O for a database.
+B=EBS st1: throughput-optimized HDD is built for large sequential workloads like logs or data warehouses and performs poorly on small random I/O.
+D=EBS sc1: cold HDD is the lowest-cost, lowest-performance EBS type for infrequently accessed data.
+T: Rebuildable data needing extreme random I/O fits instance store NVMe; HDD EBS types and S3 cannot match its latency.
+
+@ Q002743 explain
+G: ## Two views of user experience
+CloudWatch has two complementary features for measuring how users experience an application:
+- **CloudWatch Synthetics** runs **canaries**, scripts (for example in Node.js or Python) that load pages or call APIs on a schedule and record availability, latency, screenshots and errors. A canary runs in the Region where it is created, so creating canaries in several Regions measures the experience from different geographic locations, even when no real users are active.
+- **CloudWatch RUM** (real user monitoring) adds a JavaScript snippet to a web app. It collects data from real browsers: page load times, Core Web Vitals, JavaScript and HTTP errors, broken down by country, browser and device.
+Example: canaries in `us-east-1`, `eu-west-1` and `ap-northeast-2` check the checkout page every 5 minutes, while RUM shows that real users in one country see slow page loads.
+W: D=CloudWatch RUM: it collects performance data from real users' browsers, including location, so the team sees actual experience by geography.
+E=Synthetics canaries in multiple Regions: scripted checks from several Regions measure availability and latency from those locations on a steady schedule.
+X: A=IAM Access Analyzer findings: they report resources shared outside a trust zone and unused access; they say nothing about page performance.
+B=Config rules on security groups: they evaluate configuration compliance, not how fast the application responds to users.
+C=AWS Backup reports: they summarize backup and restore jobs, unrelated to user-facing performance.
+T: User experience from different places comes from Synthetics canaries (simulated users) plus RUM (real users); access, config and backup reports do not measure it.
+
+@ Q002744 explain
+G: ## Systems Manager Incident Manager
+**Incident Manager**, part of AWS Systems Manager, turns alerts into managed incidents.
+- **Response plans** define what happens when an incident starts: its impact level, which contacts and escalation plans to engage, chat channels, and an Automation **runbook** to run.
+- A CloudWatch alarm or an EventBridge rule can start an incident automatically using a response plan.
+- The incident keeps a timeline, engagement records and post-incident analysis.
+Note: Incident Manager has been closed to new customers since 2025-11-07; existing customers can keep using it, but a new account would need a different incident tool. For this question it is the AWS service built for alarm-driven incidents with runbooks.
+Example: a critical `5XX` alarm starts an incident with the plan `web-critical`, pages the on-call engineer, and runs a runbook that collects diagnostics and restarts the service.
+W: Incident Manager: its response plans open an incident directly from a CloudWatch alarm, engage responders, and run an Automation runbook as the first response.
+X: A=Inspector coverage reports: they show which resources Inspector scans for vulnerabilities; they do not open incidents or run runbooks.
+C=Cost Anomaly Detection: it alerts on unusual spending, not on operational alarms, and has no incident workflow.
+D=Trusted Advisor checks: they give best-practice recommendations and do not react to alarms with incidents or runbooks.
+T: Alarm-driven incidents with responder engagement and runbooks are Incident Manager's job; the other services only report findings.
+
+@ Q002745 explain
+G: ## When an EBS volume is the bottleneck
+Each EBS volume has a performance ceiling: provisioned IOPS for `io1`/`io2`, configurable IOPS and throughput for `gp3`, and a size-based baseline for `gp2`. When `VolumeReadOps` plus `VolumeWriteOps` per second sit at that ceiling, extra requests queue: `VolumeQueueLength` rises and the OS shows high I/O wait.
+- **Elastic Volumes** let you raise IOPS, raise throughput, or change type (for example `gp2` to `gp3`, or to `io2`) while the volume stays in use. After a change you must wait before modifying the same volume again.
+- Also check the instance's EBS bandwidth limit, which can cap performance even when the volume could do more.
+Example: an `io1` volume provisioned at 10,000 IOPS runs flat at 10,000 with a long queue; raising it to 16,000 IOPS or moving to `io2` removes the wait.
+W: More IOPS or a faster volume type: the volume is pinned at its provisioned limit, so raising that limit or moving to a higher-performance type directly relieves the queue.
+X: A=Enable encryption: encryption does not reduce the number of I/O operations, and existing volumes cannot simply be switched to encrypted in place.
+C=Detach and reattach: there is no IOPS counter to reset; the limit is a property of the volume, and detaching only causes an outage.
+D=More frequent snapshots: snapshots do not free I/O capacity; they copy changed blocks to S3 and do nothing to raise the IOPS limit.
+T: At the provisioned IOPS limit, raise IOPS or change the volume type with Elastic Volumes; encryption, reattaching and snapshots do not add capacity.
+
+@ Q002746 explain
+G: ## Health check grace period
+Auto Scaling replaces instances that fail health checks. With ELB health checks turned on, an instance whose application is not yet listening fails them and is marked unhealthy.
+The **health check grace period** tells Auto Scaling how long to wait after an instance enters `InService` before acting on its health check results.
+- If it is shorter than the startup time, new instances are judged unhealthy while still booting and are terminated, which repeats in a loop.
+- Set it slightly longer than the real startup time; lifecycle hooks can also hold an instance in `Pending:Wait` until bootstrapping finishes.
+Example: the app needs 3 minutes to start, but the grace period is 60 seconds. Setting it to 240 seconds lets instances finish starting before they are checked.
+W: Health check grace period: extending it past the three-minute startup time stops Auto Scaling from judging and replacing instances before the application is ready.
+X: A=Maximum capacity: it only caps how many instances can exist; it does not change when health checks start counting.
+B=Instance type: a larger type might start slightly faster but does not fix checks that begin before startup completes.
+C=Number of subnets: subnets decide where instances launch, not when their health is evaluated.
+T: New instances replaced right after launch means the grace period is shorter than startup time; lengthen it rather than resizing the group.
+
+@ Q002747 explain
+G: ## CloudWatch Logs subscription filters
+A **subscription filter** matches log events in a log group with a filter pattern and delivers them in near real time to a destination:
+- **Amazon Kinesis Data Streams**, for custom consumers or cross-account delivery
+- **Amazon Data Firehose**, to deliver into S3, OpenSearch or other targets
+- **AWS Lambda**, to process or forward each batch
+- **Amazon OpenSearch Service**, set up through the console using a Lambda function
+Events arrive base64-encoded and gzip-compressed. A log group can have up to two subscription filters, and an account-level policy can apply one to many log groups.
+Example: a filter pattern `"ERROR"` on `/app/api` sends error lines to a Lambda function that posts alerts, while a second filter streams everything to Kinesis Data Streams for a SIEM.
+W: A=Lambda: a subscription filter can invoke a Lambda function with batches of matching log events for processing in near real time.
+E=Kinesis Data Streams: it is a supported subscription destination, commonly used to fan logs out to consumers or to other accounts.
+X: B=RDS databases: subscription filters cannot write to a database; a Lambda function would have to do that insert itself.
+C=CloudFormation stacks: stacks provision infrastructure and cannot receive log events.
+D=EBS volumes: block storage attaches to EC2 instances and is not a delivery target for CloudWatch Logs.
+T: Subscription filters stream logs to Kinesis Data Streams, Data Firehose, Lambda or OpenSearch; databases, stacks and volumes are not destinations.

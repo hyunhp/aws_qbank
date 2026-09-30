@@ -1,0 +1,338 @@
+# SOA-C03 detailed explanations, e11 (explanation-only rewrites; letters are the published ones)
+
+@ Q002773 explain
+G: ## Bootstrapping an instance at first boot
+Every EC2 instance can receive **user data**: a script or cloud-init configuration passed at launch (usually stored in a launch template). On Amazon Linux and most Linux AMIs, **cloud-init** reads it during the first boot and runs it as root.
+- A shell script starting with `#!/bin/bash` can run `dnf install -y nginx`, pull the app from S3 and start it with `systemctl enable --now myapp`.
+- A `#cloud-config` document declares packages, files and commands instead of a script.
+- By default the script runs only on the first boot of the instance; output is written to `/var/log/cloud-init-output.log` for troubleshooting.
+Because the launch template holds the user data, every instance an Auto Scaling group launches gets the same setup with no manual step. For heavy setup, teams often bake a custom AMI and keep user data for the last few settings.
+W: User data or cloud-init in the launch template: it is the built-in hook that runs your install and start commands automatically when each new instance boots.
+X: B=IAM role on the group: a role only grants permissions (for example to read from S3); it runs no commands, and roles reach instances through an instance profile in the launch template, not through the group itself.
+C=Route 53 health check: it probes an endpoint from outside and reports healthy or unhealthy; it cannot install packages or start processes on the instance.
+D=CloudWatch CPU alarm: an alarm watches a metric and can notify or trigger scaling, but it fires on thresholds, not at first boot, and does not configure software.
+T: Configure new instances with user data (cloud-init) in the launch template; roles, health checks and alarms grant access or observe, they do not install anything.
+
+@ Q002774 explain
+G: ## Always getting the current AMI ID
+AMI IDs differ in every Region and change each time AWS publishes a new image, so hard-coding `ami-0abc...` makes a template stale and Region-bound.
+AWS publishes the latest IDs as **public Systems Manager parameters**, for example `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64`. The same path returns the right ID in every Region.
+CloudFormation can read them through a parameter of type `AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>`:
+- Set that path as the parameter's default value.
+- Reference the parameter in `ImageId` with `!Ref LatestAmiId`.
+- At create or update time, CloudFormation resolves the path to the current ID in the stack's Region.
+Note that an update picks up a newer AMI, which may replace instances, so review the change set.
+W: SSM parameter type pointing to the public alias: CloudFormation resolves the public AMI parameter in whichever Region the stack runs, so there are no IDs to maintain.
+X: A=Manual monthly mapping: someone must look up and paste IDs for every Region; it goes stale between updates and is exactly the hard-coding the team wants to avoid.
+B=One ID reused everywhere: an AMI ID exists only in the Region where it was created, so the stack fails in other Regions, and the ID also ages as new images ship.
+D=Lambda guessing by name: name patterns change and anyone can publish a similarly named AMI, so guessing risks the wrong or untrusted image; it adds code where a supported lookup already exists.
+T: Point an SSM-parameter-typed template parameter at the public AMI path; mappings or copied IDs are per-Region and go stale.
+
+@ Q002775 explain
+G: ## What happens to resources when a stack is deleted
+When a CloudFormation stack is deleted, its resources are deleted with it unless the template says otherwise; relying on defaults for a database is risky. The **`DeletionPolicy`** attribute on a resource sets the behavior explicitly:
+- `Delete` (default for most resource types): the resource is removed.
+- `Retain`: CloudFormation leaves the resource in the account; it simply stops being managed by the stack.
+- `Snapshot`: for resources that support it, such as `AWS::RDS::DBInstance`, a final snapshot is taken before deletion.
+A related attribute, **`UpdateReplacePolicy`**, uses the same values but applies only when an update *replaces* the resource (for example, changing a property that forces a new DB instance).
+Example: `DeletionPolicy: Snapshot` plus `UpdateReplacePolicy: Snapshot` on an RDS instance protects data in both cases.
+W: DeletionPolicy Retain or Snapshot: it is the attribute evaluated at stack deletion, and it either keeps the database or preserves its data in a final snapshot.
+X: A=Stack output with the endpoint: outputs only publish values; the database is still deleted with the stack, and the output disappears too.
+C=Always-false condition: a resource whose condition is false is never created, so there would be no database to keep in the first place.
+D=UpdateReplacePolicy Delete: it applies only to replacement during updates, not stack deletion, and `Delete` is the opposite of protection.
+T: Stack deletion is governed by DeletionPolicy (Retain/Snapshot); UpdateReplacePolicy only covers replacements during updates.
+
+@ Q002776 explain
+G: ## How CreationPolicy waits for an instance
+Normally CloudFormation marks an EC2 instance complete as soon as EC2 reports it running, even if the software on it failed to install. A **`CreationPolicy`** with `ResourceSignal` makes CloudFormation wait for explicit success signals instead:
+- `Count`: how many success signals are needed (for example `1`).
+- `Timeout`: how long to wait, in ISO 8601 format, such as `PT1H` for one hour.
+The instance's user data runs its setup and then calls the helper script, for example `/opt/aws/bin/cfn-signal -e $? --stack ... --resource WebServer --region ...`. If the signal never arrives before the timeout, the resource fails and the stack rolls back.
+Common reasons for a missing signal: `cfn-signal` not installed or not called, the script failing earlier, or no network path from the instance to the CloudFormation endpoint (private subnet without NAT or VPC endpoint).
+W: No success signal from cfn-signal: a one-hour wait followed by failure matches a `PT1H` timeout expiring with zero signals received.
+X: A=Instance type unavailable: EC2 rejects the launch within seconds with a capacity or unsupported-type error, so the stack would fail quickly, not after an hour.
+B=Stack policy denial: stack policies protect resources during stack updates only; they have no effect on resources created with the stack.
+C=Missing export in outputs: an import of a nonexistent export is caught right away when the template is processed; it does not cause a long wait on an instance.
+T: A stack that hangs on a resource with CreationPolicy and fails at the timeout means the instance never sent cfn-signal; real launch errors fail fast.
+
+@ Q002777 explain
+G: ## Sharing values between stacks
+Large environments are often split into layers: a network stack creates the VPC and subnets, and application stacks build on top. **Cross-stack references** connect them:
+- In the network stack, an output declares `Export: Name: prod-VpcId` with value `!Ref Vpc`.
+- In an app stack, a property uses `!ImportValue prod-VpcId`.
+Rules to remember:
+- Export names must be unique within an account and Region, and imports work only in the same account and Region.
+- While any stack imports an export, you cannot delete the exporting stack or change or remove that export.
+This gives a live, enforced link rather than copying IDs by hand. For values that change often, some teams publish them to SSM Parameter Store instead to avoid that coupling.
+W: Outputs with Export and Fn::ImportValue: the exporting stack publishes the IDs under a name, and other stacks in the same Region read them directly.
+X: A=Stack-level tags: tags are key-value labels propagated to resources for cost and organization; other stacks cannot resolve a tag into a VPC ID.
+B=Change sets: a change set previews what an update will modify in one stack; it does not pass values to other stacks.
+C=Stack policy allowing all: a stack policy controls which resources may be updated in that stack; an Allow statement just permits updates and shares nothing.
+T: Share values across stacks with Export plus Fn::ImportValue; tags, change sets and stack policies do not carry values between stacks.
+
+@ Q002778 explain
+G: ## Self-service with guardrails
+**AWS Service Catalog** lets administrators publish approved infrastructure as **products** (each a CloudFormation or Terraform template with versions) grouped in **portfolios** shared with users, groups or accounts.
+- A **launch constraint** names an IAM role that Service Catalog uses to create the resources, so developers do not need broad EC2 or IAM permissions themselves.
+- **Template constraints** limit parameter choices, for example allowing only `t3.micro` or `t3.small`.
+- Developers see only products they were granted and can launch, update and terminate them.
+Example: a "Standard web stack" product creates an Auto Scaling group behind an ALB with company tags and logging built in; a developer launches it with a few parameters and gets a compliant stack every time.
+W: Service Catalog: approved, versioned products plus launch constraints let developers deploy standard stacks without holding wide permissions.
+X: B=Trusted Advisor: it inspects an account and makes recommendations on cost, security and limits; it does not provide a catalog of launchable products.
+C=License Manager: it tracks and enforces software license usage (for example Windows or Oracle licenses); it does not package or deploy stacks.
+D=Resource Groups: it groups existing resources by tags or stacks for viewing and bulk actions; it cannot launch preconfigured products or limit what developers create.
+T: Approved self-service products with scoped launch permissions are Service Catalog; the other services advise, track licenses or group resources that already exist.
+
+@ Q002779 explain
+G: ## Platform-managed web applications
+**AWS Elastic Beanstalk** takes your application code (a ZIP, WAR or container definition) and builds the environment for you on standard AWS resources:
+- EC2 instances in an Auto Scaling group, usually behind an Elastic Load Balancer.
+- Health monitoring of instances and the application, with enhanced health reporting.
+- Platform updates, logs and deployment policies (all at once, rolling, immutable and others).
+You pick a platform such as Python, Node.js, Java or Docker, upload a version, and Beanstalk provisions capacity, configures the load balancer and scaling, and deploys. You still own the underlying resources and can tune them through configuration options or `.ebextensions`.
+Example: `eb create prod-env` followed by `eb deploy` for each release.
+W: Elastic Beanstalk: it provisions and manages instances, load balancing, scaling and health monitoring for a web app with minimal configuration.
+X: A=Storage Gateway: it connects on-premises applications to AWS storage through file, volume or tape interfaces; it does not host or scale web applications.
+B=Route 53 Resolver: it answers DNS queries for VPCs and forwards queries between VPCs and on-premises networks; it provisions no compute or load balancers.
+D=Direct Connect: it provides a dedicated private network link between a data center and AWS; it is connectivity, not an application platform.
+T: For "deploy my web app and let AWS handle capacity, load balancing and health," choose Elastic Beanstalk; the others are storage, DNS or network links.
+
+@ Q002780 explain
+G: ## Elastic Beanstalk deployment policies
+Beanstalk offers several ways to roll out a new application version:
+- **All at once**: every instance is updated together; fastest, but causes downtime and a failed deploy affects all instances.
+- **Rolling**: updates batches of existing instances, so capacity drops by one batch at a time.
+- **Rolling with additional batch**: launches an extra batch first to keep full capacity, then updates in batches; rollback means another rolling update.
+- **Immutable**: launches a full set of new instances with the new version in a temporary Auto Scaling group. Only when they pass health checks are they moved into the original group and the old instances terminated.
+- **Traffic splitting**: like immutable, but sends a percentage of traffic to the new instances for a canary period.
+With immutable, a failure is handled by simply terminating the temporary group; the original instances were never touched.
+W: Immutable deployment: old instances keep serving at full capacity while new ones launch, and rollback is just discarding the new instances.
+X: A=In-place single batch: updating the running instances in one pass is effectively all at once, taking capacity away during the deploy, and rolling back requires redeploying the old version.
+C=Rolling without batches: plain rolling updates existing instances in place, so each batch is out of service and capacity drops; a failure leaves a mix of versions to roll back.
+D=All at once: all instances are updated together, causing a brief outage, and a bad version breaks every instance until redeployed.
+T: Immutable keeps full capacity and rolls back by discarding new instances; in-place policies reduce capacity and need a redeploy to roll back.
+
+@ Q002781 explain
+G: ## Detect-and-remediate automation
+Automatic remediation needs two parts: something that **detects** the condition and something that **fixes** it.
+- **Detection by event**: when a volume is created, EventBridge receives events such as the CloudTrail `CreateVolume` API call, whose details show whether the volume is encrypted. A rule can match those events and pick a target.
+- **Detection by configuration**: an AWS Config managed rule such as `encrypted-volumes` evaluates volumes and marks unencrypted ones noncompliant.
+- **Fix**: both can start a **Systems Manager Automation runbook**. Config has built-in remediation actions that call runbooks; EventBridge can target Automation directly.
+Because an existing volume cannot be encrypted in place, a runbook typically snapshots it, copies the snapshot with encryption, and creates a new encrypted volume, or notifies and tags the owner. Turning on **EBS encryption by default** for the Region prevents new unencrypted volumes in the first place.
+W: EventBridge or Config rule invoking an SSM Automation runbook: detection happens in near real time and the runbook runs the fix without a human.
+X: B=Monthly CSV review: a human looks at a report weeks later; nothing is triggered and nothing is fixed automatically.
+C=Route 53 health check: it checks whether an endpoint answers; it cannot see volume encryption settings or run any remediation.
+D=CloudFront caching a volume list: CloudFront delivers web content from edge locations; caching a list gives visibility at best and neither detects new volumes nor fixes them.
+T: Automated remediation = event or Config rule detection plus an Automation runbook; reports and caches only show data.
+
+@ Q002782 explain
+G: ## Running tasks only in approved hours
+A **Systems Manager Maintenance Window** defines *when* and *where* operational tasks may run:
+- **Schedule**: a cron or rate expression, for example `cron(0 2 ? * SUN *)`, plus a duration and a cutoff so new tasks stop starting before the window closes.
+- **Targets**: instances by ID, by tag (such as `Environment=Dev`) or by resource group.
+- **Tasks**: Run Command documents (for example `AWS-RunPatchBaseline`), Automation runbooks, Lambda functions or Step Functions state machines, with concurrency and error thresholds.
+Example: a window every Sunday 02:00–04:00 runs a disk-cleanup Run Command on all instances tagged `Role=Web`, 10% at a time, stopping if 5% fail.
+W: Maintenance Windows: they combine a schedule, targets and registered Run Command or Automation tasks so work runs only in the approved time slot.
+X: A=Logs retention settings: retention controls how long CloudWatch Logs keeps log events; it schedules no tasks on instances.
+B=Config aggregator schedules: an aggregator collects Config data from multiple accounts and Regions; it has no task schedule and runs nothing on instances.
+C=Instance Scheduler: it starts and stops instances on a timetable to save cost; it does not run Run Command documents in a defined window.
+T: To run tasks on groups of instances only at approved times, register them in a Maintenance Window; schedulers that start or stop instances are a different job.
+
+@ Q002783 explain
+G: ## What makes an instance "managed" by Systems Manager
+An EC2 instance appears in Fleet Manager as a managed node only when three things are true:
+- **Agent**: the SSM Agent is installed and running. It is preinstalled on many AWS AMIs (Amazon Linux, recent Windows), but custom images may lack it or have it stopped.
+- **Permissions**: the instance can call Systems Manager, typically through an instance profile with the `AmazonSSMManagedInstanceCore` managed policy. (Alternatively, Default Host Management Configuration can supply an account-level role.)
+- **Network path**: outbound HTTPS (port 443) to the Systems Manager endpoints (`ssm`, `ssmmessages` and, for older agent versions, `ec2messages`), through a NAT gateway, internet gateway or interface VPC endpoints.
+Troubleshooting order: check the agent status (`systemctl status amazon-ssm-agent`), the attached role, then security groups, routes and endpoints. Agent logs are in `/var/log/amazon/ssm/`.
+W: B=Instance profile with SSM permissions: without a role granting the core SSM actions, the agent cannot register the instance with the service.
+E=SSM Agent installed and running: the agent is what registers the instance and receives commands; if it is missing or stopped, nothing registers.
+X: A=Elastic IP addresses: a static public IP is not required; instances in private subnets register fine through NAT or VPC endpoints.
+C=Termination protection: it only blocks accidental termination through the API or console and has no effect on agent registration.
+D=Largest instance type: instance size does not affect registration; even the smallest instance types can be managed nodes.
+T: Managed-node problems come down to agent, IAM permissions and network path; public IPs, termination protection and instance size do not matter.
+
+@ Q002784 explain
+G: ## Systems Manager without internet access
+The SSM Agent talks to Systems Manager over HTTPS. In a private subnet with no NAT gateway or internet route, it can reach those APIs only through **interface VPC endpoints** (AWS PrivateLink), which place network interfaces with private IPs in your subnets.
+Create endpoints for:
+- `com.amazonaws.<region>.ssm`: the main Systems Manager API.
+- `com.amazonaws.<region>.ssmmessages`: message channels used by Session Manager and, in newer agent versions, other agent messaging.
+- `com.amazonaws.<region>.ec2messages`: messaging used by older SSM Agent versions; recent agents can use `ssmmessages` instead, but creating all three keeps every agent version working.
+Settings that matter: enable **private DNS** so the normal service names resolve to the endpoint IPs, and allow inbound port 443 from the instances in the endpoint security group. Depending on features, you may also add endpoints for CloudWatch Logs or KMS, and an S3 gateway endpoint for patch downloads and output.
+W: Interface endpoints for ssm, ssmmessages and ec2messages: they give the agent a private path to the Systems Manager service while the subnet stays isolated.
+X: A=Internet gateway in the route table: routing the subnet to an internet gateway makes it a public subnet, which breaks the "no internet access" requirement.
+B=Public IP per instance: a public IP only helps with a route to an internet gateway, which the subnet lacks, and it exposes the instances.
+D=Peering to a public subnet: VPC peering is not transitive for internet access; instances cannot use another VPC's internet gateway or NAT to reach AWS public endpoints.
+T: Private subnets reach Systems Manager through the ssm, ssmmessages and ec2messages interface endpoints; public IPs and peering do not provide that path.
+
+@ Q002785 explain
+G: ## Rolling a new AMI through an Auto Scaling group
+Changing the launch template only affects instances launched *after* the change; running instances keep the old AMI. **Instance refresh** replaces them in a controlled way:
+- You start a refresh (console or `StartInstanceRefresh`) pointing at the new launch template version.
+- Auto Scaling replaces instances in batches while keeping at least the **minimum healthy percentage** (for example 90%) in service.
+- Options include **instance warmup**, **checkpoints** to pause and verify, **skip matching** to leave instances already on the new template, and **auto rollback** if the refresh fails or alarms fire.
+Example: create launch template version 5 with the new AMI, then start an instance refresh with `MinHealthyPercentage=90` so one tenth of capacity is replaced at a time.
+W: Instance refresh with the updated launch template: Auto Scaling itself replaces instances gradually while keeping enough healthy capacity.
+X: A=Termination protection on instances: it replaces nothing and does not roll out the new AMI; Auto Scaling does not honor EC2 termination protection when it terminates instances anyway.
+C=Detach and launch manually: it is slow and error-prone, and detached instances leave the group's health checks and load balancer handling.
+D=Scale to zero at midnight: all instances terminate at once, causing a full outage; nothing is gradual.
+T: Use instance refresh to replace instances gradually with a new launch template; scaling to zero or manual swaps cause outages or drift.
+
+@ Q002786 explain
+G: ## Environments as code
+**Infrastructure as code (IaC)** describes an environment in a template instead of console clicks. With CloudFormation:
+- One template defines the VPC pieces, instances, databases and security groups, with parameters such as `EnvName`.
+- Creating a stack (`aws cloudformation create-stack --stack-name test-42 ...`) builds every resource in the right order.
+- Deleting the stack removes every resource it created, so nothing is forgotten and billing stops.
+- The template lives in version control, so each environment is identical and changes are reviewed.
+Example: a test pipeline creates `test-<build-id>`, runs the tests, then deletes the stack. Watch for resources with `DeletionPolicy: Retain` or non-empty S3 buckets, which do not disappear automatically.
+W: CloudFormation stacks created and deleted: the same template produces identical environments on demand and removes them completely afterward.
+X: B=One permanent shared environment: teams interfere with each other, state drifts, and it runs and costs money even when nobody is testing.
+C=Manual copies of production: copying servers by hand is slow and inconsistent, and copying production data into test raises data-protection risk.
+D=Console builds and manual deletes: each build differs a little, leftover resources are easily missed, and it cannot keep up with frequent test cycles.
+T: Frequent identical short-lived environments come from IaC stacks you create and delete; anything manual or permanent drifts and costs more.
+
+@ Q002787 explain
+G: ## Sharing an encrypted AMI
+An AMI is backed by EBS snapshots. Sharing the AMI (adding the target account ID to its launch permissions) is enough for unencrypted snapshots. When the snapshots are **encrypted**, the target account must also be able to use the **KMS key**:
+- The key must be a **customer managed key**; the AWS managed key `aws/ebs` cannot be shared with other accounts. Snapshots encrypted with it must be copied and re-encrypted with a customer managed key first.
+- The key policy grants the target account actions such as `kms:Decrypt`, `kms:DescribeKey`, `kms:CreateGrant` and `kms:ReEncrypt*`, and the target account's IAM users or roles need matching permissions.
+- A good practice in the target account is to copy the AMI and re-encrypt it with its own key.
+Without key access, launching fails because EBS cannot decrypt the volumes.
+W: Access to the KMS key: encrypted snapshots are unusable in the other account unless it is allowed to use the customer managed key that encrypted them.
+X: A=Root user password: sharing root credentials is never acceptable, and AMI sharing works through launch permissions and key policies, not logins.
+B=CloudTrail trail: a trail records API activity for auditing; it has nothing to do with decrypting snapshots or launching an AMI.
+D=Build VPC and subnets: the AMI does not depend on where it was built; the target account launches it into its own VPC.
+T: Share an encrypted AMI by sharing the AMI and granting the other account use of the customer managed KMS key; the aws/ebs key cannot be shared.
+
+@ Q002788 explain
+G: ## Where your containers run
+Amazon ECS schedules containers from **task definitions** (image, CPU, memory, ports, IAM role) and keeps a desired number running with **services**. The containers need compute:
+- **EC2 capacity**: you run container instances yourself, choosing the AMI, patching, scaling the fleet and paying for idle capacity.
+- **AWS Fargate**: you specify CPU and memory per task and AWS provides the isolated compute. There are no instances to launch, patch or scale.
+Example: a service with `launchType: FARGATE`, `cpu: 512` and `memory: 1024` runs three tasks across two subnets; AWS handles the underlying hosts. You still manage your image, task IAM roles, networking and security groups.
+W: Amazon ECS on AWS Fargate: the team defines tasks and services while AWS runs and maintains the underlying servers entirely.
+X: A=ECS on self-managed EC2: ECS schedules the tasks, but the team still owns the container instances, including AMIs, patching and capacity.
+B=Kubernetes on on-premises VMs: the company manages everything, including hardware, VMs, the Kubernetes control plane and worker nodes.
+C=Docker on one EC2 host: the team manages the instance and Docker itself, and a single host is a single point of failure with no scheduler.
+T: "Define only tasks and services, no servers" means ECS on Fargate; any EC2 or VM-based option leaves the hosts to you.
+
+@ Q002789 explain
+G: ## Preventive plus detective controls
+Enforcing bucket standards works best with two layers:
+- **Preventive, the paved road**: buckets are created from CloudFormation templates or Service Catalog products that already set `BucketEncryption` (for example SSE-KMS with a specific key), block public access and apply required tags. Every bucket built this way is compliant from the start.
+- **Detective and corrective, the safety net**: AWS Config rules evaluate every bucket, including ones created outside the templates. Managed rules such as `required-tags` or `s3-bucket-server-side-encryption-enabled` flag noncompliant buckets, and **automatic remediation** runs an SSM Automation runbook to fix them.
+Note that since January 2023 S3 encrypts new objects with SSE-S3 by default, so encryption rules are mostly about enforcing a specific setting such as SSE-KMS.
+W: A=Templates or Service Catalog products: standard definitions build buckets with the required encryption settings and tags every time.
+E=Config rules with automatic remediation: they catch buckets created any other way and correct them without waiting for a person.
+X: B=Disabling CloudTrail: it removes the audit trail of who created what and enforces nothing; it weakens security.
+C=Bucket dashboard: a list of names by date gives visibility, but it neither checks encryption or tags nor changes any setting.
+D=Weekly reminder email: people can ignore reminders, and untagged buckets stay noncompliant until someone acts manually.
+T: Enforce standards by building from templates and backing them with Config rules plus auto-remediation; dashboards and reminders only inform.
+
+@ Q002790 explain
+G: ## Why CloudFormation cannot delete some buckets
+Amazon S3 refuses to delete a bucket that still contains objects (including object versions and delete markers in versioned buckets). When CloudFormation deletes a stack, that bucket deletion fails and the stack ends in `DELETE_FAILED`.
+Ways out:
+- **Empty the bucket** (all objects and, for versioned buckets, all versions), then retry the stack deletion.
+- **Retain it**: on retry, choose to retain the bucket so the stack deletes everything else; or set `DeletionPolicy: Retain` in the template beforehand.
+- For throwaway stacks, some teams add a custom resource that empties the bucket during deletion.
+Choose based on whether the data is still needed; emptying is permanent.
+W: Empty or retain the bucket, then retry: removing the objects lets S3 delete the bucket, and retaining it lets the rest of the stack delete while the data is kept.
+X: A=Add a tag and retry: tags are metadata; the bucket still holds objects, so the same deletion error occurs.
+B=Delete the AWS account: closing an account is a drastic, irreversible action for a single failed stack deletion, and it destroys all other workloads.
+C=Change storage class to Deep Archive: objects remain in the bucket in a different class, so the bucket is still not empty and the deletion still fails.
+T: Non-empty buckets block stack deletion: empty them or retain them; changing tags or storage class leaves the objects in place.
+
+@ Q002791 explain
+G: ## Treating operational scripts as software
+Scripts that run in Lambda change production behavior just like application code, so they benefit from the same **CI/CD** discipline:
+- Code lives in a Git repository (for example GitHub or GitLab through CodeConnections, or CodeCommit where available).
+- Changes arrive as pull requests, which are reviewed and approved before merge.
+- **AWS CodePipeline** starts on merge, runs a build and tests with CodeBuild, and deploys with CloudFormation or AWS SAM, optionally with CodeDeploy traffic shifting for Lambda aliases.
+Result: every change has an author, a reviewer and a commit, deployments are repeatable, and rollback is a revert.
+W: Repository plus CodePipeline that deploys on merge: review happens in pull requests and deployment is automatic and consistent after approval.
+X: A=Email to an administrator: there is no enforced review or history, and pasting code by hand invites copy errors.
+C=Scripts on one laptop: a single copy with no review or version control is lost if the laptop is, and manual uploads are not automated.
+D=Console edits during incidents: changes skip review, leave no reliable history, and can drift from any stored source.
+T: Code review plus automated deployment means version control and a pipeline; manual paths skip review or lose history.
+
+@ Q002792 explain
+G: ## Region-specific values in one template
+A CloudFormation **Mappings** section is a static lookup table with two levels of keys. Combined with the `AWS::Region` pseudo parameter, it lets one template choose values per Region:
+- Define `RegionSettings` with keys such as `us-east-1` and `eu-west-1`, each holding `InstanceType: m7i.large` or `InstanceType: m6i.large`.
+- In a resource, use `!FindInMap [RegionSettings, !Ref "AWS::Region", InstanceType]`.
+- When the stack is created in a Region, CloudFormation looks up that Region's row automatically.
+Mappings suit fixed values known in advance. For values that change often, parameters or SSM parameters may fit better. StackSets can then deploy the same template to many Regions.
+W: Mappings keyed by Region with Fn::FindInMap: the template carries a table of per-Region values and picks the right row from the Region it runs in.
+X: A=Stack policy denying updates: it protects resources from being updated; it does not supply different values per Region.
+B=DependsOn everywhere: it only controls creation order between resources and says nothing about which instance type a Region uses.
+D=Same-named exports everywhere: exports publish values to other stacks (and names only need to be unique per Region); they do not feed Region-specific values into this template.
+T: Per-Region values in one template come from Mappings plus FindInMap with AWS::Region; ordering, protection and exports solve other problems.
+
+@ Q002793 explain
+G: ## Staged patching with Patch Manager
+Patch Manager applies a **patch baseline** (rules for which patches are approved) with the `AWS-RunPatchBaseline` document. Which instances get patched, and when, is decided by targets and schedules:
+- **Targets by tag**: instances tagged `Environment=Dev` form one target and `Environment=Prod` another. The classic **patch group** tag can also link each group to its own baseline.
+- **Separate maintenance windows**: the Dev window runs this week; the Prod window runs a week later, after Dev has been validated.
+- Patch policies in Quick Setup can express similar schedules across accounts and Regions.
+Example: Dev window `cron(0 2 ? * TUE *)`, Prod window a week later. If Dev reveals a problem, the Prod run can be paused or the baseline adjusted.
+W: Separate tag-based targets with different maintenance windows: each environment is patched on its own schedule, so Dev goes first and Prod follows after validation.
+X: A=Disable patching for Prod: production stays exposed to known vulnerabilities indefinitely, which defeats the purpose of staging.
+B=One window for everything: every environment is patched at the same moment, so there is no Dev-first stage to catch a bad patch before Prod.
+C=Manual SSH patching: logging into each instance does not scale, is inconsistent, and leaves no central compliance reporting.
+T: Stage patching by tag-based targets and separate maintenance windows; one window for all removes the staging.
+
+@ Q002794 explain
+G: ## Chaos engineering on AWS
+**AWS Fault Injection Service (FIS)** runs controlled experiments that inject real faults so you can see how a workload behaves:
+- An **experiment template** lists actions (for example stopping EC2 instances, disrupting subnet network connectivity, or failing over an Aurora cluster), the targets, and the duration.
+- **Stop conditions** tie to CloudWatch alarms; if the alarm fires, FIS stops the experiment.
+- Prebuilt scenarios include simulating an Availability Zone power interruption, which affects compute, networking and databases in one AZ together.
+- IAM controls which resources an experiment may touch.
+Example: run the AZ scenario against a staging stack and confirm the ALB and Auto Scaling group keep serving from the other AZs within the target recovery time.
+W: Fault Injection Service: it deliberately and safely disrupts resources, including whole-AZ scenarios, with guardrails to stop the experiment.
+X: B=Trusted Advisor checks: they review configuration (for example single-AZ resources) and recommend changes, but they never inject a failure to test behavior.
+C=Compute Optimizer: it analyzes utilization and recommends instance, volume or function sizes; it has no fault-injection capability.
+D=Amazon Inspector: it scans EC2 instances, container images and Lambda functions for software vulnerabilities and network exposure, not resilience.
+T: To actually test an AZ failure, run an FIS experiment; advisory and scanning services only report on configuration or vulnerabilities.
+
+@ Q002795 explain
+G: ## Workforce access to many accounts
+**AWS IAM Identity Center** is the recommended way to give employees sign-in to multiple AWS accounts in AWS Organizations:
+- **Identity source**: the built-in Identity Center directory, Active Directory, or an external IdP such as Okta or Microsoft Entra ID (with SCIM provisioning).
+- **Permission sets**: templates of policies (for example `ReadOnly` or `NetworkAdmin`) defined once, centrally.
+- **Assignments**: a group plus a permission set plus one or more accounts. Identity Center creates matching roles in each account automatically.
+Users sign in once to the access portal (or with `aws sso login`) and pick an account and role, receiving temporary credentials. Removing someone from the group removes access everywhere.
+W: IAM Identity Center: one sign-in for employees across accounts, with permissions managed centrally through permission sets and group assignments.
+X: A=IAM users in every account: each person needs separate long-term credentials per account, so there is no single sign-on and joiners and leavers are hard to manage.
+B=Cognito user pools: they authenticate customers of your own web and mobile apps, not employees accessing AWS accounts and consoles.
+D=Directory Service only: a managed directory can be an identity source, but on its own it offers no central permission sets or single sign-on across many accounts; its console-access feature maps users to IAM roles one account at a time.
+T: Workforce SSO with central permissions across accounts is IAM Identity Center; Cognito is for app users and a directory alone gives no central multi-account access.
+
+@ Q002796 explain
+G: ## Giving AWS credentials to code on EC2
+An application on EC2 should never carry long-term keys. Instead:
+- Create an **IAM role** that EC2 can assume, with a least-privilege policy, for example `dynamodb:GetItem` and `dynamodb:Query` on `arn:aws:dynamodb:us-east-1:111122223333:table/Orders`.
+- Attach it through an **instance profile** (the container that links a role to an instance).
+- The AWS SDKs automatically fetch **temporary credentials** from the instance metadata service (preferably IMDSv2) and refresh them before they expire.
+Nothing secret is stored on disk or in code, credentials rotate automatically, and access can be changed or revoked by editing the role.
+W: IAM role through an instance profile: the application gets short-lived, auto-rotated credentials scoped to the table without storing any secret.
+X: A=Access keys in a config file: long-term keys can leak through backups, images or repositories and must be rotated by hand.
+C=Root user access keys: root has unrestricted access to the whole account and should have no access keys at all; exposing them risks the entire account.
+D=Shared IAM user password in code: passwords sign in to the console, not SDK calls, and a hard-coded shared secret is both insecure and unattributable.
+T: EC2 applications get AWS access from an IAM role via an instance profile; any stored key or password is a leak waiting to happen.
+
+@ Q002797 explain
+G: ## Organization-wide CloudTrail
+AWS CloudTrail records API activity per account. An **organization trail** is created once in the management account (or by a delegated administrator) and automatically applies to **every account in the organization**, including accounts that join later.
+- Logs go to one S3 bucket, organized under prefixes that include the organization ID and each account ID.
+- Member accounts can see the trail but cannot modify or delete it, which protects the audit record.
+- It is typically multi-Region, can also send events to CloudWatch Logs, and can use SSE-KMS and log file validation.
+Common pattern: the bucket lives in a dedicated log-archive account with a bucket policy that allows CloudTrail to write and restricts deletion.
+W: Organization trail: one trail captures API activity from all member accounts into a central bucket, and members cannot turn it off.
+X: A=Ordinary trail in the management account: a regular trail records only the management account's own activity, not API calls made in member accounts.
+C=VPC Flow Logs: they capture IP traffic metadata (addresses, ports, accept or reject), not who called which AWS API.
+D=Logs Insights queries: they search logs that already exist; they record nothing, and running them per account is not a central record.
+T: Organization-wide API logging to one bucket is an organization trail; flow logs capture network traffic and queries only read existing logs.

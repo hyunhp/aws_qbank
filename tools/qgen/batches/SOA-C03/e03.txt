@@ -1,0 +1,354 @@
+# SOA-C03 detailed explanations, e03 (explanation-only rewrites; letters are the published ones)
+
+@ Q000796 explain
+G: ## What the AWS CDK is
+The AWS Cloud Development Kit (CDK) lets you describe infrastructure in a general-purpose language such as TypeScript, Python, Java, C# or Go instead of writing JSON or YAML by hand.
+- You build an app out of **constructs**: classes that represent one resource (an S3 bucket) or a whole pattern (a load-balanced Fargate service).
+- Because it is ordinary code, you can use loops, conditionals, functions, npm packages shared across teams, and test frameworks such as Jest.
+- `cdk synth` turns the app into a CloudFormation template, and `cdk deploy` hands that template to CloudFormation.
+## Example
+A loop `for (const env of ['dev','test','prod'])` can create three identical stacks, and a unit test can assert that every bucket in the template has encryption and versioning enabled before anything is deployed.
+W: AWS CDK: it is the AWS tool for writing infrastructure in TypeScript and other languages with loops, shared construct libraries and unit tests, and it still deploys through CloudFormation stacks.
+X: A=AWS Service Catalog: it publishes approved products (often backed by CloudFormation templates) for end users to launch; it does not give you a programming language for authoring infrastructure.
+B=AWS Config rules: they evaluate whether existing resources are compliant with a rule; they do not define or deploy infrastructure.
+D=AWS OpsWorks: it was Chef/Puppet-based configuration management for servers and has reached end of life; it never compiled TypeScript into CloudFormation templates.
+T: Real programming-language features plus CloudFormation deployment means the CDK; Service Catalog distributes templates and Config only checks compliance.
+
+@ Q000797 explain
+G: ## How a CDK deployment actually happens
+The CDK is a layer on top of CloudFormation, not a replacement for it.
+- **Synthesize**: `cdk synth` runs your code and writes one CloudFormation template per stack (plus asset files such as Lambda zip files) into the `cdk.out` folder.
+- **Bootstrap**: `cdk bootstrap` creates the supporting resources (an S3 bucket, an ECR repository and IAM roles) that deployments use in each account and Region.
+- **Deploy**: `cdk deploy` uploads assets and creates or updates a CloudFormation stack. CloudFormation then creates, updates, rolls back and tracks every resource.
+## What that means in practice
+Stack events, drift detection, change sets and rollback all come from CloudFormation. If you open the CloudFormation console after `cdk deploy`, you see a normal stack with the synthesized template.
+W: CDK synthesizes templates; CloudFormation provisions: the CDK produces the template from code, and CloudFormation is the engine that creates and manages the resources.
+X: A=Replaces CloudFormation: the CDK does not call the EC2 API directly to build resources; every deployment is a CloudFormation stack operation.
+C=Serverless only: the CDK has construct libraries for almost every AWS service (VPCs, RDS, ECS, IAM and more), not just Lambda.
+D=CloudFormation inside the CDK CLI: the relationship is reversed; CloudFormation is the AWS service, and the CDK CLI simply submits templates to it.
+T: The CDK writes the template and CloudFormation does the provisioning; the CDK never bypasses CloudFormation.
+
+@ Q000798 explain
+G: ## How subnet IP addresses run out
+Every instance (strictly, every network interface) launched into a subnet takes a private IP address from that subnet's CIDR block. AWS reserves 5 addresses in every subnet, so a `/24` subnet (256 addresses) has 251 usable ones.
+When the free addresses are used up by instances, load balancer nodes, Lambda ENIs or endpoint interfaces, new launches fail. Auto Scaling records the reason in its activity history, for example `InsufficientFreeAddressesInSubnet`.
+## Why it shows up during scale-out
+The stack and template worked earlier because there were still free addresses. The failure appears only when the group grows past what is left.
+## Fixes
+- Add more subnets (ideally in several Availability Zones) to the Auto Scaling group.
+- A subnet's CIDR cannot be resized, so add a secondary CIDR to the VPC and create larger subnets if needed.
+- Delete unused network interfaces (ENIs) that still hold addresses.
+W: Subnet out of IP addresses: `InsufficientFreeAddressesInSubnet` means exactly that the subnet has no free private IPs left for new network interfaces.
+X: B=Missing ec2:RunInstances: a permissions problem produces an authorization error on every launch, not a free-address error that appears only when the group scales out.
+C=Deleted AMI: a missing AMI gives an invalid or not-found AMI error in the activity history, not an address-exhaustion message.
+D=Security group rule quota: that quota blocks adding more rules to the group; it does not stop instances from launching with the existing group.
+T: Read the activity history message: `InsufficientFreeAddressesInSubnet` points to IP exhaustion, fixed by more or larger subnets, not by IAM or AMI changes.
+
+@ Q000799 explain
+G: ## Why CloudFormation reports a circular dependency
+CloudFormation builds a dependency graph from `Ref`, `Fn::GetAtt`, `Fn::Sub` and `DependsOn`. A resource can be created only after everything it references exists.
+If resource X references Y and Y references X, neither can be created first, so validation fails with `Circular dependency between resources`.
+## Classic example
+Two security groups that allow each other: `WebSG` has an ingress rule with `SourceSecurityGroupId: !Ref AppSG`, and `AppSG` has an ingress rule pointing to `WebSG`.
+The fix is to create both groups without the inline cross-rules, then add standalone `AWS::EC2::SecurityGroupIngress` resources that reference both groups. Those rule resources depend on the two groups, but the groups no longer depend on each other, so the cycle disappears.
+The same pattern applies to other pairs, for example attaching a policy with a separate `AWS::IAM::Policy` resource instead of inside the role.
+W: Remove the mutual reference and create the association separately: moving the link into its own resource that depends on both turns the cycle into a simple one-way graph.
+X: A=Two stacks with cross-stack references: stack A would need B's export before it exists and B would need A's, so the circular dependency just moves between stacks and neither can deploy.
+B=DependsOn on each other: `DependsOn` adds edges to the graph; pointing each resource at the other makes the cycle explicit instead of breaking it.
+C=Longer stack timeout: the error is raised during template validation because no creation order exists; waiting longer cannot produce one.
+T: Break a CloudFormation cycle by pulling the cross-reference into a separate association resource, not by adding DependsOn or splitting stacks.
+
+@ Q000800 explain
+G: ## Who actually calls the APIs in CloudFormation
+When you create a stack you can pass a **service role** (`--role-arn`). CloudFormation then uses that role's permissions for every create, update and delete call in the stack, not the permissions of the person who started the deployment.
+- The user only needs permission to call CloudFormation and `iam:PassRole` for the service role.
+- The service role needs permission for everything the template creates, for example `iam:CreateRole`, `iam:PutRolePolicy` and `iam:AttachRolePolicy` for an IAM role.
+## Separate but related check
+Templates that create IAM resources must also be deployed with `CAPABILITY_IAM` or `CAPABILITY_NAMED_IAM`. Leaving that out produces an `InsufficientCapabilities` error, which is a different message from the one in this scenario.
+W: Service role lacks iam:CreateRole: the stack runs with the service role's permissions, so the user's AdministratorAccess does not help when the role itself cannot create IAM roles.
+X: B=Metadata section: template `Metadata` holds information for tools such as `cfn-init` or the console; it never grants IAM permissions.
+C=Expired AdministratorAccess: IAM policies do not expire, and the user's policy is not what CloudFormation uses when a service role is set.
+D=CloudFormation cannot create IAM resources: it can create roles, users and policies when the right capability is acknowledged and the executing role has permission.
+T: With a CloudFormation service role, the role's permissions, not the deploying user's, decide what the stack can create.
+
+@ Q000801 explain
+G: ## VPC sharing with AWS RAM
+AWS Resource Access Manager (RAM) can share subnets of a VPC with other accounts in the same AWS Organization.
+- The **owner** account (here, the network team) keeps the VPC, subnets, route tables, network ACLs, gateways and endpoints. Participants cannot change them.
+- **Participant** accounts launch their own EC2 instances, RDS databases, Lambda functions and load balancers into the shared subnets. Those resources belong to, and are billed to, the participant account, and participants manage their own security groups.
+## Example
+The network account owns `10.0.0.0/16` with private subnets in three Availability Zones and shares them with the app accounts. A developer in an app account launches instances into `subnet-0abc...` directly, while routes and NACLs stay under network-team control.
+This also saves IP space and avoids a separate VPC, peering and NAT gateways per account.
+W: AWS RAM sharing of the subnets: participants create resources in the central VPC's subnets while the owner account alone controls routing and NACLs.
+X: A=StackSets recreating the VPC: this deploys a separate VPC in each account, which each account then controls, instead of sharing one centrally managed network.
+C=Cross-account roles into the network account: instances launched this way would be owned by the network account, not the application accounts, mixing ownership and billing.
+D=VPC peering: peering connects separate VPCs that each account manages itself; it does not let an account launch instances into another account's subnets.
+T: Launch into someone else's subnets while they keep routing control means RAM VPC sharing; peering and StackSets create separate networks.
+
+@ Q000802 explain
+G: ## StackSets with service-managed permissions
+A CloudFormation **StackSet** deploys one template as stack instances across many accounts and Regions from a single place.
+- **Self-managed** permissions: you create the admin and execution IAM roles in every target account yourself.
+- **Service-managed** permissions: StackSets uses AWS Organizations trusted access, so you target organizational units (OUs) instead of account IDs and AWS creates the roles for you.
+## Automatic deployment
+With automatic deployment enabled, any account that is added to a target OU later automatically gets the stack instances in the chosen Regions, and you can choose whether stacks are removed when an account leaves.
+## Example
+Target the `Workloads` OU and Regions `us-east-1`, `eu-west-1` and `ap-northeast-2`. The 40 existing accounts get 120 stack instances, and a new account created in that OU next month receives the same baseline without anyone running a deployment.
+W: Service-managed StackSet with automatic deployment: one template reaches every current account and Region in the OU, and new accounts are covered automatically.
+X: A=Manual deployment per account: 120 console deployments is slow and error-prone, and nothing covers accounts created later.
+B=Config aggregators: an aggregator only collects configuration and compliance data from many accounts; it cannot deploy templates.
+D=Service Catalog product per owner: each owner must choose to launch it, so coverage is not guaranteed or automatic for new accounts.
+T: Mandatory baselines across an organization, including future accounts, call for service-managed StackSets with automatic deployment.
+
+@ Q000803 explain
+G: ## Share one resource or deploy many copies
+The two services solve different multi-account problems.
+- **AWS RAM** shares an existing resource with other accounts. There is still just one resource, owned by one account. Examples: subnets (VPC sharing), transit gateways, Route 53 Resolver rules, License Manager configurations.
+- **CloudFormation StackSets** deploys the same template into many accounts and Regions. Each target gets its own independent copy of the resources, owned by that account.
+## Example
+A central transit gateway shared through RAM is one gateway that every account attaches to. A StackSet that creates an IAM role for auditing produces a separate role in each of 50 accounts.
+Choose RAM when the goal is central ownership of one resource; choose StackSets when every account needs its own identical resource.
+W: RAM shares one resource; StackSets deploys copies per account: RAM grants other accounts access to a single owned resource, while StackSets provisions separate stack instances in each account and Region.
+X: A=StackSets handles one account at a time: StackSets exists specifically to deploy to many accounts and Regions in one operation.
+B=RAM requires a template: RAM shares existing resources and uses no templates, while StackSets is entirely template based.
+D=Interchangeable, both replicate: RAM does not replicate anything; the shared resource stays single, which is the key difference from StackSets.
+T: RAM equals one shared resource; StackSets equals an independent copy in every targeted account and Region.
+
+@ Q000804 explain
+G: ## Multi-cloud IaC and Terraform state
+**Terraform** uses providers (AWS, Azure, VMware vSphere and many others) behind one language (HCL) and one plan/apply workflow, so shared modules and team skills carry across platforms.
+Unlike CloudFormation, Terraform keeps a **state file** that maps configuration to real resources. The team is responsible for it:
+- store state remotely (for example in an S3 backend) rather than on a laptop;
+- enable locking so two applies cannot run at once and corrupt state;
+- encrypt it and restrict access, because state can contain secrets and resource details.
+## Example
+An `s3` backend with encryption and locking, plus IAM policies that let only the CI pipeline write state, keeps one source of truth for every AWS workspace.
+W: Terraform, with managed and locked state: it covers AWS, Azure and on-premises VMware with one tool, and the team must operate the remote state backend and its locking and security.
+X: A=CDK deploying to Azure: the AWS CDK synthesizes CloudFormation for AWS; it does not deploy Azure resources.
+B=OpsWorks across providers: OpsWorks was Chef/Puppet configuration management and has reached end of life; it never was a multi-cloud provisioning tool.
+D=CloudFormation provisioning Azure natively: CloudFormation manages AWS resources (and registry extensions), not Azure infrastructure.
+T: Keeping one IaC tool across clouds points to Terraform, and the price is that you own its state storage, locking and security.
+
+@ Q000805 explain
+G: ## Where the state lives
+Every IaC tool must remember which real resources belong to which piece of code.
+- **CloudFormation** keeps this inside the service: the stack itself tracks every resource, so there is no state file to store, lock or back up. It also offers change sets, rollback and drift detection built in.
+- **Terraform** writes a state file that the team must store (for example in an S3 backend), lock against concurrent runs and protect.
+## The tradeoff
+CloudFormation is AWS-native and removes state management, but it is not a multi-cloud tool. Terraform works across many providers, but you operate its state yourself. For an AWS-only estate, removing that operational burden can be a good reason to switch; losing multi-cloud reach usually does not matter.
+Both work well with Git, code review and CI/CD pipelines.
+W: CloudFormation is AWS-native with no state file but not multi-cloud: that is the real balance between the two tools.
+X: A=Terraform state managed by AWS: AWS does not manage Terraform state for you; the team configures the backend, locking and access control.
+C=Terraform cannot use Git: Terraform configurations are plain text files that are normally stored in Git and applied through pipelines.
+D=CloudFormation needs an S3/DynamoDB backend: that describes a Terraform backend; CloudFormation tracks state inside the stack.
+T: CloudFormation trades multi-cloud reach for service-managed state; Terraform trades self-managed state for multi-cloud reach.
+
+@ Q000806 explain
+G: ## GitOps for infrastructure
+In a GitOps-style workflow, the Git repository is the single source of truth for infrastructure.
+- A change starts as a branch and a **pull request**, which peers review.
+- **CI** runs checks on the pull request: linting (`cfn-lint`), policy checks, a change set or `terraform plan`, and tests.
+- Merging to the main branch triggers **CD**, which applies the change automatically, for example with AWS CodePipeline deploying a CloudFormation stack.
+## Why it gives traceability
+Every change in the environment corresponds to a merged commit with an author, a reviewer and a pipeline run. Rolling back means reverting the commit, and nobody needs console write access to production.
+W: GitOps-style IaC with pull requests and CI/CD: review, automated testing, automatic apply on merge and commit-level traceability are exactly what this practice defines.
+X: B=Blue/green for application code: blue/green is a release strategy for switching traffic between two environments; it says nothing about reviewing and applying infrastructure code from Git.
+C=Canary release of IaC files: canary shifts a small share of traffic to a new application version; it is not a workflow for reviewing and applying template changes.
+D=Manual console changes documented later: changes made in the console have no review, no tests and no commit, so they break traceability and cause drift.
+T: Git as the source of truth, reviewed by pull request and applied by the pipeline on merge, is GitOps; blue/green and canary are release strategies.
+
+@ Q000807 explain
+G: ## Config remediation with Systems Manager
+**AWS Config** evaluates resources against rules. The managed rule `ec2-managedinstance-patch-compliance-status-check` reads the patch compliance that Patch Manager reports for managed instances and marks instances with missing patches as noncompliant.
+A Config rule can have a **remediation action**, which is a Systems Manager Automation runbook.
+- With automatic remediation, Config starts the runbook for each resource that becomes noncompliant, with configurable retries.
+- The runbook runs with an `AutomationAssumeRole` that has the permissions it needs.
+## Example
+The remediation runbook runs the patch installation on the instance (for example by invoking `AWS-RunPatchBaseline` with `Operation=Install`). After patching, the instance reports compliant again and Config re-evaluates it.
+W: Config rule plus SSM runbook remediation: Config detects the noncompliance and automatically starts the Automation runbook that installs patches, with no human in the loop.
+X: A=Inspector launching instances: Amazon Inspector scans for vulnerabilities and reports findings; it does not launch replacement instances or patch anything.
+C=Manual Patch Manager scans: this depends on engineers' time and does not react automatically to each new finding.
+D=Logs Insights search and email: searching log text for "patch" neither reliably detects missing patches nor fixes anything.
+T: Detect with an AWS Config rule and fix with its automatic remediation runbook; scanners and emails alone do not remediate.
+
+@ Q000808 explain
+G: ## Two Systems Manager tools for different jobs
+- **Run Command** sends a Command document (such as `AWS-RunShellScript` or `AWS-RunPowerShellScript`) to managed nodes, which can be EC2 instances or hybrid on-premises servers. The SSM Agent on each node runs the commands. It is ideal for ad hoc or one-off operations across a fleet, with rate and error controls.
+- **Automation** runs runbooks: multi-step workflows with steps such as `aws:executeAwsApi`, `aws:runCommand`, `aws:approve`, `aws:branch` and `aws:waitForAwsResourceProperty`. Runbooks call AWS APIs directly, so they can manage resources such as snapshots, AMIs or RDS instances, not only the operating system.
+## Example
+Run Command: restart a service on 200 instances right now.
+Automation: stop an instance, create an AMI, wait for it to be available, start the instance again and notify the team.
+W: Run Command runs ad hoc commands; Automation orchestrates multi-step workflows: that is the core distinction between the two capabilities.
+X: A=Automation only on-premises, Run Command only EC2: both work with EC2, and Run Command also supports on-premises managed nodes; neither is limited that way.
+C=Run Command needs Lambda: Run Command uses the SSM Agent on the node; no Lambda function is involved.
+D=Same feature, two names: they use different document types (Command versus Automation) and serve different purposes.
+T: Run Command sends commands to nodes now; Automation orchestrates multi-step runbooks that call AWS APIs.
+
+@ Q000809 explain
+G: ## State Manager keeps a desired state
+Systems Manager **State Manager** uses **associations**. An association binds a document (for example a Command document that configures an agent, or `AWS-ApplyAnsiblePlaybooks`) to a set of targets, often by tag, and a schedule.
+- It applies the configuration when an instance first matches the target, then again on the schedule (for example every 30 minutes).
+- If someone changes a setting, the next run puts it back, and association compliance shows which instances failed.
+## Example
+Associate a document that installs and configures the antivirus agent and sets the required registry keys with all instances tagged `Env=Prod`, with a `rate(30 minutes)` schedule. New instances with that tag are configured automatically.
+W: State Manager: associations reapply the desired configuration on a schedule and to new instances, correcting drift continuously.
+X: B=Distributor: it packages and publishes software such as agents for installation, but it does not by itself keep settings enforced over time.
+C=Session Manager: it provides browser or CLI shell access to instances without SSH; it does not manage configuration.
+D=One-time Automation: a single execution changes things once and does nothing when an instance drifts later.
+T: Ongoing, self-correcting configuration means State Manager associations, not one-time Automation or package distribution.
+
+@ Q000810 explain
+G: ## Which identity runs an Automation
+By default, an Automation runbook runs with the permissions of the user who starts it. Many AWS-managed runbooks, including `AWS-RestartEC2Instance`, also accept an `AutomationAssumeRole` parameter. When a role is given, Automation performs every step with that role, not with the caller's own permissions.
+This is common when Automation is started by a State Manager association, a maintenance window, EventBridge or a Config remediation, which normally pass a role.
+## Troubleshooting
+An `AccessDenied` on `ec2:RebootInstances` at a specific step means the identity the step runs as cannot call that API. Check the role passed as `AutomationAssumeRole`: it needs `ec2:RebootInstances` (plus the describe permissions the runbook uses) and a trust policy for `ssm.amazonaws.com`. The caller also needs `iam:PassRole` for it.
+W: Automation role lacks ec2:RebootInstances: the step runs as the Automation role, so the engineer's personal console permissions do not apply.
+X: A=OS blocks the API call: `ec2:RebootInstances` is an AWS API call made by Systems Manager to the EC2 service, not a request that goes through the instance's operating system.
+B=Always root credentials: Automation never uses root credentials; it uses the caller's permissions or the assumed role, so IAM can deny it.
+D=Deprecated document: `AWS-RestartEC2Instance` is a current AWS-managed runbook, and a deprecated document would not produce an IAM AccessDenied error.
+T: When Automation gets AccessDenied but you can do the action yourself, check the runbook's AutomationAssumeRole permissions.
+
+@ Q000811 explain
+G: ## EventBridge as an event router
+Amazon EventBridge receives events from three kinds of sources on event buses:
+- **AWS services**, such as `EC2 Instance State-change Notification` events;
+- **SaaS partners** through partner event sources, such as monitoring or ticketing tools;
+- **your own applications** through `PutEvents`.
+Rules match events with **event patterns** on any field, for example `{"source":["aws.ec2"],"detail":{"state":["stopped"]}}`, and send them to targets such as Lambda, Step Functions, SQS or SNS.
+## Schedules
+Scheduled rules (cron or rate expressions), or the newer **EventBridge Scheduler**, can invoke the same Lambda function nightly.
+So one service covers all three triggers plus content filtering.
+W: Amazon EventBridge: it natively receives EC2 state changes and SaaS partner events, filters them with event patterns, runs schedules and routes to Lambda.
+X: A=Amazon SNS: SNS can filter messages with subscription filter policies, but it does not natively receive EC2 state-change events or SaaS partner events and has no schedules.
+B=Amazon SQS: a queue buffers messages for consumers; it does not ingest AWS service or partner events, filter on content or run on a schedule.
+C=AWS Step Functions: it orchestrates workflow steps once started; something like EventBridge still has to receive the events and start it.
+T: Many event sources, content filters and schedules routed to Lambda means EventBridge; SNS, SQS and Step Functions sit downstream of it.
+
+@ Q000812 explain
+G: ## Tagging from the API call record
+AWS CloudTrail records every `RunInstances` call, including who made it in `userIdentity` (for example the ARN of the IAM role session or user). These management events reach EventBridge as `AWS API Call via CloudTrail` events, so make sure CloudTrail is logging management events (a trail with logging turned on) in the account and Region.
+## The pattern
+- An EventBridge rule matches `{"source":["aws.ec2"],"detail-type":["AWS API Call via CloudTrail"],"detail":{"eventName":["RunInstances"]}}`.
+- The target Lambda function reads the instance IDs from `responseElements` and the principal from `userIdentity`, then calls `ec2:CreateTags` with, for example, `Owner=arn:aws:sts::111122223333:assumed-role/Dev/alice`.
+- Developers change nothing, and every launch path (console, CLI, Auto Scaling, CloudFormation) is covered shortly after the launch.
+W: EventBridge on RunInstances triggering a tagging Lambda: the CloudTrail event carries the caller identity, and the rule reacts to every launch automatically.
+X: A=S3 bucket notification: S3 notifications fire on object events in a bucket, not on EC2 instance launches, and carry no launcher identity.
+C=Required tag in the launch wizard: it changes developers' process, depends on them filling it in honestly, and misses CLI, SDK and automated launches.
+D=Hourly Run Command: Run Command executes inside instances and does not know who launched them; hourly runs also leave instances untagged for up to an hour.
+T: Tag with the creator's identity by reacting to the CloudTrail RunInstances event in EventBridge, not by relying on people or polling.
+
+@ Q000813 explain
+G: ## Two ways S3 can emit events
+- **Direct S3 event notifications** send events such as `s3:ObjectCreated:*` to three destination types: SNS, SQS and Lambda. Filtering is limited to key prefix and suffix, and there is no replay.
+- **EventBridge notifications** (one setting on the bucket) send all S3 events to the default event bus.
+## What EventBridge adds
+- Rich event patterns on any field, such as object size, key patterns or the requester.
+- Several rules per event and up to five targets per rule, across many target types including Step Functions, SNS, SQS, Kinesis, API destinations and other buses.
+- **Archive and replay**, so past events can be sent again after a bug fix.
+## Example
+One rule sends `.csv` uploads over 10 MB to a Step Functions state machine, another sends all uploads under `invoices/` to an SNS topic, and an archive keeps 30 days of events for replay.
+W: EventBridge adds rich filtering, fan-out and replay: those are exactly the extra capabilities it gives over direct S3 notifications.
+X: A=Direct notifications support more targets: direct notifications support only SNS, SQS and Lambda, while EventBridge supports many more target types.
+C=90-day replay log by default: direct S3 notifications keep no replay log at all; archive and replay is an EventBridge feature you configure.
+D=EventBridge cannot use S3: S3 can send events to EventBridge with a single bucket setting.
+T: When S3 events need complex filters, several targets or replay, enable EventBridge notifications instead of direct bucket notifications.
+
+@ Q000814 explain
+G: ## How EventBridge invokes Lambda
+EventBridge calls Lambda through the function's **resource-based policy**. The policy needs a statement that allows `lambda:InvokeFunction` for principal `events.amazonaws.com`, usually limited with a `SourceArn` of the rule.
+- The console adds this permission automatically when you pick the function as a target.
+- With the CLI, SDK or CloudFormation you must add it yourself, for example with `aws lambda add-permission` or an `AWS::Lambda::Permission` resource. Forgetting it is a very common mistake.
+## Reading the metrics
+The rule's `MatchedEvents` rises, but `Invocations` on the function stays at zero and the rule's `FailedInvocations` metric increases. That combination means EventBridge matched the event but was not allowed to deliver it. Adding a dead-letter queue to the target shows the error details.
+W: Function policy does not allow EventBridge: matching works, but without invoke permission EventBridge cannot call the function, so the invocation count stays at zero.
+X: A=Deprecated runtime: after a runtime is deprecated, AWS eventually blocks creating and updating functions on it, but existing functions can still be invoked, so it does not explain zero invocations.
+B=Pattern too broad: a broad pattern would cause more invocations, not zero.
+D=Memory too low: low memory causes slow runs, timeouts or out-of-memory errors during invocations, which would still be counted.
+T: Rule matches but Lambda never runs means the Lambda resource policy is missing permission for events.amazonaws.com.
+
+@ Q000815 explain
+G: ## OpsCenter and OpsItems
+Systems Manager **OpsCenter** is a central place to track operational issues as **OpsItems**.
+- CloudWatch alarms can create an OpsItem directly as an alarm action, and EventBridge rules can create them from events such as EC2 or RDS state changes.
+- Each OpsItem carries context: the source, severity, category, related resources (for example the RDS instance ARN), operational data and a status (Open, In progress, Resolved).
+- OpsCenter suggests relevant **Automation runbooks** that engineers can run from the OpsItem.
+- **Deduplication** uses a dedup string in the operational data so repeated alarms for the same problem update one OpsItem instead of creating dozens.
+## Example
+An RDS `CPUUtilization` alarm creates one OpsItem with the DB instance attached and a suggested runbook, and repeated alarm transitions do not flood the team.
+W: Systems Manager OpsCenter OpsItems: they turn alarms into tracked, deduplicated issues with related resources, runbook suggestions and status.
+X: B=Config rule notifications: they report compliance changes for resource configurations, not operational alarms for RDS, EC2 and Lambda, and they do not track remediation status.
+C=SNS email subscriptions: this is the scattered email the team wants to avoid; emails have no status, deduplication or linked runbooks.
+D=CloudWatch dashboards: dashboards visualize metrics and alarms but do not create or track issues.
+T: Operational issues that need context, runbooks, status and dedup belong in OpsCenter, not in email or dashboards.
+
+@ Q000816 explain
+G: ## How EventBridge starts an Automation runbook
+A scheduled EventBridge rule (cron or rate expression) has no event pattern; it simply fires on schedule. To start an SSM Automation runbook, the target needs an **IAM role that EventBridge assumes**.
+- The role trusts `events.amazonaws.com`.
+- It allows `ssm:StartAutomationExecution` on the runbook, and `iam:PassRole` if the runbook runs with its own `AutomationAssumeRole`.
+## Troubleshooting a schedule that never works
+- Check the rule's `TriggeredRules` and `FailedInvocations` metrics. If the rule triggers but invocations fail, the problem is delivery to the target, usually permissions.
+- Cron in EventBridge rules is evaluated in UTC, so `cron(0 6 * * ? *)` means 06:00 UTC, which is what was intended here.
+W: IAM role lacks ssm:StartAutomationExecution: the enabled schedule fires, but without that permission EventBridge cannot start the runbook.
+X: A=S3 bucket policy: nothing in this setup reads S3 objects; the target is an Automation runbook.
+B=Cron in local time: EventBridge rules evaluate cron in UTC (time zones are a feature of EventBridge Scheduler), and a time zone issue would make the rule fire at the wrong hour, not never.
+C=SSM Agent uninstalled: stopping instances in a runbook uses the EC2 API, and even an agent problem would show a failed Automation execution rather than no execution at all.
+T: When an EventBridge target never runs, check the rule's target role permissions (here ssm:StartAutomationExecution) before the schedule itself.
+
+@ Q000817 explain
+G: ## Automation runbooks with approval
+A Systems Manager **Automation** runbook can combine discovery, decision and action steps:
+- `aws:executeAwsApi` calls `ec2:DescribeVolumes` with a filter `status=available` to find unattached volumes and checks their creation time.
+- `aws:approve` pauses the execution until designated IAM principals approve or reject it, with a notification sent through SNS.
+- `aws:executeAwsApi` then calls `ec2:DeleteVolume` (optionally after `CreateSnapshot` as a safety copy).
+## Scheduling it
+Run the runbook nightly with an EventBridge schedule, a State Manager association or a maintenance window. Production accounts can use a version with the approval step, while nonproduction accounts delete automatically.
+W: Scheduled runbook with an approval step: it finds unattached volumes older than 7 days every night and deletes them only after a person approves in production.
+X: B=AWS Budgets alert: it warns that spending rose but does not identify or delete any volumes.
+C=Manual nightly review: this is manual toil that is easy to forget and has no built-in approval record.
+D=S3 lifecycle for snapshots: S3 lifecycle rules act on objects in S3 buckets; they cannot find or delete EBS volumes.
+T: Recurring cleanup with a human gate is an Automation runbook on a schedule using an aws:approve step.
+
+@ Q000818 explain
+G: ## Acting on DevOps Guru insights automatically
+Amazon DevOps Guru analyzes metrics, logs and events to create **insights** (reactive or proactive). It publishes events such as a new insight, new anomalies, severity changes and closed insights to **Amazon EventBridge**, and can also notify an SNS topic.
+## The architecture
+- One EventBridge rule matches every new insight (`source: aws.devops-guru`) and targets a Lambda function that calls the ticketing system's API with the insight details.
+- A second rule has a narrower pattern for the known issue (for example a specific resource or anomaly type) and targets a Systems Manager Automation runbook that remediates it.
+No one has to check the console, and remediation starts seconds after the insight is created.
+W: EventBridge rules on DevOps Guru insights to Lambda and SSM: event-driven rules create tickets for every insight and trigger the runbook only for the known pattern.
+X: B=Polling the API from EC2: this adds a server to run and patch, delays reactions until the next poll and duplicates what EventBridge events already provide.
+C=RDS database triggers: DevOps Guru does not write insights into a database, so you would need extra code to copy them there first, plus a database and trigger logic, just to recreate the event delivery EventBridge already provides.
+D=Built-in auto-remediation: DevOps Guru gives recommendations but does not itself run Systems Manager runbooks; you wire that up with EventBridge.
+T: To act automatically on DevOps Guru insights, route its EventBridge events to Lambda and SSM Automation.
+
+@ Q000819 explain
+G: ## IAM account password policy
+Each AWS account has one password policy that applies to all **IAM users** who sign in to the console with a password. It can set:
+- minimum length (for example 14) and required character types (uppercase, lowercase, numbers, symbols);
+- password expiration (for example 90 days) and whether users can change their own passwords;
+- password reuse prevention (for example the last 5 passwords);
+- whether an expired password requires an administrator reset.
+The policy is enforced when a password is created or changed. The root user and IAM Identity Center users are not governed by it.
+## Checking it
+The AWS Config managed rule `iam-password-policy` can report whether the policy meets your parameters, but the password policy is what actually enforces the rules.
+W: IAM account password policy: it directly enforces length, symbols, reuse prevention and 90-day expiration for IAM user passwords.
+X: A=SCP requiring strong passwords: SCPs limit which API actions accounts can perform; they have no settings for password complexity or expiry.
+B=Config rule resetting weak passwords: Config can evaluate the password policy settings but cannot see passwords or enforce complexity when users set them.
+C=IAM Identity Center MFA settings: these apply to Identity Center users and cover MFA, not password rules for IAM users.
+T: Password length, reuse and expiration for IAM users are set in the account password policy; SCPs and Config do not enforce passwords.
+
+@ Q000820 explain
+G: ## MFA options in IAM
+IAM supports three MFA device types for the root user and IAM users: **FIDO security keys and passkeys** (phishing resistant), **virtual authenticator apps** (TOTP) and **hardware TOTP tokens**.
+- Each user, including the root user, can register up to eight MFA devices, so an admin can have a primary and a backup key.
+- Each registered MFA device belongs to a single identity. A virtual MFA registration, for example, cannot be assigned to several users.
+## Why sharing is a bad idea
+MFA proves that a specific person is present. If several admins share one key, CloudTrail can no longer tie an action to one person and losing the key locks out everyone at once. Give each administrator their own FIDO key (plus a backup) and register it on their own identity.
+Cognito user pools are a separate identity system for application users with their own MFA settings.
+W: Keys registered per user, one identity per device: each admin registers their own security key, and one MFA device cannot serve several identities.
+X: A=One virtual MFA app for several users: an IAM MFA device assignment belongs to one identity; a single registration cannot be attached to multiple users.
+B=MFA for root only: IAM users can and should use MFA too, and a policy can require it with the `aws:MultiFactorAuthPresent` condition.
+D=IAM MFA covers Cognito logins: Cognito user pools authenticate application users separately and use their own MFA configuration.
+T: Every console identity gets its own MFA device (FIDO keys for admins, plus backups); MFA devices are never shared between users.

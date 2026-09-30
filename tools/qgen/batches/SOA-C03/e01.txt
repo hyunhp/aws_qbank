@@ -1,0 +1,324 @@
+# SOA-C03 detailed explanations, e01 (explanation-only rewrites; letters are the published ones)
+
+@ Q000746 explain
+G: ## Composite alarms
+A CloudWatch metric alarm watches one metric (or one metric math expression) against a threshold. A **composite alarm** instead watches the *states* of other alarms and combines them with a rule expression using `AND`, `OR` and `NOT`.
+- Example rule: `ALARM("cpu-high") AND ALARM("p99-latency-high")`. The composite alarm goes to ALARM only when both child alarms are in ALARM.
+- The child alarms keep their own actions. The CPU alarm can notify an SNS topic that opens a ticket, while only the composite alarm notifies the paging topic.
+## Page on symptoms, ticket on causes
+High CPU is a possible cause; high p99 latency is what customers feel. Tying the page to both means on-call is woken only when there is real impact, and noisy single-metric pages drop sharply.
+W: Composite alarm (CPU AND latency): it combines the two existing alarm states with AND logic, so the page fires only when both are breaching, while the CPU alarm on its own can keep routing to a ticketing topic.
+X: A=Anomaly detection band on CPU: it replaces a static threshold with a learned band, but it still looks at CPU alone, so it keeps paging when CPU is unusual and customers are unaffected.
+B=Longer evaluation periods: requiring CPU to stay high for longer only delays the page; it still pages on CPU alone and never checks latency.
+C=Metric math with one combined threshold: adding a CPU percentage and a latency in seconds into one number mixes units, so a single threshold on the sum cannot reliably express "both are high"; combining existing alarm states is the purpose-built way to do that.
+T: To page only when several conditions hold at once, combine existing alarms in a composite alarm instead of tuning one metric's threshold.
+
+@ Q000747 explain
+G: ## What EC2 reports by default
+EC2 publishes metrics that the hypervisor can see from outside the guest: `CPUUtilization`, network bytes and packets, disk operations for instance store, and status checks. It cannot see inside the operating system, so it does not know how much RAM is used or how full a file system is.
+## The CloudWatch agent
+The unified **CloudWatch agent** runs inside the OS (Linux or Windows) and publishes guest-level metrics such as `mem_used_percent` and `disk_used_percent` to a custom namespace (by default `CWAgent`). It can also ship log files to CloudWatch Logs.
+- Configure it with a JSON file, often stored in Systems Manager Parameter Store and pushed with Run Command.
+- The instance role needs permissions such as those in the `CloudWatchAgentServerPolicy` managed policy.
+W: CloudWatch agent: memory and disk usage are OS-level values that only software inside the instance can read, and the agent collects them and publishes them as CloudWatch metrics.
+X: A=Logs subscription filter: it streams log events that already exist in a log group to Kinesis, Firehose, Lambda or OpenSearch; it does not collect memory or disk statistics from the OS.
+B=Detailed monitoring: it only raises the frequency of the standard EC2 metrics from 5-minute to 1-minute; it adds no new metrics, so memory and disk still do not appear.
+D=CloudTrail data events: they record API calls against resources such as S3 objects or Lambda invocations; they do not measure anything inside an instance's operating system.
+T: EC2 sees the instance from the outside; for memory and disk space you need the CloudWatch agent inside the OS, not more frequent default metrics.
+
+@ Q000748 explain
+G: ## Two different questions
+- **AWS CloudTrail** answers "who did what to my AWS resources?". It records AWS API calls (console, CLI, SDK, other services) with the caller identity, time, source IP and parameters. Trails deliver these events to an S3 bucket and can also send them to CloudWatch Logs.
+- **Amazon CloudWatch Logs** answers "what did my applications and systems write?". It stores log events from applications, OS logs through the CloudWatch agent, Lambda output, VPC Flow Logs and more, in log groups with retention settings, and lets you search, run Logs Insights queries and build metric filters.
+## Example
+An operator deletes a security group: CloudTrail shows the `DeleteSecurityGroup` call and the IAM principal. The web server's stack traces after that change appear in CloudWatch Logs.
+W: CloudTrail audits API calls; CloudWatch Logs stores app/system logs: this is the actual division of work, CloudTrail for governance and auditing of API activity, CloudWatch Logs for operational log data.
+X: A=S3 requirement swapped: CloudWatch Logs does not need an S3 bucket to store logs, and S3 is in fact the standard delivery destination for CloudTrail trails.
+B=Roles reversed: it is CloudTrail that records API activity and CloudWatch Logs that holds custom application logs, not the other way around.
+C=Interchangeable: they collect different data for different purposes; CloudWatch Logs cannot record who called an AWS API unless CloudTrail sends its events there.
+T: CloudTrail is the audit record of AWS API calls; CloudWatch Logs is the store for application and system logs, and CloudTrail can feed into it.
+
+@ Q000749 explain
+G: ## How the CloudWatch agent publishes metrics
+The agent collects OS-level values (memory, disk, processes) and sends them to CloudWatch with the `PutMetricData` API. Like any AWS API call, it is signed with credentials; on EC2 these come from the **instance profile** role.
+- If the role does not allow `cloudwatch:PutMetricData`, every publish is rejected with an access-denied error. The agent process keeps running, but no data points arrive.
+- The AWS managed policy `CloudWatchAgentServerPolicy` includes this permission plus what the agent needs for logs and for reading its configuration from Parameter Store.
+## Where to look
+The agent's own log (for example `/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log` on Linux) shows AccessDenied messages, which confirms the cause.
+W: Role lacks cloudwatch:PutMetricData: the agent is running but every metric upload is refused, which matches "running process, no metrics"; attaching `CloudWatchAgentServerPolicy` to the instance role fixes it.
+X: A=No NAT gateway: a private subnet without a route to CloudWatch (NAT gateway or VPC endpoint) could block publishing, but nothing in the scenario points to that, and an instance in a public subnet needs no NAT gateway at all.
+B=Legacy CloudWatch Logs agent: the old logs agent only shipped log files and is deprecated; the unified CloudWatch agent is the tool that publishes memory and disk metrics.
+C=Instance type does not support custom metrics: custom metrics are just API calls from the guest OS, and every instance type can publish them.
+T: When the agent runs but custom metrics never show up, check the instance role for `cloudwatch:PutMetricData` before anything else.
+
+@ Q000750 explain
+G: ## Prometheus without running Prometheus servers
+Prometheus is an open-source monitoring system: applications expose metrics through client libraries, a server scrapes them, stores time series and answers PromQL queries. Running it at scale means managing storage, retention, sharding and high availability yourself.
+**Amazon Managed Service for Prometheus** is a Prometheus-compatible, serverless metrics store:
+- Ingest with Prometheus `remote_write` from Prometheus agents, the AWS Distro for OpenTelemetry collector, or AWS managed collectors (agentless scrapers for EKS).
+- Query with the same PromQL, and data is replicated across Availability Zones.
+- Pair it with Amazon Managed Grafana (or any Grafana) for dashboards.
+Existing instrumentation keeps working unchanged; only the storage and query backend moves to AWS.
+W: Amazon Managed Service for Prometheus: it ingests and stores Prometheus-format metrics at scale with PromQL support and managed availability, so the team keeps its client libraries and stops operating Prometheus servers.
+X: B=Amazon Managed Grafana: it is a managed visualization layer that queries data sources such as Managed Service for Prometheus or CloudWatch; it does not ingest or store the metrics itself.
+C=AWS X-Ray: it collects distributed traces of requests across services, not Prometheus time-series metrics.
+D=Container Insights only: it collects container performance data into CloudWatch, but it is not a managed Prometheus backend, so the team would not get a Prometheus-compatible store for its existing instrumentation and queries.
+T: Prometheus metrics that need a managed backend go to Managed Service for Prometheus; Grafana only displays them.
+
+@ Q000751 explain
+G: ## CloudWatch cross-account observability
+You designate one account as the **monitoring account** and link other accounts as **source accounts** (for example, all accounts in an organization through a CloudFormation StackSet or the Organizations integration). Under the hood, a sink in the monitoring account and links in the source accounts are managed by the Observability Access Manager (`oam`) API.
+- The monitoring account can then query and chart metrics, view alarms, search logs and see traces from source accounts as if they were local.
+- Data is not copied; it stays in the source accounts and is read in place.
+- Links are set up per Region, so you configure the monitoring account in each Region you use. A CloudWatch dashboard can hold widgets from different Regions, so one dashboard can cover all 10 accounts and 3 Regions.
+W: Cross-account observability with a monitoring account: it gives a central account read access to metrics, alarms, logs and traces of linked accounts without duplicating data, which is exactly what a single multi-account dashboard needs.
+X: B=Cross-Region log replication: copying log groups duplicates data, which the team wants to avoid, and it covers only logs, not metrics or alarms.
+C=Merging dashboard JSON: gluing dashboard definitions together is manual and brittle, and a dashboard definition by itself does not grant the viewing account any access to other accounts' data.
+D=AWS Config aggregator: it collects resource configuration and compliance data across accounts and Regions, not CloudWatch metrics or alarm states.
+T: For one view of many accounts' telemetry, link source accounts to a monitoring account; do not copy data or aggregate configuration records.
+
+@ Q000752 explain
+G: ## CloudWatch Container Insights
+Container Insights collects, aggregates and summarizes performance data from containerized workloads on Amazon ECS, Amazon EKS and Kubernetes on EC2.
+- It reports CPU, memory, network and storage at several levels: cluster, service, task and container on ECS; cluster, node, namespace, pod and container on EKS.
+- Data is sent as structured performance log events (embedded metric format) and turned into CloudWatch metrics, with ready-made automatic dashboards in the CloudWatch console.
+- The enhanced observability mode adds finer-grained metrics and curated views.
+## How you turn it on
+On ECS, enable it at the account or cluster level. On EKS, install the Amazon CloudWatch Observability add-on, which deploys the CloudWatch agent as a DaemonSet on the nodes.
+W: CloudWatch Container Insights: it is built for ECS and EKS and provides CPU and memory metrics at cluster, service, task and container level along with automatically generated dashboards.
+X: A=AWS Trusted Advisor: it runs best-practice checks for cost, security, fault tolerance, performance and service limits; it does not collect per-container performance metrics.
+B=AWS X-Ray tracing: it follows individual requests across services to show latency and errors, not resource utilization of clusters, tasks or containers.
+C=VPC Flow Logs: they record IP traffic metadata for network interfaces (source, destination, ports, accept or reject), not CPU or memory usage.
+T: Container resource metrics with prebuilt dashboards for ECS and EKS come from Container Insights, not from tracing or network logs.
+
+@ Q000754 explain
+G: ## Metric filters on JSON logs
+A **metric filter** on a CloudWatch Logs log group scans incoming events and increments a CloudWatch metric when a pattern matches. No application change is needed.
+- JSON patterns select fields: `{ $.level = "ERROR" }` matches events whose `level` is ERROR.
+- A metric filter can publish **dimensions** taken from log fields, for example `service = $.service`, so each service gets its own time series (`ErrorCount` for `service=checkout`, `service=search`, and so on).
+- Set the metric value to `1` and use the `Sum` statistic over 1 minute to get errors per minute per service.
+## Alarming
+An alarm with threshold `> 50` for 1 minute on a service's series fires when that service exceeds 50 errors. Keep dimension values low-cardinality, because each distinct value is a separate custom metric.
+W: JSON metric filter with the service as a dimension: it counts ERROR events per service directly from the logs, and CloudWatch alarms on those per-service metrics notify within a minute, with no code changes.
+X: A=CloudTrail Insights: it detects unusual volumes of AWS API calls or API errors in CloudTrail events; it does not read an application's own log group.
+B=Scheduled Logs Insights query: running a query every minute and emailing results needs extra scheduling and code, costs per GB scanned, and produces reports rather than a CloudWatch alarm with states.
+C=Subscription filter to Lambda: it works but requires writing and running custom code that calls `PutMetricData` for every event, adding cost and failure points that a metric filter avoids.
+T: To alarm on counts of log patterns, turn logs into metrics with a metric filter, using dimensions to split by a field such as service.
+
+@ Q000755 explain
+G: ## Systems Manager Automation
+An **Automation runbook** is a document of steps that call AWS APIs or run scripts, executed by Systems Manager with full execution history.
+- Useful actions: `aws:changeInstanceState` to stop instances, `aws:executeAwsApi` to call `CreateSnapshot`, `aws:executeScript` to post IDs to a ticket system, and `aws:approve` to pause until named approvers approve or reject.
+- Each run records inputs, outputs, each step's status and who approved it, which makes the process auditable. CloudTrail also logs the API calls made.
+- Runs can be scheduled with EventBridge Scheduler, a maintenance window task, or a State Manager association with a cron expression.
+## Example flow
+Approval, then stop the tagged instances, then snapshot their volumes, then write the instance and snapshot IDs to the ticket: one runbook, run every Monday.
+W: Automation runbook with an approval step on a schedule: it turns the manual procedure into a repeatable multi-step workflow with a built-in manager approval and a recorded execution history.
+X: B=Shell script from a bastion host: it depends on one server and its credentials, has no built-in approval, and leaves little central record of who ran what and with what result.
+C=Run Command executed manually: Run Command runs commands inside instances; it is not a gated multi-step workflow of API calls, and running it by hand each week is neither scheduled nor approval-driven.
+D=State Manager keeping instances stopped: an association keeps enforcing a desired state continuously; it has no approval gate and does not snapshot volumes or record IDs in a ticket.
+T: Multi-step operational tasks that need approval, auditing and a schedule belong in a Systems Manager Automation runbook.
+
+@ Q000756 explain
+G: ## Alarm-driven remediation with EventBridge
+When a CloudWatch alarm changes state, CloudWatch emits an event to the default EventBridge bus with source `aws.cloudwatch` and detail-type `CloudWatch Alarm State Change`.
+- A rule can match only transitions into ALARM for a specific alarm, for example by `detail.alarmName` and `detail.state.value = "ALARM"`.
+- **Systems Manager Automation** is a supported target, so the rule can start a runbook directly and pass the instance ID from the event as a parameter (with an input transformer).
+- The rule needs an IAM role that allows starting the automation.
+## Example
+Alarm `app-memory-high` enters ALARM, the rule starts a runbook that runs `systemctl restart myapp` on that instance through Run Command, and memory drops back without anyone logging in.
+W: EventBridge rule on the alarm state change targeting the runbook: it starts the Automation runbook automatically on each transition to ALARM, restarting only the service with no manual step and no custom code.
+X: B=Watch the dashboard and run it manually: it depends on a person noticing the alarm, which contradicts the requirement for no manual intervention.
+C=AWS Config remediation: Config evaluates resource configuration against rules; memory utilization is a runtime metric, not a configuration setting, so no Config rule becomes noncompliant here.
+D=Built-in alarm reboot action: the EC2 reboot action restarts the whole operating system, which is more disruptive than restarting one service and does not run the requested Automation runbook.
+T: Connect alarm state changes to automated fixes through an EventBridge rule; built-in EC2 alarm actions only stop, terminate, reboot or recover the instance.
+
+@ Q000757 explain
+G: ## AWS Config remediation
+AWS Config rules only evaluate resources and mark them compliant or noncompliant. To fix them, you attach a **remediation action** to a rule.
+- The action is a Systems Manager Automation runbook (AWS managed or your own).
+- Parameters such as the resource ID are passed from the noncompliant resource automatically.
+- It can run **automatically** with a retry limit, or manually on demand from the console.
+- The runbook runs with an IAM role that you supply.
+## Example
+Rule `encrypted-volumes` flags `vol-0abc` as noncompliant. A custom runbook snapshots it, copies the snapshot with encryption, creates an encrypted volume from the copy, stops the instance, swaps the volumes and starts the instance again. Config re-evaluates it as compliant.
+W: Config remediation invoking an SSM runbook: automatic remediation runs the runbook for each noncompliant volume as soon as Config flags it, so the snapshot, encrypted copy and swap happen without anyone running commands.
+X: A=Conformance packs alone: a conformance pack bundles rules for deployment and reporting; without remediation actions defined, it only detects and reports noncompliance.
+B=CloudTrail Insights alerting: it flags unusual API call volumes or error rates; it does not evaluate encryption settings or change any volume.
+D=Manual daily review: a person reading the dashboard is the opposite of automatic, and fixes can lag by up to a day.
+T: Config rules detect; Config remediation actions with SSM Automation runbooks fix, and can do so automatically.
+
+@ Q000758 explain
+G: ## Read the error first
+Each step of an EventBridge-to-Lambda automation leaves evidence:
+- The rule matched and invoked the function, because an invocation appears in the function's CloudWatch Logs.
+- The function ran its code, which then received `AccessDenied` (or an `UnauthorizedOperation` error from EC2) when calling the EC2 API.
+Lambda calls AWS APIs with its **execution role**. To stop instances the role needs `ec2:StopInstances` (and usually `ec2:DescribeInstances` to find instances by tag). If the policy uses conditions such as `aws:ResourceTag/Environment`, the condition must match the instances.
+## Other permissions are separate
+EventBridge's permission to invoke the function is a resource-based policy on the function. Since the function was invoked, that part already works.
+W: Execution role allows ec2:StopInstances: the function runs but the EC2 API refuses the call, which points directly at the execution role's permissions for stopping the tagged instances.
+X: A=Cron expression syntax: an invalid expression would stop the rule from firing at all, but the logs show the function was invoked on schedule.
+B=Detailed monitoring: it only changes how often EC2 metrics are published and has no effect on whether an API call to stop the instance is allowed.
+D=Log retention setting: retention controls how long log events are kept; it cannot cause an AccessDenied error from the EC2 API.
+T: If the trigger fired and the code ran but got AccessDenied, check the IAM permissions of the identity making the call, here the Lambda execution role.
+
+@ Q000759 explain
+G: ## EventBridge input transformers
+By default a rule sends the whole event JSON to its target. An **input transformer** lets you reshape it per target in two parts:
+- **Input paths**: pick values from the event into variables, for example `"alarm": "$.detail.alarmName"` and `"state": "$.detail.state.value"`.
+- **Input template**: build the new payload using those variables plus any fixed text, for example `{"alarm": <alarm>, "state": <state>, "severity": "SEV2 - customer impact", "runbook": "https://wiki.example.com/rb/checkout"}`.
+The target receives only the transformed payload. Because the template is set per rule target, you can use different rules (or targets) per alarm group to attach different severity labels and runbook links.
+W: Input transformer on the rule's target: it extracts fields from the alarm event and adds the severity label and runbook link before delivery, so the Lambda function gets an enriched payload without code changes.
+X: B=Schema registry entry: the registry stores and discovers event structures and generates code bindings; it does not change events on their way to a target.
+C=Event bus resource-based policy: it controls which accounts or principals can put events onto the bus; it has no effect on event content.
+D=Dead-letter queue: an SQS queue that holds events EventBridge could not deliver after retries; it handles failures and never alters successful deliveries.
+T: To reshape or enrich an event for a target without touching the target's code, use an input transformer; schemas, policies and DLQs do not modify payloads.
+
+@ Q000760 explain
+G: ## Two status checks
+- **System status check** (`StatusCheckFailed_System`): problems with the AWS infrastructure behind the instance, such as loss of network connectivity, power or a host hardware fault. AWS must fix these, or the instance must move to another host.
+- **Instance status check** (`StatusCheckFailed_Instance`): problems inside the guest, such as a misconfigured OS or exhausted memory. A reboot or your own fix helps here.
+## The recover action
+A CloudWatch alarm on `StatusCheckFailed_System` can use the built-in **EC2 recover** action. Recovery moves the instance to new hardware and keeps its instance ID, private IP addresses, Elastic IP addresses and EBS volumes. It works for supported instance types using EBS storage, not instance store. Many current instance types also get simplified automatic recovery by default, but an explicit alarm adds notification and control.
+W: StatusCheckFailed_System alarm with the recover action: it is the built-in, no-code way to move an instance off failed hardware automatically while keeping its identity.
+X: A=Trusted Advisor recovery: Trusted Advisor provides best-practice recommendations and checks; it does not take recovery actions on instances.
+B=Lambda calling RebootInstances: it needs custom code, and a reboot normally keeps the instance on the same host, so it does not fix an underlying hardware problem.
+C=Runbook triggered by AWS Config: Config tracks configuration and compliance, not health status checks, so it is an indirect, custom-built path for something the alarm action does natively.
+T: System status check failures mean the host is at fault: use an alarm with the recover action, not a reboot.
+
+@ Q000761 explain
+G: ## Amazon DevOps Guru
+DevOps Guru is a managed ML service for operational health. You choose the coverage (the whole account, CloudFormation stacks, or resources with a tag), and it learns the normal behavior of supported resources such as Lambda functions, DynamoDB tables and API Gateway APIs.
+- It analyzes CloudWatch metrics, events, deployments and configuration changes, and can analyze logs.
+- Related anomalies across resources (for example, DynamoDB throttling, then Lambda errors, then API 5xx) are grouped into one **insight** with a timeline, a likely root cause and recommended actions.
+- Insights can be sent to an SNS topic or viewed in the console; no model building is required.
+W: Amazon DevOps Guru: it applies pre-trained ML to many resources at once, correlates related anomalies into insights and suggests remediation, exactly as requested without building models.
+X: A=Trusted Advisor operational checks: they compare configurations with best practices (for example, idle resources or missing backups); they do not detect runtime anomalies or group related events.
+B=CloudWatch anomaly detection on each metric: it builds a band for one metric at a time, so each alarm fires alone with no cross-resource correlation, grouped insights or remediation advice.
+C=Lookout for Metrics with custom models: it was aimed at anomalies in business and KPI data that you configure yourself, and AWS has discontinued it; it never offered operational insights with remediation.
+T: For correlated, ML-based operational insights across serverless resources, use DevOps Guru rather than per-metric anomaly bands.
+
+@ Q000762 explain
+G: ## How a rule decides to fire
+An EventBridge rule compares each event on its bus with its **event pattern**. Every field in the pattern must match the event (field names and values are case-sensitive). Alarm state changes arrive on the default bus looking like this:
+- `"source": "aws.cloudwatch"`
+- `"detail-type": "CloudWatch Alarm State Change"`
+- `"detail": { "state": { "value": "ALARM" } }`
+A pattern such as `{"source":["aws.cloudwatch"],"detail-type":["CloudWatch Alarm State Change"],"detail":{"state":{"value":["ALARM"]}}}` matches every alarm entering ALARM. A typo, wrong case, a different bus or a value like `"Alarm"` means nothing ever matches.
+## Tell the failure modes apart
+- Rule metric `MatchedEvents` stays at 0 when the pattern is wrong.
+- `FailedInvocations` rises when the rule matches but cannot invoke the target (for example, a missing Lambda resource policy).
+No delivery errors plus no invocations points to the pattern.
+W: Event pattern doesn't match source or detail-type: an enabled rule with no errors and no invocations is simply not matching the events, so the pattern values must be corrected to what alarms actually emit.
+X: B=Lambda timeout too low: a short timeout makes invocations fail partway, but the function would still be invoked and show logs and invocation metrics.
+C=Cannot target Lambda directly: Lambda is one of the most common EventBridge targets and is supported directly.
+D=Alarms do not emit events: CloudWatch sends a `CloudWatch Alarm State Change` event to the default bus on every alarm state change.
+T: When an enabled rule never triggers and shows no errors, compare its event pattern with a real sample event before looking at the target.
+
+@ Q000763 explain
+G: ## Patch Manager building blocks
+AWS Systems Manager **Patch Manager** automates OS patching on managed nodes (EC2 or on-premises with the SSM Agent).
+- A **patch baseline** decides which patches are approved, for example "Security, Critical and Important, auto-approved 0 days after release".
+- The `AWS-RunPatchBaseline` document scans or installs patches against the baseline and reports **patch compliance** per instance.
+- A **maintenance window** (or a patch policy created with Quick Setup) runs the install on a schedule, such as daily at 02:00, for instances selected by tag.
+## Meeting a 24-hour rule
+A daily schedule with critical patches auto-approved means any missing critical patch is installed within a day, and compliance reports show which instances are still missing patches, with no one logging in.
+W: Patch Manager with a baseline and maintenance window: the baseline defines which critical patches are required, and the scheduled window installs them automatically and reports compliance, meeting the 24-hour requirement without server access.
+X: B=Session Manager manual patching: it gives interactive shell access without SSH keys, but patching by hand on each instance violates the no-manual-access requirement and does not scale.
+C=Inventory: it collects metadata about installed software and configurations; it can show what is installed but never installs anything.
+D=Parameter Store: it stores configuration values and secrets; writing down version numbers does not patch any instance.
+T: Automated, scheduled OS patching with compliance reporting is Patch Manager; Inventory and Session Manager only show or give access.
+
+@ Q000764 explain
+G: ## Fan-out with EventBridge targets
+An EventBridge rule can have **up to five targets**. When an event matches, EventBridge delivers it to every target independently, so one event can start several actions in parallel.
+- Target types include SNS topics, Systems Manager Automation, Lambda functions, Step Functions state machines, SQS queues and more.
+- Each target can have its own input transformer, retry policy and dead-letter queue, so a failure in one target does not block the others.
+## Example
+Rule on `CloudWatch Alarm State Change` for `api-5xx-high` into ALARM, with targets: an SNS topic to page on-call, an Automation runbook that restarts the service, and a Lambda function that opens a ticket.
+W: One EventBridge rule with three targets: it fans the single alarm event out to SNS, the Automation runbook and Lambda at the same time with built-in delivery and retries, and needs no orchestration code.
+X: B=Step Functions only: a state machine could call all three, but you would have to design and maintain a workflow for what is just parallel delivery, and something still has to start it from the alarm.
+C=Three alarms on the same metric: it duplicates alarm configuration that must be kept in sync and multiplies alarm cost, only to work around a fan-out that one rule already provides.
+D=One Lambda calling everything in sequence: it is custom orchestration code, runs the actions one after another, and ties all three to one function's errors, timeouts and permissions.
+T: To send one event to several independent actions, add multiple targets to one EventBridge rule instead of writing orchestration.
+
+@ Q000765 explain
+G: ## How gp2 and gp3 performance works
+- **gp2**: IOPS are tied to size at 3 IOPS per GiB. A 200 GiB volume gets 600 baseline IOPS; reaching 10,000 IOPS needs about 3,334 GiB (about 3.3 TiB). Throughput is also capped at 250 MiB/s, so gp2 cannot reach 500 MB/s at any size.
+- **gp3**: every volume includes a baseline of 3,000 IOPS and 125 MiB/s regardless of size, and you can **provision extra IOPS and throughput independently of capacity**, paying only for what you add.
+## Applying it
+Keep 200 GiB, provision 10,000 IOPS and 500 MiB/s on gp3. You pay for 200 GiB plus the extra performance, not for 3.4 TiB of storage you do not need. The change can be made online with Elastic Volumes (`ModifyVolume`), with no detach.
+W: Move to gp3 and provision IOPS and throughput: gp3 decouples performance from size, so the 200 GiB volume gets 10,000 IOPS and 500 MB/s at the lowest cost.
+X: A=Grow gp2 to 3.4 TiB: it pays for about 17 times the storage to buy IOPS, and gp2 throughput still tops out below the required 500 MB/s.
+B=io2 with 10,000 provisioned IOPS: io2 would meet the numbers, but its per-GiB and per-provisioned-IOPS prices are higher; its extra durability and latency consistency are not required here.
+C=Move to st1: st1 is a throughput-optimized HDD for large sequential reads with only a few hundred IOPS, which is far below the 10,000 random IOPS a database needs.
+T: When you need more IOPS or throughput but not more space, use gp3 and provision performance separately instead of oversizing gp2.
+
+@ Q000766 explain
+G: ## Multipart upload
+A single `PutObject` can upload at most 5 GB. **Multipart upload** splits an object into parts:
+- `CreateMultipartUpload` returns an upload ID.
+- Each part (5 MiB to 5 GiB, up to 10,000 parts) is sent with `UploadPart`, possibly in parallel, and returns an ETag.
+- `CompleteMultipartUpload` assembles the parts into one object.
+If the network drops, only the failed parts are uploaded again; completed parts stay stored until you complete or abort. AWS recommends multipart for objects over 100 MB, and the AWS CLI and SDK transfer managers use it automatically.
+## Housekeeping
+Parts of uploads that are never completed still incur storage charges. A lifecycle rule with `AbortIncompleteMultipartUpload` cleans them up after a few days.
+W: Multipart upload: it breaks each 5 GB file into independently retried parts, so an interruption costs only a part rather than the whole file, and parallel parts speed up the transfer.
+X: A=S3 Batch Operations: it runs one operation (copy, tag, restore, invoke Lambda) across many objects that already exist in S3; it does not upload files from an application.
+B=S3 Select: it ran SQL queries to retrieve subsets of data from an existing object and is no longer offered to new customers; it has nothing to do with uploading.
+C=Presigned URL with a single PUT: one PUT sits right at the 5 GB limit and any interruption forces the whole file to be sent again.
+T: For large uploads that must survive network interruptions, use multipart upload so only failed parts are retried.
+
+@ Q000767 explain
+G: ## Picking a file service by protocol
+- **Amazon FSx for Windows File Server** is a fully managed Windows Server file system. It serves shares over **SMB**, stores data on NTFS with Windows **ACLs**, and joins your **Microsoft Active Directory** (AWS Managed Microsoft AD or self-managed), so users and groups authenticate as they do on-premises. It also supports DFS namespaces, shadow copies and Multi-AZ deployments.
+- **Amazon EFS** provides NFS file systems for Linux clients and POSIX permissions.
+- **Amazon FSx for Lustre** is a high-performance parallel file system for Linux compute clusters.
+- **Amazon S3** is object storage accessed through an HTTP API, not a mounted file share.
+## Example
+A lift-and-shift of a Windows app that maps `\\fs01\finance` with AD group permissions maps directly to an FSx for Windows share with the same ACLs.
+W: Amazon FSx for Windows File Server: it natively provides SMB shares, NTFS ACLs and Active Directory integration, which is what the Windows application expects.
+X: A=Amazon EFS: it uses NFS and POSIX permissions and does not support Windows clients over SMB or NTFS ACLs.
+C=Amazon FSx for Lustre: it is built for high-throughput Linux HPC and ML workloads using the Lustre client, not SMB shares with Windows ACLs.
+D=Amazon S3: it is object storage with IAM and bucket policies; applications cannot mount it as an SMB share with NTFS permissions.
+T: SMB plus NTFS ACLs plus Active Directory points to FSx for Windows File Server; EFS and Lustre are for Linux clients.
+
+@ Q000768 explain
+G: ## Database load and wait events
+**Performance Insights** measures **DB load** as average active sessions (AAS): how many sessions are working or waiting at each moment. It samples every second and lets you slice load by:
+- **Wait events** (for PostgreSQL, for example `IO:DataFileRead`, `Lock:transactionid`, `LWLock` types): what sessions are waiting for.
+- **Top SQL**: which statements contribute most load.
+- Hosts, users and databases.
+It is enabled on the RDS instance with no software to install. Zooming into the slow periods shows, for example, one query spending its time on `IO:DataFileRead`, which suggests a missing index. AWS now presents this analysis in CloudWatch Database Insights, which builds on Performance Insights data.
+W: Amazon RDS Performance Insights: it shows which SQL statements and wait events drive database load at any moment, which directly answers the question for intermittent slow periods, without installing agents.
+X: A=AWS X-Ray: it traces requests through application code and can show that a database call was slow, but not the database's internal wait events or top SQL across all sessions.
+C=VPC Flow Logs: they record network connection metadata (IPs, ports, bytes) and contain no SQL text or database wait information.
+D=Basic CloudWatch RDS metrics only: CPU, IOPS and connections show that the instance is busy but not which statements or waits are responsible.
+T: To find which queries and waits cause database slowness, use Performance Insights; host metrics only show that the database is busy.
+
+@ Q000769 explain
+G: ## EC2 placement group strategies
+- **Cluster**: packs instances close together inside one Availability Zone, on hardware with high-bandwidth, low-latency links. Best for tightly coupled HPC jobs (MPI) that exchange data constantly. Use enhanced networking or Elastic Fabric Adapter for the best results.
+- **Partition**: splits instances into partitions on separate racks to limit correlated hardware failures.
+- **Spread**: puts each instance on distinct hardware to maximize isolation for a few critical instances.
+## Trade-off
+Cluster placement gives the best node-to-node performance at the cost of resilience: a problem affecting that part of the AZ can hit all instances together. Launch all instances in one request with the same instance type to reduce capacity errors.
+W: Cluster placement group: it places instances physically close within one AZ, giving the lowest latency and highest throughput between nodes, which is exactly the trade-off the team accepts.
+X: A=No placement group: EC2 may place instances anywhere in the AZ, so latency and bandwidth between them are not optimized or predictable.
+C=Partition placement group: it spreads groups of instances across different racks for fault isolation, which increases distance between nodes instead of minimizing latency.
+D=Spread placement group: it deliberately puts instances on separate hardware and is limited to a small number of instances per AZ, the opposite of packing them together.
+T: Lowest latency between instances means a cluster placement group; partition and spread trade proximity for fault isolation.
+
+@ Q000770 explain
+G: ## Partition placement groups
+A **partition placement group** divides instances into logical partitions, and each partition sits on its own set of racks with separate network and power. A rack failure affects only the instances in one partition.
+- Up to 7 partitions per Availability Zone, and the group can span several AZs in a Region.
+- Each partition can hold many instances, so the group can run hundreds of instances in total.
+- Instances can read their partition number from instance metadata, so a topology-aware database such as Cassandra, HDFS or Kafka can place replicas in different partitions, like different racks.
+## Compared with spread
+A spread placement group puts every instance on distinct hardware but allows only 7 running instances per AZ per group. For 12 nodes arranged in replica groups, partitions fit better.
+W: Partition placement group: it limits a hardware failure to one partition while allowing many instances per partition, and it exposes partition numbers so the database can map them to racks.
+X: A=Spread placement group: it isolates each instance on separate hardware but caps the group at 7 running instances per AZ, and it has no notion of grouped racks for replicas.
+B=Single AZ without a placement group: EC2 decides placement, so there is no control over which instances share hardware and no rack information for the database.
+D=Cluster placement group: it packs instances close together for low latency, which increases the chance that one hardware failure hits many nodes at once.
+T: For large rack-aware distributed stores, use partition placement groups; spread is for a handful of critical instances, cluster for low latency.

@@ -1,0 +1,374 @@
+# SOA-C03 detailed explanations, e07 (explanation-only rewrites; letters are the published ones)
+
+@ Q002673 explain
+G: ## Shared file storage across Availability Zones
+Block storage and file storage behave differently when several instances need the same data.
+- An **EBS volume** lives in one Availability Zone and is normally attached to one instance (Multi-Attach exists only for certain `io1`/`io2` volumes in the same AZ and needs a cluster-aware file system).
+- An **instance store** is disk physically attached to the host; its data is lost when the instance stops or the host fails.
+- **Amazon EFS** is a managed NFS file system. A **Regional** file system stores data redundantly across multiple AZs, and you create one **mount target** per AZ so instances in each AZ mount it locally.
+## Example
+Web servers in `us-east-1a`, `1b` and `1c` all mount `fs-12345678:/` at `/var/www/shared`. If `us-east-1a` fails, the instances in the other two AZs keep reading and writing the same files. An EFS **One Zone** file system would be cheaper but would not survive the loss of its AZ.
+W: Amazon EFS Regional file system: it is a POSIX file system that many Linux instances mount at the same time over NFS, and its data and mount targets span several AZs, so losing one AZ does not take the file system down.
+X: A=Single EBS volume: the volume is tied to one AZ and, in the normal case, one instance, so it is neither shared across AZs nor available when that AZ fails.
+B=Instance store: each instance has its own local, ephemeral disk; nothing is shared between instances and the data disappears when an instance stops or its host fails.
+C=Shared EBS snapshot: a snapshot is a point-in-time backup stored in S3; creating volumes from it gives each instance a separate copy that diverges immediately, not a live shared file system.
+T: Many Linux instances in several AZs sharing live files means Amazon EFS with a Regional file system; EBS and instance store are per-instance, per-AZ storage.
+
+@ Q002674 explain
+G: ## Centralized backup with AWS Backup
+AWS Backup is a managed service that protects many resource types from one place: EC2, EBS, RDS and Aurora, DynamoDB, EFS, FSx, S3 and more.
+- A **backup plan** contains **backup rules**: schedule (for example daily at 03:00 UTC), backup window, lifecycle (move to cold storage for supported types, then expire) and retention.
+- A rule can include a **copy action** that copies each recovery point to a vault in another Region or another account.
+- **Resource assignments** select what the plan protects, often by tag such as `backup=gold`, so new resources are covered automatically.
+- With AWS Organizations, **backup policies** can push plans to every member account.
+## Example
+Plan `gold`: daily backup kept 35 days, monthly backup kept 1 year, each copied to `eu-west-1`. Any EC2 instance, RDS database or DynamoDB table tagged `backup=gold` is included.
+W: AWS Backup plans: one plan defines schedules, retention and cross-Region or cross-account copies for EC2, EBS, RDS and DynamoDB together, with central monitoring of jobs and recovery points.
+X: A=S3 Lifecycle rules: they transition or expire objects inside S3 buckets; they cannot back up EC2 instances, RDS databases or DynamoDB tables.
+B=EBS Data Lifecycle Manager: DLM automates EBS snapshots and EBS-backed AMIs only; it has no coverage for RDS or DynamoDB and no central view across services.
+D=RDS automated backups only: they protect RDS databases alone, leaving EC2, EBS and DynamoDB without a common policy, and the retention is capped at 35 days.
+T: One policy for many services, with retention and cross-Region copies, is AWS Backup; DLM, S3 Lifecycle and RDS automated backups each cover a single service.
+
+@ Q002675 explain
+G: ## RDS automated backups and point-in-time recovery
+When automated backups are enabled (backup retention period 1 to 35 days), RDS does two things:
+- takes a daily **snapshot** of the DB instance during the backup window, and
+- continuously ships **transaction logs** to storage managed by AWS.
+Together they allow **point-in-time recovery (PITR)**: restore to any second between the earliest restorable time and the latest restorable time (usually within the last few minutes). The restore always creates a **new DB instance**; you then point the application at it or copy the missing data back.
+## Example
+Retention is set to 7 days. Someone runs `DELETE FROM orders` at 14:32:10. You restore to 14:32:00 as a new instance `orders-restore`, then copy the deleted rows back.
+Replication features do not help here: they copy the bad `DELETE` to every copy within seconds.
+W: Automated backups with PITR: a 7-day retention period keeps snapshots plus transaction logs, so the database can be restored to any second in that window, including just before the accidental deletion.
+X: B=Monthly manual snapshot: it restores only to the moment the snapshot was taken, so up to a month of changes could be lost and arbitrary times are impossible.
+C=Multi-AZ standby: the standby is kept synchronously identical to the primary for failover, so the deletion is applied to it immediately; it is not a backup and cannot be rewound.
+D=Cross-Region read replica: asynchronous replication also applies the deletion to the replica within seconds or minutes; it helps with read scaling and Region DR, not with undoing bad writes.
+T: To undo a bad change at a specific second, restore from automated backups with PITR; Multi-AZ and read replicas faithfully copy the mistake.
+
+@ Q002676 explain
+G: ## AWS Backup Vault Lock
+Recovery points in AWS Backup are stored in a **backup vault**. Vault Lock adds write-once-read-many (WORM) protection to that vault.
+- **Governance mode**: blocks deletion and early lifecycle changes for most users, but principals with the right IAM permissions can change or remove the lock. Good for testing.
+- **Compliance mode**: after a grace period (at least 72 hours, during which you can still remove it) the lock becomes immutable. No one, including administrators and the account root user, can delete recovery points before their retention ends, shorten retention, or remove the lock.
+- The lock can enforce a **minimum and maximum retention**, so a backup plan cannot store points for less time than required.
+## Example
+A vault `finance-7y` is locked in compliance mode with minimum retention of 2,555 days. A compromised admin account tries `DeleteRecoveryPoint`; the call is denied until the seven years pass.
+W: Backup Vault Lock in compliance mode: once the grace period ends the lock cannot be changed or removed by anyone, so recovery points stay protected from deletion, even by administrators, for the full seven-year retention.
+X: A=S3 Standard without versioning: any principal with `s3:DeleteObject` can remove or overwrite objects permanently; there is no immutability at all.
+C=IAM deny for developers only: administrators are not covered and can also edit or detach the policy, so the protection depends on the very people it must guard against.
+D=Manual snapshots in the same account: anyone with delete permissions in that account, including administrators or an attacker with admin access, can delete them.
+T: "Even administrators cannot delete" means an immutable control such as Backup Vault Lock in compliance mode, not IAM policies that admins can rewrite.
+
+@ Q002677 explain
+G: ## RPO, RTO and AWS Elastic Disaster Recovery
+- **RPO** (recovery point objective): how much data you can afford to lose, measured in time.
+- **RTO** (recovery time objective): how long recovery may take.
+Periodic backups give an RPO equal to the backup interval (a daily backup means up to 24 hours of lost data). Seconds of RPO require **continuous replication**.
+**AWS Elastic Disaster Recovery (AWS DRS)** installs a replication agent on source servers (on premises, other clouds or EC2). It replicates disks at the **block level** continuously into a low-cost **staging area** subnet in the target Region. During a drill or disaster you launch **recovery instances** from the latest or an earlier point in time, typically within minutes, then fail back when the source is healthy.
+## Example
+A database server in a data center replicates to `us-west-2`. The data center loses power; you launch its recovery instance in `us-west-2` and change DNS, losing only seconds of writes.
+W: AWS Elastic Disaster Recovery: continuous block-level replication gives an RPO of seconds, and launching pre-configured recovery instances gives an RTO of minutes, for both on-premises and EC2 servers, into another Region.
+X: A=Data Lifecycle Manager: it schedules EBS snapshots and AMIs for EC2 only; it cannot protect on-premises servers, and snapshot intervals give an RPO of hours, not seconds.
+B=Daily AWS Backup plans: with one backup per day, up to a day of data can be lost, and restoring whole servers from backups takes longer than launching already-replicated recovery instances.
+D=S3 Cross-Region Replication: it copies S3 objects between buckets; it does not replicate server disks or launch servers.
+T: Seconds of RPO and minutes of RTO for whole servers means continuous replication with Elastic Disaster Recovery, not scheduled snapshots or backups.
+
+@ Q002678 explain
+G: ## How S3 Versioning protects objects
+With Versioning enabled, S3 keeps every version of every object under its own version ID.
+- **Overwrite**: a `PUT` to an existing key creates a new current version; the old one becomes a noncurrent version and can still be read or restored.
+- **Delete** without a version ID: S3 adds a **delete marker** as the current version. The object looks deleted, but removing the delete marker brings it back.
+- Permanently deleting a specific version requires a request that names the version ID, which you can restrict with IAM, MFA Delete or S3 Object Lock.
+- Noncurrent versions cost storage, so add a lifecycle rule such as "expire noncurrent versions after 90 days".
+## Example
+`report.csv` is overwritten by a bad job. You list versions, copy the previous version ID over the current one, and the good data is back.
+W: S3 Versioning: overwrites keep the previous version and simple deletes only add a delete marker, so both accidental overwrites and deletions can be undone.
+X: A=Requester Pays: it makes the requester pay request and data transfer costs; it has no effect on whether objects can be overwritten or deleted.
+B=S3 Intelligent-Tiering: it moves objects between access tiers to save cost; a deleted or overwritten object is gone just the same.
+C=Transfer Acceleration: it speeds uploads and downloads through CloudFront edge locations; it keeps no earlier copies of objects.
+T: To recover from overwrites and deletions in S3, enable Versioning (plus Object Lock or MFA Delete for stronger protection); cost and speed features keep no history.
+
+@ Q002679 explain
+G: ## Absorbing traffic spikes: buffer, then scale
+A tightly coupled tier that processes each request synchronously must have enough capacity at the exact moment the spike arrives. Two patterns remove that pressure:
+- **Decoupling with Amazon SQS**: the web tier writes a message and returns quickly. Messages wait safely in the queue until a worker is free, so a burst becomes a backlog instead of errors.
+- **Scaling on queue depth**: an Auto Scaling group of workers uses a metric such as backlog per instance (`ApproximateNumberOfMessagesVisible` divided by running instances) with target tracking, adding workers as the queue grows and removing them as it drains.
+## Example
+Normal load is 50 messages per minute with 2 workers. A promotion pushes 5,000 messages into the queue; the group scales to 20 workers, clears the backlog, then scales back in.
+W: B=Auto Scaling on queue depth: capacity follows the actual amount of waiting work, so worker count rises with the backlog during a spike and falls afterwards.
+E=SQS between tiers: the queue absorbs the burst durably, so the web tier keeps accepting requests while workers process messages at their own pace.
+X: A=Single large instance: one instance has a fixed capacity ceiling and is a single point of failure; a spike beyond its capacity causes errors and an instance failure causes an outage.
+C=Disabling health checks: unhealthy instances would keep receiving work instead of being replaced, which lowers usable capacity during a spike.
+D=Maximum equal to minimum: the group size becomes fixed, so scaling policies have no room to add instances when load rises.
+T: Absorb spikes by buffering work in SQS and scaling workers on the backlog, not by fixing capacity on one big or fixed-size fleet.
+
+@ Q002680 explain
+G: ## High availability for ElastiCache (Redis OSS or Valkey)
+An ElastiCache replication group has one **primary** node per shard, which takes writes, and up to several **replicas**, which copy the primary asynchronously.
+- Placing replicas in **different Availability Zones** means a copy of the data survives the loss of an AZ.
+- **Multi-AZ with automatic failover** lets ElastiCache detect a failed primary and promote a replica, updating the primary endpoint without operator action. Multi-AZ requires at least one replica.
+- The cache subnet group should contain subnets in several AZs; a subnet always belongs to exactly one AZ.
+## Example
+A cluster-mode-disabled group has a primary in `us-east-1a` and replicas in `1b` and `1c`. When `1a` fails, the replica in `1b` is promoted and applications keep using the same primary endpoint.
+W: A=Replicas in different AZs: a replica outside the failed node's AZ holds a current copy of the data that can take over.
+E=Multi-AZ with automatic failover: ElastiCache promotes a healthy replica and repoints the endpoint without operator action when the primary node or its AZ fails.
+X: B=Single node with daily backups: there is no replica to fail over to; recovery means creating a new node from a backup that may be up to a day old.
+C=All nodes in one subnet: a subnet lives in a single AZ, so every primary and replica fails together if that AZ fails, even with cluster mode enabled.
+D=Larger node without replicas: more memory and CPU do not add redundancy; the node is still a single point of failure.
+T: ElastiCache resilience comes from replicas in other AZs plus Multi-AZ automatic failover, not from bigger nodes or backups.
+
+@ Q002681 explain
+G: ## DynamoDB backup options
+- **Point-in-time recovery (PITR)**: continuous backups of a table. You can restore to any second within the recovery period, which is configurable from 1 to 35 days (35 by default), and restore creates a **new table**. It is enabled per table and does not affect table performance.
+- **On-demand backups** (or AWS Backup): full backups you keep as long as you like, restorable only to the moment they were taken.
+Other features change or replicate data but are not backups:
+- **Global tables** replicate every write, including deletes, to other Regions.
+- **DynamoDB Streams** keep a record of item changes for only 24 hours, for consumers such as Lambda.
+- **Time to Live** automatically deletes items after a timestamp.
+## Example
+A bug overwrites prices at 09:14:05. With PITR enabled you restore `products` to 09:14:00 as `products-restored` and copy the good values back.
+W: Point-in-time recovery: it keeps continuous backups for up to 35 days and restores the table to any chosen second in that window.
+X: B=Global tables replica: replicas receive the same writes and deletes within about a second, so a bad change reaches every Region; there is no way to rewind.
+C=DynamoDB Streams only: the stream holds changes for just 24 hours and has no restore operation; rebuilding a table from it would be custom work and cannot cover 35 days.
+D=Time to Live: TTL deletes expired items automatically; it removes data rather than protecting it.
+T: Restoring a DynamoDB table to any second in the last 35 days is exactly PITR; replication and streams copy mistakes instead of undoing them.
+
+@ Q002682 explain
+G: ## Route 53 failover routing
+Failover routing uses two records with the same name and type:
+- a **primary** record, associated with a **health check** (or an alias to a resource with "evaluate target health"), and
+- a **secondary** record that Route 53 returns only when the primary is unhealthy.
+While the primary is healthy, all users get the primary. When the health check fails, Route 53 answers with the secondary.
+## Example
+`www.example.com` primary: alias to the Application Load Balancer, health check on `/health`. Secondary: alias to an S3 static website bucket named `www.example.com` (or a CloudFront distribution in front of it) that serves `maintenance.html`. When the ALB check fails, users see the maintenance page; when it recovers, traffic returns automatically.
+Keep the record TTL short so clients pick up the change quickly (alias records use the target's TTL).
+W: Failover routing with a health check: it expresses exactly "primary while healthy, S3 maintenance page otherwise" and switches automatically in both directions.
+X: A=Weighted 50/50: half of all users would get the maintenance page even while the site is healthy; weights split traffic, they do not express a primary and a standby.
+B=Geolocation routing: it chooses a record by the user's location, dividing users by where they are instead of sending everyone to one primary with a standby maintenance page.
+C=Simple routing with long TTL: simple records do not support health checks, so there is no automatic switch, and a long TTL makes any manual change slow to take effect.
+T: "Go to the backup only when the primary is unhealthy" is Route 53 failover routing with a health check on the primary record.
+
+@ Q002683 explain
+G: ## Why Auto Scaling groups flap
+Flapping happens when the group reacts to a metric before its last action has had any effect. A new instance needs time to boot and warm up; until then average CPU still looks high, so another scale-out fires, then too much capacity triggers scale-in, and the cycle repeats.
+- **Cooldown** (for simple scaling policies, default 300 seconds): after an activity, the group waits before starting another one.
+- **Instance warm-up** (for target tracking and step scaling, set on the group as default instance warm-up): new instances do not count toward the aggregated metric until warm-up ends, which prevents extra scale-outs.
+- Also useful: leave a gap between scale-out and scale-in thresholds and use metrics evaluated over several periods.
+## Example
+Instances need 4 minutes to start serving. With warm-up at 60 seconds, the group adds instances every minute and then removes them. Setting warm-up to 300 seconds stops the oscillation.
+W: Longer cooldown or instance warm-up: the group waits until new capacity is actually serving and reflected in the metric before acting again, which breaks the out-in-out cycle.
+X: A=Remove scale-in: it stops scale-in actions but leaves the group permanently over-provisioned after each spike, wasting money; the premature scale-outs are not fixed.
+C=Lower scale-out threshold: reacting even sooner, to smaller changes, triggers more scaling actions and makes the oscillation worse.
+D=Single Availability Zone: the number of AZs has nothing to do with how fast the group reacts to metrics, and it removes AZ-level resilience.
+T: Flapping is solved by giving new instances time to take effect (cooldown and warm-up), not by removing scale-in or reacting faster.
+
+@ Q002684 explain
+G: ## CloudFormation change sets
+A change set is a preview of a stack update. You submit the new template or parameters, and CloudFormation compares them with the current stack without changing anything.
+For each resource it lists:
+- **Action**: `Add`, `Modify`, `Remove` (and `Import` for resource import)
+- **Replacement**: `True`, `False` or `Conditional` for modified resources, which tells you whether the physical resource will be recreated (for example a new RDS instance, new ID and data risk)
+- which properties and which change source caused it
+You review the change set, then **execute** it to apply the update, or delete it if it is not what you expected.
+## Example
+Changing an RDS `DBInstanceIdentifier` in the template shows `Modify` with `Replacement: True`, warning you before the database is replaced.
+W: Change set: it lists exactly which resources will be added, modified, removed or replaced before anything is executed, which is the preview the team wants.
+X: A=Stack policy: it blocks or allows update actions on chosen resources during an update; it does not show what an update would do.
+B=Nested stack: it splits a template into reusable child stacks; updating through a nested stack still does not preview changes by itself.
+D=Drift detection: it compares the live resources with the current template to find manual changes; it says nothing about the effect of a new template.
+T: Preview an update with a change set; drift detection looks backward at manual changes, and stack policies only block updates.
+
+@ Q002685 explain
+G: ## CloudFormation StackSets
+A **stack set** lets you deploy one template as **stack instances** in many accounts and Regions from a single administrator account (or a delegated administrator).
+- **Service-managed permissions** use AWS Organizations: you target organizational units, CloudFormation creates the needed roles for you, and **automatic deployment** can create stack instances in accounts that later join those OUs (and remove them when accounts leave).
+- **Self-managed permissions** require you to create an administration role and an execution role in each target account.
+- Deployment options such as maximum concurrent accounts, failure tolerance and Region order control rollout speed and safety.
+## Example
+Target OU `ou-prod` (40 accounts) and Regions `us-east-1`, `eu-west-1`, `ap-northeast-2`: one operation creates 120 stack instances and updates all of them when the template changes.
+W: StackSets with service-managed permissions: one operation deploys and updates the template in all 40 accounts and 3 Regions, using Organizations for permissions and automatic deployment to new accounts.
+X: B=Lambda copying the template: putting a template file in each account's bucket does not create any stack; someone would still have to deploy and update 120 stacks.
+C=Manual stacks per account: 120 console deployments are slow and error prone, and later updates would have to be repeated by hand, causing drift between accounts.
+D=One stack with 120 duplicated resources: a single stack deploys only into its own account and Region, so it cannot create resources in the other accounts.
+T: One template into many accounts and Regions is CloudFormation StackSets; service-managed permissions add Organizations integration and automatic deployment.
+
+@ Q002686 explain
+G: ## What UPDATE_ROLLBACK_FAILED means
+When an update fails, CloudFormation rolls resources back to their previous state. If the rollback itself fails, the stack stops in `UPDATE_ROLLBACK_FAILED` and cannot be updated until the rollback completes.
+Common causes:
+- a resource was changed or deleted outside CloudFormation, so it cannot be returned to the old state
+- missing IAM permissions or a service quota reached during rollback
+- a dependency that no longer exists (for example a deleted security group)
+## How to recover
+First, fix the cause if you can (restore the permission, raise the quota). Then run **Continue update rollback** (`ContinueUpdateRollback`). If some resources still cannot roll back, list them in `ResourcesToSkip`: CloudFormation stops trying to roll them back (it sets them to `UPDATE_COMPLETE`) and finishes, leaving the stack in `UPDATE_ROLLBACK_COMPLETE`. Afterwards, bring the skipped resources in line with the template, because they may now differ from it.
+W: Continue update rollback: it resumes the rollback and can skip resources that cannot be rolled back, returning the stack to a stable, updatable state.
+X: A=Wait for self-recovery: a stack in `UPDATE_ROLLBACK_FAILED` stays there indefinitely; CloudFormation does not retry the rollback on its own.
+C=Edit resources in the console: manual changes cause drift and do not change the stack status, so the stack remains stuck and even further from its template.
+D=Delete and recreate the account: it destroys every workload in the account to fix one stack, when a built-in recovery operation exists.
+T: A stack stuck in UPDATE_ROLLBACK_FAILED is fixed with ContinueUpdateRollback (skipping resources if needed), not by manual edits or waiting.
+
+@ Q002687 explain
+G: ## CloudFormation drift detection
+Resources created by a stack can still be changed directly in the console, CLI or API. **Drift** is the difference between the resource's actual configuration and the configuration CloudFormation expects from the template and parameters.
+- You run drift detection on a whole stack or on single resources (on a stack set, it checks every stack instance).
+- Each resource gets a status: `IN_SYNC`, `MODIFIED`, `DELETED` or `NOT_CHECKED` (for resource types that drift detection does not support).
+- For `MODIFIED` resources, the report shows each property with its expected and actual value.
+- AWS Config also offers a managed rule that flags stacks with drift.
+## Example
+An engineer adds port 22 to a security group by hand. Drift detection marks the group `MODIFIED` and shows the extra ingress rule as the difference.
+W: Drift detection: it compares the actual configuration of the stack's resources with the template and reports exactly which resources and properties were changed outside CloudFormation.
+X: A=Stack outputs: they publish values such as endpoints or IDs, optionally for cross-stack references; they do not inspect resources for changes.
+B=Change sets: they preview what a new template would change; they do not examine changes that were already made manually.
+D=Termination protection: it prevents the stack from being deleted; it does not detect or report configuration changes.
+T: Manual changes already made are found with drift detection; planned changes are previewed with change sets.
+
+@ Q002688 explain
+G: ## Protecting stack resources during updates
+A **stack policy** is a JSON document attached to a stack that controls which update actions are allowed on which resources:
+- Actions are `Update:Modify`, `Update:Replace`, `Update:Delete` or `Update:*`.
+- Once a stack policy exists, every resource is protected by default; you add `Allow` statements for what may change and `Deny` statements for critical resources.
+- For a planned change to a protected resource you supply a temporary overriding policy for that one update.
+A stack policy applies only to stack updates. To also keep the database if the stack or resource is deleted, add `DeletionPolicy: Snapshot` or `Retain` (and `UpdateReplacePolicy` for replacements) to the resource, and turn on termination protection for the stack.
+## Example
+A policy allows `Update:*` on `*` but denies `Update:Replace` and `Update:Delete` on `LogicalResourceId/ProdDatabase`. An update that would replace the database fails instead of recreating it.
+W: Stack policy denying updates to the database: CloudFormation refuses any update action on that resource that the policy denies, so it cannot be replaced or deleted by a stack update.
+X: A=Change set per update: it shows that the database would be replaced but does not stop someone from executing the change set.
+B=Exported endpoint output: an output only publishes a value for other stacks; it places no restriction on updating or replacing the resource.
+C=Parameter with default name: it provides an input value; a parameter change could even trigger a replacement rather than prevent one.
+T: Stack policies block unwanted update actions on critical resources; change sets only preview, and DeletionPolicy protects data on deletion.
+
+@ Q002689 explain
+G: ## Systems Manager Patch Manager
+Patch Manager, a capability of AWS Systems Manager, automates OS and application patching on managed nodes (instances running the SSM Agent with an instance profile that allows Systems Manager).
+- A **patch baseline** defines which patches are approved, for example critical and security updates auto-approved 7 days after release.
+- Nodes are grouped by tags (patch groups) or targeted directly.
+- The `AWS-RunPatchBaseline` document scans or installs patches and reports compliance.
+- A **maintenance window** schedules the operation (for example the first Sunday of the month, 02:00 to 05:00) with concurrency and error thresholds, such as 10% of nodes at a time. Patch policies set up with Quick Setup offer another way to schedule this across accounts and Regions.
+## Example
+500 instances tagged `Patch Group=prod` are patched monthly in the window, 50 at a time, and compliance results appear in the Systems Manager console.
+W: Patch Manager with a maintenance window: baselines decide which patches apply, the window schedules installation across all 500 instances with rate controls, and compliance is reported automatically.
+X: A=Manual review of Inspector findings: Inspector detects vulnerabilities and missing patches but does not install anything, and a manual monthly review does not scale to 500 instances.
+B=CloudFormation update per instance AMI: replacing instances through stack updates is not a patching workflow for existing instances, and it needs a new patched AMI built for every cycle.
+C=Trusted Advisor checks: Trusted Advisor gives best-practice recommendations about cost, security and limits; it never installs OS patches.
+T: Scheduled OS patching of a fleet is Systems Manager Patch Manager in a maintenance window; Inspector finds missing patches, it does not apply them.
+
+@ Q002690 explain
+G: ## Systems Manager Session Manager
+Session Manager gives interactive shell (or PowerShell) access to managed nodes through AWS Systems Manager.
+- The **SSM Agent** on the instance opens an **outbound** HTTPS connection to Systems Manager; no inbound ports, bastion host or public IP are needed. Private subnets without internet access use VPC interface endpoints (`ssm`, `ssmmessages`, `ec2messages`).
+- Access is controlled with **IAM** policies (who can start sessions on which instances, by tag), not SSH keys.
+- Session activity can be logged to **CloudWatch Logs** or **S3**, and every session start is recorded in **CloudTrail**.
+- Port forwarding is also available for tunnelling to databases or RDP.
+## Example
+A security group with no inbound rules protects an instance in a private subnet. An engineer runs `aws ssm start-session --target i-0abc123` and gets a shell, and the full session transcript lands in a log group.
+W: Session Manager: shell access flows over the agent's outbound connection, so no inbound ports or SSH keys are needed, IAM controls who connects, and sessions are logged to CloudWatch Logs or S3.
+X: A=VPN to public IPs: private instances have no public IPs, and a VPN still leaves SSH keys and open SSH ports on the instances, with no built-in session logging.
+C=Bastion with port 22 open: it requires an open inbound port, a host to patch and harden, and SSH key management, which are exactly what the team wants to avoid.
+D=EC2 Instance Connect over the internet: it pushes a short-lived SSH key, but the instance still needs a reachable SSH port and, over the internet, a public IP, and it does not record the session contents.
+T: Portless, keyless, audited shell access is Session Manager; bastions and Instance Connect still rely on SSH port 22.
+
+@ Q002691 explain
+G: ## Systems Manager Run Command
+Run Command executes a **Systems Manager document** on many managed nodes at once, on demand.
+- Common documents: `AWS-RunShellScript` (Linux), `AWS-RunPowerShellScript` (Windows), or your own custom documents.
+- Targets: instance IDs, tags (for example `Env=prod`) or resource groups.
+- **Rate control**: maximum concurrency (such as 20 nodes or 10%) and an error threshold that stops the run if too many fail.
+- Output can be written to S3 or CloudWatch Logs, and every invocation is recorded in CloudTrail. Access is controlled with IAM, so nobody needs to log in to the instances.
+## Example
+`aws ssm send-command --document-name AWS-RunShellScript --targets Key=tag:Role,Values=web --parameters commands="sudo systemctl restart nginx" --max-concurrency 20`
+restarts nginx on all 200 web instances, 20 at a time.
+W: Run Command: it runs the same shell command on all 200 instances in one operation, with targeting by tag, rate control and centrally stored output.
+X: A=AWS Config custom rules: they evaluate resource configurations for compliance and report results; they do not execute commands on instances.
+B=CloudFormation drift detection: it compares resources with their template; it cannot run anything inside an operating system.
+D=User data on next launch: user data runs when an instance first launches (by default), so it cannot run a command now on 200 already-running instances.
+T: Run an ad hoc command across a running fleet with Systems Manager Run Command; user data only runs at launch.
+
+@ Q002692 explain
+G: ## Systems Manager Automation runbooks
+An Automation **runbook** is a document that defines a sequence of steps, each performed by an action such as:
+- `aws:executeAwsApi`: call any AWS API
+- `aws:runCommand`: run a command on instances
+- `aws:createImage`, `aws:runInstances`, `aws:changeInstanceState`
+- `aws:approve`: pause for a human approval
+- `aws:branch` and `aws:executeScript` for logic and custom Python or PowerShell
+Runbooks can run on demand, on a schedule, from an EventBridge rule or from a maintenance window, across multiple accounts and Regions, with each step's output recorded. AWS provides many ready-made runbooks, such as `AWS-UpdateLinuxAmi`.
+## Example
+A custom runbook launches an instance from the current AMI, patches it with Run Command, creates a new AMI, runs a test script, waits for approval and then creates a new launch template version that uses the new image.
+W: Automation runbooks: they chain AMI creation, testing and launch template updates into one repeatable, logged workflow that can include approvals and error handling.
+X: B=CloudWatch Logs metric filters: they count patterns in log events and turn them into metrics; they cannot run steps or change resources.
+C=S3 Event Notifications: they signal object creation or deletion in a bucket; they do not orchestrate AMI builds or launch template updates.
+D=IAM Access Analyzer findings: they report external or unused access in policies; they perform no operational actions.
+T: Multi-step operational procedures belong in Systems Manager Automation runbooks; metric filters and event notifications only signal events.
+
+@ Q002693 explain
+G: ## Where applications should keep configuration and secrets
+- **Systems Manager Parameter Store** stores configuration as a hierarchy of parameters such as `/prod/orders/db-endpoint`. Types are `String`, `StringList` and `SecureString` (encrypted with AWS KMS). It has a standard tier at no extra cost and an advanced tier for larger values and parameter policies, with IAM control per path and version history.
+- **AWS Secrets Manager** stores secrets such as database credentials and API keys, encrypted with KMS. It adds **automatic rotation** (managed rotation for supported databases or a Lambda function), fine-grained resource policies, and replication of secrets to other Regions.
+Applications read values at startup or runtime through the SDK instead of hard-coding them. A common pattern: endpoints and feature flags in Parameter Store, passwords in Secrets Manager.
+## Example
+The app reads `/prod/orders/db-endpoint` from Parameter Store and the secret `prod/orders/db` from Secrets Manager, which rotates the password every 30 days.
+W: B=Parameter Store: central, hierarchical storage for configuration such as endpoints, with `SecureString` for sensitive values and IAM control per path.
+E=Secrets Manager: central storage for passwords and other secrets, with encryption, access control and automatic rotation.
+X: A=CloudFront Functions: lightweight JavaScript that runs at CloudFront edge locations to modify viewer requests and responses; it is not a configuration or secrets store.
+C=S3 Glacier Deep Archive: the lowest-cost archive storage class, with retrieval taking hours, unsuitable for values that applications read at runtime.
+D=Direct Connect gateway: a networking resource that connects Direct Connect links to VPCs or transit gateways; it stores no data.
+T: Configuration goes in Parameter Store and secrets that need rotation go in Secrets Manager; both are central, encrypted-capable stores read through the API.
+
+@ Q002694 explain
+G: ## Terraform state and locking
+Terraform records what it manages in a **state file**. If each engineer has a local copy, their views diverge; if two runs write the same shared state at once, one can overwrite the other and corrupt it.
+A **remote backend** keeps one shared state and provides **locking**, so only one `plan` or `apply` can change the state at a time; the second run waits or fails with a lock error.
+- On AWS the usual choice is the **S3 backend**: state in a versioned, encrypted bucket. Recent Terraform versions (1.10 and later) can lock with a lock file in the same bucket (`use_lockfile = true`); older setups used a DynamoDB table for the lock, which is now deprecated.
+- Enable **S3 Versioning** on the state bucket so a damaged state can be recovered from a previous version.
+- Limit access to the bucket with IAM, because state can contain sensitive values.
+## Example
+The `backend "s3"` block sets `bucket = "tf-state-prod"`, `key = "network/terraform.tfstate"`, `region = "us-east-1"` and `use_lockfile = true`. Every engineer now reads and writes the same state, and a second concurrent `apply` stops with a lock error.
+W: Remote backend with state locking: one shared state file is stored centrally, and the lock prevents two engineers from writing it at the same time, which stops the corruption.
+X: A=Local state per laptop: each engineer has a different, unshared view of the infrastructure, which causes conflicting changes and lost state instead of preventing them.
+B=Account per engineer: the shared production infrastructure still has one state, so concurrent runs against it are not prevented; it only multiplies environments.
+C=Shorter plan output: the size of the plan output has no effect on how state is stored or whether concurrent writes are blocked.
+T: Concurrent Terraform runs need shared remote state with locking (for example the S3 backend), not local or per-person copies.
+
+@ Q002695 explain
+G: ## Golden AMIs with EC2 Image Builder
+EC2 Image Builder automates creating, hardening, testing and distributing images.
+- An **image recipe** combines a base image with **components** (install software, apply CIS hardening, run tests).
+- An **infrastructure configuration** sets the instance type, subnet and IAM role used for the build.
+- **Distribution settings** copy the AMI to Regions and accounts and can update an EC2 **launch template** so a new version uses the new AMI ID.
+- A **pipeline** runs all of this on a schedule (for example monthly) or when a new base image is available.
+Auto Scaling groups that use the updated launch template (for example `$Latest` or `$Default`) launch new instances from the new AMI. Existing instances can be replaced with an **instance refresh**.
+## Example
+Pipeline `hardened-al2023` runs on the first of each month, builds and tests the image, and creates launch template version 14 with the new AMI; an instance refresh on the group then replaces the running instances.
+W: Image Builder pipeline that updates the launch template: it builds and tests the hardened AMI on a schedule and points the launch template at it, so Auto Scaling always launches the latest approved image without manual steps.
+X: A=Manual rebuilds when remembered: builds happen irregularly and inconsistently, so instances can launch from an outdated, unapproved image.
+B=Developers patch after launch: every instance starts unpatched and depends on people remembering; results vary between instances and the launched image is still not the approved one.
+D=Two-year-old AMI: it lacks two years of security patches, which is the opposite of "latest approved, hardened".
+T: Keep Auto Scaling on the newest golden AMI with an Image Builder pipeline that updates the launch template, not with manual or post-launch patching.
+
+@ Q002696 explain
+G: ## Systems Manager tools for fleet compliance
+- **Inventory** collects metadata from managed nodes: installed applications and versions, OS details, network configuration, Windows updates, services and more. Data can be viewed centrally or synced to S3 (resource data sync) for querying with Athena.
+- **State Manager** creates **associations** that apply a document to targets on a schedule, for example "keep the CloudWatch agent installed and running" or "enforce this configuration every 30 minutes", and reapplies it when a node drifts.
+- **Compliance** summarizes patch and association compliance from these tools.
+Together: Inventory shows what each node looks like, and State Manager keeps it in the approved configuration.
+## Example
+An association runs `AWS-ConfigureAWSPackage` on all nodes tagged `Env=prod` every day; Inventory reveals three nodes with an unapproved agent version, which the association corrects on its next run.
+W: A=State Manager: associations enforce a defined configuration on a schedule and reapply it when nodes drift, reporting association compliance.
+E=Inventory: it gathers installed software and configuration from every node, so the team can see which nodes are out of compliance.
+X: B=Session Manager deploying stacks: Session Manager provides interactive shell or port-forwarding sessions; it does not deploy CloudFormation stacks or check compliance.
+C=Parameter Store hosting websites: Parameter Store holds configuration values and secrets with size limits per parameter; it does not serve static web content.
+D=Incident Manager scheduling meetings: Incident Manager handles incident response plans, escalation and on-call engagement (and is no longer open to new customers); it is not a meeting scheduler or a compliance tool.
+T: Fleet compliance with Systems Manager means Inventory to see the current state and State Manager to enforce the desired state.
+
+@ Q002697 explain
+G: ## How CloudFormation orders resource creation
+CloudFormation builds a dependency graph and creates independent resources **in parallel**; the order in which resources appear in the template does not matter.
+- **Implicit dependencies**: when a resource uses `Ref` or `Fn::GetAtt` on another resource (for example a subnet with `VpcId: !Ref MyVPC`), CloudFormation creates the referenced resource first and deletes it last.
+- **Explicit dependencies**: `DependsOn` forces ordering when there is no reference, such as a route to an internet gateway that must wait for the `VPCGatewayAttachment`, or an instance that must wait for a database.
+- Circular references are rejected when the template is validated or the stack is created.
+## Example
+`MyVPC` has no dependencies; `SubnetA` references `MyVPC`; `WebServer` references `SubnetA` with `SubnetId: !Ref SubnetA`. CloudFormation creates VPC, then subnet, then instance, while unrelated resources such as an S3 bucket are created at the same time.
+W: References plus DependsOn: `Ref` and `Fn::GetAtt` create implicit dependencies that order VPC, subnets and instances, and `DependsOn` adds explicit ordering when no reference exists.
+X: A=Separate stacks required: ordering is fully controllable inside one stack; splitting tiers into stacks is a design choice, not a requirement for ordering.
+B=Template order: CloudFormation ignores the position of resources in the template and creates independent resources in parallel.
+D=Manual creation in order: creating resources by hand abandons infrastructure as code; CloudFormation handles ordering automatically from dependencies.
+T: CloudFormation ordering comes from the dependency graph (Ref, GetAtt, DependsOn), never from template position.

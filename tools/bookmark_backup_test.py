@@ -20,7 +20,7 @@ try:
     btns=pg.query_selector_all(".bookmark-btn")[:3]
     ids=[x.get_attribute("data-qid") for x in btns]
     for x in btns: x.click()
-    pg.click(".bookmarks-chip"); pg.wait_for_timeout(300)
+    pg.click(".bookmarks-chip"); pg.wait_for_function("document.querySelectorAll('.qcard').length===3", timeout=20000)
     check("tools visible in bookmark view", pg.is_visible("#bmTools"))
     check("3 cards", len(pg.query_selector_all(".qcard"))==3)
     pg.click("#bmCopyLink"); pg.wait_for_timeout(300)
@@ -31,17 +31,17 @@ try:
     check("export contents", sorted(data["bookmarks"])==sorted(ids), data)
     # fresh context: restore by link
     ctx2=b.new_context(); pg2=ctx2.new_page(); pg2.on("pageerror", lambda e: errs.append(str(e)))
-    pg2.goto(link.replace("https://","http://")); pg2.wait_for_timeout(1500)
+    pg2.goto(link.replace("https://","http://")); pg2.wait_for_function("document.querySelectorAll('.qcard').length===3", timeout=20000)
     check("restored via link", sorted(pg2.evaluate("JSON.parse(localStorage.getItem('aws_qbank_bookmarks_v1'))"))==sorted(ids))
     check("hash normalized", pg2.evaluate("location.hash")=="#bookmarks")
     check("restored cards shown", len(pg2.query_selector_all(".qcard"))==3)
     check("toast shown", "Restored 3" in (pg2.inner_text("body")))
     # fresh context: import file
     ctx3=b.new_context(); pg3=ctx3.new_page(); pg3.on("pageerror", lambda e: errs.append(str(e)))
-    pg3.goto("http://localhost:8765/#bookmarks"); pg3.wait_for_timeout(1200)
+    pg3.goto("http://localhost:8765/#bookmarks"); pg3.wait_for_function("document.querySelector('#listArea') && document.querySelector('#listArea').innerText.includes(\"haven't bookmarked\")", timeout=20000)
     check("empty state", "haven't bookmarked" in pg3.inner_text("#listArea"))
     check("tools visible when empty", pg3.is_visible("#bmTools"))
-    pg3.set_input_files("#bmImportFile", path); pg3.wait_for_timeout(500)
+    pg3.set_input_files("#bmImportFile", path); pg3.wait_for_function("document.querySelectorAll('.qcard').length===3", timeout=20000)
     check("imported cards", len(pg3.query_selector_all(".qcard"))==3)
     check("chip count", "3" in pg3.inner_text(".bookmarks-chip"))
     # re-import is idempotent

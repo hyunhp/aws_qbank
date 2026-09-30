@@ -1,0 +1,346 @@
+# SOA-C03 detailed explanations, e05 (explanation-only rewrites; letters are the published ones)
+
+@ Q000846 explain
+G: ## Subnet-wide versus instance-specific causes
+Internet access from a public subnet depends on several layers. Some apply to the whole subnet, others to a single instance:
+- **Subnet-wide**: the subnet route table (`0.0.0.0/0` to an internet gateway) and the network ACL associated with the subnet.
+- **Per instance**: the security groups attached to its network interface, the public IPv4 address mapped to that interface, and everything inside the OS (host firewall such as `iptables`/`firewalld` or Windows Firewall, OS routing table, proxy settings).
+## Troubleshoot by comparison
+When other instances in the same subnet reach the internet, the route table and the NACL are already proven to work for that subnet. Compare the failing instance with a working one: which security groups it has, whether its outbound rules were tightened, whether the OS firewall blocks outbound traffic, and whether its OS routes send traffic somewhere unexpected. VPC Flow Logs on its ENI and Reachability Analyzer can confirm whether packets are rejected at the security group.
+W: Instance-level checks: the difference between a working and a failing instance in the same subnet must be something attached to that instance, so its security groups, OS firewall and OS routes are the right place to start.
+X: A=VPC peering: a peering connection only adds routes to another VPC's CIDR. It does not change the default route to the internet gateway, and it would affect every instance using that route table, not one instance.
+B=Shield Advanced: it is a DDoS protection subscription for resources such as load balancers, CloudFront and Elastic IPs. It does not block an instance's own outbound internet traffic.
+C=S3 gateway endpoint: it only adds a prefix-list route for Amazon S3 to the route tables. Internet destinations still use the internet gateway, and the route applies subnet-wide anyway.
+T: If neighbors in the same subnet work, skip the subnet-wide layers (routes, NACL) and look at what is unique to the failing instance: security groups and the OS.
+
+@ Q000847 explain
+G: ## Stateful security groups, stateless network ACLs
+- A **security group** is stateful: when an instance opens an outbound connection, the reply is allowed back automatically, regardless of inbound rules.
+- A **network ACL** is stateless: it evaluates each packet on its own, inbound and outbound separately. Return traffic needs its own inbound rule.
+## Ephemeral ports
+When an instance calls `api.example.com:443`, the client side of the connection uses a random high source port chosen by the OS, for example `49152`. The response comes back **to** that port. On Linux the range is typically `32768-60999`, on Windows `49152-65535`, so NACL guidance is to allow inbound TCP `1024-65535` from the destination (or `0.0.0.0/0` for internet APIs reached through a NAT gateway).
+Example: the NACL allows outbound `443` but inbound only `22` from the office. Requests leave the subnet, the API answers, and the answers are dropped at the NACL on the way back in.
+W: NACL missing ephemeral inbound: the requests demonstrably leave, so routing works; only the replies disappear, which is the classic sign of a stateless NACL without an inbound rule for the ephemeral return ports.
+X: A=Missing NAT route: without a route to a NAT gateway the requests themselves could not reach the external API. The stem says they succeed, so the outbound path exists.
+C=No Elastic IPs: instances in a private subnet reach the internet through the NAT gateway's Elastic IP. They do not need their own public addresses, and giving them one would not help without an internet gateway route.
+D=Security group outbound rule: the stem says the group allows all outbound traffic, and because security groups are stateful the reply is allowed automatically.
+T: Security groups remember connections, NACLs do not: if requests leave but replies never arrive, add an inbound NACL rule for the ephemeral port range.
+
+@ Q000848 explain
+G: ## What a flow log record says
+VPC Flow Logs capture IP-level metadata for a network interface, subnet or VPC: source and destination address and port, protocol, packets, bytes, and an `action` field.
+- `ACCEPT`: the traffic was permitted by the security groups and network ACLs.
+- `REJECT`: the traffic was denied by a security group or a network ACL.
+Flow logs work at layer 3/4. They never see HTTP methods, URLs or status codes, and they do not record CPU or application behavior.
+## Telling SG from NACL
+Security groups are stateful and NACLs are stateless, so the pattern helps: an inbound request rejected with no matching outbound record usually points to a security group or an inbound NACL rule; an accepted inbound request with a rejected reply points to the NACL's outbound rules (return traffic to ephemeral ports). Reachability Analyzer can then name the exact blocking component.
+W: Security group or NACL denial: `REJECT` in a flow log record means one of the two packet filters that flow logs evaluate, a security group or a network ACL, blocked the traffic.
+X: B=HTTP 4xx: a 4xx is an application-layer response over an accepted connection. Flow logs cannot see HTTP, and such traffic would appear as `ACCEPT`.
+C=CPU credit exhaustion: a burstable instance that runs out of credits is throttled to its baseline CPU. That slows processing but does not make the VPC reject packets.
+D=Wrong Availability Zone: routing within a VPC is not AZ-dependent in a way that produces rejections, and flow logs have no status meaning "wrong AZ".
+T: A flow log `REJECT` is a network filter decision (security group or NACL), not an application error or a performance problem.
+
+@ Q000849 explain
+G: ## How a transit gateway decides where traffic goes
+Each VPC attachment is **associated** with exactly one transit gateway route table; that table is used for traffic arriving from the attachment. Attachments can also **propagate** their CIDRs into one or more route tables, or you add static routes.
+Example: VPC-A (`10.1.0.0/16`) is associated with route table RT-1. VPC-C propagates `10.3.0.0/16` into RT-1, but VPC-B never propagates `10.2.0.0/16` into RT-1. Traffic from A to C matches a route; traffic from A to B matches nothing and is dropped.
+## Other pieces to check
+- The VPC subnet route tables must also send the remote CIDR to the transit gateway, in both VPCs.
+- Return traffic uses the route table associated with VPC-B, which needs a route back to VPC-A.
+Since A already reaches C, the attachment itself works; what is missing is a route for B's CIDR.
+W: Missing association/propagation: VPC-A's traffic is looked up in the route table associated with its attachment, and without a propagated or static route for VPC-B's CIDR there is no path, even though C's route exists.
+X: A=Overlapping CIDRs: nothing in the stem suggests the ranges overlap. Overlap is a design problem (VPC-A's local route would win for those addresses and the transit gateway cannot route both), and the direct explanation for one unreachable VPC is a missing transit gateway route.
+B=Only two VPCs: a transit gateway is a regional hub designed to connect many VPCs, VPNs and Direct Connect gateways, with quotas in the thousands of attachments.
+C=Peering still required: a transit gateway replaces the need for pairwise VPC peering; VPCs communicate through it when the route tables allow it.
+T: Transit gateway reachability is controlled by route table association and propagation; one working pair does not mean every pair has routes.
+
+@ Q000850 explain
+G: ## Seeing what AWS WAF did to a request
+AWS WAF evaluates each web request against the rules in a web ACL. Two sources show the result:
+- **WAF logs**, delivered to CloudWatch Logs, S3 or Amazon Data Firehose, record every inspected request with its headers, URI, the `action` and the `terminatingRuleId`, plus which rules inside a rule group matched.
+- **Sampled requests** in the console show a sample of recent matches per rule.
+## Fixing one rule without losing the group
+Managed rule groups contain many rules. Instead of removing the whole group, set a **rule action override** for the single rule that causes false positives to `Count`. It keeps reporting matches (and adds labels) but no longer blocks, while every other rule in the group keeps its action. You can then add a narrower rule, for example a scope-down statement or a label-match rule that excludes a known path.
+W: WAF logs plus a Count override: the logs identify the exact rule and show the blocked request details, and overriding only that rule to `Count` stops the false positives without disabling the rest of the rule group.
+X: A=VPC Flow Logs: they record IP, port and accept/reject metadata only. They cannot show HTTP request contents or which WAF rule matched.
+C=CloudTrail management events: they record API calls that change WAF configuration, such as `UpdateWebACL`. They do not record how individual web requests were evaluated.
+D=Resolver query logs: they record DNS queries made from within VPCs. The requests are already resolved and reaching the protected resource when WAF blocks them.
+T: WAF logs name the terminating rule for each request; fix false positives by overriding that one rule to Count, not by removing the rule group.
+
+@ Q000851 explain
+G: ## Dynamic routing over Site-to-Site VPN
+With BGP, the virtual private gateway and the customer gateway device exchange prefixes: the gateway advertises the VPC's CIDR blocks to on-premises, and the on-premises router advertises its networks to AWS.
+On the VPC side, subnet route tables only learn on-premises routes if **route propagation** is enabled on each route table for the virtual private gateway.
+## Why new subnets can be unreachable
+- A new subnet associated with a new or different route table where propagation was never enabled has no route back to on-premises, so replies are lost.
+- If the new subnets use an added (secondary) VPC CIDR, that prefix must be advertised to and accepted by the on-premises router; route filters or prefix lists on the customer device can drop it.
+Example: the VPC gains `10.20.0.0/16` and a new route table. On-premises has no route for `10.20.0.0/16`, or the new route table lacks the `192.168.0.0/16` route via the gateway.
+W: Advertisement and propagation: new address space must be learned by on-premises over BGP, and the new subnets' route tables must receive the on-premises routes through propagation; missing either breaks only the newly added subnets.
+X: A=Two subnets per VPC: there is no such limit. A VPN connection gives on-premises access to all VPC CIDRs that are advertised and routed.
+B=Recreate the gateway: a virtual private gateway serves the whole VPC. New subnets need routing changes, not a new gateway.
+D=BGP not supported: Site-to-Site VPN supports both dynamic (BGP) and static routing, and BGP is the recommended option.
+T: When only newly added subnets fail over a BGP VPN, check that their prefixes are advertised on-premises and that their route tables propagate the VPN routes.
+
+@ Q000852 explain
+G: ## Where a 502 can come from
+A request to CloudFront with an ALB origin crosses three layers: CloudFront edge, the load balancer, and the targets. A `502 Bad Gateway` means some layer received an invalid or no response from the next one.
+## What each log shows
+- **CloudFront standard logs** record every viewer request with `sc-status` and fields such as `x-edge-result-type` and `x-edge-detailed-result-type` (for example `OriginConnectError` or a TLS problem between CloudFront and the origin).
+- **ALB access logs** (written to S3, disabled by default) record `elb_status_code` and `target_status_code`. `elb_status_code=502` with target status `-` means the ALB got no valid response from the target, such as a closed connection or a malformed response.
+Example: CloudFront logs show 502 but the ALB log has no matching request, so the problem is between CloudFront and the ALB (TLS, certificate name, security group). If the ALB shows 502, look at the targets.
+W: CloudFront plus ALB access logs: together they show which requests failed at the edge and whether the ALB saw them and got a bad response from its targets, which isolates the failing layer.
+X: A=Route 53 query logs: DNS resolution problems cause lookup failures, not an HTTP 502 returned after CloudFront has already accepted the request.
+B=Only WAF logs: WAF blocks produce 403 responses, not 502, and WAF does not see origin or target failures.
+D=Only VPC Flow Logs: flow logs record IP-level metadata and accept/reject decisions. They never contain HTTP status codes.
+T: Trace a 502 hop by hop: CloudFront logs show the viewer-side error, ALB logs split ALB errors from target errors.
+
+@ Q002112 explain
+G: ## What EC2 can and cannot measure
+The `AWS/EC2` namespace is filled from outside the guest OS: CPU, network, disk I/O operations and status checks. It cannot see inside the guest OS, so memory usage, disk space used on a volume and process counts are not published by default.
+## The CloudWatch agent
+The unified CloudWatch agent runs inside the instance and publishes OS-level metrics, by default into the `CWAgent` namespace. For Linux, `mem_used_percent` is the usual memory metric; `disk_used_percent` covers file systems.
+- Install it with Systems Manager (`AWS-ConfigureAWSPackage`) and store its JSON configuration in Parameter Store to manage a fleet.
+- The instance role needs the `CloudWatchAgentServerPolicy` managed policy.
+- Then create an alarm on `mem_used_percent > 85`, typically per `InstanceId` dimension.
+W: CloudWatch agent memory metrics: the agent reads memory from the OS and publishes it as a custom metric, which you can alarm on like any other metric.
+X: A=Detailed monitoring: it only increases the frequency of the standard `AWS/EC2` metrics to one minute. It does not add memory metrics.
+B=CPU as a proxy: CPU and memory are independent; an instance can be at 10% CPU and out of memory, so alarms would be wrong.
+D=VPC Flow Logs: they capture network traffic metadata and contain nothing about memory usage.
+T: Anything inside the guest OS, like memory or disk space, needs the CloudWatch agent; detailed monitoring only makes hypervisor metrics more frequent.
+
+@ Q002113 explain
+G: ## Static thresholds versus anomaly detection
+A static alarm compares a metric with one fixed number. That works poorly when "normal" changes with time: 10,000 requests per minute can be normal at 10:00 on Monday and alarming at 03:00 on Sunday.
+## How CloudWatch anomaly detection works
+CloudWatch trains a model on the metric's history, including hourly and weekly patterns and trends, and produces an expected **band**. An anomaly detection alarm compares the metric with that band instead of a fixed threshold.
+- The band width is set by a number of standard deviations; a larger value means fewer alerts.
+- You choose whether to alarm above the band, below it, or both. For a "traffic dropped" problem, alarming below the band catches night-time drops that a single threshold misses.
+- You can exclude known unusual periods, such as a holiday, from training.
+W: Anomaly detection alarm: it learns the daily and weekly seasonality and alerts only when the metric leaves its expected band, so busy mornings stop firing and unusual night drops are caught.
+X: B=Maximum instead of Sum: changing the statistic changes what number is compared, but it is still compared with a fixed threshold, so seasonal swings still cause false and missed alerts.
+C=Higher static threshold: raising the threshold stops the morning alerts but makes the alarm even less sensitive to real drops at night.
+D=Disable off-hours: turning alarms off creates blind periods exactly when the missed drops occur.
+T: For metrics with strong daily or weekly patterns, alarm against a learned band (anomaly detection), not a single fixed threshold.
+
+@ Q002114 explain
+G: ## Measuring database load
+**Performance Insights** measures database load as **average active sessions (AAS)**: how many sessions are running or waiting at each moment. The load can be sliced by dimension:
+- **SQL statements**: which queries contribute most of the load.
+- **Wait events**: what sessions are waiting on, for example CPU, I/O (`IO:DataFileRead`), or locks (`Lock:transactionid`).
+- Users, hosts and databases.
+Example: load exceeds the vCPU count at 10:00, and the top SQL is one query mostly waiting on CPU; it probably needs an index.
+In the console, AWS has moved this Performance Insights view into **CloudWatch Database Insights**, which shows the same database load by SQL and wait events.
+## Compared with other tools
+- The `CPUUtilization` metric tells you CPU is high, not why.
+- **Enhanced Monitoring** collects OS metrics from an agent on the host, including a process list, at up to one-second granularity, but not per-SQL load.
+W: Performance Insights: it attributes database load to specific SQL statements and wait events, which is exactly what the DBA asked for.
+X: A=CPUUtilization metric: it confirms the CPU is high but gives no breakdown by query or wait event.
+B=Enhanced Monitoring: it shows OS-level metrics and processes on the DB host, not which SQL statements and wait events drive database load.
+C=Trusted Advisor: it runs account-level best-practice checks (cost, security, limits, some idle or underused RDS findings) and has no query-level performance analysis.
+T: CPU metrics and Enhanced Monitoring show that the database is busy; Performance Insights shows which SQL and waits make it busy.
+
+@ Q002115 explain
+G: ## Right-sizing with AWS Compute Optimizer
+Compute Optimizer analyzes CloudWatch utilization history of EC2 instances, Auto Scaling groups, EBS volumes, Lambda functions and more, and classifies each resource as under-provisioned, over-provisioned or optimized, with recommended instance types and estimated savings.
+- You opt in once, for an account or the whole organization.
+- By default it looks back 14 days; the paid enhanced infrastructure metrics option extends this to up to three months.
+## Why memory matters
+EC2 does not publish memory metrics. Without them, a recommendation to move from `m5.2xlarge` to `m5.xlarge` is based on CPU, network and disk alone and might starve a memory-heavy app. When the CloudWatch agent publishes memory utilization, Compute Optimizer includes it and makes more accurate, safer recommendations.
+W: Compute Optimizer with memory metrics: it produces right-sizing recommendations from real utilization across the whole fleet, and CloudWatch agent memory data makes those recommendations account for memory.
+X: B=Amazon Inspector: it scans for software vulnerabilities and, for EC2, network exposure. It gives no instance sizing recommendations.
+C=Pricing Calculator: it estimates the cost of a configuration you enter by hand. It does not read actual utilization.
+D=AWS Budgets: it alerts when spend or usage crosses a limit, but does not say which instances are over-provisioned or what to change them to.
+T: Right-sizing from real usage is Compute Optimizer's job; feed it memory metrics from the CloudWatch agent for accurate advice.
+
+@ Q002116 explain
+G: ## Two kinds of health in an Auto Scaling group
+An Auto Scaling group decides whether to replace an instance based on its **health check type**:
+- `EC2` (default): the instance is unhealthy only if EC2 status checks fail or the instance is not running. A hung application on a healthy VM still passes.
+- `ELB`: the group additionally treats an instance as unhealthy when the load balancer's target group health check marks it unhealthy, for example when `/health` stops answering with `200`.
+## Grace period
+The **health check grace period** gives new instances time to boot and start the app before failed health checks count. Set it long enough, or the group may replace instances that are still starting.
+Example: the app deadlocks, the ALB marks the target unhealthy after its unhealthy threshold, and with type `ELB` the group terminates and replaces it; with type `EC2` it keeps running forever.
+W: ELB health check type: it makes the Auto Scaling group act on the ALB's application-level health check, so a hung app on a running instance is replaced.
+X: A=Detailed monitoring: it only publishes EC2 metrics every minute. It does not change how the group determines instance health.
+C=Disable cross-zone: that changes how the load balancer distributes traffic across AZs, not whether unhealthy instances are replaced.
+D=Increase idle timeout: that controls how long idle connections stay open. A hung application stays hung and unreplaced.
+T: With the default EC2 health check, the group only notices dead VMs; switch to ELB health checks to replace instances whose application fails.
+
+@ Q002117 explain
+G: ## AWS Backup building blocks
+- A **backup plan** defines schedules, retention and **copy rules** for resources such as EC2, EBS and RDS, selected by tags or ARNs.
+- Copy rules can send each recovery point to a vault in another Region and, with AWS Organizations, to a vault in another account.
+- A **backup vault** stores recovery points and has its own access policy and encryption key.
+## Vault Lock
+**AWS Backup Vault Lock** in compliance mode enforces minimum and maximum retention on a vault. After the grace (cooling-off) period ends, the lock cannot be removed and recovery points cannot be deleted early by anyone, including the root user and administrators. Governance mode can still be changed by users with sufficient permissions.
+Example: production account backs up nightly, copies to a locked vault in a separate backup account in another Region with 35-day minimum retention. Even a compromised production admin cannot delete those copies.
+W: Backup plan with copies to a locked vault: AWS Backup handles the cross-Region and cross-account copies for all three services, and Vault Lock in compliance mode prevents anyone from deleting recovery points before retention ends.
+X: A=Do-not-delete tag: a tag is just metadata. Anyone with delete permissions can still delete the snapshot unless policies enforce it, and it does nothing for copies to other Regions or accounts.
+C=S3 Versioning: it protects objects in S3 buckets, not EC2, EBS or RDS backups, and versions can still be deleted by privileged users.
+D=Nightly copy script: it can copy snapshots, but it is fragile to maintain and provides no immutability; an administrator can still delete the copies.
+T: For cross-account, cross-Region backups nobody can delete early, use AWS Backup copy rules into a compliance-mode Vault Lock vault.
+
+@ Q002118 explain
+G: ## RDS automated backups and point-in-time restore
+With automated backups on, RDS takes daily snapshots and continuously saves transaction logs. That lets you restore to any second within the retention period, usually up to the latest restorable time a few minutes ago.
+- A point-in-time restore always creates a **new DB instance** with a new endpoint; the original stays untouched.
+- After verifying the data, you copy the missing rows back into the original, or point the application at the new instance (for example by renaming instances).
+Example: rows deleted at 14:05, so restore to 14:04 as `orders-restore`, export the rows and insert them into the production table.
+## Why the other mechanisms don't undo deletes
+Read replicas and Multi-AZ standbys are replicated from the primary, so they receive the delete within seconds too.
+W: Point-in-time restore to a new instance: it recreates the database exactly as it was at 14:04, before the delete, without touching the running production instance.
+X: A=In-place restore: RDS cannot restore an existing instance in place; every snapshot or point-in-time restore creates a new DB instance.
+B=Promote a read replica: a replica applies the same changes as the source, so it already contains the deletion, and promotion does not roll it back in time.
+C=Reboot with failover: the Multi-AZ standby is a synchronous copy, so after failover the rows are still gone.
+T: Replicas and standbys copy mistakes; to undo them, restore to a point in time before the mistake, which always creates a new instance.
+
+@ Q002119 explain
+G: ## Shared file storage across AZs
+Several instances writing the same files need a shared file system, and surviving an AZ failure means the data must be stored redundantly across AZs.
+**Amazon EFS** is a managed NFS file system. A Regional file system (as opposed to One Zone) stores data redundantly across multiple AZs. You create one **mount target** per AZ, and every instance mounts the file system through the mount target in its own AZ (for example with the `amazon-efs-utils` helper).
+- Thousands of clients can read and write concurrently.
+- Capacity grows and shrinks automatically, and the file system keeps working if one AZ fails.
+## Why EBS does not fit
+An EBS volume lives in a single AZ. **io2 Multi-Attach** lets up to 16 Nitro instances in the **same** AZ attach a volume, and it needs a cluster-aware file system to avoid corruption.
+W: EFS with mount targets in each AZ: it gives all instances in the three AZs one shared, concurrent read/write file system whose data is stored across AZs and survives an AZ outage.
+X: A=Instance store plus rsync: instance store data is lost when the instance stops or fails, and rsync between nodes creates conflicts and lag rather than one consistent copy.
+B=gp3 shared over NFS: the volume and the NFS server live in one AZ on one instance, so both are single points of failure.
+C=io2 Multi-Attach across AZs: Multi-Attach only works for instances in the same AZ as the volume, so it cannot span three AZs.
+T: Shared, concurrent, multi-AZ file storage for EC2 is EFS; EBS, even with Multi-Attach, stays in one AZ.
+
+@ Q002120 explain
+G: ## Patch Manager pieces
+AWS Systems Manager Patch Manager patches managed instances running Windows Server, Linux and macOS.
+- A **patch baseline** defines which patches are approved. An auto-approval rule can say, for example, classification `Security`, severity `Critical`/`Important`, approve **7 days after release**. Different baselines exist per OS.
+- **Patch groups** or patch policies map instances (for example by tag) to baselines.
+- A **maintenance window** schedules patching, for example `cron(0 2 ? * SUN *)` for production, with concurrency and error limits.
+- The `AWS-RunPatchBaseline` document scans or installs, and results feed **patch compliance** data, viewable in the console and reportable across accounts.
+Quick Setup patch policies can configure these pieces for an organization.
+W: Patch Manager: delayed auto-approval in baselines, a Sunday maintenance window for production and built-in compliance reporting cover every requirement for 800 mixed instances.
+X: A=User data on boot: user data normally runs only at first launch, would install everything unapproved, and gives no schedule control or compliance reporting.
+C=Manual updates: logging in to 800 instances every month is slow, error-prone and produces no consistent compliance record.
+D=Weekly AMI replacement: rebuilding and replacing the fleet weekly is far heavier than monthly patching and does not by itself enforce the 7-day approval rule or produce patch compliance reports.
+T: Fleet patching with approval rules, schedules and compliance reports is Patch Manager: baselines plus maintenance windows.
+
+@ Q002121 explain
+G: ## When does CloudFormation consider an instance "created"?
+By default an `AWS::EC2::Instance` reaches `CREATE_COMPLETE` as soon as EC2 reports the instance launched. User data may still be installing packages, so resources that depend on the app start too early.
+## CreationPolicy and cfn-signal
+A **CreationPolicy** tells CloudFormation to wait for success signals before marking the resource complete:
+- `ResourceSignal.Count`: how many signals are needed (for example `1`).
+- `ResourceSignal.Timeout`: how long to wait, for example `PT15M`.
+At the end of user data, the helper script `cfn-signal` sends success (exit code `0`) or failure for the resource. If a failure arrives or the timeout expires, the resource fails and the stack rolls back.
+Example: user data runs `cfn-init`, then `cfn-signal -e $? --stack mystack --resource WebServer --region us-east-1`.
+W: CreationPolicy with cfn-signal: it holds the instance in `CREATE_IN_PROGRESS` until user data reports success, so dependent resources start only after the application is installed.
+X: A=DeletionPolicy Retain: it only keeps the resource when the stack is deleted. It has no effect on when creation completes.
+C=Longer stack timeout: the stack already considers the instance complete early, so more total time changes nothing about when dependents start.
+D=DependsOn: it only orders creation after another resource completes. The instance still completes early, so dependents on it still start too soon.
+T: DependsOn orders resources; only a CreationPolicy with cfn-signal makes CloudFormation wait for bootstrapping to actually finish.
+
+@ Q002122 explain
+G: ## Run Command at fleet scale
+AWS Systems Manager Run Command runs an SSM document, for example `AWS-RunShellScript` with `systemctl restart nginx`, on managed instances without SSH.
+- **Targets**: choose instances by tag (`tag:Role` = `web`), resource group or instance IDs.
+- **Concurrency** (`MaxConcurrency`): a number or percentage of targets running at once, for example `10%` = 30 of 300.
+- **Error threshold** (`MaxErrors`): with `5`, Systems Manager stops sending the command to new targets once the sixth failure is reported; invocations already running finish.
+Output can go to S3 or CloudWatch Logs, the command history keeps per-instance status, and the `SendCommand` API call is recorded in CloudTrail.
+W: Run Command with rate controls: targeting by tag, 10% max concurrency and an error threshold of 5 implements the rolling restart and the automatic stop exactly.
+X: A=SSH loop: it needs open SSH access and key management, has no built-in concurrency or error-threshold control, and leaves no central record.
+B=User data: it runs at instance launch, not on demand against running instances, and cannot throttle across the fleet.
+D=Reboot all from the console: rebooting everything at once is disruptive, restarts whole instances rather than one service, and has no failure threshold.
+T: For controlled, auditable commands across many instances, use Run Command with tag targeting, max concurrency and max errors.
+
+@ Q002123 explain
+G: ## EC2 Image Builder pipelines
+EC2 Image Builder automates building "golden" AMIs:
+- **Image recipe**: base image (for example the latest Amazon Linux 2023) plus **build components** that install software and apply hardening such as CIS or STIG settings.
+- **Test components** run after the build, for example to validate the hardening and that the app starts.
+- **Infrastructure configuration**: instance type, subnet and IAM role for the build.
+- **Distribution settings**: copy the finished AMI to other Regions and share it with accounts or organizations.
+- **Pipeline schedule**: cron-based, and it can run only when base image or component updates are available, so new OS patches trigger a rebuild.
+Example: a weekly pipeline rebuilds only when a newer base image is released, hardens it, tests it and distributes to `us-east-1`, `eu-west-1` and `ap-northeast-2`.
+W: Image Builder pipelines: they rebuild on new patches, harden with components, run tests and distribute to multiple Regions in one managed, repeatable workflow.
+X: B=Manual snapshots: copying snapshots does not rebuild or harden anything, and it must be repeated by hand for every patch.
+C=Drift detection: it compares CloudFormation stack resources with their templates. It does not build or update AMIs.
+D=AWS Backup AMI copies: they back up and copy existing instances or AMIs; they do not apply patches, hardening or tests to produce new images.
+T: Golden AMIs that rebuild, harden, test and distribute themselves are what EC2 Image Builder pipelines do; backups and snapshots only copy what exists.
+
+@ Q002124 explain
+G: ## S3 Block Public Access
+S3 Block Public Access (BPA) is a set of four settings that override public grants:
+- `BlockPublicAcls` and `IgnorePublicAcls`: reject new public ACLs and ignore existing ones.
+- `BlockPublicPolicy` and `RestrictPublicBuckets`: reject bucket policies that grant public access and restrict access under existing public policies.
+BPA can be set per bucket or for the **whole account**. Account-level settings apply to every current and future bucket in that account, and a bucket-level setting cannot loosen them. New buckets already have BPA enabled by default, but a user with permissions can turn bucket-level settings off, which is how accidental exposure usually happens.
+Protect the account-level setting itself with IAM or an SCP that denies `s3:PutAccountPublicAccessBlock`.
+W: Account-level Block Public Access: it blocks public ACLs and public bucket policies for every bucket in the account, including buckets created later, regardless of bucket-level settings.
+X: A=Default encryption: it encrypts objects at rest. Encrypted objects can still be read by anyone if the bucket is public.
+B=Versioning: it keeps previous object versions for recovery. It has no effect on who can access the bucket.
+C=MFA Delete: it requires MFA to delete versions or change versioning state. It does not prevent public ACLs or policies.
+T: Encryption, versioning and MFA Delete protect data in other ways; only account-level Block Public Access stops any bucket from becoming public.
+
+@ Q002125 explain
+G: ## AWS Config at organization scale
+AWS Config records resource configurations and evaluates them with **rules**, such as `encrypted-volumes` or `required-tags`. Each rule reports COMPLIANT or NON_COMPLIANT per resource, but only in its own account and Region.
+- **Organization Config rules** and **organization conformance packs**, deployed from the management account or a delegated administrator, push the same rules to all member accounts.
+- An **aggregator** collects configuration and compliance data from many accounts and Regions (or the whole organization) into one aggregator account, where you can see compliance across all of them and run advanced queries.
+Example: a delegated admin in the security account deploys a conformance pack org-wide and an organization aggregator shows all 30 accounts in every enabled Region on one page.
+W: Org-wide Config rules plus an aggregator: the same rules are deployed everywhere and the aggregator combines their compliance results into a single view across all accounts and Regions.
+X: A=Check each account manually: 30 accounts times several Regions is slow, error-prone and gives no single view.
+C=CloudTrail everywhere: CloudTrail records API activity (who did what). It does not evaluate whether volumes are encrypted or tags exist.
+D=Trusted Advisor: it runs a fixed set of AWS best-practice checks and cannot evaluate your own rules such as required tags for every resource.
+T: Organization Config rules evaluate compliance everywhere; a Config aggregator shows the combined result in one place.
+
+@ Q002126 explain
+G: ## How KMS key rotation works
+A KMS key is a logical key with a stable key ID and ARN. Behind it are one or more versions of **key material**.
+When you enable **automatic rotation** on a symmetric customer managed key, KMS generates new key material on a schedule (by default every year; you can choose a period from 90 to 2,560 days). On-demand rotation is also available.
+- New encryptions use the newest material.
+- KMS keeps all previous material and automatically uses the right version to decrypt older ciphertext.
+- The key ID, ARN, aliases and policies do not change, so applications need no code change and existing data needs no re-encryption.
+Example: `alias/app-data` keeps pointing at the same key while its material rotates each year.
+W: Automatic key rotation: it rotates the key material regularly while keeping the same key ID, and older data stays decryptable, so no re-encryption or code change is required.
+X: A=New key plus manual re-encryption: this works but requires re-encrypting all data and updating applications to the new key, the two things the requirement rules out.
+B=Switch to SSE-S3: S3 manages those keys, so you lose control and auditing of the key, it applies only to S3, and switching requires rewriting existing objects anyway.
+D=Delete the key: deleting a KMS key makes all data encrypted under it permanently unrecoverable, and KMS does not generate a replacement.
+T: KMS rotation swaps key material behind the same key ID and keeps old material for decryption, so nothing needs re-encrypting.
+
+@ Q002127 explain
+G: ## Locking an S3 origin to CloudFront
+With an S3 REST origin, **origin access control (OAC)** makes CloudFront sign its requests to S3 with SigV4 using the `cloudfront.amazonaws.com` service principal. You then write a bucket policy that allows `s3:GetObject` only for that principal and only when `AWS:SourceArn` equals your distribution's ARN, for example `arn:aws:cloudfront::111122223333:distribution/EDFDVBD6EXAMPLE`.
+- Direct requests to the bucket URL are unsigned or come from other principals, so they are denied.
+- Block Public Access can stay enabled because the bucket is not public.
+- OAC replaces the older origin access identity (OAI) and also supports SSE-KMS encrypted objects.
+W: OAC plus a distribution-scoped bucket policy: S3 accepts only requests signed by CloudFront for that specific distribution, so direct S3 URLs are refused.
+X: B=Custom header only: CloudFront would send the header, but with no bucket-side check the bucket accepts requests without it; the S3 URL stays usable.
+C=Public website bucket: making the bucket public lets everyone read it directly, which is the opposite of the goal.
+D=Transfer Acceleration: it speeds up transfers over long distances using edge locations. It changes nothing about who may access the bucket.
+T: The bucket, not CloudFront, must enforce the restriction: use OAC and a bucket policy that allows only your distribution.
+
+@ Q002128 explain
+G: ## Where Route 53 health checkers run
+Route 53 health checkers run on the public internet from several AWS locations. An endpoint health check (HTTP, HTTPS or TCP) can only reach public IP addresses or domain names. An application with only a private IP in a VPC is unreachable from them, so the check always fails.
+## Health checks based on CloudWatch alarms
+Route 53 also supports health checks that watch the state of a **CloudWatch alarm** instead of probing an endpoint. The alarm can use any metric that reflects the private application's health:
+- The target group's `HealthyHostCount` behind an internal load balancer.
+- A custom metric published by a Lambda function or CloudWatch Synthetics canary running inside the VPC.
+When the alarm goes to `ALARM`, the health check becomes unhealthy and the failover record switches to the secondary.
+W: CloudWatch alarm health check: it lets Route 53 judge a private application by an alarm on metrics collected from inside the VPC, instead of probing a private IP it cannot reach.
+X: A=Simple routing: it removes health-based failover entirely, which defeats the purpose of the failover record.
+B=Latency graphs: they only display response times of an endpoint check. The check still cannot reach the private IP.
+C=Private IP with shorter interval: Route 53 checkers still cannot reach a private address; probing more often just fails more often.
+T: Route 53 health checkers cannot reach private IPs; for internal endpoints, base the health check on a CloudWatch alarm.
+
+@ Q002129 explain
+G: ## How a public NAT gateway reaches the internet
+A zonal public NAT gateway translates private source addresses to its Elastic IP and forwards traffic out. It only works if the NAT gateway itself can reach the internet:
+- It must be created in a **public subnet**, whose route table has `0.0.0.0/0` pointing to an **internet gateway**.
+- The private subnet route table points `0.0.0.0/0` to the NAT gateway.
+Path: instance, private route table, NAT gateway in the public subnet, public route table, internet gateway, internet.
+## What goes wrong here
+If the NAT gateway sits in the private subnet, its own outbound traffic follows the private route table, whose default route points back to the NAT gateway. There is no path to an internet gateway, so nothing gets out.
+NAT gateways also offer a regional availability mode that is not placed in a single subnet, but a zonal NAT gateway placed in a subnet has to be in a public one.
+W: NAT gateway in a public subnet: a zonal NAT gateway needs a subnet with an internet gateway route to send translated traffic out; placed in the private subnet it has no route to the internet.
+X: A=Disable DNS hostnames: DNS hostnames only control whether instances get public DNS names. Disabling them never enables internet access and is unrelated to NAT.
+C=Security group on NAT: NAT gateways have no security groups; traffic filtering uses the instances' security groups and the subnets' NACLs.
+D=Elastic IPs on instances: instances behind a NAT gateway share the NAT gateway's Elastic IP. Giving them their own addresses would not help without an internet gateway route.
+T: A zonal NAT gateway must live in a public subnet with an internet gateway route; the private subnet only points its default route at it.

@@ -1,0 +1,346 @@
+# SOA-C03 detailed explanations, e06 (explanation-only rewrites; letters are the published ones)
+
+@ Q002130 explain
+G: ## Stateful security groups vs stateless network ACLs
+A **security group** is stateful: when it allows an inbound request, the response is automatically allowed back out, whatever the outbound rules say.
+A **network ACL** is stateless: it checks every packet in each direction on its own. A response is a new packet that must match an outbound rule.
+## What a response looks like
+A client connects from a random high source port (an ephemeral port, for example `51514`) to the server on `443`. The server's reply goes from port `443` back to destination port `51514`.
+- The inbound NACL rule for `443` lets the request in.
+- The outbound NACL rule for `443` only matches traffic sent *to* port 443, so the reply to `51514` is dropped.
+- The fix is an outbound NACL rule allowing TCP `1024-65535` (the ephemeral range) to the clients, for example `0.0.0.0/0` for a public web server.
+W: Outbound NACL rule for ephemeral ports: the NACL is stateless, so the server's replies, which are addressed to the client's ephemeral port, need their own outbound allow rule; outbound 443 does not match them.
+X: A=Outbound security group rule for 443: security groups are stateful, so replies to an allowed inbound connection leave automatically; an outbound SG rule would not help the NACL drop.
+B=Elastic IP for a NAT gateway: a NAT gateway serves outbound connections from private subnets. This server is in a public subnet answering inbound requests, so no NAT gateway is involved.
+C=Inbound SG rule for ephemeral ports: the replies are outbound from the server, and the security group already tracks the connection; opening inbound ephemeral ports only widens exposure.
+T: Security groups remember connections and NACLs do not, so a NACL needs an outbound ephemeral-port rule for response traffic, not just a rule for the service port.
+
+@ Q002131 explain
+G: ## How an ALB reuses backend connections
+An Application Load Balancer keeps TCP keep-alive connections open to its targets and reuses them for later requests. Two timers matter:
+- The **ALB idle timeout** (default `60` seconds) says how long the ALB keeps an idle connection before closing it.
+- The **application keep-alive timeout** (set in the web server, for example Node.js `keepAliveTimeout` or Apache `KeepAliveTimeout`) says how long the target keeps it.
+## The race that causes 502s
+Here the target closes idle connections after 5 seconds, but the ALB still considers them usable for 60 seconds. When the ALB sends a new request on a connection the target just closed, the target resets it and the ALB returns **HTTP 502 Bad Gateway**. The errors are intermittent because they only hit requests that land on a connection idle for more than 5 seconds.
+The fix is to make the target keep connections longer than the ALB does, for example a keep-alive of 65 seconds, so the ALB is always the side that closes first.
+W: App keep-alive longer than the ALB idle timeout: the ALB then never reuses a connection the target has already closed, which removes the reset-induced 502s.
+X: A=Access logs only: access logs record the 502s and their target status, which helps confirm the cause, but they do not change either timeout, so the errors continue.
+B=More registered targets: each additional target has the same 5-second keep-alive, so connections still go stale and the ALB still reuses closed ones.
+D=Shorter health check interval: health checks decide whether a target is healthy; the targets are healthy here, and faster checks do not affect how idle connections are closed.
+T: When the backend closes idle connections before the ALB does, the ALB reuses dead connections and returns 502, so set the backend keep-alive above the ALB idle timeout.
+
+@ Q002650 explain
+G: ## What EC2 reports to CloudWatch by itself
+Without any agent, EC2 publishes metrics the hypervisor can see from outside the guest: `CPUUtilization`, network bytes and packets, disk I/O for instance store, and status checks (EBS volumes publish their own metrics).
+The hypervisor cannot see inside the operating system, so **memory usage**, **disk space used** on a file system and per-process data are not available by default.
+## The CloudWatch agent
+The unified CloudWatch agent runs inside the OS (Linux or Windows) and publishes those metrics, by default in the `CWAgent` namespace, for example `mem_used_percent` and `disk_used_percent`. It can also ship log files to CloudWatch Logs.
+- The instance needs an IAM role with permissions such as the `CloudWatchAgentServerPolicy` managed policy.
+- The agent is configured with a JSON file that lists metrics, collection interval and log files.
+W: Install and configure the CloudWatch agent: memory is an OS-level metric, and the agent running inside the instance is what collects it and publishes it to CloudWatch.
+X: A=CloudTrail trail for EC2 API activity: CloudTrail records API calls such as `RunInstances` or `StopInstances`; it never measures resource utilization inside an instance.
+C=Detailed monitoring: detailed monitoring changes the period of the existing hypervisor metrics from 5 minutes to 1 minute; it adds no memory metric.
+D=VPC Flow Logs: flow logs record accepted and rejected IP traffic metadata for network interfaces; they contain nothing about memory usage.
+T: Detailed monitoring makes default metrics more frequent, but memory and disk-space metrics only exist once the CloudWatch agent runs inside the OS.
+
+@ Q002651 explain
+G: ## Composite alarms
+A **metric alarm** watches one metric (or a metric math expression) against a threshold. A **composite alarm** watches the states of other alarms and combines them with a rule written in `AND`, `OR` and `NOT`.
+Example rule: `ALARM("web-cpu-high") AND ALARM("alb-5xx-high")`.
+- The two underlying alarms still evaluate their metrics, but you leave them without notification actions.
+- Only the composite alarm has the SNS or incident action, so the team is paged once, and only when both conditions are true at the same time.
+- High CPU alone (for example a batch job) or a short 5XX blip alone no longer pages anyone.
+This is the standard way to reduce alarm noise while keeping each signal visible on its own.
+W: Composite alarm with AND: it goes into ALARM only when both child alarms are in ALARM, which is exactly the condition that should page, and it can suppress noise from either signal alone.
+X: A=Two separate alarms that each page: each alarm fires on its own condition, so the team is paged for CPU spikes and 5XX blips separately, the noise the team wants to remove.
+B=Metric filter on the application log group: a metric filter turns log lines into a metric; it cannot combine CPU and ALB 5XX alarm states into one condition.
+C=Dashboard widget showing both metrics: dashboards are for viewing; they have no alarm state or actions, so nobody is notified when both metrics are high.
+T: Use a composite alarm to page on a combination of conditions; separate alarms page on every individual condition.
+
+@ Q002652 explain
+G: ## From log lines to an alarm
+CloudWatch alarms evaluate **metrics**, not raw log text. A **metric filter** on a log group bridges the gap: every new log event that matches a pattern increments a custom metric.
+Example:
+- Filter pattern `ERROR` on the application log group.
+- Metric name `AppErrorCount`, metric value `1` for each match, default value `0`.
+- Alarm on `Sum` of `AppErrorCount` over a `5`-minute period with threshold `> 10`.
+Metric filters only process events ingested after the filter is created; they do not scan older logs. Once the metric exists, the alarm can notify through SNS or trigger other actions like any other alarm.
+W: Metric filter that counts ERROR events: it converts matching log events into a metric, and that metric is what the 10-in-five-minutes alarm evaluates.
+X: A=Logs Insights saved query only: a saved query is run on demand to explore logs; on its own it produces no continuous metric for an alarm to watch.
+C=Five-minute retention policy: retention only controls how long log events are kept (and five minutes is not a valid retention value); it counts nothing.
+D=Subscription filter to Kinesis: a subscription filter streams log events to another destination for processing; it does not create the CloudWatch metric the alarm needs.
+T: Alarms need metrics, so the first step for alarming on log patterns is a metric filter, not a query or a log stream.
+
+@ Q002653 explain
+G: ## How alarms handle missing data
+An alarm evaluates data points each period. When a metric is only published when something happens, many periods have no data, and by default the alarm treats them as `missing`, which can move it to `INSUFFICIENT_DATA`.
+The `TreatMissingData` setting chooses what a missing point means:
+- `missing` (default): the point is ignored for evaluation; with too little data the state becomes `INSUFFICIENT_DATA`.
+- `notBreaching`: a gap counts as within the threshold, so the alarm stays or returns to `OK`.
+- `breaching`: a gap counts as a breach, useful when silence itself means failure (for example a heartbeat metric).
+- `ignore`: the current state is kept.
+Here gaps are normal, so `notBreaching` keeps the alarm `OK` between reports while it still goes to `ALARM` when real data crosses the threshold.
+W: Treat missing data as not breaching: it tells the alarm that gaps are healthy, which removes the confusing INSUFFICIENT_DATA flips without weakening detection of real breaches.
+X: A=One-second resolution: high resolution only matters when data is published; if the application reports intermittently, there are still periods with no data, and gaps remain.
+B=Delete the alarm and review weekly: this removes automatic detection entirely and swaps it for a slow manual review, which is worse than fixing the alarm setting.
+D=Lower the threshold: the threshold decides what counts as a breach for data that exists; it does nothing for periods with no data and would add false alarms.
+T: For sparse metrics where silence is normal, set missing-data treatment to notBreaching; for heartbeat metrics where silence means failure, use breaching.
+
+@ Q002654 explain
+G: ## CloudWatch Logs Insights
+Logs Insights is an interactive query engine for data already in CloudWatch Logs. You choose one or more log groups and a time range (up to what the retention keeps), then write a query with commands such as `fields`, `filter`, `parse`, `stats`, `sort` and `limit`.
+Example for this task, assuming JSON logs with `status` and `path` fields:
+- `filter status >= 500`
+- `| stats count(*) as errors by path`
+- `| sort errors desc`
+- `| limit 10`
+It automatically discovers fields in JSON logs and can `parse` plain-text lines. Results can be added to a dashboard, and queries can be saved for reuse. You pay for the data scanned.
+W: CloudWatch Logs Insights queries: it filters, aggregates and sorts the log contents directly, so a single query over the 30-day range returns the top 10 error paths.
+X: A=AWS Config advanced queries: these use SQL over the recorded configuration of AWS resources (for example, instances by type); they never read application log lines.
+B=CloudTrail event history search: event history lists AWS API calls, such as who called `PutObject`, not the request paths your application writes to its logs.
+C=VPC Reachability Analyzer: it analyzes whether a network path between two resources is configured to allow traffic; it does not look at logs or HTTP requests.
+T: To aggregate what is inside application logs, use Logs Insights; Config covers resource settings and CloudTrail covers AWS API calls.
+
+@ Q002655 explain
+G: ## The two EC2 status checks
+- The **system status check** tests the AWS side: the physical host, its power, network and hypervisor. A failure means the hardware your instance runs on has a problem that you cannot fix from inside the OS.
+- The **instance status check** tests your side: whether the OS responds, for example a kernel panic, a full disk or a bad network configuration. You fix these with reboots or OS changes.
+Since only the system check fails here, the OS is fine and the host is the problem.
+## Why stop and start helps
+For an EBS-backed instance, a **stop** releases the host and a **start** places the instance on different, healthy hardware. The instance ID and EBS volumes are kept.
+Things to know: instance store data is lost, and an auto-assigned public IPv4 address changes (an Elastic IP stays). AWS may also schedule a retirement event for a degraded host.
+W: Stop and start the instance: a stop/start moves an EBS-backed instance to a new host, which is the remedy for a failed system status check caused by the underlying hardware.
+X: A=Reboot the OS: a reboot keeps the instance on the same physical host, so the hardware problem that fails the system check is still there.
+B=Increase the root EBS volume: volume size relates to disk space inside the OS, an instance-side issue; the failing check is about the host.
+D=Allow all inbound traffic: security groups filter network traffic to the instance; status checks do not depend on them, and opening everything only adds risk.
+T: A failed system check means AWS hardware, so stop/start to move hosts; a failed instance check means the OS, so troubleshoot inside the instance.
+
+@ Q002656 explain
+G: ## Automatic recovery of an EC2 instance
+When a system status check fails, the fix is to move the instance to healthy hardware. EC2 can do this automatically with the **recover** action of a CloudWatch alarm:
+- Create an alarm on `StatusCheckFailed_System` for the instance (for example, 2 consecutive 1-minute periods).
+- Add the action `recover` (an ARN like `arn:aws:automate:us-east-1:ec2:recover`).
+- When the alarm fires, EC2 migrates the instance to new hardware and keeps its **instance ID, private IPs, Elastic IPs, EBS volumes and metadata**.
+Recovery is available only for supported instance types and configurations, for example it does not apply to instances with instance store volumes. Many current instance types also have simplified automatic recovery turned on by default, but the alarm action is the explicit, configurable way to get this behavior.
+W: CloudWatch alarm with the EC2 recover action: it reacts to the system check failure by moving the same instance to new hardware, keeping its ID, private IP and EBS volumes as required.
+X: A=SNS email for each failure: an email tells people about the failure but performs no recovery; someone still has to act manually.
+C=Lambda that creates new instances weekly: new instances get new IDs and IPs, and a weekly schedule does not respond to failures when they happen.
+D=Auto Scaling scheduled action: scheduled scaling changes capacity at fixed times, and Auto Scaling replaces unhealthy instances with new ones that have new IDs, not the same instance.
+T: To keep the same instance identity after a hardware failure, use the alarm recover action; replacement approaches create different instances.
+
+@ Q002657 explain
+G: ## Detect and fix configuration drift with AWS Config
+AWS Config records configuration changes to resources such as security groups. A **Config rule** evaluates each change against a desired state and marks the resource **COMPLIANT** or **NON_COMPLIANT**.
+- Managed rules such as `restricted-ssh` or `vpc-sg-open-only-to-authorized-ports` check common security group mistakes; custom rules can check anything else.
+- Change-triggered rules evaluate shortly after the change is recorded.
+## Automatic remediation
+A rule can have a **remediation action** that runs a Systems Manager Automation runbook against the noncompliant resource, for example `AWS-DisablePublicAccessForSecurityGroup` (which removes rules opening SSH and RDP to all addresses), or a custom runbook that restores the approved rules. With **automatic** remediation (and retry settings), Config runs it without a human, so an unauthorized change is reverted within minutes and the evaluation history shows what happened.
+W: Config rule with automatic SSM Automation remediation: Config detects the out-of-process security group change as noncompliant, and the attached runbook reverts it automatically within minutes.
+X: A=Billing alarm on forecast costs: a security group change does not meaningfully change spend, and a billing alarm cannot see or undo configuration changes.
+B=Dashboard counting security groups: a count does not change when a rule inside an existing group is edited, and a dashboard takes no corrective action.
+D=Monthly manual review: a monthly review leaves unauthorized rules in place for weeks and depends on people, far from reverting changes within minutes.
+T: Config rules detect drift and SSM Automation remediation fixes it automatically; monitoring views and reviews only show or find problems later.
+
+@ Q002658 explain
+G: ## Reacting to AWS service events with EventBridge
+Many AWS services send events to the default **Amazon EventBridge** event bus automatically. EC2 emits an event with detail-type `EC2 Instance State-change Notification` whenever an instance moves between `pending`, `running`, `stopping`, `stopped`, `shutting-down` and `terminated`.
+An EventBridge **rule** matches events with a pattern and sends them to targets. Example pattern:
+- `"source": ["aws.ec2"]`
+- `"detail-type": ["EC2 Instance State-change Notification"]`
+- `"detail": {"state": ["stopped"]}`
+Targets can include a Lambda function, an SNS topic for the notification, an SQS queue or a Step Functions state machine, and one rule can have several targets. No polling or agent is needed.
+W: EventBridge rule on EC2 state-change events: EC2 publishes the state change as an event, and a rule matching `stopped` can send it to both SNS and Lambda.
+X: A=Logs subscription filter on OS logs: OS logs are written inside the instance and may not capture a stop initiated from the API; a subscription filter streams log lines, not EC2 lifecycle events.
+B=Config aggregator: an aggregator collects Config compliance and configuration data from many accounts and Regions for viewing; it does not route events to Lambda.
+C=Trusted Advisor refresh: Trusted Advisor produces best-practice checks on cost, security and limits; it does not report individual instance state changes.
+T: For "when X happens in AWS, run Y", use an EventBridge rule on the service event; logs and assessment tools are not event routers.
+
+@ Q002659 explain
+G: ## Finding what loads a database
+The main question for a slow database is "what is the database busy with?". **Performance Insights** answers it with the **DB load** metric: the average number of active sessions, broken down by dimension.
+- **Top SQL** shows which statements contribute the most load.
+- **Wait events** show what those sessions wait on, such as CPU, I/O or locks.
+- You can also slice load by host, user or database.
+Example: DB load averages 12 while the instance has 4 vCPUs; Top SQL shows one `SELECT` without an index causing most of it, waiting on I/O. That points to adding an index rather than a bigger instance.
+AWS has moved the console experience for this analysis into CloudWatch Database Insights, which uses the same DB load data (the Performance Insights API remains); the Standard mode keeps a short history and the Advanced mode adds longer retention and deeper analysis.
+W: RDS Performance Insights: it breaks database load down by SQL statement and wait event, which directly identifies the queries consuming the most load.
+X: B=Multi-AZ deployment: Multi-AZ adds a standby for failover; it does not analyze queries, and the standby of a Multi-AZ instance deployment does not serve reads.
+C=Automated backups: backups provide point-in-time recovery; they give no insight into which SQL uses resources.
+D=Read replica lag metric: `ReplicaLag` shows how far a replica is behind its source; it says nothing about which statements load the primary.
+T: To see which SQL drives database load, use Performance Insights; availability and backup features do not diagnose performance.
+
+@ Q002660 explain
+G: ## gp2 burst credits vs gp3 provisioned performance
+**gp2** ties performance to size: a baseline of 3 IOPS per GiB. Smaller volumes can burst to 3,000 IOPS by spending credits from a bucket, and when the bucket empties, performance drops to the baseline.
+Example: a 200 GiB gp2 volume has a 600 IOPS baseline. During a long peak it bursts at 3,000 IOPS until credits run out, then falls to 600 and I/O becomes slow. Growing the volume to raise the baseline means paying for space you do not need.
+**gp3** has no burst credits. Every gp3 volume gets a baseline of 3,000 IOPS and 125 MiB/s regardless of size, and you can provision more IOPS and throughput independently of capacity.
+The change can be made in place with Elastic Volumes (modify volume type from `gp2` to `gp3`) without detaching the volume.
+W: Migrate to gp3 and provision IOPS and throughput: gp3 delivers consistent performance with no credit bucket, and performance is set separately from size, so no over-provisioning of capacity is needed.
+X: A=Move to another Availability Zone: burst credits belong to the volume's type and size; a new AZ (which would require a snapshot and new volume) does not change how gp2 performance works.
+C=Hourly snapshots: snapshots protect data; they do not add IOPS, and the initial reads of volumes restored from them can even be slower.
+D=Encryption with a customer managed key: EBS encryption is handled with no meaningful effect on IOPS or burst behavior, so it does not fix the throttling.
+T: gp2 performance depends on size and burst credits; gp3 gives a steady baseline and lets you buy IOPS and throughput separately from capacity.
+
+@ Q002661 explain
+G: ## Right-sizing with AWS Compute Optimizer
+Compute Optimizer uses machine learning on CloudWatch utilization history (CPU, network, disk and, if the CloudWatch agent publishes it, memory) to judge whether each resource is sized well.
+- Each EC2 instance is classified as **Under-provisioned**, **Over-provisioned** or **Optimized**.
+- It recommends alternative instance types with projected utilization, performance risk and estimated price difference.
+- It also covers Auto Scaling groups, EBS volumes, Lambda functions, ECS services on Fargate and other resources.
+Example: an `m5.2xlarge` that never exceeds 15% CPU might be flagged over-provisioned with an `m5.large` or Graviton option recommended.
+You opt in at the account or organization level, and it needs a minimum amount of metric history (at least about 30 hours for EC2) before recommendations appear.
+W: AWS Compute Optimizer: it analyzes actual utilization and recommends instance types and sizes, labeling instances as under- or over-provisioned.
+X: A=AWS Artifact: Artifact is a portal for downloading AWS compliance reports and agreements; it knows nothing about your instances' utilization.
+C=Amazon Inspector: Inspector scans EC2 instances, container images and Lambda functions for software vulnerabilities and exposure, not for sizing.
+D=AWS Backup: Backup centrally schedules and retains backups; it does not evaluate performance or capacity.
+T: Right-sizing recommendations based on utilization come from Compute Optimizer; Inspector covers vulnerabilities, not size.
+
+@ Q002662 explain
+G: ## The three placement group strategies
+A placement group tells EC2 how to place instances on the underlying hardware:
+- **Cluster**: packs instances close together inside one Availability Zone on a low-latency, high-bandwidth network segment. Used for tightly coupled HPC where nodes exchange data constantly.
+- **Partition**: splits instances into partitions on separate racks so a rack failure affects only one partition. Used for large distributed systems such as HDFS, HBase or Cassandra.
+- **Spread**: places each instance on distinct hardware (and can span AZs) to minimize correlated failures for a small number of critical instances.
+## Enhanced networking
+Enhanced networking with **ENA** gives higher bandwidth, higher packet rates and lower latency. The **Elastic Fabric Adapter (EFA)** adds OS-bypass for MPI-style HPC traffic. Combined with a cluster placement group, instances get the lowest inter-node latency EC2 offers.
+W: Cluster placement group with enhanced networking: it puts the instances physically close in one AZ, and ENA or EFA maximizes bandwidth and minimizes latency between them.
+X: A=Partition placement group, single partition: partitions are designed to separate racks for fault isolation, not to guarantee the tight, low-latency packing of a cluster group.
+B=Spread placement group across three AZs: spread maximizes physical separation and cross-AZ traffic adds latency, the opposite of what a tightly coupled workload needs.
+D=Different Regions with peering: inter-Region traffic travels long distances with far higher latency and data transfer cost, unsuitable for HPC communication.
+T: Tightly coupled, latency-sensitive workloads go in a cluster placement group; partition and spread groups trade proximity for fault isolation.
+
+@ Q002663 explain
+G: ## Detecting problems before users do
+Proactive monitoring means your tooling notices a problem while it is starting, instead of waiting for a support ticket. Two CloudWatch features do most of this work:
+- **Alarms** watch key metrics such as latency, `HTTPCode_Target_5XX_Count`, queue depth or error rates, and notify or act when a threshold is crossed for a set number of periods.
+- **CloudWatch Synthetics canaries** are scripts (Node.js or Python, using a headless browser or API calls) that run on a schedule, for example every 5 minutes, and repeat a user journey such as log in, search and check out. A broken step or slow page fails the canary even when no real user is active, such as at night.
+Canaries publish success and duration metrics, so you alarm on them as well. Together they cover both "something is degrading" (metrics) and "a user flow is broken" (canaries).
+W: A=Alarms on key metrics: alarms evaluate metrics continuously and notify the team as soon as thresholds are crossed, before users complain.
+E=Synthetics canaries: canaries test user journeys on a schedule and fail when a page or API breaks, even when no real user traffic is present.
+X: B=Disable detailed monitoring: this lowers metric frequency from 1 minute to 5 minutes, which delays detection; it saves money but reduces visibility.
+C=Annual log export to S3: exporting once a year is archiving; nothing in it analyzes logs or alerts on current problems.
+D=Delete old log groups: deleting logs lowers storage cost but removes history needed for investigation, and it detects nothing.
+T: Proactive detection comes from alarms on the right metrics plus canaries that exercise user journeys; cost-cutting and archiving steps do not detect anything.
+
+@ Q002664 explain
+G: ## CloudTrail answers "who did what, when"
+Every AWS API call, including `DeleteBucket`, is recorded by AWS CloudTrail with the caller identity (IAM user or role and session), time, source IP and request parameters.
+- **Event history** is on by default and shows the last 90 days of management events in a Region. `DeleteBucket` is a management event, so a deletion last week is there.
+- A **trail** delivers events to an S3 bucket (and optionally CloudWatch Logs) for long-term retention.
+## Querying at scale
+Trail logs in S3 can be queried with **Amazon Athena**, for example filtering `eventname = 'DeleteBucket'` and returning `useridentity.arn`. **CloudTrail Lake** is a managed event data store with SQL queries; it is closed to new customers from 2026-05-31 (existing customers keep using it), so new setups typically use Athena on trail logs instead.
+W: D=CloudTrail event history or trail logs: they record the `DeleteBucket` call with the identity that made it and the time.
+E=CloudTrail Lake or Athena queries on trail logs: SQL queries over CloudTrail data find the delete event and the caller quickly, especially across many accounts or long periods.
+X: A=CloudWatch CPU utilization: CPU metrics describe how busy a resource is and contain no record of API calls or identities.
+B=VPC Flow Logs for the NAT gateway: flow logs capture IP addresses and ports of traffic, not the IAM identity or the API operation, and S3 API calls may not pass through a NAT gateway at all.
+C=S3 Storage Lens: Storage Lens reports storage usage and activity trends in aggregate; it does not show who deleted a specific bucket.
+T: Identity and API actions come from CloudTrail, via event history, trail logs or SQL queries on them; metrics and network logs do not show who did something.
+
+@ Q002665 explain
+G: ## Caching repeated reads
+When many requests run the same query, the database repeats the same work each time. A cache stores the result in memory the first time and answers later requests from there.
+**Amazon ElastiCache** (Valkey, Redis OSS or Memcached) is typically used with the **cache-aside** pattern:
+- The application first looks up a key such as `product:123` in the cache.
+- On a hit it returns the cached value in well under a millisecond.
+- On a miss it queries RDS, then writes the result to the cache with a TTL, for example 300 seconds.
+If most queries are repeats, most requests never reach the database, so its CPU and connection load drop sharply. The TTL (or explicit invalidation on writes) controls how stale cached data can get.
+W: ElastiCache caching layer: repeated identical queries are served from memory, which removes most of the read load from the database.
+X: A=Enable Multi-AZ: a Multi-AZ instance deployment adds a standby for failover that does not serve reads, so the primary still handles every query.
+B=Smaller instance class: less CPU and memory makes an overloaded database even slower; cost savings do not address the load.
+D=35-day backup retention: retention controls how far back point-in-time recovery reaches; it does not change query load.
+T: Repeated identical reads are best absorbed by a cache in front of the database; Multi-AZ is for availability, not for read capacity.
+
+@ Q002666 explain
+G: ## Managing the CloudWatch agent at scale
+The CloudWatch agent reads a JSON configuration listing which log files to send (file path, log group, log stream) and which metrics to collect. Editing this on hundreds of instances by hand leads to drift.
+**Systems Manager** provides a central approach:
+- Store the agent configuration as a parameter in **Parameter Store**, conventionally named with the `AmazonCloudWatch-` prefix, for example `AmazonCloudWatch-linux-web`.
+- Install the agent with Run Command using `AWS-ConfigureAWSPackage` (package `AmazonCloudWatchAgent`).
+- Apply the configuration with `AmazonCloudWatch-ManageAgent`, pointing to the parameter, targeting instances by tag.
+- Use a State Manager association to reapply it on a schedule and to new instances automatically.
+Instances need the SSM Agent and an instance profile with SSM and CloudWatch agent permissions. Changing the parameter and rerunning updates every instance consistently.
+W: Parameter Store config deployed with Systems Manager: one stored configuration is pushed to all instances by tag, so every agent sends logs to CloudWatch Logs the same way.
+X: A=Weekly manual edits on each instance: logging in to hundreds of instances is slow and error-prone, and configurations drift between visits.
+C=Developers email log files: emailed files are not centralized, searchable or timely, and nothing reaches CloudWatch Logs.
+D=Daily manual copy script to S3: a manual daily copy is delayed and inconsistent, and logs land in S3 rather than CloudWatch Logs as required.
+T: Keep one agent configuration in Parameter Store and deploy it with Systems Manager; per-instance manual work does not scale or stay consistent.
+
+@ Q002667 explain
+G: ## Auto Scaling policy types
+- **Target tracking**: you pick a metric and a target value, for example `ASGAverageCPUUtilization` = `50`. Auto Scaling creates and manages the CloudWatch alarms and adds or removes instances to keep the metric near the target, like a thermostat.
+- **Step scaling**: you define alarms and different adjustments for different breach sizes.
+- **Simple scaling**: one alarm triggers one fixed adjustment, then waits for a cooldown before acting again.
+- **Scheduled scaling**: changes capacity at set times.
+- **Predictive scaling**: forecasts load from history and scales ahead of time.
+## Fit for this workload
+Load rises and falls gradually but not at exact times, and the goal is stated as a metric target (average CPU 50%). Target tracking follows the curve in both directions automatically without tuning step sizes.
+W: Target tracking on average CPU: it keeps average CPU near 50% by adding capacity as load rises in the morning and removing it as load falls in the evening.
+X: A=Scheduled scaling at night only: a single fixed-time action cannot follow gradual changes during the day and does not respond to actual CPU.
+B=Simple scaling with one fixed step: it reacts in fixed increments with cooldown pauses and needs manual threshold tuning, so it tracks a target less smoothly.
+C=Manual scaling by on-call: it depends on a human watching metrics and is not automatic, which the team explicitly wants.
+T: When the goal is "keep this metric at a value", use target tracking; step, simple and scheduled policies need more tuning or fixed timing.
+
+@ Q002668 explain
+G: ## Why reactive scaling is late for slow-starting instances
+Reactive policies such as target tracking launch instances only after a metric rises. If an instance needs eight minutes to boot, install and warm up, users wait through that gap every morning.
+Two features close it:
+- **Scheduled scaling** (for example, raise desired capacity at 8:45 on weekdays) or **predictive scaling** (which learns the daily pattern and launches capacity before the forecast rise) add instances before 9:00.
+- A **warm pool** keeps pre-initialized instances in `Stopped`, `Hibernated` or `Running` state. The slow initialization has already been done, so moving one into service takes far less time than launching from scratch.
+Together they ensure capacity is ready at the spike and any extra scale-out is fast. Target tracking can still run alongside for unexpected load.
+W: Scheduled or predictive scaling plus a warm pool: capacity is added before the known 9:00 spike, and pre-initialized instances remove most of the eight-minute startup delay for further scale-out.
+X: B=Lower maximum group size: a smaller maximum caps capacity, so the group could serve even less of the spike.
+C=Round-robin DNS instead of the load balancer: DNS round robin adds no capacity, ignores instance health and is slowed by client caching.
+D=Target tracking alone with longer cooldown: it still reacts only after load rises, and a longer cooldown delays further scaling, making the lag worse.
+T: For predictable spikes with slow startup, scale before the spike and keep pre-initialized instances in a warm pool; reactive scaling alone always lags.
+
+@ Q002669 explain
+G: ## DynamoDB capacity modes
+- **Provisioned** mode: you set read and write capacity units (RCUs and WCUs). Requests above them are throttled. Auto scaling can adjust the settings, but it reacts over minutes, so sudden spikes can still throttle.
+- **On-demand** mode: no capacity to set. DynamoDB accommodates traffic as it arrives and you pay per read and write request. It is designed for unknown or spiky workloads and for teams that do not want to manage capacity.
+Example: a flash sale jumps from 50 to 2,000 writes per second within a minute. A provisioned table set to 100 WCUs throttles; an on-demand table absorbs the jump without configuration changes. One caveat: traffic that grows to more than double the table's previous peak within about 30 minutes can be briefly throttled while on-demand capacity adapts.
+You can switch an existing table between modes, with limits on how often.
+W: On-demand capacity mode: it scales with request traffic automatically and bills per request, so there is no capacity to plan or tune for the unpredictable spikes.
+X: B=A GSI per spike: a global secondary index is an alternate key for queries with its own capacity; it does not add capacity to the base table, and indexes are not created per event.
+C=Provisioned mode without scaling: fixed RCUs and WCUs throttle requests above the setting, so sudden spikes fail.
+D=DynamoDB Accelerator only: DAX caches eventually consistent reads in memory; writes and cache misses still need table capacity, which remains unmanaged.
+T: Unpredictable DynamoDB traffic with no capacity management points to on-demand mode; caches and indexes do not replace table capacity.
+
+@ Q002670 explain
+G: ## RDS Multi-AZ deployments
+With a **Multi-AZ DB instance** deployment, RDS keeps a **synchronous standby** in a different Availability Zone. Every committed write goes to both copies, so the standby is always current.
+- The application connects to one DNS endpoint, for example `mydb.abc123.us-east-1.rds.amazonaws.com`.
+- If the primary's AZ, host or storage fails, RDS automatically promotes the standby and points the endpoint to it. Failover usually completes in one to two minutes.
+- The application just reconnects to the same endpoint; no data loss for committed transactions.
+Converting a single-AZ instance to Multi-AZ is a modification that can be applied without downtime. A **Multi-AZ DB cluster** option (two readable standbys) also exists for supported engines.
+W: Multi-AZ deployment: it maintains a synchronous standby in another AZ and fails over to it automatically when the primary's AZ becomes unavailable.
+X: A=Hourly manual snapshots: restoring a snapshot is a manual process that creates a new instance and loses up to an hour of changes; nothing fails over automatically.
+B=Largest instance size: a bigger instance still runs in one AZ, so an AZ failure takes it down all the same.
+C=Read replica in the same AZ: it fails together with the primary in an AZ outage, and a read replica must be promoted manually rather than failing over automatically.
+T: Automatic database failover across AZs is Multi-AZ; snapshots, replicas and bigger instances do not provide it.
+
+@ Q002671 explain
+G: ## How a multi-AZ web tier rides through an AZ failure
+An Application Load Balancer runs nodes in each enabled Availability Zone and sends traffic only to targets that pass its **health checks**. An Auto Scaling group spread over three AZs keeps its **desired capacity** by replacing instances that are unhealthy or gone.
+When one AZ fails:
+- Targets in that AZ fail health checks, so the ALB stops sending them requests and serves users from the healthy AZs.
+- The Auto Scaling group sees the lost instances and launches replacements in the remaining AZs to restore desired capacity.
+- When the AZ recovers, Auto Scaling rebalances instances across all three AZs again.
+"Correct configuration" means subnets in several AZs, health checks on the target group, and ideally enough headroom to absorb one AZ's share while replacements start.
+W: ALB stops routing to that AZ and the group launches instances elsewhere: health checks remove failed targets from rotation, and Auto Scaling restores capacity in the healthy AZs.
+X: A=Group deletes itself: an Auto Scaling group is a Regional configuration; an AZ failure does not delete it, it keeps working with the remaining AZs.
+C=All traffic stops until the AZ recovers: this is what a single-AZ design suffers; with three AZs, the other two keep serving traffic.
+D=ALB moves to another Region: an ALB is a Regional resource and never moves between Regions; cross-Region failover needs separate infrastructure and DNS routing.
+T: Multi-AZ Auto Scaling behind an ALB survives an AZ loss because health checks shift traffic and Auto Scaling replaces capacity in the healthy AZs.
+
+@ Q002672 explain
+G: ## Auto Scaling health check types
+An Auto Scaling group decides whether to replace an instance based on its **health check type**:
+- **EC2** (default): only the EC2 status checks count. An instance whose OS is up but whose application hangs is still "healthy" and is never replaced.
+- **ELB**: the group also uses the target group's health checks, for example `GET /health` expecting HTTP `200`. If the load balancer marks the instance unhealthy, Auto Scaling terminates and replaces it.
+When turning on ELB health checks, set a **health check grace period** long enough for new instances to boot and start the application, so they are not replaced before they are ready.
+Example: a Java service deadlocks. EC2 checks pass because the VM runs; the ALB check on `/health` times out; with ELB checks enabled, the group replaces the instance automatically.
+W: Use ELB health checks for the group: application-level failures seen by the load balancer then mark the instance unhealthy, and Auto Scaling replaces it.
+X: A=Second ALB listener on another port: listeners define how clients connect to the ALB; they do not change which health signal Auto Scaling uses.
+B=Termination protection: instance termination protection does not stop Auto Scaling health replacement, and scale-in protection only affects scale-in, so neither causes app failures to be detected.
+D=Increase the minimum size: more instances add capacity, but the unresponsive ones are still considered healthy and stay in the group.
+T: EC2 health checks only see the host and OS; turn on ELB health checks so Auto Scaling replaces instances whose application stops responding.

@@ -1,0 +1,373 @@
+# SOA-C03 detailed explanations, e08 (explanation-only rewrites; letters are the published ones)
+
+@ Q002698 explain
+G: ## Auto Scaling lifecycle events
+Amazon EC2 Auto Scaling publishes an event every time it launches or terminates an instance, and also when an attempt fails. These events go to Amazon EventBridge automatically, with no agent or polling.
+- Detail types include `EC2 Instance Launch Successful`, `EC2 Instance Launch Unsuccessful`, `EC2 Instance Terminate Successful` and `EC2 Instance Terminate Unsuccessful`.
+- A failure event carries the group name and a status message, for example that the launch template references a deleted AMI or that the account hit an instance quota.
+## Turning events into actions
+An EventBridge rule matches an event pattern such as `"source": ["aws.autoscaling"]` with `"detail-type": ["EC2 Instance Launch Unsuccessful"]` and sends it to targets.
+- An Amazon SNS topic pages the on-call engineer.
+- An AWS Lambda function or a Systems Manager Automation runbook can collect diagnostics, open a ticket or fix a known cause.
+The same result without EventBridge would require scanning the group's activity history on a schedule, which adds delay.
+W: EventBridge rule on launch-failure events: the rule fires within moments of each failed launch and can fan out to SNS for notification and to Lambda or Automation for the automated response, which is exactly what the team asked for.
+X: A=Monthly activity history review: the activity history does record failures, but a human reading it once a month finds problems weeks late and takes no automated action.
+C=CloudFormation output of instances: stack outputs are static values set when the stack is created or updated; they do not watch the group and never report a failed launch.
+D=S3 lifecycle policy on logs: lifecycle rules only transition or expire stored objects by age; they cannot detect an event or trigger a response.
+T: For "notify and act when something happens" in AWS, route the service's native event through an EventBridge rule to SNS or Lambda, instead of reviewing logs after the fact.
+
+@ Q002699 explain
+G: ## Reusing infrastructure code in CloudFormation
+When many templates need the same approved building block, such as a VPC with standard subnets, route tables and flow logs, the block should be defined once and referenced everywhere.
+- **Nested stacks**: a parent template declares an `AWS::CloudFormation::Stack` resource whose `TemplateURL` points to the VPC template in S3. Parameters go in, and the child's outputs (VPC ID, subnet IDs) come back through `Fn::GetAtt`.
+- **Modules**: a reusable fragment registered in the CloudFormation registry with a type name like `MyOrg::Network::StandardVpc::MODULE`. Templates use it like any resource type, and its resources are expanded into the calling stack.
+## Why this matters
+When the network team improves the approved design, they update one template or publish one new module version. Every consuming template picks up the change on its next update, so the design stays consistent and reviewable.
+W: Nested stacks or modules: both package the approved VPC design as a single versioned component that many templates reference, which is CloudFormation's built-in way to reuse a standard pattern.
+X: B=Manual creation with documentation: building the VPC by hand in the console leaves no template to reuse or version, and each person following the steps can produce a slightly different network.
+C=Copy and paste into each template: every copy becomes an independent fork, so a fix or security change must be repeated in dozens of places and the copies drift apart.
+D=Share one VPC and a password: a VPC has no password, and handing out shared credentials breaks accountability; it also does not give teams a reusable design for their own templates.
+T: Reuse approved CloudFormation components through nested stacks or registry modules, not through copy-paste or manual builds that drift.
+
+@ Q002700 explain
+G: ## What GuardDuty does
+Amazon GuardDuty is a managed threat detection service. Once enabled, it analyzes data sources that AWS already collects, so there is nothing to install on instances for the core detections.
+- **Foundational sources**: CloudTrail management events, VPC Flow Logs and Route 53 Resolver DNS query logs. GuardDuty reads these directly; you do not need to enable them yourself for GuardDuty.
+- **Optional protection plans** add coverage for S3 data events, EKS, RDS login activity, Lambda network activity, malware scanning and runtime monitoring.
+## Example findings
+- `CryptoCurrency:EC2/BitcoinTool.B!DNS`: an instance queries domains tied to crypto-mining.
+- `UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS`: credentials issued to an instance role are being used from outside AWS.
+Findings are scored Low, Medium, High or Critical and are sent to EventBridge, so they can trigger alerts or automated response.
+W: Amazon GuardDuty: it continuously detects threats such as compromised credentials and crypto-mining by analyzing logs AWS already has, with no agents to deploy or manage for its foundational detections.
+X: A=Amazon Macie: Macie discovers and classifies sensitive data such as personal information in S3 buckets; it does not look for compromised credentials or mining activity.
+B=Amazon Inspector: Inspector scans EC2 instances, container images and Lambda functions for software vulnerabilities and network exposure, which is vulnerability management rather than detection of active threats.
+C=AWS Artifact: Artifact is a portal for downloading AWS compliance reports and agreements; it does not analyze anything in your accounts.
+T: Active threats (compromised keys, mining, reconnaissance) point to GuardDuty; vulnerabilities point to Inspector and sensitive data to Macie.
+
+@ Q002701 explain
+G: ## Central view of security findings
+Each security service produces findings in the account and Region where it runs. With 30 accounts, reviewing them one by one does not scale.
+AWS Security Hub CSPM (the service long known simply as Security Hub) collects findings from GuardDuty, Inspector, Macie and partner tools in the AWS Security Finding Format (ASFF), so they can be searched, prioritized and automated in one place. It also runs automated checks against standards such as AWS Foundational Security Best Practices and CIS AWS Foundations Benchmark. The newer AWS Security Hub builds on these signals to correlate and prioritize risks.
+## Multi-account setup
+- In AWS Organizations, the management account designates a **delegated administrator**, typically a security tooling account.
+- Member accounts can be enabled automatically as they join the organization.
+- **Cross-Region aggregation** links Regions to one home Region, so the administrator sees findings from every account and Region in one console.
+- Findings are also sent to EventBridge for ticketing or automated remediation.
+W: Security Hub with a delegated administrator and aggregation: it gathers GuardDuty, Inspector and Macie findings from all member accounts into one account and adds security standard checks, which meets both requirements.
+X: A=Log in to each account: 30 separate consoles gives no single view, no correlation across accounts and no consistent standard checks, and it multiplies the manual effort.
+C=Disable the services in member accounts: this removes detection in exactly the accounts that need protection; less noise is achieved by prioritizing and suppressing findings, not by switching off the sources.
+D=Weekly spreadsheets by email: exports are manual, stale by the time they are read and easy to get wrong, and they provide no automated standard checks.
+T: Multi-account security findings plus standard checks means Security Hub with a delegated administrator and aggregation, not per-account manual review.
+
+@ Q002702 explain
+G: ## Service control policies
+A service control policy (SCP) is an AWS Organizations policy attached to the root, an OU or an account. It defines the maximum permissions available to IAM users and roles in member accounts.
+- An action denied by an SCP cannot be performed by any user or role in that account, including one with `AdministratorAccess`, because the effective permission is the intersection of the SCP and the identity policy.
+- SCPs do not grant anything; they only limit.
+- SCPs do not restrict the management account.
+## Example
+An SCP with `"Effect": "Deny"` on `cloudtrail:StopLogging`, `cloudtrail:DeleteTrail` and often `cloudtrail:UpdateTrail` and `cloudtrail:PutEventSelectors`, attached to the OU, stops any member account from turning off or weakening its trail. A condition can exempt a dedicated security role if needed.
+An organization trail created from the management account is also protected, because member accounts cannot modify it.
+W: SCP denying StopLogging and DeleteTrail: SCPs cap permissions for everyone in member accounts, so even account administrators cannot perform the denied CloudTrail actions.
+X: B=Tag on the trail: a tag is only metadata; it enforces nothing unless a policy references it, and an administrator can remove the tag.
+C=IAM policy on the developers group: an account administrator can edit or detach that policy, or act through a role outside the group, so it does not bind administrators.
+D=CloudWatch alarm on logging stopping: an alarm detects the change after it happens; it does not prevent it, and there is a gap in logging until someone reacts.
+T: To stop even administrators in member accounts from doing something, use a deny in an SCP; IAM policies and alarms do not constrain the account's own admins.
+
+@ Q002703 explain
+G: ## IAM Access Analyzer external access findings
+IAM Access Analyzer uses automated reasoning to analyze resource-based policies and report which resources can be accessed from outside a **zone of trust**.
+- When you create an external access analyzer, you choose the zone of trust: your account or your whole AWS Organization.
+- It covers resources such as IAM role trust policies, S3 buckets, KMS keys, Lambda functions, SQS queues and Secrets Manager secrets.
+- Each finding names the resource, the external principal (for example another account ID or `*` for public) and the actions allowed.
+## Example
+A role trust policy allows `arn:aws:iam::111122223333:root` to assume it, and account `111122223333` is not in the organization. With the organization as the zone of trust, the analyzer reports an active finding. You either archive it as intended or fix the policy.
+Access Analyzer can also flag unused access and validate policies before deployment.
+W: IAM Access Analyzer: it analyzes resource and trust policies and lists exactly the roles and buckets that grant access to principals outside the organization when the organization is the zone of trust.
+X: A=Amazon Detective: Detective helps investigate security findings by graphing activity from logs; it does not evaluate which policies grant external access.
+B=AWS Trusted Advisor: Trusted Advisor runs best-practice checks such as open security group ports or public buckets, but it does not analyze role trust policies against an organization boundary.
+C=AWS Cost Explorer: Cost Explorer shows spending and usage trends; it has no view of permissions or sharing.
+T: "Who outside my account or organization can reach this resource?" is answered by IAM Access Analyzer external access findings.
+
+@ Q002704 explain
+G: ## AWS Config rules and conformance packs
+AWS Config records resource configurations and evaluates them with **Config rules**, either AWS managed rules like `s3-bucket-server-side-encryption-enabled` or custom rules. Evaluations run when a resource changes or on a schedule, so compliance is continuous.
+A **conformance pack** is a YAML template that bundles many Config rules, plus optional remediation actions, into one deployable unit.
+- Sample packs exist for frameworks such as operational best practices for CIS or PCI DSS.
+- An **organization conformance pack**, deployed from the management account or a delegated administrator, applies the same pack to every member account.
+- Compliance results can be aggregated across accounts and Regions with a Config aggregator.
+## Example
+A pack with `encrypted-volumes`, `restricted-ssh` and `required-tags` deployed to the organization marks any non-compliant resource in any account within minutes of the change.
+W: Config conformance packs across the organization: they evaluate resources continuously against a bundled rule set and deploy that identical rule set to all accounts in one operation.
+X: A=Quarterly manual drift detection: drift detection only compares CloudFormation-managed resources to their templates, not compliance rules, and running it quarterly is not continuous.
+B=CloudWatch dashboards of resource counts: counts show how many resources exist, not whether each one meets a rule, and dashboards evaluate nothing.
+D=Trusted Advisor reviewed by owners: Trusted Advisor has a fixed set of best-practice checks, not your own compliance rules, and per-owner review is manual and inconsistent.
+T: Continuous, organization-wide compliance rules means AWS Config conformance packs, not manual reviews or dashboards.
+
+@ Q002705 explain
+G: ## EBS encryption by default
+EBS encryption by default is an account setting that applies **per Region**. Once turned on, every new EBS volume created in that Region is encrypted, and every snapshot copy of it stays encrypted.
+- The volume is encrypted with the AWS managed key `aws/ebs` unless you set a customer managed KMS key as the default.
+- Launches cannot opt out: even if a template or API call does not request encryption, the volume is encrypted.
+- It does not change existing unencrypted volumes; those must be migrated by copying a snapshot with encryption and creating a new volume.
+## Example
+An administrator runs `aws ec2 enable-ebs-encryption-by-default` in each Region the company uses. A developer then launches an instance from an old unencrypted AMI; the resulting root volume is still encrypted.
+W: Enable EBS encryption by default in each Region: one setting per Region forces encryption for every new volume automatically, with no reliance on engineers or extra processes.
+X: A=Nightly encrypted snapshots: snapshots are backups; the live volumes remain unencrypted, and data sits unencrypted until and between snapshot jobs.
+B=Ask engineers to choose encryption: a manual step will eventually be forgotten, so it is neither automatic nor enforced.
+C=Use only instance store volumes: instance store is temporary storage lost when the instance stops, so it cannot replace EBS for durable data, and it does not meet the stated requirement for EBS volumes.
+T: For "every new EBS volume encrypted automatically", turn on EBS encryption by default per Region rather than relying on people or backups.
+
+@ Q002706 explain
+G: ## Why RDS encryption is set at creation
+Amazon RDS encryption at rest is chosen when a DB instance is created and cannot be switched on for an existing unencrypted instance. The same rule applies to its snapshots and replicas: an unencrypted instance produces unencrypted snapshots, and you cannot create an encrypted read replica from an unencrypted instance.
+## The snapshot copy path
+- Take a manual snapshot of the unencrypted instance.
+- Copy the snapshot and select encryption with a KMS key during the copy (`copy-db-snapshot` with `--kms-key-id`).
+- Restore a new DB instance from the encrypted copy.
+- Point the application to the new endpoint, or rename instances so the endpoint name stays the same, then remove the old instance.
+Writes made after the snapshot are not in the copy, so plan a short write freeze, or use a replication tool such as AWS DMS to keep the new instance in sync until cutover.
+W: Snapshot, copy with encryption, restore: copying a snapshot is the step where RDS lets you add encryption, and restoring from that copy produces an encrypted instance.
+X: B=Enable encryption on the running instance: the modify operation has no option to encrypt an existing unencrypted instance's storage.
+C=Encrypted read replica then promote: RDS does not allow creating an encrypted read replica from an unencrypted source instance.
+D=Modify the instance class: changing the instance class only changes CPU and memory; it never alters the storage encryption setting.
+T: An unencrypted RDS instance becomes encrypted only through a new instance: snapshot, copy the snapshot with encryption, and restore.
+
+@ Q002707 explain
+G: ## S3 Block Public Access
+S3 Block Public Access is a set of four settings that override any policy or ACL that would make data public:
+- `BlockPublicAcls` and `IgnorePublicAcls` reject new public ACLs and ignore existing ones.
+- `BlockPublicPolicy` rejects bucket policies that grant public access.
+- `RestrictPublicBuckets` limits access to buckets with public policies to AWS service principals and authorized users in the bucket owner's account.
+## Account level versus bucket level
+The settings can be applied to each bucket or at the **account level**. S3 uses the most restrictive combination, so account-level settings apply to every current and future bucket, and a bucket owner cannot loosen them with a bucket policy. With AWS Organizations, an SCP can also stop member accounts from changing their account-level settings.
+New buckets have Block Public Access turned on by default, but account-level settings add a guarantee that no one can turn it off per bucket.
+W: Account-level Block Public Access: it applies to all buckets in the account and overrides any bucket policy or ACL that would grant public access, which is exactly "regardless of individual bucket policies".
+X: A=Object Lock in governance mode: Object Lock keeps object versions from being deleted or overwritten for a retention period; it has no effect on who can read them.
+C=Transfer Acceleration: it speeds up long-distance uploads and downloads through edge locations and does not change access permissions.
+D=Versioning on every bucket: versioning keeps previous versions of objects for recovery; a public bucket stays public with versioning on.
+T: To guarantee no bucket in an account can be public, turn on S3 Block Public Access at the account level.
+
+@ Q002708 explain
+G: ## Secrets Manager rotation
+AWS Secrets Manager stores secrets encrypted with KMS and can rotate them on a schedule, for example every 30 days.
+- Rotation is done by a Lambda function. For Amazon RDS, Aurora, Redshift and DocumentDB, AWS provides ready-made rotation functions, and managed rotation is available for some integrations.
+- Rotation uses version staging labels: `AWSPENDING` for the new password while it is being set and tested, `AWSCURRENT` for the active one and `AWSPREVIOUS` for the last one.
+## Avoiding downtime
+Applications do not store the password; they call `GetSecretValue` (usually with caching) to read `AWSCURRENT`. The **alternating users** strategy rotates between two database users, so one valid credential always exists while the other is being changed. The single-user strategy is simpler but can cause brief login failures during the switch.
+W: Secrets Manager with rotation: it changes the database password automatically on a 30-day schedule with built-in RDS support, and apps that fetch the secret at runtime keep working through the change.
+X: A=Password in an S3 text file: a plain file has no rotation, and anyone who can read the object gets the password; access control and encryption would all be custom work.
+B=Parameter Store standard String: a String parameter is not even encrypted like a SecureString, and Parameter Store has no built-in rotation, so you would have to build scheduling and database updates yourself.
+D=Password in EC2 user data: user data is readable by anyone who can view the instance attributes or query the metadata service from the instance, and it cannot rotate anything.
+T: Scheduled database password rotation without downtime means Secrets Manager rotation, not static storage in files, parameters or user data.
+
+@ Q002709 explain
+G: ## Layer 7 protection with AWS WAF
+AWS WAF is a web application firewall that inspects HTTP and HTTPS requests. You attach a **web ACL** to an Application Load Balancer, CloudFront distribution, API Gateway stage or other supported resource.
+- A web ACL holds rules that match request content: headers, query strings, URI, body, source IP or geography.
+- **AWS managed rule groups** give ready-made protections, for example `AWSManagedRulesSQLiRuleSet` for SQL injection and `AWSManagedRulesCommonRuleSet` for common exploits.
+- The **Bot Control** managed rule group identifies and blocks or challenges bad bots, and rate-based rules limit abusive clients.
+## Example
+A request with `' OR 1=1 --` in a query parameter matches the SQL injection rule set and is blocked before it reaches the targets behind the ALB.
+Network ACLs and security groups only see IPs, ports and protocols, so they cannot tell an attack from a normal request on port 443.
+W: AWS WAF with managed rule groups: WAF inspects the content of HTTP requests at the ALB, and its managed SQL injection and Bot Control rule groups block exactly these threats with little custom work.
+X: B=Network ACL with an allow rule: network ACLs filter by IP, port and protocol at the subnet level and cannot inspect request content for SQL injection or bot behavior.
+C=Security group open to all IPs: this permits all traffic on the allowed port and inspects nothing, so it adds exposure rather than protection.
+D=Shield Standard alone: Shield Standard protects against common network and transport layer DDoS attacks; it does not inspect application requests for SQL injection or bots.
+T: Application-layer attacks such as SQL injection and bad bots need AWS WAF rules; network ACLs, security groups and Shield Standard work below the HTTP layer.
+
+@ Q002710 explain
+G: ## Encryption in transit to an ALB
+Data in transit is protected with TLS. On an Application Load Balancer that means an **HTTPS listener** on port 443:
+- The listener needs a certificate. AWS Certificate Manager (ACM) issues public certificates at no charge, renews them automatically and deploys them to the ALB, so the private key is never handled by people.
+- A **security policy** on the listener controls which TLS versions and ciphers clients may use, for example a policy that allows only TLS 1.2 and later.
+## Enforcing HTTPS
+Clients may still type `http://`. Keep a listener on port 80 whose default action is a **redirect** to `HTTPS` on port 443 with status code `HTTP_301`. The browser follows it, and all application data then travels encrypted.
+If the back end also needs encryption, the target group can use HTTPS to the instances as well.
+W: D=HTTPS listener with an ACM certificate: the listener terminates TLS with a managed certificate, so traffic between clients and the ALB is encrypted.
+E=Redirect HTTP to HTTPS: a redirect action on the port 80 listener sends every plain HTTP request to the HTTPS listener, so no session stays unencrypted.
+X: A=S3 versioning on the log bucket: versioning keeps old object versions for recovery; it has nothing to do with traffic between users and the ALB.
+B=Allow only port 80: port 80 carries plain HTTP, so allowing only it would guarantee unencrypted traffic.
+C=TLS private key in user data: user data is readable from the instance metadata service and by anyone who can view the instance attributes, so this exposes the key; ACM manages the key securely instead.
+T: Protect data in transit to an ALB by serving HTTPS with an ACM certificate and redirecting HTTP to HTTPS.
+
+@ Q002711 explain
+G: ## Preventive and detective controls
+Governance works best in two layers:
+- **Preventive** controls stop a non-compliant action before it happens.
+- **Detective** controls find anything that got through, for example resources created before the policy existed or by a path the policy did not cover.
+## Preventive: IAM condition keys
+An IAM policy (or an SCP) on `ec2:RunInstances` can allow only specific AMIs with the `ec2:ImageID` condition key, or deny launches unless `aws:RequestTag/CostCenter` is present and `aws:TagKeys` includes the required keys. A launch that breaks the condition fails with an access denied error.
+## Detective: AWS Config rules
+AWS managed Config rules such as `approved-amis-by-id` (or `approved-amis-by-tag`) and `required-tags` evaluate each instance and mark any violation as `NON_COMPLIANT`. Results can trigger an SSM Automation remediation or an alert.
+W: C=Config rules for AMIs and tags: they continuously detect instances running unapproved AMIs or missing required tags, catching anything the preventive policy missed.
+E=IAM policies with AMI and tag conditions: conditions on `ec2:ImageID` and request tags block non-compliant launches at the API call itself.
+X: A=Shared administrator password: sharing credentials removes individual accountability and does not restrict which AMIs or tags are used.
+B=Instance count dashboard: counts by Region reveal nothing about which AMI an instance uses or whether its tags are present.
+D=Disabling CloudTrail: this removes the audit trail of who launched what, weakening governance instead of enforcing it.
+T: Pair preventive IAM conditions on AMI IDs and tags with detective Config rules to enforce approved launches.
+
+@ Q002712 explain
+G: ## What Amazon Macie does
+Amazon Macie discovers and classifies sensitive data in Amazon S3. It first builds an inventory of your buckets, reporting ones that are public, shared or unencrypted, and then inspects object contents.
+- **Managed data identifiers** detect types such as credit card numbers, bank account numbers, passport numbers and personal names and addresses, across many countries and formats.
+- **Custom data identifiers** use a regular expression plus keywords for your own formats, such as internal customer IDs.
+- **Automated sensitive data discovery** samples objects across the estate continuously; **sensitive data discovery jobs** scan chosen buckets fully, once or on a schedule.
+## Example
+A job over 200 buckets reports that `s3://exports-archive/2025/payments.csv` contains credit card numbers. The finding goes to EventBridge and Security Hub so the team can restrict or clean up the object.
+Macie supports multi-account management with a delegated administrator.
+W: Amazon Macie: it scans S3 objects with managed data identifiers that recognize credit card numbers and other sensitive data across many buckets and accounts.
+X: A=Amazon GuardDuty: GuardDuty detects threats such as suspicious API calls or anomalous S3 access patterns; it does not read object contents to find card numbers.
+C=AWS Resource Access Manager: RAM shares resources such as subnets or transit gateways between accounts and does not inspect data.
+D=AWS Firewall Manager: Firewall Manager centrally applies WAF rules, security groups and network firewall policies across accounts; it has nothing to do with data classification.
+T: Finding sensitive data such as card numbers inside S3 objects is Macie's job; GuardDuty looks for threats, not content.
+
+@ Q002713 explain
+G: ## Outbound-only internet access
+A subnet is **public** when its route table sends `0.0.0.0/0` to an internet gateway. Instances there with public IPs can be reached from the internet, subject to security groups.
+A **private** subnet has no such route. To let its instances start connections outward, such as downloading patches, without letting the internet start connections inward, you use a NAT gateway.
+## How a NAT gateway works
+- A zonal public NAT gateway sits in a public subnet with an Elastic IP.
+- The private subnet's route table sends `0.0.0.0/0` to the NAT gateway (`nat-xxxx`).
+- The NAT gateway translates the private source IP to its own address and tracks the connection, so replies return, but unsolicited inbound connections have nowhere to go.
+For resilience, use one zonal NAT gateway per Availability Zone, or a regional NAT gateway, which AWS also offers.
+W: NAT gateway in a public subnet with a private route: private instances can open outbound connections for updates, and the NAT gateway blocks connections initiated from the internet.
+X: A=Internet gateway on the private subnet: internet gateways attach to the VPC, not a subnet, and routing the subnet to one makes it public, exposing instances with public IPs to inbound traffic.
+B=S3 gateway endpoint: it gives private access only to Amazon S3; general internet destinations such as package repositories stay unreachable.
+C=Peering to a public VPC: VPC peering does not support edge-to-edge routing through another VPC's internet gateway or NAT gateway, so instances cannot reach the internet through a peer.
+T: Outbound-only internet access for private subnets means a NAT gateway plus a default route to it, not an internet gateway route.
+
+@ Q002714 explain
+G: ## Hub-and-spoke with Transit Gateway
+AWS Transit Gateway is a regional router that connects VPCs, VPN connections and Direct Connect gateways through **attachments**.
+- Each VPC attaches once to the transit gateway instead of connecting to every other VPC.
+- On-premises networks connect with Site-to-Site VPN or Direct Connect to the same transit gateway.
+- **Transit gateway route tables** control which attachments can reach which, so you can segment, for example, production VPCs from development ones while all reach on-premises.
+## Why not a peering mesh
+VPC peering is one-to-one and not transitive. Full connectivity between 30 VPCs needs n(n-1)/2 = 30 x 29 / 2 = 435 peering connections, each with route updates in both VPCs, and on-premises traffic cannot pass through a peer to reach another VPC. With a transit gateway, 30 VPC attachments plus one on-premises connection give centralized routing.
+W: AWS Transit Gateway: it connects all 30 VPCs and the on-premises network through one hub with central route tables, scaling far better than point-to-point links.
+X: B=Internet gateway per VPC: internet gateways give each VPC internet access; they do not connect VPCs to each other or to on-premises privately.
+C=NAT gateway in each VPC: NAT gateways translate outbound traffic from private subnets and cannot route traffic between VPCs.
+D=Full-mesh VPC peering: 435 separate connections with no transitive routing and no way to share the on-premises link makes routing decentralized and hard to manage.
+T: Many VPCs plus on-premises with central routing is a Transit Gateway hub; peering meshes grow quadratically and are not transitive.
+
+@ Q002715 explain
+G: ## NAT gateway data processing charges
+A NAT gateway charges per hour and per GB of data it processes. Private instances that read and write large volumes to Amazon S3 through a NAT gateway pay that per-GB charge on every byte, even though S3 is an AWS service.
+## S3 gateway endpoints
+A **gateway VPC endpoint** for S3 adds a route to the private route tables that points the S3 prefix list (`pl-xxxx` for the Region's S3 addresses) to the endpoint (`vpce-xxxx`).
+- Traffic to S3 in the same Region then takes the endpoint route instead of the NAT gateway route, because the prefix list is more specific than `0.0.0.0/0`.
+- Gateway endpoints have no hourly or data processing charge.
+- An endpoint policy can restrict which buckets are reachable.
+Gateway endpoints exist for S3 and DynamoDB only.
+W: S3 gateway endpoint in the private route tables: S3 traffic bypasses the NAT gateway through a free endpoint, removing the NAT data processing charges for that traffic.
+X: A=Second NAT gateway in the same AZ: the same traffic is still processed and billed per GB, and another gateway adds more hourly charges.
+C=S3 Transfer Acceleration: it routes transfers through edge locations for long-distance clients, adds its own per-GB fee and still sends private traffic through the NAT gateway.
+D=Public subnet with public IPs: it avoids the NAT gateway by exposing instances directly to the internet, which breaks the private design, while a gateway endpoint saves the cost without that risk.
+T: Heavy S3 traffic from private subnets should use a free S3 gateway endpoint instead of the NAT gateway.
+
+@ Q002716 explain
+G: ## Two kinds of VPC endpoints
+VPC endpoints let resources reach AWS services without an internet gateway, NAT device or public IPs.
+- **Gateway endpoints** add a route table entry. They exist only for Amazon S3 and Amazon DynamoDB.
+- **Interface endpoints** (AWS PrivateLink) create elastic network interfaces with private IPs in your subnets. Most AWS services, including Amazon SQS, are reached this way.
+## How an SQS interface endpoint works
+You create an interface endpoint for `com.amazonaws.<region>.sqs` in the subnets where the applications run and attach a security group allowing HTTPS (443) from them. With **private DNS** enabled, the normal SQS hostname resolves to the endpoint's private IPs, so the SDK needs no code change. An endpoint policy can limit which queues are allowed.
+W: Interface VPC endpoint for SQS: it places private network interfaces for SQS in the VPC, so applications call SQS over private IPs with no internet path.
+X: A=Egress-only internet gateway: it provides outbound IPv6 internet access, which is still internet access, and does not reach SQS privately.
+B=Direct Connect public VIF only: a public virtual interface connects on-premises networks to AWS public endpoints; it does not give resources inside a VPC a private path to SQS.
+D=Gateway VPC endpoint for SQS: gateway endpoints are available only for S3 and DynamoDB, so this cannot be created.
+T: Private access to SQS from a VPC uses an interface endpoint; gateway endpoints are only for S3 and DynamoDB.
+
+@ Q002717 explain
+G: ## Content delivery with CloudFront
+Amazon CloudFront is a content delivery network with hundreds of edge locations worldwide. When a user requests a file, DNS directs them to a nearby edge location.
+- **Cache hit**: the edge already has the file and returns it immediately.
+- **Cache miss**: the edge fetches the file from the **origin**, here the S3 bucket, over the AWS network, returns it and keeps a copy for the next user until the TTL expires.
+- Connections from users are terminated close to them, which cuts the round-trip time of TLS handshakes and TCP ramp-up.
+## Example
+Images in a bucket in `us-east-1` are downloaded by users in Seoul. Without CloudFront, each request crosses the Pacific. With CloudFront, only the first request per edge goes back to the origin; later requests are served from an edge in or near Seoul.
+Origin access control keeps the bucket private while CloudFront serves the content.
+W: CloudFront with the bucket as origin: caching static assets at edge locations near global users removes most long-distance round trips and speeds up downloads.
+X: A=Route 53 simple routing: DNS only returns an address; users still download from the single distant Region, and nothing is cached.
+B=Larger EC2 instance in front of S3: distance, not server size, causes the slowness, and a single proxy instance adds a bottleneck and a point of failure.
+D=Cross-Region Replication to one Region: a second copy in one more Region helps only users near that Region and needs routing logic; it is not a global cache.
+T: Slow static content for a global audience calls for CloudFront edge caching, not DNS changes or bigger servers.
+
+@ Q002718 explain
+G: ## How CloudFront caching can serve stale content
+Each edge location keeps a cached object until its TTL expires. The TTL comes from the cache policy (minimum, default and maximum TTL) and from origin headers such as `Cache-Control: max-age`. Updating a file in S3 does not notify CloudFront, so edges keep serving the old copy until it expires.
+## Invalidations
+An **invalidation** removes objects from all edge caches before they expire. The next request for each path is a cache miss and fetches the new version from the origin.
+- Paths can be exact (`/css/site.css`) or use a wildcard (`/images/*`, or `/*` for everything).
+- Invalidations take effect across edges within minutes.
+- Paths beyond a monthly free allowance are billed, so wildcards or targeted paths help.
+For frequent releases, a longer-term pattern is **versioned file names** such as `site.v42.css`, which never need invalidation because each new version is a new object.
+W: CloudFront invalidation for the changed paths: it evicts the cached copies from every edge, so the next request retrieves the updated files immediately.
+X: A=Increase the default TTL: a longer TTL keeps cached objects even longer, making the stale content last more, not less.
+B=Disable CloudFront logging: logging only records requests; turning it off does not touch cached content.
+C=Delete and recreate the bucket: this risks data loss and does nothing to the edge caches, which still hold the old objects until they expire.
+T: To show updated origin content now, invalidate the changed paths in CloudFront; TTL changes only affect future caching.
+
+@ Q002719 explain
+G: ## Route 53 routing policies
+Route 53 decides which answer to return for a DNS query based on the record's routing policy:
+- **Simple**: one record, no health-based choice.
+- **Weighted**: split traffic by assigned weights, such as 90/10 for a canary.
+- **Latency-based**: return the record for the AWS Region with the lowest measured latency to the user.
+- **Geolocation / geoproximity**: choose by the user's location or distance.
+- **Failover**: primary and secondary based on health checks.
+- **Multivalue answer**: return up to eight healthy records at random.
+## How latency-based routing works
+You create records with the same name, each tagged with a Region, for example one pointing to an ALB in `eu-west-1` and one in `ap-northeast-2`. Route 53 uses latency measurements between user networks and AWS Regions to pick the best one. With health checks, an unhealthy Region is skipped.
+W: Latency-based routing: it answers each query with the Region that has the lowest latency for that user, which is exactly the requirement.
+X: B=Multivalue routing: it returns several healthy records at random for simple client-side load spreading, without considering latency.
+C=Simple routing: it returns the same record for everyone, so all users go to one place regardless of latency.
+D=Weighted routing: it splits traffic by fixed percentages, such as for a gradual rollout, and ignores where users are or how fast each Region responds.
+T: "Lowest latency Region" means Route 53 latency-based routing; weighted and multivalue spread traffic without measuring latency.
+
+@ Q002720 explain
+G: ## The zone apex problem
+The zone apex (root domain) is the name `example.com` itself, without a prefix like `www`. DNS rules require the apex to hold the zone's `SOA` and `NS` records, and a `CNAME` cannot coexist with other records at the same name, so a CNAME is not allowed at the apex.
+An Application Load Balancer has no fixed IP address; it is reached by a DNS name such as `my-alb-123.us-east-1.elb.amazonaws.com`, whose IPs change over time.
+## Route 53 alias records
+An **alias record** is a Route 53 extension: an `A` or `AAAA` record whose target is an AWS resource rather than an IP.
+- Route 53 resolves the target's current IPs itself and returns them, so the apex works like a normal A record.
+- Targets include ALBs, CloudFront distributions, API Gateway, S3 website endpoints and other records in the same zone.
+- Queries to alias records that point to AWS resources are free.
+W: Route 53 alias record: an alias A record at `example.com` points to the ALB's DNS name and returns its current IPs, working at the apex where a CNAME cannot.
+X: A=MX record for the ALB: MX records tell mail servers where to deliver email for the domain; browsers never use them to find a website.
+C=TXT record with the IP: TXT records hold text such as verification strings or SPF data; clients do not use them to route traffic, and ALB IPs change anyway.
+D=CNAME at the apex: DNS does not allow a CNAME at the zone apex because the apex already has SOA and NS records.
+T: Point a zone apex to an ALB with a Route 53 alias record; CNAMEs are allowed only on subdomains.
+
+@ Q002721 explain
+G: ## Keeping the S3 origin private
+If a bucket is public, users can bypass CloudFront and download objects directly, skipping CloudFront caching, WAF rules, signed URLs and logging.
+**Origin access control (OAC)** fixes this. CloudFront signs its requests to S3 with SigV4 as the CloudFront service principal, and the bucket accepts only those requests.
+## Setting it up
+- Create an OAC and assign it to the S3 origin of the distribution.
+- Keep S3 Block Public Access on.
+- Add a bucket policy that allows `s3:GetObject` to principal `cloudfront.amazonaws.com` with a condition `AWS:SourceArn` equal to the distribution's ARN, for example `arn:aws:cloudfront::111122223333:distribution/EDFDVBD6EXAMPLE`.
+A direct request to the bucket URL now gets `403 Access Denied`, while requests through the distribution succeed. OAC replaces the older origin access identity (OAI) and supports SSE-KMS encrypted objects.
+W: OAC with a bucket policy for the distribution: only signed requests from that specific distribution are allowed, so content is served through CloudFront and direct bucket access is denied.
+X: B=Public read with logging: public read lets anyone fetch objects straight from S3; logging records requests but blocks nothing.
+C=Transfer Acceleration: it speeds up transfers to the bucket through edge locations but does not restrict who can access it.
+D=Security group on the bucket: S3 buckets do not have security groups, and CloudFront IP ranges are shared by all customers, so an IP-based allow would not tie access to one distribution.
+T: Serve S3 only through CloudFront with origin access control and a bucket policy scoped to the distribution ARN.
+
+@ Q002722 explain
+G: ## Two layers of network filtering
+Traffic to an instance passes both:
+- **Network ACLs** at the subnet boundary. They are **stateless**: return traffic is not automatically allowed, so rules are needed in both directions. Rules are evaluated in number order and the first match wins.
+- **Security groups** at the instance. They are **stateful**: if inbound 443 is allowed, the response is allowed automatically.
+## Why ephemeral ports matter
+A client connects from a random high source port, for example `203.0.113.10:51544` to `10.0.1.20:443`. The response goes from port 443 back to port 51544. The network ACL must therefore allow:
+- inbound TCP 443 from the clients, and
+- outbound TCP `1024-65535` (the ephemeral range) to the clients.
+A custom network ACL denies everything not explicitly allowed. If the security group is correct and the subnet routes to an internet gateway, the ACL is the next layer to check, then OS firewall and the service itself.
+W: Network ACL rules for inbound 443 and outbound ephemeral ports: the stateless ACL must allow both the request and the response, and a missing rule in either direction blocks the connection even though the security group allows it.
+X: A=CloudTrail trail configuration: CloudTrail records API activity for auditing and has no role in whether packets reach an instance.
+B=IAM role permissions for S3: an instance role governs AWS API calls the instance makes, not inbound network connections to it.
+D=S3 bucket policy for static files: bucket policies control access to S3 objects and cannot block traffic to the instance on port 443.
+T: When the security group is right but traffic still fails, check the stateless network ACL in both directions, including outbound ephemeral ports.

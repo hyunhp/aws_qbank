@@ -1,0 +1,398 @@
+# DEA-C01 batch 07: Domain 4 (data security and governance), 4 questions for each of T4.1 to T4.5
+
+@ DEA-C01 D4 T4.1 applied use-case
+S: Analysts connect to an Amazon Redshift provisioned cluster from a BI tool that uses the Amazon Redshift JDBC driver. Policy forbids storing a static database password in the tool, and access must follow each analyst's IAM identity and be revocable by removing IAM permissions. Which approach fits BEST?
+A: Create one shared database user, store its password in AWS Systems Manager Parameter Store, and let the BI tool read it at startup
+B: Turn on IAM authentication in the JDBC connection so the driver requests temporary database credentials for the caller's IAM identity
+C: Place the cluster in a public subnet and restrict the security group to the office CIDR so that only analysts can open the connection
+D: Give each analyst an access key pair with redshift:* permissions and paste the keys into the BI tool as the database user and password
+K: B
+G: ## Two ways to log in to Redshift
+- **Database password**: a user created with `CREATE USER ... PASSWORD`. The password is long lived and lives wherever the client stores it.
+- **IAM authentication**: the driver calls the Redshift API (for a provisioned cluster, `redshift:GetClusterCredentials`, or `GetClusterCredentialsWithIAM`) using the caller's IAM identity and receives a **temporary** database user name and password, valid for a short time.
+## Why it fits the policy
+- No password is stored anywhere, because the credentials are generated on demand.
+- Permission to call the API is an IAM permission, so removing it from the role or user stops new logins.
+- Every credential request appears in CloudTrail against the IAM identity.
+W: IAM authentication: the driver exchanges the analyst's IAM identity for short-lived database credentials, so there is no stored password and access ends when the IAM permission is removed.
+X: A=Shared user in Parameter Store: still a static password shared by everyone, and it hides individual identities behind one database user, so revoking one analyst is not possible.
+C=Public subnet with a CIDR rule: this limits network paths but does nothing about authentication or identity, and it exposes the cluster endpoint to the internet for no reason.
+D=Access keys as database credentials: access keys are not database passwords, and long-lived keys with wildcard Redshift permissions are the opposite of the requirement.
+T: For BI tools on Redshift, use IAM authentication so the driver fetches temporary credentials per IAM identity instead of storing a password.
+V: Amazon Redshift, AWS IAM
+
+@ DEA-C01 D4 T4.1 applied tradeoff
+S: A partner analytics vendor runs a SaaS product in its own AWS account and must write daily exports into an S3 bucket owned by the company. The company wants no long-lived credentials shared, and wants protection against another customer of the vendor tricking the vendor's service into writing to the company's bucket. Which design fits BEST?
+A: A role in the company account trusted by the vendor account, with an sts:ExternalId condition that the vendor must send in AssumeRole
+B: An IAM user in the company account whose access key is emailed to the vendor and rotated every 90 days by a calendar reminder
+C: A bucket policy that allows s3:PutObject to the whole vendor account root, with no role and no condition on the calls made
+D: A pre-signed URL valid for one year that the vendor stores in its configuration and reuses for every daily upload it performs
+K: A
+G: ## Cross-account access with roles
+A role in your account can trust a principal in another account. The other party calls `sts:AssumeRole` and receives **temporary credentials**, so no key is ever handed over.
+## The confused deputy problem
+If a vendor serves many customers, one customer could supply another customer's role ARN and make the vendor act on it. The fix is an **external ID**: a value that the customer sets in the role's trust policy condition (`sts:ExternalId`) and that the vendor must send on every AssumeRole call. The vendor keeps a separate external ID per customer, so a request for the wrong customer fails.
+W: Role with an external ID: the vendor receives only temporary credentials and the unique external ID stops the vendor from being tricked into acting for the wrong customer.
+X: B=IAM user key sent by email: a long-lived key that travels through email and depends on a manual reminder for rotation, which the company wanted to avoid.
+C=Account-wide bucket policy: any principal in the vendor account with matching IAM permissions could write, and nothing separates the vendor's customers from each other.
+D=One-year pre-signed URL: a pre-signed URL is limited to one object key and one operation, and a year-long validity is a long-lived credential in disguise.
+T: For third parties, use a cross-account role with an external ID: temporary credentials, and protection from the confused deputy problem.
+V: AWS IAM, AWS STS, Amazon S3
+
+@ DEA-C01 D4 T4.1 applied troubleshooting
+S: A team stored SASL/SCRAM user credentials in AWS Secrets Manager and tried to associate them with an Amazon MSK cluster so producers could sign in with a user name and password, but the association call fails. Which TWO issues could be the cause? (Select TWO)
+A: The secret is encrypted with the default AWS managed key aws/secretsmanager instead of a customer managed KMS key
+B: The secret is stored in the same Region as the cluster, but MSK requires secrets to be stored in a different Region
+C: The secret name does not begin with the prefix AmazonMSK_ that MSK requires for secrets used for SCRAM authentication
+D: The secret has automatic rotation switched off, and MSK refuses to associate any secret that lacks a rotation schedule
+E: The secret value is a JSON document with username and password keys, which MSK accepts only as a plain-text string
+K: A,C
+G: ## SCRAM on MSK
+With SASL/SCRAM, clients authenticate with a user name and password. MSK does not store the passwords itself: they live in **Secrets Manager**, and you attach them to the cluster with the `BatchAssociateScramSecret` API.
+## Requirements for the secrets
+- The secret name must start with `AmazonMSK_`.
+- The secret must be encrypted with a **customer managed KMS key**, because MSK cannot read secrets that use the default `aws/secretsmanager` key.
+- The secret value is a JSON document with `username` and `password`, and it must be in the same Region and account as the cluster.
+W: A=Default AWS managed key: MSK cannot decrypt a secret protected by aws/secretsmanager, so a customer managed key is needed.
+C=Name prefix: only secrets whose names start with `AmazonMSK_` can be associated with the cluster.
+X: B=Different Region: the secret must be in the same Region as the cluster, so a secret stored elsewhere would be the problem instead of the fix.
+D=Rotation schedule: rotation is optional for these secrets, and associating a secret does not depend on having one.
+E=Plain text format: the secret is supposed to be the JSON document with the user name and password keys, so that format is correct.
+T: MSK SCRAM secrets need the AmazonMSK_ name prefix and a customer managed KMS key, in the cluster's Region.
+V: Amazon MSK, AWS Secrets Manager, AWS KMS
+
+@ DEA-C01 D4 T4.1 applied troubleshooting
+S: A developer with broad data engineering permissions calls glue:CreateJob to create a Glue ETL job that runs as an existing role named ETL-Curated-Role. The call fails with AccessDenied although the developer can list and read other Glue jobs. The role has the required S3 and Glue permissions. What is the MOST likely fix?
+A: Add an inline policy to ETL-Curated-Role that allows glue:CreateJob so the role can create the job on the developer's behalf
+B: Attach the AWSGlueConsoleFullAccess managed policy to the role that the job uses so that the job can pass itself
+C: Grant the developer iam:PassRole on that role and confirm its trust policy names the service principal glue.amazonaws.com
+D: Create an S3 VPC gateway endpoint in the job's subnet so that the Glue service can validate the role through a private path
+K: C
+G: ## Passing a role to a service
+When you create a resource that will run with an IAM role (a Glue job, a Lambda function, an EMR cluster), you hand that role to the service. AWS requires the caller to hold **`iam:PassRole`** on the role, so that a user cannot borrow a more powerful role than they are allowed to use.
+## Two parts must line up
+- The caller's identity policy allows `iam:PassRole` for that role ARN (often with a condition `iam:PassedToService = glue.amazonaws.com`).
+- The role's **trust policy** lists `glue.amazonaws.com` as a principal, so Glue is allowed to assume it.
+W: iam:PassRole plus a Glue trust policy: the developer needs permission to pass this role and the role must trust Glue, otherwise CreateJob is denied although the developer's Glue permissions are fine.
+X: A=Permission on the job role: the role runs the job, it does not call CreateJob. The denied caller is the developer, so the missing permission belongs on the developer.
+B=Console managed policy on the role: this adds Glue permissions to the wrong identity and does not give the developer the right to pass the role.
+D=S3 gateway endpoint: network paths are not involved in IAM checks on the CreateJob API call, so the error would not change.
+T: To attach a role to a service resource, the caller needs iam:PassRole on it and the role must trust the service principal.
+V: AWS Glue, AWS IAM
+
+@ DEA-C01 D4 T4.2 applied troubleshooting
+S: A data lake team registered an S3 location with AWS Lake Formation and granted SELECT on a single column of a table to an analyst role. Analysts still see every column of the table when they query it with Athena. Nothing else grants the role access. What should the team check FIRST?
+A: Whether the Athena workgroup uses engine version 2, because column grants are ignored by every workgroup that runs newer engines
+B: Whether the S3 bucket has versioning enabled, because Lake Formation grants only apply to buckets that store all object versions
+C: Whether the analyst role has a Lake Formation permission boundary attached that lists the table as a resource owned by the role
+D: Whether the IAMAllowedPrincipals group still holds permissions on the database and table, so access falls back to plain IAM
+K: D
+G: ## Two permission models in one catalog
+Lake Formation adds its own grants on top of IAM. But for backward compatibility, databases and tables can carry permissions for a special group, **IAMAllowedPrincipals**. When that group has access, Lake Formation steps aside and access is decided by **IAM and S3 policies only**.
+## What that means
+- Databases created by default may use the "Use only IAM access control" setting, which gives IAMAllowedPrincipals full access.
+- Any principal whose IAM policy allows the Glue and S3 actions then reads all columns, and column-level grants are never enforced.
+To enforce Lake Formation grants, turn off the default setting, revoke IAMAllowedPrincipals from the database and tables, and grant only the intended principals.
+W: IAMAllowedPrincipals: while the group still holds permissions on the table, Lake Formation does not enforce column grants and IAM decides, so the analyst sees every column.
+X: A=Athena engine version 2: column-level Lake Formation permissions are enforced by Athena through the Data Catalog, and the engine version is not what disables column grants.
+B=Bucket versioning: versioning affects how S3 keeps object versions and has no effect on whether Lake Formation grants are enforced.
+C=Permission boundary: Lake Formation has no permission boundary feature for table ownership, and an IAM permission boundary would only restrict access more.
+T: If Lake Formation grants seem ignored, check whether IAMAllowedPrincipals still holds permissions: it hands enforcement back to IAM.
+V: AWS Lake Formation, Amazon Athena
+
+@ DEA-C01 D4 T4.2 applied use-case
+S: A company stores raw and curated data in Amazon S3. Employees sign in through AWS IAM Identity Center with corporate directory groups. Each team must read and write only its own prefix, and the security team wants access decided per directory identity without writing an ever-growing bucket policy or creating an IAM role for every team. Which feature fits BEST?
+A: S3 Access Grants that map directory users and groups to prefixes, so that applications request short-lived credentials for the matched prefix
+B: S3 Object Lambda access points that filter every response through a function that inspects the caller's group and returns only permitted data
+C: S3 Batch Operations jobs that copy each team's objects into a dedicated bucket and then set a bucket ACL naming the team's canonical user
+D: S3 Storage Lens dashboards with an activity metric per prefix so the security team can review who used which prefix each week
+K: A
+G: ## The scaling problem with bucket policies
+A bucket policy is one JSON document with a size limit, and per-team IAM roles multiply as teams grow. Neither understands the corporate directory directly.
+## S3 Access Grants
+- You register a **location** (bucket or prefix) and create **grants** that give a **grantee** (an IAM principal, or a user or group from an IAM Identity Center directory) READ, WRITE or READWRITE on a prefix.
+- A client or application calls `GetDataAccess`; S3 Access Grants checks the grants and returns **temporary credentials** scoped to the matched prefix.
+- Changes to a team's access are grant changes, not policy rewrites.
+W: S3 Access Grants: directory identities are mapped to prefixes as grants, and callers receive short-lived, prefix-scoped credentials, so no huge policy or role per team is required.
+X: B=Object Lambda: transforms data on the way out of S3, but it is a processing layer and does not replace authorization for the underlying bucket access.
+C=Batch copy plus ACLs: duplicates data, keeps growing operational work and relies on ACLs, which AWS recommends disabling for new buckets.
+D=Storage Lens: reports usage and activity metrics but does not grant or restrict any access.
+T: For directory-based access to S3 prefixes at scale, use S3 Access Grants: identity to prefix grants with temporary credentials.
+V: Amazon S3, AWS IAM Identity Center
+
+@ DEA-C01 D4 T4.2 applied tradeoff
+S: A platform team wants to let each data engineering team create its own IAM roles for Glue jobs, but no team may ever grant a role more than access to its own S3 prefix and the Glue Data Catalog, even if a team writes a policy with wildcards. Which control fits BEST?
+A: An identity policy on each team's admin that denies iam:CreateRole unless the request tag names the platform team as the approver
+B: A permission boundary policy that caps the maximum permissions, with team admins allowed to create roles only when that boundary is attached
+C: A trust policy on every new role that lists only the Glue service, since a trust policy also limits what actions the role may perform
+D: An S3 lifecycle rule on each team prefix that expires any object written by a role whose name does not begin with the team's name
+K: B
+G: ## Delegating role creation safely
+If you let a team create IAM roles, they could create a role with more power than they have. A **permission boundary** solves this: it is a managed policy attached to a role or user that sets the **maximum** permissions the identity can ever have. Effective permissions are the intersection of the identity policy and the boundary.
+## The pattern
+- Create a boundary that allows only the team's prefix and the catalog.
+- Give team admins `iam:CreateRole` and `iam:AttachRolePolicy` with a condition that `iam:PermissionsBoundary` equals that boundary ARN.
+- Any role they create is capped, even when its own policy says `"Action": "*"`.
+W: Permission boundary: it sets a hard ceiling for the delegated roles, and forcing its attachment on creation means team-authored wildcard policies cannot exceed the boundary.
+X: A=Approval by tag: a request tag is only a label. It records who approved but does not limit what permissions the created role can hold.
+C=Trust policy: decides who may assume the role, not what the role may do once assumed.
+D=Lifecycle rule: expires objects and is a storage cost control, not an authorization mechanism for IAM roles.
+T: To delegate role creation with a ceiling on privileges, require a permission boundary on every role the delegates create.
+V: AWS IAM, AWS Glue
+
+@ DEA-C01 D4 T4.2 applied use-case
+S: In a shared analytics account, the raw-data S3 bucket must be readable only by the pipeline role and one break-glass admin role, even though many other roles in the account carry broad s3:* permissions through their own IAM policies. Which TWO controls achieve this? (Select TWO)
+A: A bucket policy statement with an explicit Deny for any principal whose aws:PrincipalArn is not one of the two allowed roles
+B: A service control policy in the organization that denies access to that bucket unless the caller's aws:PrincipalArn is one of the two roles
+C: An additional identity policy on the pipeline role that allows s3:GetObject on the bucket, since an allow blocks other roles
+D: An S3 access control list that grants READ only to the two roles, while the bucket policy stays permissive for other principals
+E: S3 Object Lock in governance mode on the bucket, which stops all users without the bypass permission from reading objects
+K: A,B
+G: ## Allow does not restrict, deny does
+In IAM, an **explicit Deny** always wins over any Allow. A broad `s3:*` Allow on other roles cannot be cancelled by another Allow. To carve out exceptions to broad permissions you need a Deny with a condition.
+## Two places to put the Deny
+- A **bucket policy** on the resource: `Deny` with `StringNotEquals` on `aws:PrincipalArn`, listing the allowed roles.
+- A **service control policy (SCP)** on the organization or OU: guardrail that applies to every principal in the member accounts, however their IAM policies are written.
+W: A=Bucket policy deny: an explicit deny for every other principal overrides their s3:* allows.
+B=Service control policy: a deny on the bucket for callers outside the two roles limits all principals in member accounts at the organization level.
+X: C=Extra allow: granting the pipeline role more access does not remove access from the other roles, because allows are additive.
+D=ACL plus permissive policy: leaving the bucket policy open means other roles keep access, and ACLs are a legacy mechanism that cannot deny.
+E=Object Lock: prevents deletion or overwrite for a retention period, but does not control who can read objects.
+T: To exclude principals that already have broad allows, use an explicit Deny with a condition on aws:PrincipalArn, in a bucket policy or an SCP.
+V: Amazon S3, AWS IAM, AWS Organizations
+
+@ DEA-C01 D4 T4.3 applied troubleshooting
+S: A team enabled cross-Region snapshot copy from an encrypted Amazon Redshift cluster in eu-west-1 to eu-central-1 for disaster recovery. The copy of automated snapshots never appears in the destination Region. Which missing step is the MOST likely cause?
+A: A snapshot copy grant in the destination Region that lets Amazon Redshift use a KMS key there to re-encrypt the copied snapshots
+B: A replica of the source KMS key created as a multi-Region key, because Redshift cannot copy snapshots that use a single-Region key
+C: A bucket policy on an S3 bucket in the destination Region that allows the Redshift service to write the snapshot files into it
+D: An S3 Cross-Region Replication rule for the Redshift service bucket that replicates the snapshot objects to the destination Region
+K: A
+G: ## Keys are Regional
+A KMS key exists in one Region. An encrypted Redshift snapshot cannot be decrypted in another Region by the source key, so when snapshots are copied across Regions they must be **re-encrypted** under a key in the destination Region.
+## Snapshot copy grant
+In the **destination** Region you create a snapshot copy grant that gives Amazon Redshift permission to use a chosen KMS key there. When you turn on cross-Region snapshot copy for an encrypted cluster, you specify the destination Region and that grant name. Without it, the copy cannot be created.
+W: Snapshot copy grant: it authorizes Redshift to use a KMS key in the destination Region to re-encrypt the copied snapshots; without it the cross-Region copy of an encrypted cluster does not work.
+X: B=Multi-Region key: not required. Redshift re-encrypts snapshots under a destination key through the grant, so a single-Region key works.
+C=Customer bucket: Redshift snapshots are stored in AWS-managed storage, not in a bucket you own or write a policy for.
+D=S3 replication rule: the snapshot storage is not a bucket in your account, so you cannot configure replication on it.
+T: Cross-Region copies of encrypted Redshift snapshots need a snapshot copy grant in the destination Region for a KMS key there.
+V: Amazon Redshift, AWS KMS
+
+@ DEA-C01 D4 T4.3 applied use-case
+S: An analytics group runs Athena queries and the results are written to an S3 results bucket. Security requires that all query results are encrypted with a specific customer managed KMS key, even when an analyst's client or JDBC settings do not ask for encryption. Which configuration fits BEST?
+A: A workgroup with a result location and encryption set to SSE-KMS with the key, plus the option to override client-side settings
+B: A bucket policy on the results bucket that encrypts every uploaded object automatically by rewriting the request before it is stored
+C: An IAM policy on analysts that allows athena:StartQueryExecution only when the request contains an encryption header set by the client
+D: A Glue security configuration attached to the workgroup, since Athena reads the result encryption settings from Glue job settings
+K: A
+G: ## Where Athena result settings live
+Athena writes query results to S3. The result location and encryption can be set by each client, or centrally in a **workgroup**. If the workgroup has **Override client-side settings** turned on, its result configuration wins over whatever the analyst's console, driver or SDK specifies.
+## Encryption choices
+For results you can choose SSE-S3, **SSE-KMS** or CSE-KMS. Choosing SSE-KMS with a customer managed key in the workgroup makes every query in that workgroup write encrypted results with that key, and access to the results depends on the KMS key policy too.
+W: Workgroup with SSE-KMS and override: the setting is enforced centrally, so results are encrypted with the customer managed key regardless of what each client asks for.
+X: B=Bucket policy rewriting requests: a bucket policy can deny non-encrypted uploads but cannot rewrite them, and denying would make queries fail rather than encrypting results. Default bucket encryption is the closer feature.
+C=Client header condition: still relies on every client sending the right header, so it does not enforce a specific key and it breaks queries instead of fixing them.
+D=Glue security configuration: applies to Glue jobs, crawlers and development endpoints, not to Athena result encryption.
+T: Enforce Athena result encryption centrally: set SSE-KMS in the workgroup and turn on override of client-side settings.
+V: Amazon Athena, AWS KMS, Amazon S3
+
+@ DEA-C01 D4 T4.3 applied comparison
+S: A Glue job loads customer records that include free-form columns which may contain email addresses and phone numbers. The data team must keep the records joinable on the sensitive value across datasets without exposing the clear value to analysts. Which transform fits BEST?
+A: The Detect Sensitive Data transform in AWS Glue Studio, with the action set to replace detected values with a SHA-256 cryptographic hash
+B: The Detect Sensitive Data transform in AWS Glue Studio, with the action set to replace detected values with a fixed redaction string
+C: A Glue crawler with a classifier that tags the columns as sensitive in the catalog and leaves the stored values unchanged
+D: A Glue Data Quality ruleset that fails the job when a column contains values that match an email or phone number pattern
+K: A
+G: ## Detect, then act
+The **Detect Sensitive Data** transform in Glue Studio finds PII such as emails and phone numbers in rows or chosen columns. You then choose the action for detected values.
+## Redact or hash
+- **Redaction** replaces the value with a fixed string. The result is safe, but every value looks the same, so two datasets cannot be joined on it.
+- **Cryptographic hashing** replaces the value with a deterministic hash. The same input always gives the same output, so equality joins and counting distinct values still work, while the original is not readable.
+W: Hashing action: detected values are replaced by a deterministic hash, so the same email is the same token everywhere and joins keep working without showing the clear value.
+X: B=Fixed redaction string: hides the value but destroys the ability to join, since all detected values become identical.
+C=Crawler classifier: classification labels metadata only. The stored data remains clear text, so analysts still see it.
+D=Data Quality rules: only evaluates data and can fail a job; it does not transform values, so nothing is protected.
+T: To protect sensitive values but keep them joinable, detect them in Glue and replace them with a deterministic hash rather than a constant redaction.
+V: AWS Glue
+
+@ DEA-C01 D4 T4.3 applied comparison
+S: A security team reviews how automatic rotation works on a symmetric customer managed AWS KMS key that protects objects in several S3 buckets. Which TWO statements are correct? (Select TWO)
+A: The key ID and ARN stay the same after rotation, so applications and bucket settings that reference the key need no change
+B: Older key material is kept, so data encrypted before the rotation can still be decrypted without re-encrypting it
+C: Rotation immediately re-encrypts every existing object in the buckets with the new key material, which can take several days
+D: The rotation period is fixed at exactly one year and cannot be changed to a shorter or longer number of days
+E: Rotation must be switched on separately in each bucket's default encryption settings, because the S3 service performs the key rotation
+K: A,B
+G: ## What rotation changes
+A KMS key has a permanent **key ID** and ARN, and one or more **key material** versions. With automatic rotation, KMS creates new key material on a schedule and uses it for all **new** encryption operations.
+## What it does not change
+- The key ID and ARN are unchanged, so nothing that references the key must be edited.
+- Previous key material is **retained** so that ciphertext produced earlier still decrypts. Existing objects are not rewritten.
+- The period is configurable (from 90 to 2,560 days, with the default at 365 days), and automatic rotation is set on the KMS key itself, only for symmetric encryption keys with KMS-generated key material.
+W: A=Same key ARN: rotation swaps in new key material behind the same key, so references stay valid.
+B=Old material retained: earlier ciphertext still decrypts, so no bulk re-encryption is needed.
+X: C=Immediate re-encryption: KMS never re-encrypts existing data during rotation, because old material is kept to decrypt it.
+D=Fixed one-year period: the period can be configured, one year is only the default.
+E=Per-bucket rotation: rotation is a property of the KMS key, enabled on the key, and S3 buckets that reference the key are not involved.
+T: KMS automatic rotation keeps the key ARN and old material: new encryptions use new material, old ciphertext still decrypts.
+V: AWS KMS, Amazon S3
+
+@ DEA-C01 D4 T4.4 applied use-case
+S: Auditors ask the data platform team to show which IAM principals read data from which Lake Formation governed tables during the last quarter. Analysts query the tables through Athena, and CloudTrail management events are already delivered to S3. Which evidence source answers the question BEST?
+A: CloudTrail events recorded when Lake Formation vends temporary credentials, which name the calling principal and the table involved
+B: The Athena query history in the console, which keeps every query text from every workgroup for at least two years by default
+C: S3 Storage Lens activity metrics for the data lake bucket, which list the individual IAM principals that read each table's files
+D: AWS Config configuration history for the Glue tables, which records every read operation and the identity that performed it
+K: A
+G: ## Lake Formation records data access
+When Athena or another integrated engine reads a governed table, it asks Lake Formation for temporary credentials to the underlying S3 data. The engine calls Lake Formation's **GetDataAccess** API for the principal, and Lake Formation **logs it in CloudTrail**. The event shows who requested access and for which table, and it is delivered with your other management events.
+## Why other sources fall short
+- Athena query history is limited in time and to the console.
+- Storage Lens shows aggregate metrics, not identities.
+- Config records changes to resource configuration, not reads.
+W: Lake Formation CloudTrail events: each credential-vending call names the principal and the table, giving the audit trail of who read which governed table over the quarter.
+X: B=Athena history: the console retains query history for a limited time (45 days), and the question asks for evidence across a quarter, so it cannot guarantee coverage.
+C=Storage Lens: aggregates activity by bucket and prefix and does not identify the calling principal.
+D=Config history: tracks configuration changes such as a table schema edit, never read access.
+T: For who accessed which governed table, read the CloudTrail events that Lake Formation emits when it vends credentials.
+V: AWS Lake Formation, AWS CloudTrail, Amazon Athena
+
+@ DEA-C01 D4 T4.4 applied troubleshooting
+S: A team turned on S3 server access logging for a sensitive bucket and named a separate log bucket as the target, in the same Region and account. Several days later no log objects have ever appeared. The log bucket uses default encryption with SSE-KMS and a customer managed key. What is the MOST likely cause?
+A: The log bucket lacks a lifecycle rule, and S3 does not begin delivering logs until an expiration rule has been added there
+B: The log bucket's default encryption uses SSE-KMS, but server access log delivery supports only SSE-S3 default encryption on the target
+C: The source bucket has versioning turned on, and S3 does not create access logs for any bucket that stores several object versions
+D: The log bucket sits in the same Region as the source, and S3 requires the target bucket to be in a different Region for logs
+K: B
+G: ## How server access logs are delivered
+S3 delivers server access logs to a target bucket using the S3 logging service principal, which needs permission to write there (bucket policy or, historically, the log delivery ACL group).
+## Common delivery blockers
+- The target bucket must be in the **same Region** and account (or permitted account) as the source, so the same Region is correct.
+- The target bucket's **default encryption must be SSE-S3**. Server access log delivery does not support SSE-KMS on the target bucket, so logs are silently not written.
+- Delivery is best effort and can lag, but an encryption mismatch means it never happens.
+For a stronger audit trail of object-level API calls, CloudTrail data events for S3 are the alternative.
+W: SSE-KMS default encryption on the target: server access log delivery supports only SSE-S3 there, so the customer managed key setting prevents any logs from arriving.
+X: A=Lifecycle rule: expiration is optional housekeeping and has no effect on whether delivery starts.
+C=Versioning on the source: logging works for versioned buckets, and the log records the version ID of accessed objects.
+D=Same Region: the target must be in the same Region as the source, so this setup is correct, not the cause.
+T: Server access logs need a target bucket in the same Region that uses SSE-S3 default encryption, not SSE-KMS.
+V: Amazon S3
+
+@ DEA-C01 D4 T4.4 applied use-case
+S: Compliance requires that the exact SQL text and the IAM identity for every Amazon Athena query be kept for two years, in a store the analysts cannot alter. Athena query history in the console only goes back a short time. Which solution fits BEST?
+A: Ask analysts to export their query history from the console each month and upload the files to a shared S3 bucket
+B: Enable Athena workgroup metrics in CloudWatch, which store the complete query text and the caller identity for each query
+C: Deliver CloudTrail events to a protected S3 bucket, where StartQueryExecution calls record the query string and caller
+D: Turn on S3 server access logs for the Athena results bucket, which store the SQL that produced each results file
+K: C
+G: ## Athena is an API
+Every Athena query starts with an API call such as `StartQueryExecution`. CloudTrail records API calls with the **caller identity** and the **request parameters**, which include the SQL query string.
+## Keeping the evidence
+- A CloudTrail **trail** (ideally an organization trail) delivers events to S3 for as long as needed. Combine it with S3 Object Lock or restrictive bucket policies and log file validation, so analysts cannot alter the logs.
+- Console history is limited (45 days) and user-controlled, and workgroup metrics contain counts and timings, not text.
+W: CloudTrail delivered to a protected S3 bucket: StartQueryExecution events carry the SQL and the identity, and the trail keeps them for as long as the bucket retention requires.
+X: A=Manual exports: depend on people remembering, can be edited or skipped, and are not tamper resistant.
+B=Workgroup metrics: report numbers such as data scanned and execution time, and do not include the statement text or caller.
+D=Server access logs on results bucket: record requests to result objects (who fetched which file), not the SQL text that created them.
+T: For Athena audit trails with SQL and identity, use CloudTrail delivered to protected S3 storage instead of console history.
+V: Amazon Athena, AWS CloudTrail, Amazon S3
+
+@ DEA-C01 D4 T4.4 applied troubleshooting
+S: A team enabled audit logging on an Amazon Redshift provisioned cluster with delivery to Amazon S3. Connection logs and user logs appear, but the auditors also need the full text of every SQL statement executed, and no such log exists. What is the MOST likely fix?
+A: Set the enable_user_activity_logging parameter to true in the cluster's custom parameter group, which adds the user activity log to audit logging
+B: Create a database user named audit and grant it SELECT on the system tables, so that every executed statement is copied to it as a log
+C: Attach the AWSCloudTrailReadOnlyAccess policy to the cluster's IAM role, so that the cluster starts writing statement text to the trail
+D: Raise the wlm_query_slot_count parameter of the queue, since statement text is logged only for queries that use more than one slot
+K: A
+G: ## Three Redshift audit logs
+Redshift audit logging can deliver three logs to S3 or CloudWatch Logs:
+- **Connection log**: authentication attempts, connections and disconnections.
+- **User log**: changes to database user definitions.
+- **User activity log**: every SQL query before it runs, with the user and the time.
+## The extra switch
+The connection and user logs are produced once audit logging is enabled. The **user activity log** is off until you also set the **`enable_user_activity_logging`** parameter to `true` in the cluster's parameter group (a custom group, since the default cannot be edited). The setting only applies once it takes effect on the cluster.
+W: enable_user_activity_logging: the user activity log holds the SQL text and is generated only when this parameter is on, in addition to audit logging.
+X: B=Audit database user: SELECT grants do not copy statements to a user or write logs, so nothing is created.
+C=CloudTrail read-only policy: an IAM policy attached to a role does not change what Redshift logs; CloudTrail records API calls, not SQL text run inside the database.
+D=wlm_query_slot_count: controls how many slots a query uses in workload management and has no link to logging statement text.
+T: Redshift's user activity log needs enable_user_activity_logging set to true in the parameter group, on top of audit logging.
+V: Amazon Redshift
+
+@ DEA-C01 D4 T4.5 applied use-case
+S: A company keeps employee records in S3 where each employee has an identifier in the form EMP followed by seven digits, with the words "employee id" nearby. Amazon Macie's managed data identifiers do not recognize this format. The company wants Macie sensitive data discovery jobs to report objects that contain it. What should the team create?
+A: A custom data identifier in Macie defined by a regular expression for the format, with optional keywords and a proximity distance
+B: An S3 Inventory report that lists every object whose key contains the text EMP, which Macie then uses as the sensitive list
+C: A Glue crawler classifier with a grok pattern for the format, which Macie reads through the Data Catalog before it starts a job
+D: An Amazon Comprehend custom entity recognizer trained on a few samples, which Macie calls automatically during every discovery job
+K: A
+G: ## Managed and custom identifiers
+Macie detects sensitive data with **managed data identifiers** for common types such as credit card numbers, names and national IDs. For company-specific formats you add a **custom data identifier**.
+## What a custom identifier contains
+- A **regular expression** that matches the pattern (`EMP[0-9]{7}`).
+- Optional **keywords** (for example "employee id") that must appear within a **maximum match distance** of the match, which cuts false positives.
+- Optional **ignore words**.
+Include the identifier in a sensitive data discovery job, and any object with matches is reported in findings.
+W: Custom data identifier: a regex with keywords and a proximity distance describes the internal ID format, and discovery jobs then report objects that match it.
+X: B=S3 Inventory: lists object metadata such as keys, not the content, so employee IDs inside files are never inspected.
+C=Glue classifier: classifiers determine file schema for the Data Catalog and are not consumed by Macie for detection.
+D=Comprehend custom recognizer: a separate service that Macie does not call during discovery jobs.
+T: For proprietary sensitive formats, add a Macie custom data identifier: regex plus keywords and proximity.
+V: Amazon Macie, Amazon S3
+
+@ DEA-C01 D4 T4.5 applied comparison
+S: A financial firm must store trade confirmations in Amazon S3 for seven years so that no user, including the account root user, can delete or overwrite any object version before the retention period ends, and regulators must be able to rely on that guarantee. Which configuration fits BEST?
+A: S3 Object Lock in governance mode, with a seven-year default retention period applied to the bucket
+B: S3 Object Lock in compliance mode, with a seven-year default retention period applied to the bucket
+C: A bucket policy that denies s3:DeleteObject to every principal except a break-glass role in the account
+D: S3 Versioning with MFA delete turned on, so that deletes need a hardware token held by the root user
+K: B
+G: ## WORM in S3
+**S3 Object Lock** provides write-once-read-many protection for object versions (the bucket must have versioning, enabled with Object Lock). Two retention modes:
+- **Governance mode**: users with the special `s3:BypassGovernanceRetention` permission can remove or shorten retention or delete the version. It protects against accidents, not against privileged users.
+- **Compliance mode**: **nobody**, including the root user, can delete the version, overwrite it, or shorten retention until the date passes. It is designed for regulatory requirements.
+## Why the others fall short
+A bucket policy or MFA delete can still be changed or used by an authorized person.
+W: Object Lock in compliance mode: retention cannot be shortened or removed by any user, including root, so the seven-year guarantee holds.
+X: A=Governance mode: principals with the bypass permission can still delete or shorten retention, so it does not meet the no-one requirement.
+C=Deny bucket policy with exception: a break-glass role can still delete, and an administrator can edit the policy itself.
+D=MFA delete: requires the root user's token and can be used to permanently delete versions, so it does not block deletion.
+T: For no-one-can-delete retention, use S3 Object Lock in compliance mode; governance mode lets privileged users bypass it.
+V: Amazon S3
+
+@ DEA-C01 D4 T4.5 applied troubleshooting
+S: A versioned S3 bucket holds customer exports. To meet a 90-day retention policy, a lifecycle rule expires current objects after 90 days. The exports disappear from listings, yet storage costs and the data volume stay almost the same, and auditors find old customer data still recoverable. What should the team add?
+A: A rule that transitions the current versions to S3 Glacier Deep Archive at day 91 so that the old data is stored more cheaply
+B: A rule with noncurrent version expiration so that previous versions are permanently deleted a few days after they become noncurrent
+C: A lifecycle rule on the bucket that enables S3 Intelligent-Tiering so that unused objects are removed after 90 days of no access
+D: An S3 Inventory configuration that lists all versions weekly, which lets S3 remove any version that is older than 90 days
+K: B
+G: ## Expiration on a versioned bucket
+In a versioned bucket, an expiration action on **current** versions does not delete data. S3 adds a **delete marker**, and the previous version becomes **noncurrent**. The object disappears from normal listings, but the old version is still stored, billed and recoverable.
+## Removing the data for good
+Add a lifecycle rule with **`NoncurrentVersionExpiration`** (for example a few days after becoming noncurrent). S3 then permanently deletes those versions. A rule that removes **expired object delete markers** cleans up leftover markers once no versions remain.
+W: Noncurrent version expiration: it permanently deletes the versions kept behind the delete markers, which is what actually removes the data and the cost.
+X: A=Glacier Deep Archive transition: moves data to a cheaper class but keeps it, which is the opposite of deleting data under a retention policy.
+C=Intelligent-Tiering: changes storage tier by access pattern and never deletes objects.
+D=S3 Inventory: only reports on objects and versions; it does not delete anything.
+T: On a versioned bucket, expiring current objects only adds delete markers; also expire noncurrent versions to really delete data.
+V: Amazon S3
+
+@ DEA-C01 D4 T4.5 applied use-case
+S: A contact center stores thousands of call transcripts as text files in S3. The transcripts contain names, addresses and card numbers in free text. Before analysts explore them in Athena, the company must remove the personal data, and they need the transcripts to remain readable text. Which approach fits BEST?
+A: An Amazon Comprehend PII redaction job on the transcripts that writes new files with detected entities masked or replaced by their type
+B: An Amazon Macie sensitive data discovery job on the bucket, which redacts the detected values inside every transcript it scans
+C: An S3 Lifecycle rule that moves transcripts with card numbers to S3 Glacier Flexible Retrieval and blocks their reading in Athena
+D: An Athena view with a column mask on the transcript column, which hides the sensitive words from analysts at query time
+K: A
+G: ## Finding versus removing personal data
+- **Amazon Macie** discovers sensitive data in S3 and reports **findings**. It does not modify the objects.
+- **Amazon Comprehend** can detect **PII entities** in unstructured text (names, addresses, card numbers) and, with a **PII redaction job**, write new documents where those entities are masked or replaced by the entity type, such as `[NAME]`.
+## Why it fits here
+The transcripts are free text with no columns, so column masking does not help. A redaction job produces clean text files that stay readable, and analysts query the redacted copy.
+W: Comprehend PII redaction: it detects personal data in free text and writes redacted transcripts, which is the removal step the requirement asks for.
+X: B=Macie job: only reports where sensitive data is found, without changing any transcript.
+C=Lifecycle to Glacier: moves objects between storage classes based on age, is unrelated to the content, and would make the transcripts unavailable rather than cleaned.
+D=Athena column mask: masking works on columns of structured data, and a transcript stored as free text has no sensitive column to mask.
+T: Macie finds PII; to remove it from free text, run a Comprehend PII redaction job and analyze the redacted copy.
+V: Amazon Comprehend, Amazon Macie, Amazon S3

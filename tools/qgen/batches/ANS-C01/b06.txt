@@ -1,0 +1,413 @@
+# ANS-C01 D4 batch 06: inspection design, DNS/WAF/Shield controls, logging and auditing, encryption in transit
+
+@ ANS-C01 D4 T4.1 advanced troubleshooting
+S: A company inspects all inter-VPC traffic in a central inspection VPC that has AWS Network Firewall endpoints in three Availability Zones. Spoke VPCs are attached to a transit gateway, and the spoke route tables send 0.0.0.0/0 to the inspection VPC attachment. Short-lived flows between two spokes work, but long TCP sessions between a client in one Availability Zone and a server in another Availability Zone are reset intermittently, and the stateful engine logs show only one direction of those flows. What should the network engineer change?
+A: Enable appliance mode on the transit gateway attachment of the inspection VPC so both directions of a flow use the same Availability Zone's firewall endpoint
+B: Add a stateless rule group that forwards all traffic to the stateful engine so the engine can rebuild session state for flows that arrive out of order
+C: Disable route propagation on the spoke attachments and replace the propagated routes with static routes that point at one firewall endpoint subnet
+D: Turn on cross-zone load balancing for the firewall so any endpoint can accept return packets and share the flow state table with the other endpoints
+K: A
+G: ## Why state matters for a firewall
+A stateful firewall decides about a packet by looking up the connection it belongs to. If the request passes through one firewall endpoint and the reply passes through another, the second endpoint has never seen the handshake and drops or resets the reply.
+## Transit gateway and Availability Zones
+By default a transit gateway keeps traffic inside the Availability Zone where it entered, when the destination attachment has a network interface in that zone. With a client in zone one and a server in zone two, the request and the reply can therefore leave the transit gateway toward different zones of the inspection VPC, and hit different firewall endpoints.
+- **Appliance mode** on the VPC attachment tells the transit gateway to pick one network interface for a given flow (based on the flow hash) and to keep using the same one for the return traffic.
+- Firewall endpoints do not share state with each other, so the fix must be in the routing path.
+W: Appliance mode: with it enabled on the inspection VPC attachment, the transit gateway sends both directions of a flow to the same Availability Zone, so the same firewall endpoint sees the handshake and the replies, and the sessions stop being reset.
+X: B=Forward everything in a stateless group: sending traffic to the stateful engine is already the normal path, and a stateful engine cannot rebuild a session from packets it never received. Forwarding does not change which endpoint sees the reply.
+C=Static routes to one endpoint: pointing all spokes at a single firewall endpoint subnet would remove the asymmetry only by giving up zone redundancy, and it is not how a transit gateway chooses among the zones of an attachment. Appliance mode solves it while keeping all three endpoints.
+D=Cross-zone firewall balancing: Network Firewall endpoints are independent, and there is no cross-zone setting that shares a connection table between them. The symmetric path has to be enforced by the transit gateway.
+T: Centralized inspection through a transit gateway needs appliance mode on the inspection VPC attachment, otherwise cross-zone flows can return through a different firewall endpoint and break stateful rules.
+V: AWS Network Firewall, AWS Transit Gateway
+
+@ ANS-C01 D4 T4.1 advanced troubleshooting
+S: A centralized inspection VPC uses the CIDR 100.64.0.0/16 and inspects traffic for spoke VPCs in 10.0.0.0/8. A security engineer adds a Suricata-compatible stateful rule group with the rule alert http $HOME_NET any -> $EXTERNAL_NET any (http.host; content:"pastebin.example"; sid:1000001;). Test requests from spoke instances to that host are forwarded without any alert, although the same content in a rule that uses any as the source does alert. What is the most likely cause and fix?
+A: HOME_NET defaults to the inspection VPC range, so spoke sources look external; override HOME_NET with the spoke CIDRs in the policy variables
+B: The http keyword only inspects traffic that was decrypted first, so a TLS inspection configuration with a certificate from ACM has to be attached to the policy
+C: The alert action is evaluated only for stateless rule groups, so the rule must be moved into a stateless group and given the aws:forward_to_sfe action
+D: The rule group capacity was set too low, so Network Firewall silently skipped rules that were added after the capacity limit was reached
+K: A
+G: ## Suricata variables in Network Firewall
+Suricata rules use variables such as `$HOME_NET` (the networks you protect) and `$EXTERNAL_NET` (everything else, by default the opposite of HOME_NET). Network Firewall sets `HOME_NET` by default to the CIDR of the VPC where the firewall is deployed.
+## What goes wrong in a central design
+In a centralized inspection VPC the firewall sits in 100.64.0.0/16, but the protected sources are the spokes. A packet from 10.1.2.3 is not inside HOME_NET, so it matches `$EXTERNAL_NET`, and a rule that says `$HOME_NET any -> $EXTERNAL_NET` needs the source to be inside HOME_NET. It never matches.
+- You can define `HOME_NET` as an IP set variable in the rule group, or override it for all rule groups in the firewall policy, listing the spoke CIDRs (or a prefix list based set).
+- Rules that use `any` or explicit CIDRs are not affected, which is why the comparison rule worked.
+W: HOME_NET override: by default the variable covers only the inspection VPC range, so traffic sourced from spoke VPCs is treated as external and the rule never matches; defining HOME_NET with the spoke CIDRs makes the same rule fire.
+X: B=Decryption for HTTP: plain http rules inspect unencrypted HTTP with no TLS inspection needed. TLS inspection matters for HTTPS payloads; here the identical content matched when the source was any, so the payload is inspectable.
+C=Alert only in stateless groups: stateful rule groups are where Suricata rules with alert actions live. Stateless groups use their own match syntax and cannot hold Suricata rules.
+D=Capacity too low: rules that exceed the group's capacity are rejected when you create or update the group, not skipped silently afterward. The rule loaded and worked once the source was changed to any.
+T: In a centralized inspection VPC, override HOME_NET with the spoke CIDRs, because the default covers only the firewall VPC and rules that reference HOME_NET will otherwise miss spoke traffic.
+V: AWS Network Firewall, AWS Transit Gateway
+
+@ ANS-C01 D4 T4.1 applied tradeoff
+S: An internet-facing Application Load Balancer serves a website and a login page at /login. Each client IP address must be limited to 100 requests per 5 minutes on /login only, because normal browsing on other paths legitimately exceeds that rate. The team uses AWS WAF and wants the smallest change to the existing web ACL. Which rule should the engineer add?
+A: A rate-based rule with the IP address aggregation key, a limit of 100, and a scope-down statement that matches URI paths starting with /login
+B: A rate-based rule with the IP address aggregation key and a limit of 100 that has no scope-down statement, placed before all other rules in the web ACL
+C: A rate-based rule with a custom aggregation key on the URI path and a limit of 100, so that requests to /login are counted separately from other paths
+D: A regular rule that blocks requests to /login whose source address is not on an IP set reference statement that lists the known office ranges
+K: A
+G: ## What a rate-based rule counts
+An AWS WAF rate-based rule counts requests per aggregation key over a sliding window and takes its action on any key that goes over the limit. By default the key is the client IP address, and every request that reaches the rule is counted.
+## Narrowing what is counted
+- A **scope-down statement** limits the rule to requests that match it, so only those requests are counted and rate limited.
+- The **aggregation key** decides how requests are grouped. A key on the URI path groups all clients that call the same path into one counter.
+- Combining IP aggregation with a scope-down on the path gives a per-client limit for one URL only.
+W: Scope-down with IP aggregation: only requests to /login are counted, each client IP has its own counter with a limit of 100, and browsing on other paths is never counted or blocked.
+X: B=No scope-down: the rule would count all paths, so ordinary browsing above 100 requests per 5 minutes would block legitimate users on the whole site.
+C=URI path aggregation key: this puts all clients that call /login into one shared counter, so a single abusive client can block everyone, and a busy hour can block all users while abusers stay under the shared limit.
+D=Office IP allow set: this blocks all users outside the office ranges from logging in and does not limit request rates at all.
+T: To rate limit one URL per client, combine a rate-based rule that aggregates on IP address with a scope-down statement for that path.
+V: AWS WAF, Elastic Load Balancing
+
+@ ANS-C01 D4 T4.1 applied use-case
+S: A company provides employees with AWS Client VPN access. Users sign in through a SAML 2.0 identity provider and are members of the groups Finance and Engineering. Finance users may reach only the accounting database subnet 10.0.10.0/24, and Engineering users may reach only the build subnet 10.0.20.0/24. Both subnets are in the VPC that is associated with the endpoint. The company wants one Client VPN endpoint and the smallest possible configuration. What should the network engineer configure?
+A: One authorization rule per group, each with the destination CIDR of its subnet and the identity provider group ID as the access group
+B: One authorization rule for the VPC CIDR that allows all users, plus security groups on the endpoint that permit only the subnet each group needs
+C: A separate Client VPN endpoint for each group, each with a network ACL on the associated subnet that matches the users' assigned client CIDR range
+D: One route table entry for each subnet in the endpoint route table, with a target that names the identity provider group that may use the route
+K: A
+G: ## Two layers in a Client VPN endpoint
+- **Routes** in the endpoint route table say where traffic for a destination goes. Association with a subnet adds a route to the VPC CIDR automatically.
+- **Authorization rules** say which users may reach which destination network. They are a firewall at the endpoint, and each rule names a destination CIDR and either allows all users or a specific **access group**.
+## Group-based access
+With Active Directory or a SAML identity provider, the group ID (for SAML, the group value sent in the assertion) can be the access group of a rule. A user reaches a destination only if some rule for that CIDR applies to one of the user's groups.
+Two rules, `10.0.10.0/24` for Finance and `10.0.20.0/24` for Engineering, give the required least privilege with one endpoint and no extra routes, because both subnets are already reachable through the VPC route.
+W: Group authorization rules: each rule binds a destination CIDR to an identity provider group, so Finance users can reach only the accounting subnet and Engineering users only the build subnet, using one endpoint and no additional routes.
+X: B=One allow-all rule plus security groups: a security group on the endpoint applies to every client connection and cannot tell Finance users from Engineering users. The allow-all authorization rule would also open the whole VPC CIDR to both groups.
+C=Endpoint per group with a client CIDR NACL: this multiplies endpoints and cost, and client CIDR assignment is not tied to a user's group, so a network ACL cannot enforce a group boundary.
+D=Route targets by group: routes in the endpoint route table have a target subnet or local target, not an identity group. Routes control forwarding, not who is authorized.
+T: Client VPN routes decide where traffic goes; authorization rules with an access group decide who may go there, so use one rule per destination CIDR and identity provider group.
+V: AWS Client VPN, Amazon VPC
+
+@ ANS-C01 D4 T4.1 advanced use-case
+S: A company runs an internet-facing Application Load Balancer in a VPC with public subnets in two Availability Zones. A new policy requires that all inbound internet traffic is inspected by third-party firewall appliances in a Gateway Load Balancer target group before it reaches the load balancer, and that the appliances never receive traffic that skips the inspection path. Which design meets the requirement?
+A: Add Gateway Load Balancer endpoints in dedicated subnets, associate a route table with the internet gateway that sends each ALB subnet CIDR to the endpoint in its zone, and route returns back through it
+B: Register the appliance instances as targets of the internet-facing Application Load Balancer and have listener rules forward each request to them before the application
+C: Place a Gateway Load Balancer endpoint in each ALB subnet and add a route in the main route table that points 0.0.0.0/0 at the endpoint for both directions
+D: Assign Elastic IP addresses to the appliances, publish those addresses in DNS instead of the ALB addresses, and let the appliances re-encrypt and forward requests to the load balancer
+K: A
+G: ## Gateway Load Balancer in a nutshell
+A Gateway Load Balancer (GWLB) puts a fleet of virtual appliances into the traffic path. Traffic reaches it through **Gateway Load Balancer endpoints** (GWLBe), which you use as the target of a route. The GWLB wraps packets in GENEVE, sends them to an appliance, and the appliance returns them to the GWLB.
+## Inserting inspection for inbound internet traffic
+Traffic from the internet enters the VPC at the internet gateway. To steer it, you use **ingress routing**: a route table associated with the internet gateway ("edge association") that has a route for the destination subnet CIDR pointing to the GWLBe.
+- The GWLBe sits in its own subnet in each zone, so the inspected packet then continues to the ALB subnet.
+- The ALB subnet's route table sends its return traffic to the internet through the same endpoint, so both directions are inspected symmetrically.
+W: Ingress routing: the internet gateway route table forces every packet destined for the ALB subnets through the Gateway Load Balancer endpoint of the same zone, and the return route keeps flows symmetric, so no inbound traffic can bypass the appliances.
+X: B=Appliances behind the ALB: an Application Load Balancer forwards HTTP requests to its own targets, not IP packets to security appliances, and it cannot enforce a mandatory inspection stage for the traffic.
+C=Endpoint in the ALB subnet with a main-table route: the internet gateway route table decides where inbound packets go before any subnet route table is used, so inbound traffic still bypasses the endpoint. Traffic sent from the endpoint's own subnet toward the ALB subnet is also not a supported symmetric inspection path.
+D=Elastic IPs on appliances: this moves the internet entry point onto the appliances without a managed path, gives up load balancing and health checks, and does not guarantee that other traffic cannot reach the ALB directly.
+T: To inspect inbound internet traffic with a Gateway Load Balancer, use ingress routing: an internet gateway route table that sends the protected subnet CIDRs to a GWLB endpoint in the same Availability Zone.
+V: Elastic Load Balancing, Amazon VPC
+
+@ ANS-C01 D4 T4.1 applied tradeoff
+S: A regulated company uses Amazon Route 53 Resolver DNS Firewall in all VPCs to block resolution of domains on a curated deny list. The security policy says that if DNS Firewall cannot evaluate a query, for example during a service disruption, the query must not be answered without filtering, even if some applications temporarily fail to resolve names. Which configuration matches the policy?
+A: Set the fail-open setting to disabled in the DNS Firewall configuration of each VPC, and accept that queries may fail while the firewall is unavailable
+B: Enable the fail-open setting in the DNS Firewall configuration of each VPC so that queries continue and the deny list applies again when the firewall recovers
+C: Enable DNSSEC validation on the VPC resolver, which makes Route 53 Resolver return no answer for any query that DNS Firewall has not evaluated
+D: Change every rule in the rule group to the BLOCK action with a NODATA response, so that queries that cannot be evaluated receive an empty answer
+K: A
+G: ## How DNS Firewall handles an outage
+DNS Firewall rule groups are associated with VPCs. When a VPC's DNS query is evaluated, Route 53 Resolver asks the DNS Firewall service about the domain. If that lookup cannot complete, the VPC-level **firewall fail-open** setting decides what happens.
+- **Fail open (enabled)**: the query is allowed to continue without evaluation. Availability wins, but a blocked domain can resolve during the disruption.
+- **Fail closed (fail open disabled)**: the query is not answered. Security wins, but applications may fail to resolve names until the service recovers.
+## Choosing
+The setting is per VPC in the DNS Firewall configuration. A policy that forbids unfiltered answers needs fail closed everywhere.
+W: Fail closed: with the fail-open setting disabled on each VPC, a query that DNS Firewall cannot evaluate is not answered, which satisfies the rule that nothing resolves unfiltered even if some applications briefly lose name resolution.
+X: B=Fail open: this favors availability and lets unevaluated queries through, which is exactly what the policy forbids.
+C=DNSSEC validation: DNSSEC checks the authenticity of signed DNS answers and has no connection to whether DNS Firewall evaluated a query.
+D=NODATA response: the block response type only controls what a client gets for a domain that matches a block rule. It does not change how the resolver behaves when it cannot evaluate a query.
+T: DNS Firewall has a per-VPC fail-open switch: leave it disabled (fail closed) when policy forbids unfiltered resolution, and enable it only when availability matters more.
+V: Amazon Route 53 Resolver DNS Firewall
+
+@ ANS-C01 D4 T4.1 applied use-case
+S: A media company runs a public application on an Application Load Balancer and wants AWS Shield Advanced to engage the AWS Shield Response Team (SRT) proactively when an attack makes the application unhealthy, without waiting for the company to open a support case. Which TWO actions are required for proactive engagement to work? (Select TWO)
+A: Associate an Amazon Route 53 health check that reflects the application's health with the protected Application Load Balancer resource in Shield Advanced
+B: Provide emergency contact details in Shield Advanced that the SRT can use, and enable proactive engagement for the subscription
+C: Turn on automatic application layer DDoS mitigation for the protected resource so that the SRT is added to the web ACL
+D: Grant the SRT access to the AWS WAF web ACL logs in the Amazon S3 bucket that receives them
+E: Create an AWS Firewall Manager Shield Advanced policy so that the resource is tracked by the SRT
+K: A,B
+G: ## What proactive engagement is
+With **Shield Advanced proactive engagement**, the SRT contacts you when Shield detects an event that affects the availability of a protected resource, instead of waiting for you to open a case. Two things are needed for the SRT to know an event matters and to reach you.
+- **Health-based detection**: the protected resource is associated with a Route 53 health check. When the health check turns unhealthy during an attack, Shield treats it as impact and can escalate.
+- **Contacts**: you register emergency contacts (email, phone number, notes) and enable proactive engagement.
+## What is optional
+Automatic application layer mitigation, SRT access to logs or roles for support cases, and Firewall Manager management are useful, but proactive engagement does not depend on them.
+W: A=Health check association: without it, Shield cannot use application health to decide that an event is affecting the resource.
+B=Emergency contacts: with proactive engagement enabled, the SRT has a way to reach you when the health check fails.
+X: C=Automatic application layer mitigation: this feature lets Shield create and manage WAF rules against layer 7 floods. It is separate from proactive engagement and is not a prerequisite.
+D=SRT access to WAF logs: access lets the SRT analyze traffic and write mitigations when you engage them, but it does not trigger or enable proactive contact.
+E=Firewall Manager policy: Firewall Manager can enroll many resources at scale, but a resource protected manually in Shield Advanced can use proactive engagement without any Firewall Manager policy.
+T: Proactive engagement from the SRT needs a Route 53 health check on the protected resource and registered emergency contacts with the feature enabled.
+V: AWS Shield, Amazon Route 53
+
+@ ANS-C01 D4 T4.2 advanced use-case
+S: A company shares one transit gateway among 25 accounts in an organization. Auditors ask for evidence of which VPC attachments exchanged traffic, including packets dropped because a route pointed to a blackhole, for all VPC-to-VPC and on-premises flows. The network team owns the transit gateway, but it cannot enable logs in each account's VPCs. Which solution gives the evidence with the least operational effort?
+A: Create Transit Gateway flow logs on the gateway with custom fields for attachment IDs and dropped packet counters, and deliver them to Amazon S3
+B: Create VPC Flow Logs on the transit gateway network interfaces in each attached VPC and aggregate them in the network account
+C: Enable Traffic Mirroring on the transit gateway attachments and send the mirrored packets to a Network Load Balancer in the network account for later analysis
+D: Enable AWS CloudTrail data events for the transit gateway so that every forwarded packet is recorded as an event in the organization trail
+K: A
+G: ## Where different logs are collected
+- **VPC Flow Logs** describe traffic at network interfaces, subnets or a VPC. Each account has to create them for its own VPCs.
+- **Transit Gateway Flow Logs** are created on the transit gateway or a single attachment by its owner. They record traffic that passes through the transit gateway, with fields such as `tgw-id`, source and destination attachment IDs, `packets-lost-blackhole` and `packets-lost-no-route`.
+- **CloudTrail** records API calls, not data-plane traffic.
+## Fit for this audit
+Only one owner has the transit gateway, and the requirement includes dropped packets due to blackhole routes. Transit Gateway flow logs, published to S3, CloudWatch Logs or Firehose, give per-attachment records with those counters from one place.
+W: Transit Gateway flow logs: created once by the transit gateway owner, they cover all attachments and include attachment IDs and packets lost to blackhole or missing routes, which is the exact evidence requested.
+X: B=Interface flow logs in each VPC: the transit gateway network interfaces in each VPC are managed by AWS, so they cannot be logged, and the team also lacks permission in the member accounts.
+C=Traffic Mirroring on attachments: Traffic Mirroring works on elastic network interfaces of supported instances and is not available for transit gateway attachments. Full packets are also more than the audit asks for.
+D=CloudTrail data events: CloudTrail logs API activity, such as route changes, not the traffic that flows across attachments.
+T: To audit traffic across a shared transit gateway from one place, enable Transit Gateway flow logs on the gateway instead of relying on flow logs in every attached VPC.
+V: AWS Transit Gateway, Amazon S3
+
+@ ANS-C01 D4 T4.2 applied troubleshooting
+S: A security engineer sets up VPC Traffic Mirroring to feed an intrusion detection appliance. The source is the primary network interface of an instance on the Nitro system. The mirror target is a Network Load Balancer whose targets are the IDS instances, and the mirror filter accepts all inbound and outbound traffic. The session shows as active, yet the IDS instances receive no packets. The security group of the IDS instances allows TCP 22 from the management subnet and TCP 443 from the tools subnet only. What is the most likely reason?
+A: Mirrored packets arrive VXLAN-encapsulated on UDP port 4789, and the IDS instances' security group does not allow that traffic
+B: The mirror filter needs a separate rule for each protocol, because an accept-all rule is not applied to TCP and UDP traffic
+C: Mirror targets can only be network interfaces of single instances, so a Network Load Balancer cannot be used as a mirror session destination
+D: The source instance must have a VPC Flow Logs configuration before its interface can be a mirror source
+K: A
+G: ## How Traffic Mirroring works
+Traffic Mirroring copies packets from an elastic network interface on a supported (Nitro-based) instance and sends the copies to a **target**: another network interface, a Network Load Balancer, or a Gateway Load Balancer endpoint. The copies are encapsulated in **VXLAN** with a UDP header, destination port **4789**, and the target sees them as inbound traffic.
+## What controls delivery
+- The **security group of the target** must allow inbound UDP 4789 from the source, otherwise the copies are dropped before the appliance sees them.
+- The mirror filter decides which packets are copied; an accept rule for all protocols is valid.
+- Targets can be a load balancer, which is how you scale a fleet of analysis instances.
+W: The target security group only opens SSH and HTTPS, so the VXLAN packets on UDP 4789 are dropped at the IDS instances; adding an inbound rule for that port from the source interfaces makes the packets arrive.
+X: B=Per-protocol filter rules: a filter rule with the protocol left unspecified matches all protocols, so one accept rule per direction is enough.
+C=Interface targets only: Network Load Balancers and Gateway Load Balancer endpoints are supported mirror targets, and the design is documented for scaling.
+D=Flow logs prerequisite: Traffic Mirroring and VPC Flow Logs are independent. Neither needs the other to be enabled.
+T: Mirrored traffic reaches the target as VXLAN on UDP 4789, so the target's security group and network ACLs must allow it, even when the session and filter look correct.
+V: Amazon VPC Traffic Mirroring, Elastic Load Balancing
+
+@ ANS-C01 D4 T4.2 advanced comparison
+S: A network engineer runs VPC Reachability Analyzer from an application instance to an Amazon RDS for PostgreSQL DB instance on port 5432. The analysis result is Reachable and shows the path through the instance security group, the route table and the database security group. Nevertheless, the application still times out when it connects to the database. What should the engineer conclude?
+A: Reachability Analyzer only analyzes configuration and sends no packets, so check what it cannot see, such as a host firewall or a listener that is not accepting connections
+B: The analysis result is cached for 24 hours, so a recent security group change is missing and the analysis has to be started again after the cache expires
+C: Reachability Analyzer skips network ACLs, so an ACL deny on the database subnet must be the cause and only VPC Flow Logs can reveal it
+D: Reachable results apply only to the ICMP protocol, so the engineer has to rerun the analysis with the TCP option to test port 5432
+K: A
+G: ## What Reachability Analyzer does
+Reachability Analyzer builds a model of your VPC configuration (security groups, network ACLs, route tables, gateways, endpoints and more) and decides whether a path exists between a source and a destination for a protocol and port. It is a **static analysis of configuration**: it does not send packets through the network.
+## What it cannot see
+- Firewalls inside the operating system, such as iptables or a Windows firewall.
+- Whether a process is listening on the port, or whether the database accepts the login and source address.
+- Problems such as an overloaded instance, a DNS answer that points elsewhere, or MTU issues.
+Here the modeled path is valid, so the next steps are on the hosts: check the DB parameter and listener, test with a client from the instance, and use VPC Flow Logs to see whether packets are accepted or rejected.
+W: Configuration analysis: a Reachable result says that the VPC-level configuration permits the path, not that the application will work, so the engineer should check host firewalls, the database listener and credentials, and confirm live behavior with flow logs.
+X: B=A 24-hour cache: each analysis is computed when you start it from the current configuration, and there is no such caching window.
+C=Skipping network ACLs: Reachability Analyzer does evaluate network ACLs and reports a denying ACL entry as the explanation of an unreachable path.
+D=ICMP only: the analysis supports TCP and UDP with a destination port, and the engineer analyzed TCP 5432 as required.
+T: Reachability Analyzer proves that the VPC configuration allows a path; it does not test host firewalls, listeners or application behavior, so combine it with flow logs and live tests.
+V: VPC Reachability Analyzer, Amazon VPC
+
+@ ANS-C01 D4 T4.2 applied troubleshooting
+S: A team wants to log requests that AWS WAF blocks on an internet-facing Application Load Balancer, to keep the logs in Amazon S3 for audits, and to make sure Authorization header values never appear in the logs. An engineer creates a bucket named corp-waf-logs and tries to choose it as the logging destination of the web ACL, but the configuration is rejected. Which set of actions completes the requirement?
+A: Use a bucket whose name starts with aws-waf-logs-, add a logging filter that keeps BLOCK actions, and redact the Authorization header field
+B: Enable S3 server access logging on the corp-waf-logs bucket and have the web ACL write its sampled requests to that bucket every five minutes for the audit
+C: Create an AWS CloudTrail trail with data events for the web ACL and store the events in the corp-waf-logs bucket with SSE-KMS
+D: Send the logs to Amazon CloudWatch Logs in a log group with any name, then create a metric filter that removes the Authorization header value
+K: A
+G: ## AWS WAF logging destinations
+AWS WAF web ACL logging can deliver full request logs to CloudWatch Logs, Amazon S3 or Amazon Data Firehose. The destination name has to start with **`aws-waf-logs-`**, for example a bucket `aws-waf-logs-corp-prod`, a log group with that prefix or a Firehose stream with that prefix.
+## Filters and redaction
+- A **logging filter** keeps or drops records by rule action or by the label of the matching rule, so you can store only blocked requests.
+- **Redacted fields** (URI path, query string, HTTP method or a single named header) are replaced by `REDACTED` in the logs, which keeps secrets such as `Authorization` out of the archive.
+Sampled requests in the console are a small, temporary view and are not an audit record.
+W: WAF log destination naming: a bucket with the aws-waf-logs- prefix is accepted, the filter reduces the archive to blocked requests, and header redaction ensures that the Authorization values are never written.
+X: B=Server access logs and sampled requests: S3 server access logs record requests to the bucket, not WAF decisions. Sampled requests are shown in the console and are not written to S3.
+C=CloudTrail data events: CloudTrail records WAF API calls, not the web requests inspected by the web ACL, so it would not hold blocked requests.
+D=Any log group name with a metric filter: a CloudWatch Logs destination also has to use the aws-waf-logs- prefix, and metric filters produce metrics but cannot rewrite stored log events.
+T: WAF full logs need a destination named with the aws-waf-logs- prefix; use logging filters to keep only what you need and redacted fields to keep sensitive headers out.
+V: AWS WAF, Amazon S3
+
+@ ANS-C01 D4 T4.2 advanced tradeoff
+S: A security team stores VPC Flow Logs from 200 VPCs in Amazon S3 as gzip-compressed text with the default format and no partitioning. Analysts use Amazon Athena to answer questions about a single day, but each query scans months of data and costs and run times keep growing. The team wants to cut the scanned data without changing how analysts write their SQL more than adding a date filter. Which change is the best fit?
+A: Publish new logs in Apache Parquet with Hive-compatible S3 prefixes and hourly partitions, and define the Athena table with partitions on the date and hour
+B: Keep the text format and add an S3 Lifecycle rule that moves objects older than 30 days to S3 Glacier Deep Archive so that Athena skips them
+C: Create a CloudWatch Logs subscription filter that copies each record to an Amazon OpenSearch Service domain and query the domain instead of Athena
+D: Set a per-query data usage limit on the Athena workgroup so that any query that would scan more than a fixed amount of data is cancelled
+K: A
+G: ## Why Athena cost follows the bytes scanned
+Athena charges by data scanned. A table that has no partitions reads every object under its location, however narrow the WHERE clause is.
+## What flow logs offer for S3
+When VPC Flow Logs deliver to S3 you can choose:
+- **Parquet** as the file format: a compressed columnar format, so queries that read a few columns scan far fewer bytes.
+- **Hive-compatible S3 prefixes**, which write objects under `year=/month=/day=` style folders that Athena can register as partitions.
+- **Hourly partitions** (per-hour) so a single hour of the day maps to one folder.
+A `WHERE` clause on the partition columns then reads only the matching folders. Partition projection or `MSCK REPAIR TABLE` keeps the table in sync.
+W: Parquet with Hive-compatible hourly partitions: analysts add a date filter and Athena reads only that day's folders, in a columnar format, which reduces scanned bytes and cost without new tools.
+X: B=Glacier Deep Archive: archived objects cannot be queried by Athena until restored, and moving data does not reduce what a query on recent data scans.
+C=OpenSearch Service: this adds a new system to run, index and pay for, and does not use the existing S3 archive. It is more than the requirement calls for.
+D=Workgroup data usage limit: this caps the cost of a runaway query by cancelling it, but it does not reduce the bytes a valid one-day query has to scan, so analysts would simply see failed queries.
+T: Cut Athena cost for flow logs by writing Parquet with Hive-compatible, time-based partitions and filtering on the partition columns.
+V: Amazon VPC, Amazon Athena, Amazon S3
+
+@ ANS-C01 D4 T4.2 applied use-case
+S: A security operations team supports 60 accounts in an AWS Organization. They need one central store that keeps VPC Flow Logs, Route 53 Resolver query logs and CloudTrail management events from all accounts and Regions in a common schema, so that several third-party security analytics tools can query the same data without building separate parsers. Which service should the team use?
+A: Amazon Security Lake with a delegated administrator, the log sources enabled for the organization, and a subscriber for each tool
+B: AWS Config with a multi-account aggregator, using advanced queries to search the network logs that the aggregator collects
+C: Amazon Detective, which stores the raw logs of every account and lets outside tools read them through a data-sharing API
+D: Amazon CloudWatch Logs cross-account observability, with a Lambda parser for each source that converts every log to a shared schema
+K: A
+G: ## What Security Lake does
+Amazon Security Lake collects security data from AWS sources such as CloudTrail management events, VPC Flow Logs, Route 53 Resolver query logs, AWS Security Hub findings and others, and from custom sources. It converts it to the **Open Cybersecurity Schema Framework (OCSF)** and stores it as Parquet in S3 buckets that you own, per Region, with rollup Regions if wanted.
+## Central operation
+- An organization designates a **delegated administrator** account and enables the log sources for all member accounts.
+- **Subscribers** (analytics or SIEM tools) get access through S3 or query access with Lake Formation, and they all read the same normalized schema.
+Config aggregators hold configuration items, Detective analyzes findings and logs internally, and a Lambda parser fleet is custom work that Security Lake replaces.
+W: Security Lake: it normalizes network and API logs from all accounts into OCSF and Parquet in S3, and subscribers use the same schema, so no custom parsers are needed.
+X: B=Config aggregator: AWS Config collects resource configuration and compliance data, not flow logs, DNS query logs or API activity in a shared schema.
+C=Amazon Detective: Detective builds behavior graphs for investigations from CloudTrail, flow logs and findings. It does not offer a raw log lake for other tools.
+D=Cross-account observability with parsers: this monitors and searches logs across accounts, but the team would still write and operate a parser per source to reach a common schema.
+T: For an organization-wide, normalized (OCSF) network and API log lake shared with several tools, use Amazon Security Lake with a delegated administrator and subscribers.
+V: Amazon Security Lake, Amazon S3
+
+@ ANS-C01 D4 T4.2 applied use-case
+S: A compliance team needs to know quickly when anyone turns off network visibility by deleting an AWS VPC Flow Logs configuration in a production account, and needs an ongoing check that every VPC has flow logs enabled. Which TWO mechanisms together meet the requirement? (Select TWO)
+A: An AWS Config managed rule that evaluates whether flow logs are enabled for each VPC, with findings reported through Config compliance
+B: An Amazon EventBridge rule that matches the CloudTrail management event for DeleteFlowLogs and notifies an Amazon SNS topic
+C: An Amazon CloudWatch Logs metric filter on the flow log group that raises an alarm when the volume of records reaches zero
+D: A VPC Reachability Analyzer scheduled analysis that fails when a flow log configuration is no longer attached to the VPC
+E: A Network Access Analyzer scope that lists every VPC in the organization whose flow log configuration is deleted
+K: A,B
+G: ## Detective and continuous checks
+- **AWS Config** evaluates resource configuration against rules. The managed rule `vpc-flow-logs-enabled` checks that flow logs are enabled for VPCs, and it re-evaluates when configuration changes or on a schedule, giving an ongoing compliance view.
+- **CloudTrail and EventBridge** record and react to the API call that removes a configuration. Management events include `DeleteFlowLogs`, and an EventBridge rule can send an alert to SNS within minutes.
+## Why the others fall short
+Zero records is also what a quiet subnet looks like, and the log group may not exist after deletion. Reachability Analyzer and Network Access Analyzer analyze network paths, not whether a logging feature is configured.
+W: A=Config rule: it continuously reports which VPCs lack flow logs, so gaps are visible even if nobody triggers an alert.
+B=EventBridge on DeleteFlowLogs: it fires as soon as the API call happens, so the team hears about the deletion immediately.
+X: C=Zero-volume alarm: a flow log group that goes quiet is ambiguous, because idle networks also produce no records, and deleting the configuration does not raise any metric to alarm on.
+D=Reachability Analyzer schedule: it analyzes network paths between resources, not the state of logging features.
+E=Network Access Analyzer scope: it finds unintended network paths against a scope you define, not missing flow log configurations.
+T: Pair AWS Config rules (state and drift) with EventBridge on CloudTrail API events (immediate notice) to prove that flow logs stay enabled.
+V: AWS Config, Amazon EventBridge, AWS CloudTrail
+
+@ ANS-C01 D4 T4.3 advanced use-case
+S: A financial company publishes an API on an Application Load Balancer for about 30 partner banks. Each partner uses its own certificate authority, and the list of accepted authorities changes weekly through a workflow owned by the application team. The application must run its own validation logic, including partner-specific revocation checks, and must see the full client certificate. The ALB must still terminate TLS. Which ALB configuration meets the requirement?
+A: Configure the HTTPS listener with mutual authentication in passthrough mode, so the ALB forwards the client certificate chain to the targets in the X-Amzn-Mtls-Clientcert header
+B: Configure the HTTPS listener with mutual authentication in verify mode, upload one trust store bundle to Amazon S3 and let the ALB reject any certificate that is not in it
+C: Configure the listener as a TCP listener without TLS termination, so the targets receive the client handshake and validate the certificate themselves
+D: Configure an authenticate-oidc action on the listener rule and require partners to present an ID token that carries the certificate subject as a claim
+K: A
+G: ## Three mutual TLS modes on an Application Load Balancer
+An HTTPS listener supports client certificates in these modes:
+- **Off**: no client certificate is requested.
+- **Verify**: the ALB validates the client certificate against a **trust store** (CA bundle in S3, optionally with revocation lists) and rejects invalid connections. It passes certificate details to targets in headers.
+- **Passthrough**: the ALB terminates TLS, requests the certificate but does not validate it, and forwards the whole certificate chain to the targets in the `X-Amzn-Mtls-Clientcert` header (URL-encoded PEM). The application makes the decision.
+## Matching the scenario
+The application team needs its own validation and revocation logic per partner, and a fast-changing CA list. Passthrough keeps that logic in the application without rebuilding a trust store, while the ALB still terminates TLS.
+W: Passthrough mode: the ALB terminates TLS and forwards the client certificate chain in a header to the targets, so the application applies its own per-partner validation and revocation checks.
+X: B=Verify mode: the ALB would decide on its own trust store and revocation lists, which does not let the application run partner-specific logic and needs a trust store update every time the list changes.
+C=TCP listener: an Application Load Balancer has no TCP listeners, and the requirement says the ALB must terminate TLS. A Network Load Balancer would be needed for that design.
+D=OIDC authentication: this authenticates users through an identity provider token, not through the TLS client certificate of the partner system.
+T: ALB mutual TLS has verify mode (the ALB decides using a trust store) and passthrough mode (the ALB forwards the certificate chain and the application decides).
+V: Elastic Load Balancing, Amazon S3
+
+@ ANS-C01 D4 T4.3 applied tradeoff
+S: A payment application uses an Application Load Balancer with an HTTPS listener that still has the security policy ELBSecurityPolicy-2016-08. A PCI assessment requires that TLS 1.0 and TLS 1.1 be refused. Modern browsers should be able to use TLS 1.3, but the company also has point-of-sale terminals that only support TLS 1.2 and must keep working. Which security policy should the engineer select?
+A: ELBSecurityPolicy-TLS13-1-2-2021-06, which accepts TLS 1.3 and TLS 1.2 and refuses older protocol versions
+B: ELBSecurityPolicy-TLS13-1-3-2021-06, which accepts only TLS 1.3 and refuses every earlier protocol version
+C: ELBSecurityPolicy-TLS-1-2-2017-01, which accepts only TLS 1.2 and cannot negotiate TLS 1.3 sessions
+D: ELBSecurityPolicy-2016-08, which accepts TLS 1.0 through TLS 1.2 and adds TLS 1.3 in the newest software release
+K: A
+G: ## Security policies on Elastic Load Balancing
+A **security policy** is the set of TLS protocol versions and cipher suites that a listener accepts. You pick a predefined policy; the names tell you the versions.
+- `ELBSecurityPolicy-2016-08` accepts TLS 1.0, 1.1 and 1.2.
+- `ELBSecurityPolicy-TLS-1-2-2017-01` accepts TLS 1.2 only.
+- `ELBSecurityPolicy-TLS13-1-2-2021-06` accepts TLS 1.3 and TLS 1.2 (the recommended policy for new listeners).
+- `ELBSecurityPolicy-TLS13-1-3-2021-06` accepts TLS 1.3 only.
+## Matching the requirement
+The assessor forbids 1.0 and 1.1, browsers want 1.3, and terminals need 1.2. Only the policy that enables both 1.3 and 1.2 satisfies all three.
+W: TLS13-1-2 policy: it drops TLS 1.0 and 1.1 for compliance, lets browsers negotiate TLS 1.3 and keeps TLS 1.2 available for the terminals.
+X: B=TLS 1.3 only: the terminals speak only TLS 1.2 and would fail to connect.
+C=TLS 1.2 only: it satisfies the assessor and the terminals but takes away TLS 1.3 from modern browsers, which the requirement wants.
+D=The 2016-08 policy: it is the policy already in place and still accepts TLS 1.0 and 1.1, so it fails the assessment. Existing policies do not get new protocol versions automatically.
+T: Pick the ELB security policy whose name matches the exact TLS versions you must accept: TLS13-1-2 for TLS 1.3 plus 1.2 with TLS 1.0 and 1.1 removed.
+V: Elastic Load Balancing
+
+@ ANS-C01 D4 T4.3 advanced use-case
+S: A company has a 1 Gbps hosted AWS Direct Connect connection to a transit gateway through a transit virtual interface. Policy requires that the traffic on the connection is encrypted with IPsec and that no public IP addresses are used for the tunnels, because the connection is a private path. MACsec is not available on this connection. Which TWO actions build the solution? (Select TWO)
+A: Configure a CIDR block on the transit gateway to provide the private IP addresses that AWS uses for the tunnel endpoints of the VPN
+B: Create a Site-to-Site VPN attachment on the transit gateway with a private IPv4 outside address type, using the Direct Connect gateway attachment as its transport
+C: Create a Site-to-Site VPN on a public virtual interface and connect the tunnels to the public IP addresses of the customer gateway device
+D: Enable MACsec on the hosted connection by requesting the CKN and CAK through the Direct Connect console
+E: Attach a virtual private gateway to the VPC, associate it with a private virtual interface and create a private IP VPN on that gateway
+K: A,B
+G: ## Private IP VPN over Direct Connect
+An AWS Site-to-Site VPN normally uses public IP addresses on both ends. A **private IP VPN** builds IPsec tunnels between private addresses and rides over an existing Direct Connect connection, which encrypts the traffic without leaving the private path.
+## Requirements
+- It works with a **transit gateway** attachment and a **transit virtual interface** to a Direct Connect gateway associated with the transit gateway.
+- The VPN attachment is created with the **outside IP address type set to PrivateIpv4**, and the **Direct Connect gateway attachment** is chosen as the transport attachment.
+- The transit gateway needs a **CIDR block** from which AWS takes the private IP addresses for its tunnel endpoints; the customer gateway device uses private addresses too.
+Public-VIF VPNs use public addresses, MACsec is not available on this connection, and virtual private gateways do not support private IP VPN.
+W: A=Transit gateway CIDR: it supplies the private endpoint addresses for the AWS side of the tunnels.
+B=Private IPv4 VPN attachment: with the Direct Connect gateway attachment as transport, it runs the IPsec tunnels over the private virtual interface.
+X: C=VPN on a public virtual interface: this design uses public IP addresses for the tunnels, which the policy forbids.
+D=MACsec on a hosted connection: the stem says MACsec is unavailable, and MACsec keys are not requested through a console button for hosted connections.
+E=Virtual private gateway: a private IP VPN attaches to a transit gateway, not to a virtual private gateway.
+T: Encrypt a private Direct Connect path without MACsec by using a private IP VPN: transit gateway CIDR for endpoints plus a PrivateIpv4 VPN attachment with the Direct Connect gateway attachment as transport.
+V: AWS Site-to-Site VPN, AWS Direct Connect, AWS Transit Gateway
+
+@ ANS-C01 D4 T4.3 applied troubleshooting
+S: A security auditor reviews an Application Load Balancer that has an HTTPS listener and an HTTPS target group. The targets present self-signed certificates, and one of them expired three weeks ago. Users are not affected: the ALB keeps forwarding requests to all targets and health checks still pass. The auditor asks why the ALB has not rejected the expired certificate. What is the correct explanation and action?
+A: The ALB encrypts traffic to targets but never validates the target certificate's chain, expiry or name, so backend identity needs other controls
+B: The ALB validates target certificates only against ACM certificates in its Region, so self-signed ones pass because they postdate the listener certificate
+C: The ALB automatically renews expired self-signed certificates on its targets through an ACM integration, so the expiry has no effect on the connection
+D: The ALB skipped the certificate check because health checks use HTTP; switching the health check protocol to HTTPS would enforce validation for the traffic too
+K: A
+G: ## Encryption versus authentication of backends
+When a target group uses HTTPS, the ALB opens a new TLS connection from the ALB to each target, so traffic between them is encrypted. The ALB does **not** verify the certificate that a target presents: it does not check the chain, the expiry date or the host name. Self-signed and expired certificates therefore work.
+## What that means for compliance
+- **Confidentiality** in transit is provided.
+- **Backend identity** is not proven by the certificate. Controls such as security groups that allow only the ALB, private subnets and controlled deployment pipelines protect against a rogue target.
+- Rotating certificates is still good practice, and auditors may require it.
+W: No validation on the ALB to target hop: the connection is encrypted, but expiry, chain and name are not verified, so the auditor's point is handled by rotating certificates and by security group and deployment controls that restrict who can be a target.
+X: B=Validation against ACM certificates: the ALB does not compare target certificates with ACM. ACM certificates are used on the listener side.
+C=Automatic renewal on targets: ACM cannot install or renew certificates on target instances. Public ACM certificates cannot be exported for that purpose, and self-signed certificates are unmanaged.
+D=HTTP health checks: the health check protocol is a separate setting. Making the check HTTPS does not turn on certificate validation, and the health checks in the stem already pass.
+T: An ALB encrypts the hop to HTTPS targets but does not validate their certificates, so backend identity depends on network and deployment controls, and certificates should still be rotated.
+V: Elastic Load Balancing, AWS Certificate Manager
+
+@ ANS-C01 D4 T4.3 applied use-case
+S: A security team wants to guarantee that data in an Amazon S3 bucket is accessed only over TLS 1.2 or later, and that older clients that still negotiate TLS 1.0 or 1.1 or use plain HTTP are refused rather than merely reported. The bucket is accessed from VPCs through a gateway endpoint and from the internet. Which control enforces this?
+A: Bucket policy Deny statements for requests where aws:SecureTransport is false and for requests where s3:TlsVersion is numerically less than 1.2
+B: A bucket policy statement with a Deny effect only for requests where aws:SecureTransport is false, which also blocks all TLS versions older than 1.2 by design
+C: An AWS Config rule for S3 buckets that requires SSL requests and marks the bucket noncompliant when TLS 1.0 is used, so the objects are then blocked
+D: A gateway endpoint policy that allows access to the bucket only when the aws:SourceVpce value matches, which limits access to TLS 1.2 clients
+K: A
+G: ## Two separate conditions
+- `aws:SecureTransport` tells whether the request used TLS (`true`) or plain HTTP (`false`). A Deny when it is `false` refuses HTTP but accepts any TLS version.
+- `s3:TlsVersion` is an S3 condition key with the TLS version of the request, so a numeric condition can refuse versions below a threshold, for example `NumericLessThan` 1.2.
+## Detective versus preventive
+An AWS Config rule such as `s3-bucket-ssl-requests-only` **detects** buckets without an SSL-only policy. It does not block requests. A VPC endpoint policy that limits sources controls which network path is used and not the TLS version.
+Combining the two Deny statements refuses HTTP and TLS 1.0 and 1.1 from every path, including the gateway endpoint.
+W: Two Deny statements: one on aws:SecureTransport false refuses plain HTTP, and one on s3:TlsVersion below 1.2 refuses older TLS versions, so the requirement is enforced for every client.
+X: B=SecureTransport alone: it separates HTTP from HTTPS but does not distinguish TLS 1.0 from TLS 1.2, so old TLS clients still get through.
+C=AWS Config rule: Config evaluates and reports; it does not deny requests. Objects stay accessible until a preventive control blocks them.
+D=Endpoint policy on source VPC endpoint: it restricts which endpoint or network path is allowed and says nothing about the TLS version negotiated by the client.
+T: Enforce TLS on S3 with bucket policy Deny statements: aws:SecureTransport false for HTTP and s3:TlsVersion below 1.2 for old TLS; Config rules only detect.
+V: Amazon S3, AWS Config
+
+@ ANS-C01 D4 T4.3 advanced troubleshooting
+S: A company exposes an Amazon API Gateway REST API to partners. A custom domain name api.example.com is configured with mutual TLS and a truststore in Amazon S3, and partners that use the custom domain must present certificates. A security test shows that a client without any certificate can still call the API by using the default https://abc123.execute-api.us-east-1.amazonaws.com URL. What should the company do to close the gap?
+A: Disable the default execute-api endpoint so clients can reach the API only through the mutual TLS custom domain name
+B: Attach an AWS WAF web ACL to the stage with a rule that blocks requests for the default execute-api host name
+C: Add the partner certificates to the API's resource policy so that API Gateway checks them on the default endpoint
+D: Change the custom domain endpoint type to edge-optimized, which applies the S3 truststore to the default endpoint as well
+K: A
+G: ## Where mutual TLS lives in API Gateway
+Mutual TLS for API Gateway is configured on a **custom domain name**, with a **truststore** (PEM file with the CA certificates) stored in S3. Clients connecting to that domain must present a certificate that chains to the truststore.
+## The default endpoint is another door
+Each REST API also has a default endpoint, `https://{api-id}.execute-api.{region}.amazonaws.com`, which does not use the custom domain, so mutual TLS does not apply to it. To force all traffic through the custom domain, set **`disableExecuteApiEndpoint`** to true on the API (the "Default endpoint" setting) and redeploy.
+- Resource policies can filter by source IP, VPC endpoint and account, not by TLS client certificate.
+- Mutual TLS is supported for Regional custom domain names of REST APIs.
+W: Disable the default endpoint: requests to the execute-api host name are then refused, so every call must come through the custom domain where the truststore is enforced and a client certificate is required.
+X: B=WAF host name block: AWS WAF cannot see the TLS client certificate, and blocking by host name adds a rule that could be worked around, where disabling the endpoint removes the path.
+C=Certificates in the resource policy: resource policies are IAM-style policies and have no mechanism to validate a client TLS certificate.
+D=Edge-optimized custom domain: mutual TLS is supported on Regional custom domain names, and changing the type of the domain does not affect the default endpoint.
+T: API Gateway mutual TLS protects only the custom domain, so disable the default execute-api endpoint to stop clients from bypassing the certificate requirement.
+V: Amazon API Gateway, Amazon S3

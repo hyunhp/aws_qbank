@@ -1,0 +1,400 @@
+# MLA-C01 batch 07: Domain 4 (securing ML resources and monitoring inference for drift, bias and responsible ML), detailed explanations
+
+@ MLA-C01 D4 T4.3 applied troubleshooting
+S: A data scientist has `sagemaker:CreateTrainingJob` permission and calls it with `RoleArn` set to the team's existing SageMaker execution role. The call fails with "User is not authorized to perform iam:PassRole on resource" and names that role. The execution role itself already has all the S3 and ECR access the job needs. Which change fixes the error while keeping least privilege?
+A: Attach the AdministratorAccess managed policy to the data scientist so that any role in the account can be handed to SageMaker jobs
+B: Allow iam:PassRole on the ARN of that one execution role, with the iam:PassedToService condition set to sagemaker.amazonaws.com
+C: Add the data scientist's IAM user to the trust policy of the execution role so that the user can assume the role directly
+D: Attach the AmazonS3FullAccess managed policy to the data scientist so that SageMaker can read the training data on the user's behalf
+K: B
+G: ## Two different permissions are involved
+- The **execution role** is what the training container assumes at run time. Its trust policy names `sagemaker.amazonaws.com`, and its permissions policy covers the data, images and keys the job touches.
+- The **caller** (the data scientist) is the identity that starts the job. To hand a role to a service, the caller needs `iam:PassRole` on that role. AWS requires this so that a user cannot give a service a more powerful role than the user is allowed to use.
+## Scoping PassRole
+Grant `iam:PassRole` only on the specific role ARN, and add the `iam:PassedToService` condition so the role can be passed only to SageMaker and not to other services such as Lambda or EC2.
+Example: the policy on the data scientist allows PassRole for `arn:aws:iam::111122223333:role/ml-team-execution` with `iam:PassedToService` equal to `sagemaker.amazonaws.com`, and nothing broader.
+W: Scoped iam:PassRole: it supplies exactly the missing permission for that single role and limits it to SageMaker, so the caller cannot pass the role to any other service.
+X: A=AdministratorAccess: it does fix the error but grants every permission in the account, far beyond what starting a training job requires.
+C=Adding the user to the trust policy: the training job must be assumed by the SageMaker service principal, and this does not give the caller the PassRole permission that the API call checks.
+D=AmazonS3FullAccess: the error is about passing the role, not about reading S3, and the execution role already has the data access the job needs.
+T: Starting a SageMaker job with an execution role needs iam:PassRole on that role for the caller; scope it to one role ARN and iam:PassedToService = sagemaker.amazonaws.com.
+V: AWS IAM, Amazon SageMaker AI
+
+@ MLA-C01 D4 T4.3 applied use-case
+S: Applications in a private VPC call a SageMaker real-time endpoint through an interface VPC endpoint for the SageMaker Runtime service. The security team wants to make sure those applications can invoke only the `fraud-scoring` endpoint and cannot use the same network path to invoke any other endpoint, including endpoints in other AWS accounts. What should the ML engineer do?
+A: Attach a security group to the interface endpoint that allows outbound traffic only to the private IP address of the fraud-scoring instances
+B: Add a network ACL to the private subnets that denies traffic to the DNS names of every SageMaker endpoint other than fraud-scoring
+C: Attach a bucket policy to the model artifact bucket that denies reads of any model.tar.gz that does not belong to the fraud-scoring endpoint
+D: Attach a VPC endpoint policy that allows sagemaker:InvokeEndpoint only on the fraud-scoring endpoint ARN and denies it for other resources
+K: D
+G: ## Endpoint policies control what can be done through the endpoint
+An interface VPC endpoint (AWS PrivateLink) carries API calls to a service privately. Each endpoint can have an **endpoint policy**, an IAM-style resource policy that limits which principals, actions and resources are allowed **through that endpoint**. The default policy allows everything.
+## Applying it here
+The SageMaker Runtime endpoint (`com.amazonaws.<region>.sagemaker.runtime`) carries `InvokeEndpoint` calls. A policy that allows `sagemaker:InvokeEndpoint` only on the ARN of the `fraud-scoring` endpoint means a call for any other endpoint, in this account or another one, is denied when it uses this path. IAM policies on the callers still apply as well, so the effective permission is the intersection of the two.
+W: VPC endpoint policy: it is evaluated for every request that uses the interface endpoint and can restrict InvokeEndpoint to one endpoint ARN.
+X: A=Security group on the endpoint: security groups filter by IP address and port, they cannot see which SageMaker endpoint name a request is for, and the runtime API is reached through the service, not the instance addresses.
+B=Network ACLs: ACLs work on IP ranges and ports, not on DNS names, and all runtime calls share the same PrivateLink addresses.
+C=Bucket policy on model artifacts: this controls access to files in S3, not which endpoints can be invoked, and invocation does not read from the bucket at request time.
+T: To limit what can be invoked through a private path, attach an endpoint policy to the interface VPC endpoint and combine it with IAM permissions on the callers.
+V: Amazon SageMaker AI, AWS PrivateLink, Amazon VPC
+
+@ MLA-C01 D4 T4.3 applied use-case
+S: A partner company in a different AWS account must send real-time inference requests to a SageMaker endpoint in the model-owner account. The model-owner's security team wants no long-term IAM access keys shared with the partner and wants permission limited to invoking that one endpoint. Which TWO steps meet these requirements? (Select TWO)
+A: In the model-owner account, create an IAM role that trusts the partner account and allows only sagemaker:InvokeEndpoint on that endpoint ARN
+B: In the model-owner account, add a resource-based policy to the SageMaker endpoint that names the partner account as the allowed principal
+C: In the model-owner account, create an IAM user for the partner with an access key and rotate the key each month using a scheduled function
+D: In the partner account, allow the calling application's role to call sts:AssumeRole on the model-owner role and use the temporary credentials
+E: In the partner account, copy the model artifacts to a local bucket and deploy a second endpoint that the partner's applications call directly
+K: A,D
+G: ## Cross-account access to SageMaker endpoints
+SageMaker endpoints do not support resource-based policies. Cross-account invocation therefore uses **role assumption**: the caller assumes a role in the account that owns the endpoint and calls the API with the short-lived credentials that `sts:AssumeRole` returns.
+## Both sides must allow it
+- In the owner account, the role's **trust policy** names the partner account (or a specific partner role), and its **permissions policy** allows `sagemaker:InvokeEndpoint` on the endpoint ARN only.
+- In the partner account, the calling identity needs an IAM permission for `sts:AssumeRole` on the owner's role ARN.
+An external ID condition can be added to the trust policy when a third party is involved. No long-term secrets are exchanged.
+W: A=Trusted role with narrow permissions: this gives the partner a controlled entry point with permission only to invoke the one endpoint.
+D=AssumeRole from the partner side: the partner's role must be allowed to assume the owner's role, and the temporary credentials expire without any rotation work.
+X: B=Resource-based policy on the endpoint: SageMaker endpoints have no resource-based policy, so there is nothing to attach.
+C=IAM user with rotated keys: this still shares a long-term credential with the partner, which the security team explicitly wanted to avoid.
+E=Second endpoint in the partner account: this copies the model outside the owner's control and adds cost, and it does not grant access to the owner's endpoint.
+T: SageMaker endpoints have no resource policies, so grant cross-account invocation with an assumable role that allows only InvokeEndpoint, plus sts:AssumeRole permission on the caller's side.
+V: AWS IAM, AWS STS, Amazon SageMaker AI
+
+@ MLA-C01 D4 T4.3 applied use-case
+S: Data scientists clone a private GitHub repository into SageMaker Studio. A security review found the personal access token pasted into notebook cells and shared in chat. The team wants Studio to authenticate to the repository without any person handling the token. What should the ML engineer do?
+A: Store the token in an S3 object with a public read block and have every notebook download the object at startup to configure git
+B: Store the token as a plain-text SageMaker environment variable on the Studio domain so that every space gets the value at launch
+C: Store the token in AWS Secrets Manager and register the repository with SageMaker using the secret's ARN as its credential
+D: Encode the token with base64 and commit it to a private configuration file in the same repository so that git can find it
+K: C
+G: ## Keep credentials out of code and chat
+A personal access token is a secret. It should live in a managed secret store, be readable only by the identities that need it, and never appear in notebooks, environment variables or repositories.
+## SageMaker Git repository resources
+SageMaker AI lets you create a **code repository** resource that points to a Git URL. For a private repository, its configuration references an **AWS Secrets Manager secret** (JSON with `username` and `password`, where the password field holds the personal access token) by ARN. Studio then pulls the credential at clone time, so users select the repository from a list and never see the token.
+The secret's resource policy and the user's execution role control who can use it, and Secrets Manager can rotate it and logs each access in CloudTrail.
+W: Secrets Manager with a SageMaker code repository: the token is stored encrypted, referenced by ARN, used by the service on the user's behalf, and every access is auditable.
+X: A=Token in an S3 object: it is still a file that many identities can read, it ends up in shell history and notebooks, and blocking public access does not control internal readers.
+B=Plain-text environment variable: anyone with access to a space can print it, and it appears in configuration and logs.
+D=Base64 in the repository: base64 is an encoding, not encryption, so anyone who can read the repository can recover the token.
+T: Keep Git tokens in Secrets Manager and register the repository in SageMaker by secret ARN so the service supplies the credential and users never handle it.
+V: AWS Secrets Manager, Amazon SageMaker AI, AWS IAM
+
+@ MLA-C01 D4 T4.3 applied troubleshooting
+S: A team trains a model in one account with output encrypted by a customer managed KMS key using SSE-KMS. In the deployment account, creating a SageMaker endpoint fails with an AccessDenied error while the container downloads model.tar.gz. The deployment execution role has `s3:GetObject` on the artifact bucket, and the bucket policy allows that role. What is the most likely missing piece?
+A: The KMS key policy and the deployment role's IAM policy must both allow kms:Decrypt so that the role can decrypt the artifact objects
+B: The S3 bucket needs versioning enabled so that the deployment role can read the encrypted objects that the training job wrote
+C: The deployment role needs the AmazonSageMakerFullAccess managed policy so that it can read encrypted objects in another account
+D: The endpoint configuration must set network isolation so that the artifacts are decrypted before the container starts downloading
+K: A
+G: ## Reading an SSE-KMS object takes two permissions
+For an object encrypted with SSE-KMS, `s3:GetObject` is not enough. S3 asks KMS to decrypt the object's data key on the caller's behalf, so the caller also needs `kms:Decrypt` on the key.
+## Cross-account rules
+A customer managed key belongs to one account. When the caller is in another account, **both** must allow it: the **key policy** must permit the external account or role (for example with a statement for `kms:Decrypt` and `kms:DescribeKey`), and the **caller's IAM policy** must allow the same actions on the key ARN. If either is missing, the request is denied, and S3 reports it as AccessDenied.
+The AWS managed key `aws/s3` cannot be shared across accounts, which is why cross-account artifacts should use a customer managed key.
+W: KMS permissions on both sides: the object read succeeds only when the key policy and the role's IAM policy both allow kms:Decrypt for the deployment role.
+X: B=Versioning: it protects against overwrites and deletions, and has no effect on whether a role may decrypt an object.
+C=AmazonSageMakerFullAccess: it does not grant access to a KMS key in another account, and the key policy would still have to allow the role.
+D=Network isolation: it blocks the container's outbound calls at run time and does not change how model artifacts are decrypted or downloaded by the service.
+T: SSE-KMS objects need kms:Decrypt in addition to s3:GetObject, and across accounts both the key policy and the caller's IAM policy must allow it.
+V: AWS KMS, Amazon S3, Amazon SageMaker AI
+
+@ MLA-C01 D4 T4.3 applied tradeoff
+S: Three teams share one SageMaker Studio domain. The fraud team's data lives in a bucket that the marketing team must never read, and the reverse also applies. Today every user profile inherits the domain's default execution role, which can read both buckets. The company wants to fix this without creating a separate domain for each team. Which approach fits BEST?
+A: Keep the default execution role and ask each team to avoid opening the other team's bucket in their notebooks and jobs
+B: Remove S3 access from the default execution role and let each user paste their own IAM access keys into the notebook terminal
+C: Create one execution role per team with access to only that team's bucket and assign it to each team's user profiles or spaces
+D: Move all of the data into a single shared bucket and separate the teams with different folder names that they agree to use
+K: C
+G: ## What a Studio user can access
+Code that runs in a Studio space, and the jobs it starts, use an **execution role**. A domain has a default execution role, but you can set a different one for each **user profile** (and for shared spaces). The role, not the person, decides which S3 buckets, KMS keys and other resources are reachable.
+## Least privilege in a shared domain
+Create a role per team (or per user) that allows only that team's bucket and key, give each user profile its own role, and control who may pass which role with `iam:PassRole`. Users then share one domain, one VPC configuration and one set of shared settings, but cannot read each other's data.
+This is more scalable than one domain per team, and it puts the boundary in IAM, where it can be audited.
+W: One role per team on the user profiles: it enforces the data boundary in IAM while the teams still share a single domain.
+X: A=Relying on people to avoid the other bucket: this is a convention and not a control, and any mistake or malicious action still reads the data.
+B=Pasting long-term access keys: this spreads long-term credentials into terminals and history, which is exactly what execution roles are meant to avoid.
+D=One shared bucket with agreed folders: without IAM conditions per team, everyone with bucket access can read every folder, so the boundary is only a naming habit.
+T: Give each Studio user profile or space an execution role scoped to that team's data; one shared domain does not require one shared permission set.
+V: Amazon SageMaker AI, AWS IAM, Amazon S3
+
+@ MLA-C01 D4 T4.3 applied use-case
+S: An auditor asks a bank which employees and roles read the customer files in the training data bucket during the last quarter. The bank has a CloudTrail trail that records management events for all Regions, but the auditor finds no `GetObject` entries. What should the ML engineer do to answer this kind of question going forward?
+A: Turn on S3 server access logging only for the SageMaker output bucket because it records who reads training data objects
+B: Enable CloudTrail data events for that S3 bucket on the trail so that object-level API calls such as GetObject are recorded
+C: Turn on AWS Config recording for the bucket so that a configuration item is stored each time a training job reads an object
+D: Use Amazon CloudWatch Logs Insights on the SageMaker training log group to find the users who read the bucket objects
+K: B
+G: ## Management events versus data events
+CloudTrail records **management events** (control-plane actions such as `CreateTrainingJob`) by default. **Data events** cover high-volume, data-plane actions such as S3 `GetObject` and `PutObject`. Data events are **off by default** and must be turned on for the buckets you care about, with an optional filter for read or write activity.
+## What you get
+A data event includes the calling principal, the source IP address, the time and the object key, so the bank can show which role read which files. Because data events can be large, select only the sensitive bucket instead of every bucket.
+Example: enable data events for `arn:aws:s3:::bank-training-data/` on the existing trail, delivered to a protected S3 bucket.
+W: CloudTrail data events for the bucket: they add object-level reads to the trail with the principal and the object key, which the management-event trail lacks.
+X: A=Server access logging on the output bucket: it is on the wrong bucket, and it delivers best-effort logs to S3 that are harder to query and audit than CloudTrail events.
+C=AWS Config recording: Config tracks changes to resource configuration and does not record each object read.
+D=CloudWatch Logs Insights on training logs: those logs contain what the job prints, so they cannot tell who accessed objects in S3 across all users and services.
+T: Object-level S3 audit (who read which file) needs CloudTrail data events, which are not enabled by default.
+V: AWS CloudTrail, Amazon S3
+
+@ MLA-C01 D4 T4.3 applied troubleshooting
+S: A training job runs with `EnableNetworkIsolation` set to true because the data is sensitive. The training script runs `pip install` for two libraries and calls boto3 to read a reference dataset from a second S3 bucket. The job fails inside the script with connection errors, but the main input channel is read correctly. Which change fixes the failure while keeping the isolation?
+A: Add a NAT gateway to the job's private subnets so that the container can reach package repositories and Amazon S3 while isolation remains on
+B: Build the libraries into the training image and supply the reference dataset as an additional S3 input channel of the training job
+C: Attach an S3 gateway endpoint policy that allows the second bucket so that the isolated container can call the S3 API directly
+D: Grant the training execution role s3:GetObject on the second bucket so that the calls made from the script are authorized
+K: B
+G: ## What network isolation does
+With network isolation on, the training container has **no outbound network access**: no internet, no calls to AWS APIs, no package downloads. SageMaker itself, outside the container, still downloads the input channels to the instance and uploads the output, so the main channel works.
+## Working within it
+Anything the script needs must already be in the container or arrive as an **input data channel**. Install dependencies when you build the image, and add the reference dataset as another channel (each channel can have its own S3 prefix), so the service copies it in before the script starts.
+Network isolation is a property of the container's network stack, so route tables, NAT gateways and endpoint policies do not change it.
+W: Bundle the libraries into the image and use an extra input channel: the script needs nothing from the network at run time, so isolation can stay on.
+X: A=NAT gateway: isolation blocks the container's own network stack, so a NAT gateway does not restore outbound access and would also weaken the design.
+C=S3 gateway endpoint policy: this controls which requests may pass through a route, but an isolated container has no network path to use it.
+D=s3:GetObject on the second bucket: the role permission is needed for the service to read a channel, but the script's calls never leave the container, so IAM is not the cause of the connection errors.
+T: Network isolation removes all outbound access from the container, so bake dependencies into the image and pass extra data as input channels.
+V: Amazon SageMaker AI, Amazon S3, Amazon VPC
+
+@ MLA-C01 D4 T4.3 applied use-case
+S: A company exposes a chat assistant built on an Amazon Bedrock foundation model. Compliance requires that email addresses and phone numbers a user types are not sent to the model in raw form and that any such data in a reply is masked, without changing the application's prompt logic. What should the ML engineer use?
+A: Amazon Bedrock Guardrails with a sensitive information filter configured to mask personal data types in inputs and in model responses
+B: A CloudWatch Logs metric filter on the model invocation log group that deletes any prompt lines that contain an email address
+C: An IAM policy on the application role that denies bedrock:InvokeModel whenever a request contains a phone number or email address
+D: A VPC endpoint policy for Amazon Bedrock that removes personal data from the request bodies before they reach the model
+K: A
+G: ## Guardrails sit around the model
+Amazon Bedrock Guardrails evaluate both the **user input** and the **model output** against configured policies, independent of the model and prompt. You attach a guardrail to `InvokeModel` or `Converse` calls (or to an agent or knowledge base), and Bedrock applies it on each call.
+## Sensitive information filters
+A guardrail can detect personally identifiable information such as email addresses and phone numbers, plus custom regular expressions. For each type you choose to **block** the content or **mask** it (replacing it with a placeholder). Other policies cover denied topics, content filters, word filters and contextual grounding checks.
+Because the guardrail is a separate resource, one configuration protects several applications, and the prompt logic remains unchanged.
+W: Guardrails sensitive information filter: it masks or blocks personal data types in both prompts and responses at invocation time.
+X: B=Metric filter on logs: metric filters only count matching log events, and by the time a log exists the request has already been sent to the model.
+C=IAM deny on request contents: IAM authorizes API actions and resources, and it cannot inspect what is inside the prompt body.
+D=VPC endpoint policy: endpoint policies allow or deny principals, actions and resources, and cannot rewrite request bodies.
+T: Use Bedrock Guardrails sensitive information filters to mask or block PII in prompts and responses without touching application logic.
+V: Amazon Bedrock, Amazon Bedrock Guardrails
+
+@ MLA-C01 D4 T4.3 applied use-case
+S: A platform team must guarantee that no SageMaker notebook instance in the company account can be created with root access enabled, whatever permissions a user's own IAM policy grants. Which approach enforces this?
+A: Add a note to the team wiki that requires users to choose the option that turns off root access when they create a notebook instance
+B: Attach an SCP or IAM policy that denies sagemaker:CreateNotebookInstance unless the sagemaker:RootAccess condition key is Disabled
+C: Create an EventBridge rule that emails the security team each time a notebook instance starts so that the team can review its settings
+D: Turn on default encryption for the account's S3 buckets so that root access on a notebook instance cannot reach the stored data
+K: B
+G: ## Preventive controls with condition keys
+IAM allows a request only if no explicit deny applies. SageMaker publishes **condition keys** for many create-time settings, and a policy can deny a call when the setting is not the required value. Examples include `sagemaker:RootAccess`, `sagemaker:DirectInternetAccess`, `sagemaker:VolumeKmsKey` and `sagemaker:NetworkIsolation`.
+## Where to attach the policy
+- A **service control policy** (SCP) in AWS Organizations applies to every principal in the member accounts, including administrators, so it is a guardrail nobody can override in the account.
+- An IAM identity policy or permissions boundary works when the control is only for certain roles.
+Here, the deny statement on `sagemaker:CreateNotebookInstance` (and on `sagemaker:UpdateNotebookInstance`, so root access cannot be switched on later) with `sagemaker:RootAccess` not equal to `Disabled` blocks the API call itself, so a non-compliant notebook is never created.
+W: A deny with the sagemaker:RootAccess condition key: it blocks creation of non-compliant notebook instances regardless of what other policies allow.
+X: A=Wiki note: guidance is not enforcement, so a single mistaken choice creates a notebook with root access.
+C=EventBridge email after start: this is detective and manual, and the non-compliant resource already exists by the time the email arrives.
+D=Default S3 encryption: encryption at rest does not stop a root user on the instance from reading data with the instance's permissions.
+T: Enforce SageMaker settings with a deny on the create action using SageMaker condition keys, ideally in an SCP so no one can override it.
+V: AWS IAM, AWS Organizations, Amazon SageMaker AI
+
+@ MLA-C01 D4 T4.3 applied troubleshooting
+S: An application in a private subnet calls a SageMaker real-time endpoint through an interface VPC endpoint for `sagemaker.runtime`. Private DNS is enabled on the VPC endpoint and IAM permissions are correct, but every `InvokeEndpoint` call times out. Calls from an EC2 test instance in a different subnet with a different security group work. What is the most likely cause?
+A: The SageMaker endpoint must be recreated with a public IP address so that the interface endpoint can forward the traffic to it
+B: The application role needs an inline policy that lets it create network interfaces in the subnet used by the interface endpoint
+C: The security group on the interface endpoint does not allow inbound HTTPS (port 443) from the application's security group or subnet
+D: The route table of the private subnet needs a route for the SageMaker service prefix list that targets an internet gateway
+K: C
+G: ## How an interface endpoint is reached
+An interface VPC endpoint creates elastic network interfaces (ENIs) in your subnets, and each ENI has a **security group**. Clients reach the service by sending HTTPS traffic to those ENIs, so the security group must allow **inbound TCP 443** from the clients. With private DNS enabled, the normal service name resolves to the ENI addresses.
+## Reading the symptom
+A timeout, as opposed to an error response, points to blocked network traffic and not to IAM (which would return AccessDenied). A test instance that works from a different security group shows that the endpoint and DNS are fine and that the difference is what the security group allows.
+The fix is one rule on the endpoint's security group, for example allowing 443 from the application's security group ID.
+W: Security group on the interface endpoint: it must allow inbound 443 from the client, and a timeout with a working alternative client points to exactly this.
+X: A=Public IP on the SageMaker endpoint: the interface VPC endpoint reaches the SageMaker service over PrivateLink, so the model hosting instances never need a public address for this path.
+B=Inline policy for network interfaces: the service creates the ENIs when the VPC endpoint is made, so the application role plays no part in it.
+D=Route to an internet gateway: interface endpoints work through ENIs in the VPC, so no internet gateway route is needed, and sending the traffic that way defeats the private design.
+T: A timeout to an interface VPC endpoint usually means its security group is missing an inbound 443 rule for the client, while an IAM problem returns AccessDenied.
+V: Amazon SageMaker AI, AWS PrivateLink, Amazon VPC
+
+@ MLA-C01 D4 T4.3 applied troubleshooting
+S: A training job is configured with private subnets and no NAT gateway or internet gateway. The subnets already have a gateway VPC endpoint for Amazon S3. The job fails at startup with a timeout while pulling its custom training image from a private Amazon ECR repository. Which TWO changes fix this? (Select TWO)
+A: Add a gateway VPC endpoint for Amazon ECR so that the image manifest requests are routed through the route table
+B: Create an interface VPC endpoint for com.amazonaws.<region>.ecr.api so that the ECR API calls stay inside the VPC
+C: Create an interface VPC endpoint for Amazon SageMaker Runtime so that the training job can reach the image repository
+D: Set EnableNetworkIsolation to true on the training job so that the image layers are copied into the instance before start
+E: Create an interface VPC endpoint for com.amazonaws.<region>.ecr.dkr so that the Docker registry calls stay inside the VPC
+K: B,E
+G: ## Pulling an ECR image without internet access
+Training containers in a VPC-only setup have no path to public endpoints. To pull from private ECR, two things are needed:
+- **ECR API** calls (authorization and image manifest lookups) go to `ecr.api`.
+- **Docker registry** calls (the image pull itself) go to `ecr.dkr`.
+Each needs its own **interface** VPC endpoint. The image layers are stored in **Amazon S3**, so a route to S3 through a gateway endpoint is also needed, and the scenario already has one. The endpoint security groups must allow inbound 443 from the training subnets, and the S3 endpoint policy must allow the ECR layer bucket.
+## Note
+There is no gateway endpoint for ECR, and network isolation removes the container's outbound access rather than enabling any image pull.
+W: B=ecr.api interface endpoint: covers the authentication and manifest requests that the image pull starts with.
+E=ecr.dkr interface endpoint: covers the registry requests that download the image layers, together with the S3 gateway endpoint already in place.
+X: A=Gateway endpoint for ECR: gateway endpoints exist only for S3 and DynamoDB, so ECR cannot use one.
+C=SageMaker Runtime endpoint: that endpoint carries InvokeEndpoint calls, and image pulls do not use it.
+D=Network isolation: it blocks outbound calls from the container after start, and it does not affect how the image is pulled or add network paths.
+T: A VPC-only job that pulls from private ECR needs interface endpoints for ecr.api and ecr.dkr, plus S3 access through a gateway endpoint for the image layers.
+V: Amazon ECR, Amazon SageMaker AI, Amazon VPC
+
+@ MLA-C01 D4 T4.1 applied troubleshooting
+S: A team runs a SageMaker Model Quality monitoring schedule for a churn endpoint. Ground truth files are uploaded to Amazon S3 each week. The monitoring executions complete, yet the reports contain no accuracy or AUC values and a note says no records could be merged with ground truth. Which TWO actions are needed to fix this? (Select TWO)
+A: Send an inference ID with each `InvokeEndpoint` request and use the same value as the inference ID in the ground truth records
+B: Raise the data capture sampling percentage above 100 so that more inference records exist to be merged with labels
+C: Place the ground truth files under the S3 prefix that is configured for ground truth, organized by date and hour of the inferences
+D: Replace the Model Quality schedule with a Data Quality schedule because ground truth is only used by data quality monitoring
+E: Delete the baseline constraints file so that the monitor no longer requires labels to compute the quality metrics
+K: A,C
+G: ## How Model Quality monitoring gets its labels
+Model Quality monitoring compares predictions with **ground truth**, which arrives later and separately. Each run has a merge step:
+- Captured request and response records are joined with ground truth records by an **inference ID**. The application supplies it when it calls the endpoint (the `InferenceId` parameter), and the ground truth records carry the same ID.
+- The monitor reads ground truth from the **S3 URI** configured on the schedule, in a folder layout of `yyyy/mm/dd/hh`, which lets it find labels for the inferences in the monitoring window.
+Only after the merge does it compute metrics such as accuracy, precision, recall and AUC and compare them with the baseline constraints.
+If the IDs do not match or the labels are in the wrong place, the merge finds nothing and no metrics are produced.
+W: A=Matching inference IDs: the join between captured predictions and labels uses this ID, so without a shared value nothing can be merged.
+C=Ground truth in the configured prefix and date-hour layout: the monitor only searches that location and time layout for the labels that belong to the window.
+X: B=Sampling above 100: the percentage cannot exceed 100, and the problem is matching records, not the amount of captured data.
+D=Data Quality instead: data quality monitoring checks input statistics, and it cannot measure accuracy or other model quality metrics.
+E=Deleting baseline constraints: constraints are what the metrics are compared with, and removing them would not create the labels that are missing.
+T: Model Quality monitoring needs inference IDs shared by requests and ground truth, and the labels in the configured S3 location laid out by date and hour.
+V: Amazon SageMaker AI, SageMaker Model Monitor, Amazon S3
+
+@ MLA-C01 D4 T4.1 applied comparison
+S: A lending model's feature attribution drift monitor, configured with SageMaker Clarify, reports a violation even though all input feature distributions still match the data quality baseline. Which statement explains what the monitor compares and why this can happen?
+A: It compares the ranking of features by their SHAP-based attribution in live data with the ranking in the baseline, using the NDCG score
+B: It compares the mean and standard deviation of each input column in live data with the training statistics, using a Kolmogorov-Smirnov test
+C: It compares the count of missing values and data types for every input column, and flags any column that has a new data type
+D: It compares the model's average predicted probability per day with the average in the baseline, using a population stability index
+K: A
+G: ## Distributions and attributions are different things
+- **Data quality monitoring** looks at the inputs: statistics such as mean, min, max, missing values and data types, compared with baseline constraints.
+- **Feature attribution drift monitoring** (SageMaker Clarify with Model Monitor) looks at **why the model predicts what it does**. It computes SHAP-based attributions for live inference data and ranks the features by importance.
+## The comparison
+The monitor compares the live ranking with the baseline ranking using the **normalized discounted cumulative gain (NDCG)** score. If the score falls below the constraint, a violation is reported, meaning the features driving predictions have changed in importance.
+This can happen even when each input distribution looks the same, for example when the relationship between two features and the label has shifted, so the model leans on different features than at training time.
+W: NDCG on SHAP-based rankings: the monitor detects a change in which features drive predictions, which is invisible to input distribution checks.
+X: B=Column statistics with a statistical test: this describes the checks that data quality monitoring performs on inputs, and it would not explain a violation when the inputs match.
+C=Missing values and data types: this is also a data quality check, and it does not involve model explanations.
+D=Average predicted probability per day: that would be prediction distribution drift, which Clarify's feature attribution monitor does not compute.
+T: Feature attribution drift compares SHAP-based feature rankings with an NDCG score, so it can fire while input distributions look unchanged.
+V: Amazon SageMaker AI, SageMaker Clarify, SageMaker Model Monitor
+
+@ MLA-C01 D4 T4.1 applied use-case
+S: A retailer scores 2 million customers every night with a SageMaker batch transform job, and no real-time endpoint exists. The ML team wants to know each morning whether the input feature distributions differ from the training data, using SageMaker's managed monitoring tools. What should the ML engineer do?
+A: Deploy a real-time endpoint next to the batch job and mirror a sample of nightly records to it so that endpoint data capture works
+B: Enable data capture on the transform job, then create a Model Monitor schedule that uses the captured batch input as its source and checks it against a baseline
+C: Write a scheduled AWS Glue job that computes column statistics of the nightly file and publishes the values as a custom CloudWatch metric
+D: Turn on SageMaker Debugger on the batch transform job so that it profiles the feature distribution of every nightly input file
+K: B
+G: ## Model Monitor is not limited to real-time endpoints
+Model Monitor can watch two kinds of sources:
+- **Real-time endpoints**, using data capture that writes requests and responses to S3.
+- **Batch transform jobs**, by turning on data capture in the transform job (`DataCaptureConfig`) and giving the monitoring schedule a batch transform input (`BatchTransformInput`) that points at the captured S3 location, so no endpoint is needed.
+## Steps
+1. Run a baselining job on the training data to produce `statistics.json` and `constraints.json`.
+2. Run the transform job with data capture on, then create a monitoring schedule whose batch transform input points at the captured data, timed to run after the nightly job.
+3. Read the violations report in S3 and set a CloudWatch alarm on the emitted metrics.
+The processing job compares the batch input with the baseline exactly as for an endpoint.
+W: Data capture on the transform job plus a Model Monitor schedule: Model Monitor accepts batch transform data as a source, so managed drift checks run without any real-time endpoint.
+X: A=Mirroring to a new endpoint: this adds an always-on endpoint and only monitors a sample, and the batch job itself is still not monitored.
+C=Custom Glue job: this rebuilds baselines, constraints and violation reports that Model Monitor already provides, and adds code to maintain.
+D=SageMaker Debugger: Debugger targets training job tensors and system metrics, and it does not compare inference input distributions with a baseline.
+T: Model Monitor can monitor batch transform jobs as well as real-time endpoints, so drift checks do not require an endpoint.
+V: Amazon SageMaker AI, SageMaker Model Monitor, SageMaker Batch Transform
+
+@ MLA-C01 D4 T4.1 applied use-case
+S: An application calls Amazon Bedrock models on demand. During peak hours some calls fail because the account exceeds its quota, and the on-call team learns about it only from user complaints. The team wants an automatic notification as soon as Bedrock throttles requests, with the least effort. What should the ML engineer do?
+A: Create a CloudWatch alarm on the InvocationThrottles metric in the AWS/Bedrock namespace and send the alarm state changes to an Amazon SNS topic
+B: Turn on model invocation logging to S3 and run an hourly Athena query that counts records that report a throttling error, then emails the result
+C: Create an AWS Config rule that marks the account non-compliant whenever the application receives more throttled Bedrock requests than the quota
+D: Create a CloudTrail trail for management events and set an alarm on the Bedrock InvokeModel event, which reports each quota failure separately
+K: A
+G: ## Bedrock runtime metrics
+Amazon Bedrock publishes runtime metrics to CloudWatch in the `AWS/Bedrock` namespace, per model ID, with no setup. They include `Invocations`, `InvocationLatency`, `InvocationClientErrors`, `InvocationServerErrors`, `InvocationThrottles`, `InputTokenCount` and `OutputTokenCount`.
+## Alerting
+A CloudWatch alarm on `InvocationThrottles` (for example, a sum of at least 1 over one minute) notifies an SNS topic within minutes. Follow-up options are a quota increase request, retries with exponential backoff, cross-Region inference profiles or provisioned throughput.
+Model invocation logging is off by default. It stores prompts and responses for content review, but it is not the cheapest way to watch throttling.
+W: CloudWatch alarm on InvocationThrottles: the metric is published automatically, so an alarm and an SNS topic give near-real-time notification without custom code.
+X: B=Invocation logging plus Athena: it needs logging turned on, a table, and a scheduled query, and it reports up to an hour late while duplicating a metric that already exists.
+C=AWS Config rule: Config evaluates resource configuration and does not observe request throttling in the application's calls.
+D=CloudTrail management events: InvokeModel is a data-plane call that management events do not record, and a throttled request is not reported as a separate event type, so an alarm cannot count throttles from the trail.
+T: Watch Bedrock throttling and errors with the AWS/Bedrock CloudWatch metrics, such as InvocationThrottles, and alarm on them to notify through SNS.
+V: Amazon Bedrock, Amazon CloudWatch, Amazon SNS
+
+@ MLA-C01 D4 T4.1 applied use-case
+S: A team hosts a real-time endpoint that receives large request payloads. For drift monitoring they only need about one in ten requests, and they only need the request features, not the model's responses, in the capture files. Which endpoint configuration meets this with the lowest storage volume?
+A: Enable data capture with InitialSamplingPercentage set to 10 and a CaptureOptions list that contains only the Input capture mode
+B: Enable data capture with InitialSamplingPercentage set to 100 and delete the response files from the S3 capture location every night
+C: Enable data capture with InitialSamplingPercentage set to 10 and CaptureOptions that list both the Input and Output capture modes
+D: Enable CloudWatch Logs for the endpoint container and filter every tenth request line into a log group for monitoring to read
+K: A
+G: ## Data capture settings
+Data capture is configured in the endpoint configuration (`DataCaptureConfig`). `InitialSamplingPercentage` sets what share of requests are captured (0 to 100), and `CaptureOptions` lists which parts are written to S3: `Input`, `Output` or both. Captured records are stored as JSON Lines under the destination S3 prefix, and they can be encrypted with a KMS key.
+## Fit for this case
+Sampling at 10 percent and capturing only `Input` cuts both the record count and the size of each record, which lowers S3 cost and monitoring processing time. A data quality monitor needs only inputs, while model quality monitoring also needs the outputs.
+The sampling percentage can be changed later by updating the endpoint configuration, without rebuilding the model.
+W: DataCaptureConfig with 10 percent sampling and Input-only capture: it writes only the request data that data quality monitoring reads, at a tenth of the volume.
+X: B=Capture everything and delete later: this stores ten times the records and both directions before the cleanup, and adds a job to maintain.
+C=Both capture modes: this keeps the response data that was not needed, so each captured record is larger than necessary.
+D=Container logs in CloudWatch Logs: Model Monitor reads capture files in S3 and not container log lines, and a filter cannot pick every tenth request.
+T: Data capture supports a sampling percentage and Input or Output capture modes, so capture only what the monitor needs.
+V: Amazon SageMaker AI, SageMaker Model Monitor, Amazon S3
+
+@ MLA-C01 D4 T4.1 applied tradeoff
+S: A demand-forecast endpoint has a Model Monitor data quality schedule and a model quality schedule, each emitting CloudWatch metrics. Retraining costs about $3,000 per run, and the drift alarm on one feature fires several times a month even though forecast accuracy stays within target. The team wants to retrain only when there is evidence of harm. Which approach fits BEST?
+A: Retrain on every data drift alarm because the cost of a bad forecast is always greater than the cost of a training run
+B: Lower the data quality constraint thresholds so that the drift alarm fires more often and retraining happens earlier
+C: Create a composite alarm that is in ALARM only when the feature drift alarm and the model quality alarm are both in ALARM
+D: Disable the model quality schedule and use only the data drift alarm because ground truth arrives too slowly to be helpful
+K: C
+G: ## Drift is a signal, not proof of harm
+Data drift says the inputs changed. Model quality says whether the predictions are still correct. Inputs can drift in ways that do not matter to the model, so retraining on every drift alarm pays for runs that add nothing.
+## Composite alarms
+A CloudWatch **composite alarm** evaluates a rule expression over other alarms, for example `ALARM(feature-drift) AND ALARM(model-quality)`. It triggers its actions (SNS notification, EventBridge event that starts a SageMaker Pipeline) only when the rule is true, which reduces noisy notifications.
+## Trade-off
+The design waits for labeled evidence, so it reacts more slowly than a drift-only trigger. Add a rule for severe drift alone, for example `OR ALARM(severe-drift)`, if waiting is too risky.
+W: Composite alarm on drift and model quality: retraining starts only when the inputs moved and measured quality actually dropped.
+X: A=Retrain on every drift alarm: this repeats a $3,000 run several times a month without evidence that forecasts got worse.
+B=Lower thresholds: a more sensitive alarm fires even more often, which increases unneeded retraining.
+D=Dropping model quality monitoring: this removes the only signal of actual harm, and slow labels are handled by scheduling the monitor accordingly.
+T: Combine drift and model quality alarms in a CloudWatch composite alarm so retraining requires evidence of both changed inputs and degraded predictions.
+V: Amazon CloudWatch, Amazon SageMaker AI, SageMaker Model Monitor
+
+@ MLA-C01 D4 T4.1 applied troubleshooting
+S: A team's endpoint accepts JSON requests containing a nested `customer` object and a list of `events`. After data capture is enabled and a Data Quality monitoring schedule runs, the baseline and reports are empty or full of unexpected feature names that do not match the training columns. What should the ML engineer do?
+A: Provide a record preprocessor script to the monitoring schedule that flattens each captured JSON record into the training feature columns
+B: Increase the instance size of the monitoring processing job so that it can parse the nested JSON records that are in the captured data
+C: Set the data capture sampling percentage to 100 so that every nested field in each request is written to the capture files
+D: Convert the endpoint's container to accept only CSV requests so that the captured data can never contain nested fields
+K: A
+G: ## What Model Monitor expects
+Data Quality monitoring works on **tabular** records. For an endpoint that accepts CSV or flat JSON lines, the built-in analyzer can read the captured data directly. When the payload is nested or in a custom format, the monitor cannot map it to the baseline's columns, so it produces missing or unexpected features.
+## Preprocessing script
+The schedule accepts a **record preprocessor script** (`record_preprocessor_script`), a Python function that runs on each captured record and returns a flat dictionary or list of feature values with the same names as in the baseline. There is a matching **post-analytics processor script** for custom checks after analysis.
+Example: the function extracts `customer.age`, `customer.tenure` and the summary of `events` into columns, so live data is compared with the training statistics column by column.
+W: Record preprocessor script: it converts each nested captured record into the tabular feature layout that the baseline and constraints use.
+X: B=Larger instance: the failure is a format mismatch and not a lack of memory or CPU, so more capacity yields the same wrong columns.
+C=100 percent sampling: sampling changes how many records are captured and does not alter their structure.
+D=CSV-only container: this forces a change to the model container and all clients to fix a monitoring problem that a script solves without touching the endpoint.
+T: For nested or custom payloads, give the Model Monitor schedule a record preprocessor script that flattens records into the baseline's feature columns.
+V: Amazon SageMaker AI, SageMaker Model Monitor
+
+@ MLA-C01 D4 T4.1 applied use-case
+S: A company runs 40 models in production across several SageMaker endpoints, each with monitoring schedules for data quality, bias drift and model quality. Governance wants one view that shows which models have monitoring violations, which are missing monitoring or have inactive schedules, and which endpoints are running. What should the ML engineer use?
+A: A CloudWatch dashboard that the team builds by hand, with one widget for every model, schedule and violation report
+B: An AWS Config aggregator that lists the SageMaker endpoints and reports which ones are non-compliant with monitoring rules
+C: The Amazon SageMaker Model Dashboard, which consolidates model, endpoint and monitoring status and violations in one place
+D: The AWS Cost Explorer SageMaker view, filtered by the cost allocation tags that the team assigned to each production model
+K: C
+G: ## One place to see model risk
+A large set of models needs a portfolio view, not 40 separate reports. The **SageMaker Model Dashboard** is a centralized portal in SageMaker AI that shows the models in an account and Region together with their details. It combines information from model cards, endpoints, batch transform jobs and **Model Monitor** schedules.
+## What it shows
+- Which models have monitoring schedules for data quality, model quality, bias drift and feature attribution drift, and which have none.
+- Whether monitoring has found **violations** and their status, so reviewers can go from a model to the report.
+- Endpoint status and links to model cards, plus the model risk rating that governance records in the card.
+It reads the resources that already exist, so there is nothing to build; alarms and notifications are still set separately with CloudWatch and EventBridge.
+W: SageMaker Model Dashboard: it gathers monitoring status, violations, endpoints and model cards for all models in one managed view.
+X: A=Hand-built CloudWatch dashboard: it needs to be maintained for every new model and schedule, and does not show missing monitors or model cards.
+B=AWS Config aggregator: Config evaluates resource configuration against rules and does not read Model Monitor violations or model quality results.
+D=Cost Explorer: it shows spend by tag and service, and holds no information about monitoring violations or model risk.
+T: Use the SageMaker Model Dashboard for a single view of monitoring status and violations across all production models.
+V: Amazon SageMaker AI, SageMaker Model Monitor, SageMaker Model Cards

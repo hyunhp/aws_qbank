@@ -1,0 +1,385 @@
+# DVA-C02 batch 10: D2 (20), detailed explanations
+
+@ DVA-C02 D2 T2.1 applied use-case
+S: A web app signs users in with a Cognito user pool and exchanges the ID token for AWS credentials through an identity pool whose authenticated role selection is set to "Choose role from token". Some users belong to both the analysts group, which maps to a read-only role, and the admins group, which maps to a broader role. Those users must receive the broader role. What should the developer configure?
+A: Give the admins group a lower precedence number than the analysts group so that its role becomes the value of the cognito:preferred_role claim
+B: Attach the read-only role and the broader role to the same identity pool as a role list so that STS merges both roles into one credential set
+C: Set the identity pool role resolution option to DENY so that users who belong to several groups automatically fall back to the broadest role
+D: Reorder the two groups alphabetically in the user pool so that the admins group is evaluated first when the ID token is generated
+K: A
+G: ## Two Cognito services, two jobs
+- A **user pool** authenticates users and issues JWTs. When a user belongs to groups, the ID token carries `cognito:groups`, `cognito:roles` (the IAM roles of all the user's groups) and `cognito:preferred_role`.
+- An **identity pool** exchanges those tokens for temporary AWS credentials by choosing one IAM role to assume.
+## How the role is chosen
+With "Choose role from token", the identity pool reads the role from the token. A group can have an IAM role and a numeric **precedence**; the lower the number, the higher the priority. When a user is in several groups, `cognito:preferred_role` is set to the role of the group with the lowest precedence number. The identity pool assumes that single role: credentials are never a merge of several roles.
+W: Group precedence: setting a lower precedence number on the admins group makes its role the preferred role in the token, so users in both groups get the broader role.
+X: B=Merged role list: an identity pool assumes exactly one IAM role per credential request, and STS does not merge roles. The cognito:roles claim only lists candidates.
+C=DENY role resolution: this setting decides what happens when no single role can be chosen, and DENY rejects the request instead of picking a broader role.
+D=Alphabetical group order: the order of names has no effect on role choice. Only the precedence value of each group decides which role becomes the preferred role.
+T: With "Choose role from token", the group with the lowest precedence number supplies cognito:preferred_role, and the identity pool assumes only that role.
+V: Amazon Cognito, AWS IAM, AWS STS
+
+@ DVA-C02 D2 T2.1 applied troubleshooting
+S: A REST API uses a Lambda TOKEN authorizer with the default result cache of 300 seconds. The authorizer returns an Allow policy whose Resource is the ARN of the exact method being called. A client calls GET /orders successfully, then calls POST /customers with the same token within a minute and receives 403 with the message that the user is not authorized to access this resource. What should the developer change?
+A: Return a policy whose Resource covers the API's stage and methods, for example with wildcards for the verb and path, so the cached policy applies to every route
+B: Add the Access-Control-Allow-Origin header to the authorizer response so that the second call passes the browser's CORS preflight check for the new route on the same origin
+C: Increase the memory of the authorizer function so that the policy for the second method is generated before the cached result expires
+D: Return a Deny statement for POST /customers in the same policy so that API Gateway evaluates the explicit rule instead of the cached statement
+K: A
+G: ## What API Gateway caches
+A Lambda authorizer returns an IAM policy document. When result caching is enabled, API Gateway stores that policy keyed by the authorizer's identity source, for a TOKEN authorizer the value of the `Authorization` header. For the TTL, the authorizer is not called again for the same token.
+## Why the second call fails
+The cached policy is evaluated against every later request that uses the same token. If the policy allows only `arn:aws:execute-api:region:acct:apiid/stage/GET/orders`, a request for `POST /customers` does not match any Allow statement and API Gateway answers 403.
+Two ways to avoid it: return a policy that covers the routes the caller may use (for example `.../stage/*/*`), or set the TTL to 0 to disable caching.
+W: Wider policy resource: allowing the whole stage (or the routes the user may call) makes the single cached decision valid for every route the token is authorized for.
+X: B=CORS header: authorizer responses do not carry CORS headers, and the 403 comes from the cached policy not matching the route, not from a browser preflight.
+C=Function memory: the function is not invoked at all for the second call because the cached policy is reused. More memory cannot change that.
+D=Extra Deny statement: a Deny would only block more access. The problem is a missing Allow for the second route, and an explicit Deny always overrides an Allow.
+T: A cached Lambda authorizer policy is reused for the whole TTL, so its Resource must cover every route the token may call, or caching must be turned off.
+V: Amazon API Gateway, AWS Lambda
+
+@ DVA-C02 D2 T2.1 advanced troubleshooting
+S: A Lambda function assumes a role in a partner's account using sts:AssumeRole and passes session tags so that the partner's policies can use aws:PrincipalTag conditions. The call fails with AccessDenied and the message states the caller is not authorized to perform sts:TagSession on the target role. The partner's role already trusts the caller's account. What is the fix?
+A: Add sts:TagSession next to sts:AssumeRole in the target role's trust policy statement that trusts the calling principal
+B: Add iam:TagRole and iam:TagUser to the calling role's identity policy so that the role can attach tags to the target role
+C: Replace AssumeRole with GetSessionToken, which accepts a Tags parameter and returns credentials that carry the session tags
+D: Enable the STS regional endpoint for the partner's Region in the caller's account so that tag operations are accepted there
+K: A
+G: ## Session tags
+When you call `AssumeRole` with the `Tags` parameter, the tags become **session tags**: key-value pairs attached to the temporary credentials. Policies can then read them with `aws:PrincipalTag/<key>`, which enables attribute-based access control (ABAC) without a role per team or tenant.
+## Who must allow it
+Passing session tags is a separate action, `sts:TagSession`. The **trust policy of the target role** must allow it for the calling principal, usually in the same statement that allows `sts:AssumeRole`. Without it the whole AssumeRole call is denied, even though the role trust itself is fine.
+W: Trust policy: the target role must grant sts:TagSession to the caller, because the trust policy is the resource-based policy that decides which principals may assume the role and pass tags.
+X: B=iam:TagRole and iam:TagUser: these actions tag IAM resources stored in an account. Session tags live only on the temporary credentials, so those permissions do not apply.
+C=GetSessionToken: this API returns credentials for the caller's own identity and has no Tags parameter, and it cannot assume a role in a partner account.
+D=STS regional endpoint: the AccessDenied message names a missing permission. Endpoint selection affects latency and availability, not authorization.
+T: To pass session tags with AssumeRole, the target role's trust policy must also allow sts:TagSession for the caller.
+V: AWS STS, AWS IAM
+
+@ DVA-C02 D2 T2.1 applied troubleshooting
+S: A container on Amazon ECS on Fargate starts without errors and pulls its image from Amazon ECR, but the application code fails with AccessDenied when it calls dynamodb:PutItem. A developer had added a DynamoDB policy to the task execution role. What is the correct fix?
+A: Attach the DynamoDB permissions to the task role referenced by taskRoleArn in the task definition, because application code uses that role
+B: Keep the permissions on the task execution role and add a trust policy for the application's container process to assume it at runtime
+C: Attach the DynamoDB permissions to the ECS service-linked role so that every task in the cluster inherits them automatically
+D: Create an IAM user with an access key and place the key in the container's environment variables in the task definition
+K: A
+G: ## Two roles on every ECS task
+- The **task execution role** is used by the ECS agent (or Fargate) on your behalf: pulling images from ECR, sending container logs to CloudWatch Logs, and reading secrets referenced in the task definition.
+- The **task role** (`taskRoleArn`) is the identity of your application code. The SDK in the container receives its temporary credentials through the container credentials endpoint.
+## Diagnosis
+The task started and the image was pulled, so the execution role works. AccessDenied inside the code means the task role lacks the permission.
+W: Task role: application SDK calls use the credentials of the role in taskRoleArn, so the DynamoDB permissions belong there.
+X: B=Execution role assumed at runtime: the application does not use the execution role, and adding trust does not change which role the SDK receives. The container gets the task role.
+C=Service-linked role: ECS uses it to manage cluster resources such as network interfaces and load balancer registration. Tasks do not inherit it, and you cannot add arbitrary permissions to it.
+D=IAM user access key: long-lived keys in environment variables leak easily and require manual rotation. The task role supplies temporary credentials automatically.
+T: Execution role = the ECS agent (image pull, logs, secrets); task role = your application code. Application AccessDenied means fix the task role.
+V: Amazon ECS, AWS Fargate, AWS IAM
+
+@ DVA-C02 D2 T2.1 advanced troubleshooting
+S: A team runs Docker containers on an EC2 instance whose instance profile grants access to Amazon SQS. The instance requires IMDSv2 with the default hop limit. The AWS SDK on the instance itself works, but the SDK inside a container times out while looking for credentials. Security requires that IMDSv2 stays mandatory. What should the team do?
+A: Raise the instance metadata HttpPutResponseHopLimit to 2 with modify-instance-metadata-options so that token responses can reach the container network
+B: Set HttpTokens to optional on the instance so that containers can request credentials with IMDSv1 without first having to fetch a session token with a PUT request
+C: Attach a second instance profile that is dedicated to the containers so that each container network namespace receives its own role
+D: Copy the instance's temporary credentials into environment variables when each container starts and refresh them by hand before expiry
+K: A
+G: ## IMDSv2 and the hop limit
+The instance metadata service (IMDS) at `169.254.169.254` hands out the instance profile's temporary credentials. IMDSv2 requires a session token, obtained with a `PUT` request, and the response's IP **TTL (hop limit)** defaults to 1.
+## Why containers time out
+A container sits one network hop behind the instance because traffic passes through the Docker bridge. With a hop limit of 1 the PUT response is dropped before it reaches the container. Setting `HttpPutResponseHopLimit` to 2 allows it while `HttpTokens=required` keeps IMDSv2 enforced.
+W: Hop limit of 2: the token response then survives the extra hop into the container, and IMDSv2 stays required, which meets the security constraint.
+X: B=HttpTokens optional: this re-enables IMDSv1, which is the exact weakness IMDSv2 was built to close (SSRF-style credential theft), so it violates the requirement.
+C=Second instance profile: an instance can be associated with only one instance profile at a time, and containers do not get separate profiles.
+D=Copied credentials: they expire (roughly every few hours) and manual refresh is fragile. Increasing the hop limit lets the SDK refresh from IMDS itself.
+T: Containers behind a bridge need an IMDSv2 hop limit of 2; do not fall back to IMDSv1.
+V: Amazon EC2, AWS IAM
+
+@ DVA-C02 D2 T2.1 applied use-case
+S: A single-page application written in JavaScript signs users in through an Amazon Cognito user pool with the hosted UI and then calls an API. Which TWO choices follow current OAuth 2.0 guidance for this public client? (Select TWO)
+A: Use the authorization code grant with PKCE so that the browser exchanges a one-time code plus a code verifier for tokens at the token endpoint
+B: Create the app client without a client secret, since a secret in downloadable browser code cannot be kept confidential
+C: Use the implicit grant so that the access token is returned in the URL fragment and no token endpoint call is needed
+D: Ship the app client secret in the bundle after minifying the code so that the token endpoint accepts requests from the browser
+E: Use the client credentials grant from the browser so that the app obtains tokens that identify the signed-in end user
+K: A,B
+G: ## Public clients cannot keep secrets
+A single-page app or mobile app runs on the user's device, so anything in its code can be read. OAuth calls such apps **public clients**.
+## What to use instead
+- The **authorization code grant with PKCE** proves that the app that started the sign-in is the one finishing it: the app sends a hash of a random `code_verifier` at the start and reveals the verifier when exchanging the code.
+- The app client is created **without a client secret**, because a secret would be exposed to every user.
+- The implicit grant returns tokens in the redirect URL, where they can leak through history or logs, and is discouraged. The client credentials grant is for machine-to-machine access and represents the app, not a user.
+W: A=Code grant with PKCE: the browser gets tokens through a back-channel exchange, and the verifier stops a stolen code from being redeemed by anyone else.
+B=No client secret: a secret in the bundle is not secret, so public clients must use an app client that has none.
+X: C=Implicit grant: tokens travel in the URL fragment where browser history, referrers and logs can expose them, which is why it is no longer recommended.
+D=Minified secret: minification is not protection. Anyone can read the secret in developer tools and impersonate the app client.
+E=Client credentials grant: it issues tokens for the app itself, with no signed-in user, so it cannot identify the end user.
+T: SPAs and mobile apps are public clients: authorization code + PKCE, and an app client without a secret.
+V: Amazon Cognito
+
+@ DVA-C02 D2 T2.1 advanced troubleshooting
+S: A REST API in Account A uses AWS_IAM authorization on its methods. A role in Account B signs requests with Signature Version 4 and has an identity policy that allows execute-api:Invoke on the API. A developer attaches a resource policy to the API that allows that role, but calls still return 403 several minutes later. Nothing else was changed. What should the developer do?
+A: Deploy the API to the stage again, because a resource policy takes effect on a stage only after a new deployment
+B: Add the API Gateway service principal to the trust policy of the role in Account B so that the API can assume it
+C: Create a usage plan in Account A with an API key for the role in Account B and associate it with the deployed stage
+D: Switch the methods to a Lambda authorizer that returns Account B's account ID in the principalId of its policy
+K: A
+G: ## Resource policies and deployments
+For IAM authorization, API Gateway checks the caller's SigV4 signature and then evaluates policies. Same account: an identity policy or the API's resource policy is enough. **Cross-account**: both must allow, the API's **resource policy** naming the outside principal and the caller's **identity policy** allowing `execute-api:Invoke`.
+## Why this call still fails
+Here both policies are correct, but a resource policy is part of the API configuration that is snapshotted into a stage. When you attach or change it, you must **deploy the API again** to the stage. Until then the stage keeps enforcing the old configuration, which has no statement for the outside role.
+W: Redeployment: the stage keeps enforcing the previous configuration until the API is deployed again, after which the new resource policy allows the Account B role.
+X: B=Trust policy for API Gateway: API Gateway never assumes the caller's role, and the trust policy only governs who can assume that role. It has no part in this authorization.
+C=Usage plan: usage plans work with API keys for throttling and quotas. They are not an authorization mechanism for IAM principals.
+D=Lambda authorizer: a method has one authorization type, and a Lambda authorizer replaces IAM authorization. Its principalId is only an identifier and does not grant cross-account access.
+T: An API resource policy takes effect on a stage only after the API is deployed again; cross-account IAM auth needs it plus the caller's identity policy.
+V: Amazon API Gateway, AWS IAM
+
+@ DVA-C02 D2 T2.2 advanced use-case
+S: A batch orchestrator starts many short-lived worker roles, one per job. Each worker must be able to decrypt one customer managed KMS key only while its job runs, and access must be removed when the job ends. The team does not want to edit the key policy for every job. Which approach fits?
+A: Have the orchestrator call CreateGrant for the worker role with the Decrypt operation, and retire or revoke the grant when the job finishes
+B: Rewrite the key policy with PutKeyPolicy at the start and end of each job so that the worker role is added and removed as a principal
+C: Create a new customer managed key for each job and schedule its deletion with the shortest waiting period once the job completes
+D: Add a kms:ViaService condition to the key policy so that workers can use the key only while calls originate from the batch service
+K: A
+G: ## Three ways to authorize KMS use
+- The **key policy** is the primary document. Every key has one, and it is limited in size, so per-job edits do not scale and are easy to get wrong.
+- **IAM policies** can allow key use only if the key policy permits IAM control.
+- **Grants** are programmatic, delegable permissions: `CreateGrant` names a grantee principal, the allowed operations (for example `Decrypt`), and optionally a retiring principal. Grants suit temporary and per-job access, and `RetireGrant` or `RevokeGrant` removes them.
+W: Grants: the orchestrator issues a narrow, time-bounded Decrypt permission per worker and retires it when the job ends, without touching the key policy.
+X: B=PutKeyPolicy each job: this replaces the whole policy on every call, risks locking out other principals with a mistake, and is slow and hard to audit at job frequency.
+C=One key per job: keys carry a monthly fee, and deletion needs a 7 to 30 day waiting period, so this is costly and would leave data unreadable once the key is gone.
+D=kms:ViaService: this condition restricts which AWS service may make the call on the principal's behalf. It does not grant permission or tie access to the lifetime of a job.
+T: Use KMS grants for temporary, programmatic access; retire them when done instead of rewriting key policies.
+V: AWS KMS
+
+@ DVA-C02 D2 T2.2 applied tradeoff
+S: A company stores documents in S3. Requirements: encryption happens on the S3 side, each use of the key is recorded in AWS CloudTrail, and security can cut off all access to the objects by disabling the key. Which option meets all three?
+A: Server-side encryption with a customer managed KMS key (SSE-KMS), because disabling the key stops decryption and each key use is logged
+B: Server-side encryption with Amazon S3 managed keys (SSE-S3), because the default AES-256 encryption is logged per object in CloudTrail
+C: Server-side encryption with the AWS managed key aws/s3, because security can disable that key at any time from the KMS console
+D: Server-side encryption with customer-provided keys (SSE-C), because S3 stores the key so that security can disable it centrally
+K: A
+G: ## Comparing the S3 server-side options
+- **SSE-S3**: S3 owns and rotates the keys. It is simple and free of key requests, but you cannot see key usage, set a key policy, or disable the key.
+- **SSE-KMS with an AWS managed key** (`aws/s3`): KMS logs use in CloudTrail, but you cannot edit its policy, disable it, or schedule its deletion.
+- **SSE-KMS with a customer managed key**: you control the key policy, can disable or schedule deletion of the key, and every `GenerateDataKey` and `Decrypt` call is a CloudTrail event.
+- **SSE-C**: you send the key with each request; S3 does not store it, and KMS is not involved.
+W: SSE-KMS with a customer managed key: S3 encrypts on the server side, KMS calls appear in CloudTrail, and disabling the key blocks decryption of objects encrypted under it.
+X: B=SSE-S3: S3 manages the keys internally, so there is no per-key CloudTrail record of key use and no switch that security can turn off.
+C=AWS managed key: KMS logs its use, but AWS owns and manages the key. Customers cannot disable it or change its key policy.
+D=SSE-C: S3 does not store the supplied key at all. No central key exists to disable, and the key use is not a KMS event.
+T: SSE-KMS with a customer managed key gives server-side encryption, CloudTrail records of key use, and a key you can disable.
+V: Amazon S3, AWS KMS, AWS CloudTrail
+
+@ DVA-C02 D2 T2.2 advanced use-case
+S: A SaaS platform creates a per-customer data key at sign-up and stores it, encrypted, in DynamoDB. Security requires that the plaintext data key never exists in the sign-up service's memory at that point. The key is decrypted later, only when the customer's data is first written. Which KMS API should the sign-up service call?
+A: GenerateDataKeyWithoutPlaintext, which returns only the ciphertext copy of the new data key for storage
+B: GenerateDataKey, which returns both plaintext and ciphertext, so that the service can encrypt the first record immediately
+C: GenerateRandom, which returns random bytes that the service then encrypts with the Encrypt API before storing them
+D: ReEncrypt, which moves an existing data key from one KMS key to another without exposing it to the caller
+K: A
+G: ## Data key APIs
+Envelope encryption uses a KMS key to protect **data keys**, which encrypt the data itself.
+- `GenerateDataKey` returns a plaintext data key and an encrypted copy. You use the plaintext key to encrypt data, then discard it.
+- `GenerateDataKeyWithoutPlaintext` returns **only the encrypted copy**. You store it and call `Decrypt` later, at the moment you need the key.
+- `GenerateRandom` returns random bytes from the KMS hardware. It does not create a key that is tied to a KMS key.
+- `ReEncrypt` re-wraps existing ciphertext under another KMS key.
+W: GenerateDataKeyWithoutPlaintext: the service never sees the plaintext key at sign-up, and Decrypt recovers it at the first write.
+X: B=GenerateDataKey: it returns the plaintext key to the caller, which is exactly what the requirement forbids at sign-up.
+C=GenerateRandom plus Encrypt: the random bytes are returned in plaintext to the service, so the plaintext key exists in memory. It is also not a KMS-generated data key.
+D=ReEncrypt: it needs an existing ciphertext to transform and does not create a new data key.
+T: Use GenerateDataKeyWithoutPlaintext to pre-create encrypted data keys; call Decrypt only when the key is needed.
+V: AWS KMS, Amazon DynamoDB
+
+@ DVA-C02 D2 T2.2 advanced troubleshooting
+S: An S3 bucket sends object-created events to an SQS queue that is encrypted with a customer managed KMS key. The queue policy already allows s3.amazonaws.com to call sqs:SendMessage from the bucket. No messages arrive. What is the most likely fix?
+A: Add a key policy statement that lets the S3 service principal call kms:GenerateDataKey and kms:Decrypt on the customer managed key
+B: Grant the consumer application's role kms:Decrypt on the key so that S3 can deliver events to the queue on the consumer's behalf
+C: Switch the queue to the AWS managed key alias/aws/sqs, whose key policy already trusts every AWS service that sends messages
+D: Enable an S3 Bucket Key on the source bucket so that the bucket uses its own data key when publishing the event notifications
+K: A
+G: ## Service principals and KMS
+When a queue uses SSE with a KMS key, SQS encrypts each message with a data key. If S3 is the sender, S3 must be allowed to use the key, otherwise the send fails silently from the bucket's perspective and no event appears.
+The key policy must therefore include a statement for `Service: s3.amazonaws.com` allowing `kms:GenerateDataKey` and `kms:Decrypt`, typically limited with `aws:SourceArn` and `aws:SourceAccount` conditions.
+## Why the AWS managed key does not help
+`alias/aws/sqs` is an AWS managed key. Its policy cannot be changed and does not authorize S3 to publish, so encrypted queues that receive S3 events need a customer managed key.
+W: Key policy for S3: with GenerateDataKey and Decrypt allowed for the S3 principal, S3 can write encrypted messages and the events arrive.
+X: B=Consumer decrypt: the consumer reads messages later. Delivery from S3 to the queue fails before any consumer is involved.
+C=AWS managed key: you cannot edit its key policy, and it does not trust S3 as a sender, so this would keep the events from arriving.
+D=Bucket Key: it reduces KMS requests for objects stored in the bucket. It has no effect on the encryption of event messages sent to SQS.
+T: Event sources such as S3 need kms:GenerateDataKey and kms:Decrypt in the customer managed key's policy to publish to an encrypted queue.
+V: Amazon S3, Amazon SQS, AWS KMS
+
+@ DVA-C02 D2 T2.2 applied troubleshooting
+S: A developer creates a public ACM certificate in eu-west-1 and wants it on an edge-optimized custom domain name for an API Gateway API in eu-west-1. The certificate does not appear in the custom domain console. The API must stay edge-optimized. What should the developer do?
+A: Request or import the certificate in us-east-1, because edge-optimized custom domains use a CloudFront distribution that reads certificates from that Region
+B: Export the private key of the eu-west-1 certificate from ACM and import it into the API Gateway custom domain configuration directly
+C: Enable cross-Region certificate replication on the ACM certificate so that a synchronized copy is created in the us-east-1 Region that CloudFront reads from
+D: Upload the certificate to the IAM server certificate store in eu-west-1, which API Gateway edge-optimized domains use as a fallback
+K: A
+G: ## Where ACM certificates must live
+ACM certificates are Regional. A service can use only certificates in the same Region, with one exception: services that front a global CloudFront distribution need their certificate in **us-east-1**.
+- **Edge-optimized API custom domains** are served by an API Gateway-managed CloudFront distribution, so the certificate must be in us-east-1.
+- **Regional API custom domains** and Application Load Balancers use a certificate from the same Region as the resource.
+## What does not exist
+ACM does not export public certificate private keys and has no cross-Region replication feature.
+W: us-east-1: the certificate for an edge-optimized custom domain must be created or imported there, whatever Region the API itself is in.
+X: B=Export and import: ACM public certificates cannot be exported, because ACM keeps the private key and never releases it.
+C=Certificate replication: ACM has no such feature. Each Region holds its own certificates.
+D=IAM certificate store: this store exists for CloudFront in Regions where ACM is not available. API Gateway custom domains take certificates from ACM.
+T: ACM certificates are Regional; edge-optimized API domains and CloudFront need them in us-east-1, Regional APIs and ALBs need them in their own Region.
+V: AWS Certificate Manager, Amazon API Gateway
+
+@ DVA-C02 D2 T2.2 applied troubleshooting
+S: A Lambda function generates a presigned GET URL for an object encrypted with SSE-KMS under a customer managed key. The function's role can call s3:GetObject on the bucket but has no KMS permissions. Users who open the URL receive AccessDenied. What is the fix?
+A: Allow kms:Decrypt on the key for the role that signed the URL, since a presigned request runs with the permissions of its signer
+B: Grant each end user kms:Decrypt on the key, so that requests that carry the presigned URL are authorized as the end user
+C: Increase the URL expiration time so that the KMS key policy has enough time to authorize the presigned request
+D: Make the bucket public for reads so that the presigned URL no longer has to pass through the KMS key policy
+K: A
+G: ## How presigned URLs authorize
+A presigned URL embeds a signature made with the signer's credentials. S3 treats the request as if the **signer** made it, so the signer's permissions decide the result, for as long as the URL and the credentials are valid. The end user needs no AWS identity.
+## SSE-KMS adds a second check
+For an SSE-KMS object, S3 must call KMS to decrypt the data key for the signer. The signer therefore also needs `kms:Decrypt` on the key (and the key policy must allow it). Requests for KMS-encrypted objects must use Signature Version 4, which current SDKs use by default.
+W: Signer permissions: adding kms:Decrypt to the role that generated the URL lets S3 decrypt the object on that role's behalf.
+X: B=End user permissions: users hold only the URL and have no IAM identity. Their permissions are never evaluated.
+C=Longer expiration: the failure is a missing permission, not a time window. A longer URL just stays denied for longer.
+D=Public bucket: objects that are SSE-KMS encrypted still need KMS permissions for whoever reads, so public access does not remove the KMS check, and it is unsafe.
+T: A presigned URL acts with its signer's permissions, so the signer needs kms:Decrypt for SSE-KMS objects.
+V: Amazon S3, AWS KMS, AWS Lambda
+
+@ DVA-C02 D2 T2.2 advanced use-case
+S: A partner without any AWS account must send confidential files that only the company can read. The company wants the private key to stay inside AWS KMS and never be exported. Which design fits?
+A: Create an asymmetric RSA KMS key with ENCRYPT_DECRYPT usage, share its public key from GetPublicKey, and decrypt with kms:Decrypt
+B: Create a symmetric KMS key, export its key material through the console, and send the material to the partner for local encryption
+C: Create an IAM user for the partner with kms:Encrypt permission on a symmetric key and give the partner an access key for that user
+D: Ask the partner to upload files with SSE-C so that the company's KMS key encrypts them and S3 keeps the customer-provided key
+K: A
+G: ## Symmetric and asymmetric KMS keys
+- A **symmetric** KMS key never leaves KMS unencrypted. Every encrypt or decrypt is a KMS API call that needs AWS credentials.
+- An **asymmetric** KMS key is a public and private key pair. The private key stays in KMS. `GetPublicKey` returns the public half, which anyone can use outside AWS to encrypt, with no AWS credentials.
+## Fit for this scenario
+The partner encrypts locally with the public key (RSA with OAEP padding). The company later calls `kms:Decrypt` with the key ID. Direct RSA encryption handles only small payloads, so in practice the partner encrypts a random symmetric key this way and uses that key for the file.
+W: Asymmetric RSA key: the public key can be given out freely while the private key remains in KMS and is used only through kms:Decrypt.
+X: B=Exporting a symmetric key: KMS does not export key material of KMS keys, and sharing one secret key with an outside party defeats the goal.
+C=IAM user for the partner: it creates long-lived credentials for someone outside the organization, and the requirement says the partner has no AWS account.
+D=SSE-C: with SSE-C, S3 encrypts with a key that the client supplies on each request, and KMS is not used. The key is not stored, so it cannot be a KMS key.
+T: Use an asymmetric KMS key when outside parties must encrypt for you: publish the public key, keep the private key in KMS.
+V: AWS KMS
+
+@ DVA-C02 D2 T2.3 applied use-case
+S: An application in us-east-1 reads a database password from Secrets Manager. The company adds a warm standby in eu-west-1 that must use the same secret name with the current, automatically rotated value, without custom synchronization code. Which approach fits?
+A: Enable multi-Region replication of the secret to eu-west-1 so that the replica receives every rotated value from the primary
+B: Create a separate secret in eu-west-1 and give it its own rotation schedule so that both secrets rotate at about the same time
+C: Store the password in Parameter Store and turn on cross-Region parameter replication so that the standby reads the same value
+D: Run a scheduled Lambda function that copies the secret from us-east-1 into eu-west-1 with an EventBridge rule every few minutes
+K: A
+G: ## Secret replication
+Secrets Manager can **replicate a secret to other Regions**. The replica has the same name and value as the primary, can be read in the remote Region, and can use a different KMS key there.
+- Rotation runs on the **primary**. Each new secret version is copied to the replicas automatically.
+- A replica can be **promoted** to a standalone secret if the primary Region is lost.
+## Why not the other options
+Two independent secrets drift apart when rotations differ or fail. Parameter Store has no cross-Region replication. A copy job works but adds code, failure modes and lag that replication already handles.
+W: Replication: the replica in eu-west-1 keeps the same name and always holds the value that the primary rotated, so failover needs no synchronization code.
+X: B=Two independent secrets: each rotation generates a new password, so the database and the two secrets will not match unless the rotation lands on the same value, which independent rotations cannot guarantee.
+C=Parameter Store replication: Parameter Store has no cross-Region replication feature, and it has no built-in rotation.
+D=Scheduled copy Lambda: it adds custom code, permissions and a window in which the standby reads a stale value, all of which replication already solves.
+T: Use Secrets Manager multi-Region replication for DR: rotate on the primary, read the replica locally, promote it if needed.
+V: AWS Secrets Manager
+
+@ DVA-C02 D2 T2.3 advanced troubleshooting
+S: A secret in Account A is encrypted with the default aws/secretsmanager key. The developer added a resource-based policy allowing a role in Account B to call secretsmanager:GetSecretValue, and the role's identity policy allows it too. The call still fails. What should the developer change?
+A: Re-encrypt the secret with a customer managed KMS key whose key policy allows the Account B role to use kms:Decrypt
+B: Add a statement to the key policy of the aws/secretsmanager key so that the role in Account B may decrypt values with it
+C: Replicate the secret to Account B with multi-Region replication so that the role can read a local copy in its own account
+D: Attach the AWSSecretsManagerReadWrite managed policy to the role in Account B so that it may read secrets in every account
+K: A
+G: ## Cross-account secrets have two layers
+1. **Access to the secret**: the secret's resource-based policy plus the caller's identity policy, both allowing `secretsmanager:GetSecretValue`.
+2. **Access to the encryption key**: the caller must be allowed to use the KMS key that encrypts the secret.
+## The AWS managed key limitation
+The `aws/secretsmanager` key is owned by AWS and its key policy is not editable. It can only be used by principals in the same account, so other accounts can never decrypt with it. A secret meant for cross-account use must be encrypted with a **customer managed key** whose key policy allows the other account, and the caller's role needs `kms:Decrypt` too.
+W: Customer managed key: it lets you write a key policy that trusts Account B, which is required for the outside role to decrypt the secret value.
+X: B=Editing the AWS managed key: you cannot modify the key policy of an AWS managed key, so there is nothing to change.
+C=Replication to Account B: multi-Region replication copies a secret to other Regions of the same account, not to another account. Cross-account access uses resource-based policies.
+D=Managed policy: this only adds identity permissions in Account B. The block is on the key, and identity policies cannot grant use of a key that lives in another account.
+T: Cross-account secret access needs the resource policy, the caller's identity policy, and a customer managed KMS key that trusts the other account.
+V: AWS Secrets Manager, AWS KMS
+
+@ DVA-C02 D2 T2.3 applied use-case
+S: An orders microservice must read only the SecureString parameters under the path /prod/orders/, including any parameters that the team adds later, and must never read parameters of other teams. Parameters use a customer managed KMS key. Which IAM policy design meets this with least privilege?
+A: Allow ssm:GetParameter and ssm:GetParameters on the ARN pattern parameter/prod/orders/*, and allow kms:Decrypt on the specific key ARN
+B: Allow ssm:GetParameter on the ARN pattern parameter/* in the account, and rely on parameter names to hide the other teams' values
+C: Allow ssm:* on all parameters, and add a Deny for each of the other teams' parameter paths as those teams are onboarded
+D: Allow ssm:GetParameter on the exact ARN of each current parameter, and update the policy on the role each time a new one is created
+K: A
+G: ## Hierarchies and IAM
+Parameter Store names can be organized as paths, such as `/prod/orders/db-password`. IAM policies can use a wildcard on the parameter ARN, for example `arn:aws:ssm:us-east-1:111122223333:parameter/prod/orders/*`, to grant access to everything below a path, including parameters created later.
+## The KMS half
+Reading a `SecureString` with `WithDecryption` also calls KMS on the caller's behalf. With a customer managed key, the role needs `kms:Decrypt` on that key, and the key policy must allow it. Scoping both permissions narrowly keeps the blast radius small.
+W: Path ARN wildcard plus key-scoped decrypt: covers current and future parameters under /prod/orders/ and nothing outside them.
+X: B=parameter/*: this allows reading every parameter in the account. Names are not a secret, and a name is the only thing standing in the way.
+C=ssm:* with Deny lists: it starts from broad access and depends on someone adding a Deny for every future team, so a missed path leaks values.
+D=Per-parameter ARNs: it meets least privilege, but it requires a policy change for each new parameter, which the requirement said must work automatically.
+T: Organize parameters in paths and grant access to a path wildcard ARN plus kms:Decrypt on the specific key.
+V: AWS Systems Manager Parameter Store, AWS IAM, AWS KMS
+
+@ DVA-C02 D2 T2.3 applied use-case
+S: Developers upload customer documents to S3 buckets, and the compliance team suspects some contain personal data such as national ID numbers and credit card numbers. They want automated discovery of which objects hold sensitive data, with findings sent to EventBridge. Which service should be used?
+A: Amazon Macie sensitive data discovery jobs, which scan S3 objects with managed data identifiers and publish findings to EventBridge
+B: Amazon GuardDuty S3 protection, which inspects the contents of uploaded objects and reports the ID and card numbers it detects in them
+C: Amazon Inspector, which scans S3 objects for national ID numbers and credit card numbers as part of its vulnerability assessments
+D: IAM Access Analyzer, which classifies S3 objects by data sensitivity and reports the buckets that hold personal data
+K: A
+G: ## Which service answers which question
+- **Amazon Macie** looks **inside** S3 objects. Sensitive data discovery jobs and automated discovery use managed data identifiers (financial data, personal identifiers, credentials) and custom identifiers, and publish findings to EventBridge and Security Hub.
+- **Amazon GuardDuty** detects threats from behaviour, such as unusual API calls or access patterns, including S3 data events. It does not read the contents of objects for personal data.
+- **Amazon Inspector** finds software vulnerabilities and unintended network exposure in EC2, ECR images and Lambda functions.
+- **IAM Access Analyzer** finds resources shared outside your account or organization. It reports who can reach the data, not what the data contains.
+W: Macie: it scans object content with managed data identifiers for personal and financial data and emits findings to EventBridge.
+X: B=GuardDuty S3 protection: it monitors S3 data events for suspicious activity. It does not scan object contents for personal data.
+C=Inspector: it assesses compute workloads for vulnerabilities, and it does not classify content in S3 objects.
+D=Access Analyzer: it tells you which buckets are exposed outside the trust zone, not which objects hold sensitive data.
+T: Macie discovers sensitive data inside S3; GuardDuty, Inspector and Access Analyzer answer threat, vulnerability and exposure questions.
+V: Amazon Macie, Amazon S3, Amazon EventBridge
+
+@ DVA-C02 D2 T2.3 advanced comparison
+S: A team writes a custom rotation Lambda function for a third-party API key stored in Secrets Manager. In the rotation workflow, which step should call the third-party API to make the new key valid, and under which staging label does the new version exist at that point?
+A: The setSecret step calls the third-party API using the new version, which is labeled AWSPENDING until the finishSecret step promotes it
+B: The createSecret step calls the third-party API, using the AWSCURRENT version so that the new key is valid before it is stored
+C: The testSecret step calls the third-party API to create the new key, and the new version holds the AWSPREVIOUS label until it is verified
+D: The finishSecret step calls the third-party API to register the new key, and the new version already holds the AWSCURRENT label
+K: A
+G: ## The four rotation steps
+Secrets Manager invokes a rotation function repeatedly, once per step, with the secret ARN, a client request token (the new version) and the step name:
+1. `createSecret`: generate a new secret value and store it as a new version labeled **AWSPENDING**.
+2. `setSecret`: change the credential in the **target service** (database, API) to match the pending value.
+3. `testSecret`: verify that the pending value works.
+4. `finishSecret`: move **AWSCURRENT** to the new version. The old one receives **AWSPREVIOUS**.
+## Why the labels matter
+Applications read `AWSCURRENT` by default, so they keep working with the old value until the last step. If a step fails, AWSCURRENT is unchanged.
+W: setSecret with AWSPENDING: only after the third-party API knows the new key does testSecret verify it and finishSecret move the AWSCURRENT label.
+X: B=createSecret with AWSCURRENT: this step only generates and stores a new pending value. It does not change the third-party service, and AWSCURRENT still points to the old key.
+C=testSecret creating the key: this step only verifies the pending value. The label AWSPREVIOUS marks the old value after the switch, not a new version.
+D=finishSecret registering the key: by this step the API must already accept the new key. The step only moves labels, and the label is not AWSCURRENT before it runs.
+T: Rotation steps: createSecret (AWSPENDING), setSecret (change the target), testSecret (verify), finishSecret (move AWSCURRENT).
+V: AWS Secrets Manager, AWS Lambda
+
+@ DVA-C02 D2 T2.3 applied use-case
+S: A CodeBuild project needs a private registry token during the build. The token is stored in Secrets Manager, and it must not appear in the buildspec file, in the project configuration in plaintext, or in build logs. Which TWO actions should the developer take? (Select TWO)
+A: Reference the secret in the env section of the buildspec under secrets-manager, mapping it to an environment variable name
+B: Allow secretsmanager:GetSecretValue on the secret in the CodeBuild service role so that the build can resolve the reference
+C: Define the token as a PLAINTEXT environment variable on the project and rely on the project's KMS key to encrypt the value
+D: Commit the token to the source repository in an encrypted zip file and unzip it in the pre_build phase using a passphrase
+E: Store the token in an S3 object next to the buildspec and copy it into the build environment with the AWS CLI when the build starts
+K: A,B
+G: ## Keeping secrets out of build configuration
+CodeBuild environment variables can be of type `PLAINTEXT`, `PARAMETER_STORE` or `SECRETS_MANAGER`. Values of the last two types are fetched at build time, and CodeBuild masks them in logs.
+- In a buildspec, the `env` section has `secrets-manager` and `parameter-store` maps that turn secret references into variables.
+- The **service role** of the project must have permission to read the secret (and decrypt it if a customer managed key is used), otherwise the build fails while resolving the variable.
+W: A=Secrets Manager mapping: the buildspec holds only a reference, and CodeBuild fetches the value at run time and masks it in the logs.
+B=Service role permission: the build resolves the reference with the project's role, so that role must be allowed to read the secret.
+X: C=PLAINTEXT variable: the value is readable in the project configuration and in the console. The project KMS key encrypts artifacts, not the visibility of plaintext variables.
+D=Encrypted zip in the repository: it spreads a secret through source history, and the passphrase must be stored somewhere as another secret.
+E=Token in S3: it moves the secret into an object store instead of a secret manager, without rotation, and the CLI call may print it in the logs.
+T: Use SECRETS_MANAGER (or PARAMETER_STORE) variable types in the buildspec and let the service role read the secret.
+V: AWS CodeBuild, AWS Secrets Manager

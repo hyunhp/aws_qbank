@@ -1,0 +1,409 @@
+# DOP-C02 batch 07: Domain 6 (security and compliance), T6.1 IAM automation, T6.2 security control automation, T6.3 monitoring and auditing
+
+@ DOP-C02 D6 T6.1 advanced use-case
+S: A company runs about 60 AWS accounts in AWS Organizations and manages workforce access with IAM Identity Center. Platform engineers want the "PlatformAdmins" group to receive the "OperationsAccess" permission set in every account under the Workloads OU, including accounts created in the future, with no ticket-driven manual assignment. Account creation is already automated with AWS Control Tower Account Factory. Which solution meets the requirement with the LEAST operational overhead?
+A: An EventBridge rule on the Control Tower account lifecycle event that invokes a Lambda function calling CreateAccountAssignment
+B: A scheduled Lambda function deployed in every new account that polls Organizations hourly and then writes the new account ID into the group's IAM policy in that account
+C: A service control policy attached to the Workloads OU that grants the PlatformAdmins group all of the OperationsAccess permissions in every member account
+D: A CloudFormation StackSet with auto-deployment that creates an IAM role trusting the identity provider in each account, replacing the permission set entirely
+K: A
+G: ## How Identity Center grants access to accounts
+IAM Identity Center does not attach permissions to accounts directly. You create a **permission set**, and an **account assignment** links a principal (user or group), a permission set and one AWS account. When an assignment is created, Identity Center provisions a matching IAM role in the target account.
+## Why assignments need automation
+Assignments are created per account. A new account has no assignments until something creates them, so a fleet that grows by automated account vending needs an event-driven step that runs at the moment an account appears.
+- Control Tower publishes lifecycle events (for example when Account Factory finishes creating or enrolling an account) to EventBridge in the management account.
+- The Identity Center APIs, including `CreateAccountAssignment`, can be called from the management account or from a delegated administrator account.
+W: EventBridge plus Lambda: the Control Tower lifecycle event fires exactly when a new account is ready, and the function creates the group assignment through the Identity Center API. Nothing is polled, nothing has to be deployed inside the member account, and the same function can be reused for every OU.
+X: B=Hourly polling inside each account: member accounts have no reason to hold this logic, and an IAM policy in an account cannot create Identity Center assignments, which are managed centrally. Polling also leaves new accounts without access for up to an hour.
+C=SCP on the OU: service control policies only set the maximum permissions an account can use. They never grant access to anyone, so this would not give the group any permissions.
+D=StackSet with a custom role: this bypasses Identity Center, so access is no longer governed by permission sets, session durations and central group membership. It also still needs a trigger for each new account.
+T: Identity Center access to new accounts needs an account assignment; trigger CreateAccountAssignment from the account-creation lifecycle event. SCPs never grant permissions.
+V: AWS IAM Identity Center, AWS Control Tower, Amazon EventBridge
+
+@ DOP-C02 D6 T6.1 advanced tradeoff
+S: A platform team stores IAM policy templates for application roles in a Git repository and deploys them with CodePipeline and CloudFormation. Security requires that a pull request must fail if the changed policy would grant any access that the previously deployed version of the policy did not already grant, so reviewers only need to focus on genuine permission increases. Which pipeline step implements this check?
+A: A CodeBuild step calling IAM Access Analyzer CheckNoNewAccess with the updated policy and the currently deployed policy as reference
+B: A CodeBuild step that calls IAM Access Analyzer ValidatePolicy on the updated policy document and fails the build on any error, security warning or suggestion returned
+C: A CloudFormation Guard rule that fails when the policy document contains the string "Allow" more times than the current version
+D: An IAM Access Analyzer external access analyzer for the account, with an EventBridge rule that notifies the team after deployment
+K: A
+G: ## Two different Access Analyzer capabilities
+IAM Access Analyzer is often described as one feature, but it offers several checks that answer different questions.
+- **ValidatePolicy** lints a single policy against the IAM policy grammar and best practices, and returns errors, security warnings and suggestions. It has no notion of "before and after".
+- **Custom policy checks** compare policies. `CheckNoNewAccess` takes a reference policy and a new policy and reports whether the new one allows anything the reference did not. `CheckAccessNotGranted` checks a policy against a list of actions or resources that must never be allowed.
+- The **external access analyzer** inspects resources that are already deployed and reports access from outside your zone of trust.
+## Where each fits in a pipeline
+Custom policy checks are meant to run in CI/CD before deployment, using the reference policy from the last good version.
+W: CheckNoNewAccess compares the proposed policy with the reference and fails when permissions were added, which is exactly the "only real increases" signal the reviewers need, and it runs before the change reaches an account.
+X: B=ValidatePolicy: it evaluates one policy in isolation for syntax and best-practice findings. A policy can be perfectly valid and still grant far more than the previous version, and warnings can also appear for policies that grant nothing new.
+C=Guard rule counting "Allow": counting statements says nothing about the effective permissions. A single statement that widens an action wildcard adds far more access than a new narrow statement, so the check would give both wrong verdicts.
+D=External access analyzer: it works on deployed resources and reports external principals, not permission increases for principals inside the account, and it acts after the change has already been deployed.
+T: To block permission increases before deployment, run Access Analyzer custom policy checks (CheckNoNewAccess against the reference policy); ValidatePolicy only lints one policy.
+V: IAM Access Analyzer, AWS CodeBuild, AWS CodePipeline
+
+@ DOP-C02 D6 T6.1 advanced use-case
+S: An enterprise runs data-collection servers in three on-premises data centers. The servers currently use IAM user access keys that are rotated by a script every 90 days, and several rotations have failed and left servers with expired keys. The company operates a private certificate authority and wants the servers to call AWS APIs with short-lived credentials, without long-term secrets stored on the servers. Which solution should the DevOps engineer implement?
+A: Configure IAM Roles Anywhere with a trust anchor for the private CA and a profile that maps to an IAM role, and use the credential helper with each server's certificate
+B: Register the servers as Systems Manager hybrid nodes and let each application read its access key from a Parameter Store SecureString parameter that is rotated daily
+C: Create an Amazon Cognito identity pool and have each server sign in as an unauthenticated identity to receive temporary credentials
+D: Move the rotation script into an AWS Secrets Manager rotation Lambda function so the access keys are rotated every 30 days
+K: A
+G: ## Long-term keys versus temporary credentials
+An IAM user access key stays valid until someone rotates or deletes it, so it is a permanent secret on every machine that holds it. Temporary credentials from AWS STS expire on their own, typically within an hour, and cannot be reused long after a leak.
+## IAM Roles Anywhere
+Workloads outside AWS often cannot use an instance profile or an OIDC token. IAM Roles Anywhere lets them prove their identity with an X.509 certificate instead.
+- A **trust anchor** registers your certificate authority (AWS Private CA or an external CA).
+- A **profile** lists which IAM roles can be assumed and can restrict them with session policies.
+- The **credential helper** signs the request with the server's private key and returns temporary credentials that the AWS SDKs read as an external credential process.
+W: Roles Anywhere turns the existing private CA into the identity source. Servers authenticate with their certificates and receive temporary credentials, so there are no access keys to rotate and no stored secrets except the certificate's private key.
+X: B=Hybrid nodes plus SecureString: Systems Manager hybrid activations register machines for Systems Manager, and they do not vend credentials to your own applications. Storing an access key in Parameter Store still keeps a long-term key on every machine.
+C=Unauthenticated Cognito identities: anyone who can reach the identity pool could obtain the credentials, so it removes authentication instead of improving it, and it is not designed for identifying servers.
+D=Secrets Manager rotation for keys: shortening the rotation window helps a little, but the servers still depend on long-term keys and on a rotation process that already failed. The requirement was to eliminate stored long-term secrets.
+T: On-premises workloads with a certificate authority should use IAM Roles Anywhere (trust anchor, profile, credential helper) instead of rotated IAM user keys.
+V: IAM Roles Anywhere, AWS Private CA, AWS IAM
+
+@ DOP-C02 D6 T6.1 advanced troubleshooting
+S: A DevOps engineer creates a CloudFormation StackSet with service-managed permissions from the management account. The template creates IAM roles with explicit RoleName values. Every create-stack-instances operation fails immediately with an InsufficientCapabilitiesException, and no stack instance is created in any account. The engineer confirms that trusted access for StackSets is enabled in Organizations. What is the cause and the fix?
+A: The template creates named IAM resources, so the StackSet must be created or updated with the CAPABILITY_NAMED_IAM capability acknowledged
+B: The target accounts lack the AWSCloudFormationStackSetExecutionRole, so it must be created manually in every account before deployment
+C: Named IAM roles are not allowed in StackSets, so the RoleName property must be removed to let CloudFormation generate names
+D: The operation must be run from a delegated administrator account because the management account cannot deploy IAM resources
+K: A
+G: ## Why CloudFormation demands capabilities
+Templates that create or modify IAM resources can change who has access to an account. CloudFormation therefore refuses to run them unless the caller explicitly acknowledges it.
+- `CAPABILITY_IAM` acknowledges IAM resources that CloudFormation names itself.
+- `CAPABILITY_NAMED_IAM` is required when the template sets custom names such as `RoleName`.
+- `CAPABILITY_AUTO_EXPAND` is for macros and nested stacks with transforms.
+The acknowledgement is part of the request. It applies to StackSets exactly as it applies to a regular stack.
+## Service-managed versus self-managed
+With service-managed permissions, StackSets uses trusted access with Organizations and creates the execution roles in target accounts on its own. With self-managed permissions you create the administration and execution roles yourself.
+W: An InsufficientCapabilitiesException that appears before any instance is created means the request did not acknowledge the IAM capability. Custom role names require CAPABILITY_NAMED_IAM, so passing it when creating or updating the StackSet resolves the failure.
+X: B=Missing execution roles: those roles are only needed for self-managed permissions. With service-managed permissions, StackSets creates them, and a missing role would produce a failure per stack instance rather than an error about capabilities.
+C=Named roles are not allowed: StackSets can deploy roles with custom names. The only difference is the capability that must be acknowledged, and a fixed name also has to be unique per account.
+D=Delegated administrator needed: the management account can deploy service-managed StackSets, including IAM resources. A delegated administrator is an option for separating duties, not a requirement to create IAM roles.
+T: IAM resources with custom names need CAPABILITY_NAMED_IAM, also for StackSets; an InsufficientCapabilitiesException means the capability was not acknowledged.
+V: AWS CloudFormation, AWS Organizations
+
+@ DOP-C02 D6 T6.1 advanced use-case
+S: A security team applies an SCP to the Workloads OU that must prevent anyone from changing or deleting IAM roles whose names start with "sec-baseline-". The only exception is the "sec-pipeline-deployer" role, which the central pipeline uses to maintain these roles in every account. The engineer drafts a Deny statement for iam:DeleteRole, iam:UpdateAssumeRolePolicy, iam:PutRolePolicy and related actions on the baseline role ARNs. How should the exception for the deployer role be expressed?
+A: Add a Condition with ArnNotLike on aws:PrincipalArn that lists the deployer role's ARN pattern, so the Deny does not match calls from that role
+B: Use a NotPrincipal element in the Deny statement that names the deployer role
+C: Add a second SCP statement that Allows the same actions for the deployer role's ARN
+D: Add a Condition with StringNotEquals on the aws:username key set to the name of the sec-pipeline-deployer role so the Deny skips it
+K: A
+G: ## What SCP statements can and cannot contain
+Service control policies use IAM policy syntax, but only part of it. They limit what identities in an account can do, and they never grant permissions. Two consequences matter here.
+- SCPs do not support the `Principal` or `NotPrincipal` elements. To target or exempt particular identities you must use condition keys.
+- An Allow statement in an SCP only lets permissions through the guardrail. It cannot override an explicit Deny, because an explicit Deny always wins.
+## The common exemption pattern
+A Deny statement can be scoped so that it applies to everyone except a trusted role by adding a condition on `aws:PrincipalArn` with `ArnNotLike`. The deployer role, matching the condition, is not affected by the Deny, while its own IAM policy still decides what it can do.
+W: Condition-based exemption: ArnNotLike on aws:PrincipalArn makes the Deny apply to every principal except the deployer role. Because the pattern can include the account wildcard, one SCP works for all accounts in the OU.
+X: B=NotPrincipal: the Principal and NotPrincipal elements are not supported in SCPs, so the policy would be rejected. Principal-based exceptions belong in resource policies.
+C=Second Allow statement: an explicit Deny takes precedence over any Allow, so the deployer would still be blocked. Allow statements in an SCP also never grant anything on their own.
+D=aws:username: this key is present for IAM users and is not populated when a role is assumed, so the condition would not identify the deployer and the exception would silently fail to match.
+T: SCPs have no Principal element; exempt a role from a Deny with an ArnNotLike condition on aws:PrincipalArn. An explicit Deny cannot be overridden by another Allow.
+V: AWS Organizations, AWS IAM
+
+@ DOP-C02 D6 T6.1 advanced tradeoff
+S: A SaaS company has 200 project teams. Each team's engineers sign in through IAM Identity Center, and each project has its own S3 buckets and DynamoDB tables tagged with a Project tag. The security team wants engineers to reach only resources of their own project, without creating and maintaining a separate permission set or policy for each of the 200 projects, and without changes when engineers move between projects. Which design should the DevOps engineer implement?
+A: Enable attributes for access control, map a Project attribute, and use one permission set comparing aws:PrincipalTag/Project with aws:ResourceTag/Project
+B: Create one permission set per project with resource ARNs hardcoded in the policy, and generate them with a script from the project list
+C: One permission set for all engineers with access to tagged resources, plus an SCP that denies access whenever a resource lacks a Project tag
+D: Create an IAM user for each engineer in every account and attach a policy that is edited whenever the engineer changes projects
+K: A
+G: ## Attribute-based access control (ABAC)
+Role-based access control needs a role or policy per group of resources. **ABAC** decides access by comparing tags: attributes on the caller (the principal) against tags on the resource.
+- IAM Identity Center can pass user attributes from its identity store, or from an external identity provider, to the session as principal tags when attributes for access control is enabled.
+- A single policy can then use a condition such as `aws:ResourceTag/Project` equal to `${aws:PrincipalTag/Project}`.
+## Why it scales
+New projects only need correctly tagged resources and correctly populated user attributes. No policy changes are required, and an engineer who changes projects gets different access as soon as the attribute changes and the next session starts.
+W: ABAC with one permission set: the Project attribute becomes a principal tag on each session and the policy allows actions only when it equals the resource's Project tag. The 200 projects need no additional policies, and moves between teams are handled in the identity source.
+X: B=Scripted permission sets: this still creates and maintains 200 permission sets and every project change means regenerating and reprovisioning them. It automates the burden without removing it.
+C=Broad permission set plus SCP: an SCP that only checks whether the tag is missing does not compare the caller's project with the resource's project, so any engineer could still reach every tagged project.
+D=Per-engineer IAM users: IAM users bypass central sign-in, create long-term credentials and multiply policies across accounts, the opposite of the goal.
+T: For many projects with one policy, use ABAC: Identity Center attributes for access control become principal tags compared with resource tags.
+V: AWS IAM Identity Center, AWS IAM
+
+@ DOP-C02 D6 T6.1 advanced use-case
+S: A platform team lets application teams deploy their own stacks through a shared CodePipeline, and the stacks create IAM roles for workloads. The team wants to prevent privilege escalation through the pipeline. Which TWO controls should be implemented together? (Select TWO)
+A: Allow developers to pass only the designated CloudFormation service role, using iam:PassRole with the iam:PassedToService condition set to cloudformation.amazonaws.com
+B: Add a condition to the service role's policy so that iam:CreateRole and iam:PutRolePolicy are allowed only when the role carries the approved permissions boundary
+C: Grant developers the AdministratorAccess managed policy in the deployment account and have the security team review CloudTrail events for misuse every week
+D: Enable IAM Access Analyzer unused access findings and delete any role that appears in the report each quarter
+E: Store the stack templates in a private S3 bucket with versioning enabled so that changes to a template can be reversed
+K: A,B
+G: ## How escalation happens through a pipeline
+A CloudFormation service role runs with its own permissions, not the developer's. If the developer can pass a powerful role to the stack, or if the service role can create any role without limits, then anyone allowed to edit a template can obtain permissions above their own.
+## Two guardrails that close the gap
+- **Restrict who can pass which role.** `iam:PassRole` should cover only the intended service role, and the `iam:PassedToService` condition confines it to CloudFormation.
+- **Restrict what the service role can create.** The service role's policy can require the permissions boundary condition key `iam:PermissionsBoundary` on role creation and on actions that change role permissions, so every role created through the pipeline is capped.
+W: A=PassRole restriction: developers can hand only the approved service role to CloudFormation, so they cannot pick a more powerful role for their stacks.
+B=Boundary condition on the service role: every role the pipeline creates must carry the approved permissions boundary, so a template cannot mint a role with more access than the boundary allows.
+X: C=AdministratorAccess: giving developers administrative access removes the guardrail entirely, and detection after the fact does not prevent escalation.
+D=Unused access findings: these report permissions that are not being used, which is good hygiene, but they do not stop a new role from being created with excessive permissions.
+E=Versioned template bucket: versioning helps you review and roll back template changes, but it does not restrict which roles can be passed or created.
+T: Prevent pipeline privilege escalation by limiting iam:PassRole to the service role and requiring a permissions boundary on the roles it creates.
+V: AWS CloudFormation, AWS IAM, AWS CodePipeline
+
+@ DOP-C02 D6 T6.2 advanced troubleshooting
+S: A team configured the AWS Config rule ec2-ebs-encryption-by-default and attached an automatic remediation action that runs the AWS-managed SSM Automation runbook AWS-EnableEbsEncryptionByDefault. Noncompliant Regions are correctly reported, but every remediation execution ends with an AccessDenied error in the SSM Automation execution history, and the rule stays noncompliant. The rule's remediation configuration does not specify any role parameter. What is the most likely fix?
+A: Add an AutomationAssumeRole parameter naming an IAM role that ssm.amazonaws.com trusts and that may call ec2:EnableEbsEncryptionByDefault
+B: Attach the AWSConfigRole managed policy to the Config service-linked role so that it can call Systems Manager
+C: Change the remediation from automatic to manual so that the console user's own permissions are used whenever an administrator runs the runbook for a Region
+D: Enable Config recording of all resource types, because the runbook cannot read resources that are not recorded
+K: A
+G: ## How Config remediation actually runs
+An AWS Config rule only evaluates compliance. A **remediation configuration** connects a rule to an SSM Automation runbook and supplies its parameters, such as the resource ID.
+- Config starts the Automation execution, but the runbook's steps run under the identity in the `AutomationAssumeRole` parameter.
+- If none is given, Automation uses the permissions of the caller that started it. For automatic remediation that caller is Config, which does not have the resource-modifying permissions the runbook needs.
+- The role therefore needs a trust policy for `ssm.amazonaws.com` and permissions for the specific changes, and Config's caller must be allowed to pass it.
+## Reading the failure
+The error appears inside the Automation execution rather than in the rule's evaluation, which shows detection works and permissions for the fix do not.
+W: AutomationAssumeRole supplies the identity that performs the change. With a role trusted by ssm.amazonaws.com and permissions to enable EBS encryption by default, the runbook can make the change and the rule becomes compliant.
+X: B=AWSConfigRole on the service-linked role: that policy grants Config read access for recording. The service-linked role is managed by AWS, and the missing permissions are for changing resources, not for starting Automation, which already happens.
+C=Manual remediation: it would only run under whoever clicks it, and defeats the goal of automatic remediation within minutes. It does not fix the missing role for the automatic path.
+D=Record all resource types: the Region is already evaluated and reported noncompliant, so evaluation is working. The failure is on the change, not on reading the resource.
+T: Config remediation needs an AutomationAssumeRole (trusted by ssm.amazonaws.com, allowed to make the change); AccessDenied in the Automation history points to it.
+V: AWS Config, AWS Systems Manager
+
+@ DOP-C02 D6 T6.2 advanced tradeoff
+S: An organization uses AWS Security Hub (Cloud Security Posture Management) with a delegated administrator account. Findings from the "sandbox" accounts, which developers use for experiments, create thousands of MEDIUM findings for S3 buckets tagged Environment=sandbox and overwhelm the triage queue. The security team wants such findings automatically set to informational severity and marked suppressed as soon as they are ingested, without building and operating custom code. Which approach should be used?
+A: Create a Security Hub automation rule with criteria on the resource tag and severity that updates the severity and sets the workflow status to SUPPRESSED
+B: Create an EventBridge rule on Security Hub findings that invokes a Lambda function, which calls BatchUpdateFindings for each matching sandbox finding it receives
+C: Disable the S3 controls in the security standard for the entire organization so that sandbox buckets are not evaluated
+D: Create a Config aggregator authorization for the sandbox accounts so that their findings are sent to a separate aggregator
+K: A
+G: ## Two ways to change findings automatically
+Security Hub normalizes findings from many services into one format. Teams often need to adjust them, for example to lower severity for low-risk environments or to route findings to a ticketing system.
+- **Automation rules** are configured in Security Hub itself. They match findings on criteria such as resource tags, account IDs or severity and apply actions such as updating severity, workflow status, or adding notes. They run on findings as they are ingested or updated, without any code to operate.
+- **EventBridge with Lambda** reacts to findings and can do anything, including calling `BatchUpdateFindings`, but you write, deploy, secure and monitor the function.
+## Choosing
+When the required change is one Security Hub already offers as a rule action, automation rules give the least overhead. Custom code is for actions outside Security Hub, such as opening a ticket or isolating a resource.
+W: An automation rule matches the sandbox tag and updates severity and workflow status as findings arrive. It is managed from the delegated administrator account, needs no code, and the suppressed findings stay available for audit.
+X: B=EventBridge and Lambda: this can achieve the same result, but it means writing, permissioning, scaling and monitoring a function for something the service does natively. It also reacts after ingestion rather than as part of it.
+C=Disable the S3 controls organization-wide: this removes checks for production buckets as well and loses real findings. The requirement was to reduce noise for sandbox only.
+D=Config aggregator authorization: aggregators collect Config data for querying. They do not route or transform Security Hub findings.
+T: To adjust Security Hub findings without code, use automation rules; use EventBridge and Lambda only for actions the rules cannot express.
+V: AWS Security Hub, Amazon EventBridge
+
+@ DOP-C02 D6 T6.2 advanced comparison
+S: A company builds container images in CodeBuild and pushes them to Amazon ECR in a shared services account. Security requires detection of operating system and application-language package vulnerabilities (for example Python and Java libraries) in images, plus automatic re-evaluation of already stored images when new CVEs are published, with findings visible in Security Hub. Which ECR configuration meets these requirements?
+A: Enable enhanced scanning at the registry level so Amazon Inspector scans on push and rescans as new vulnerabilities are published
+B: Enable basic scanning with scan on push for all repositories and have an engineer run a manual scan of the older stored images once every month
+C: Add an image tag immutability setting to all repositories so that vulnerable images cannot be overwritten
+D: Enable ECR pull-through cache rules so that base images are always retrieved from an upstream registry
+K: A
+G: ## Basic versus enhanced scanning in ECR
+- **Basic scanning** uses a native scanner against operating system packages. Scans run on push, or manually, and results are a snapshot: an image that was clean yesterday is not rechecked when a new CVE is published tomorrow.
+- **Enhanced scanning** is powered by Amazon Inspector. It covers operating system packages and programming language packages, scans on push, and continuously rescans stored images when new vulnerability information is published. Findings flow into Inspector and Security Hub.
+## Which requirement decides
+Coverage of language packages and re-evaluation of stored images both need enhanced scanning. Anything that only scans once cannot meet "when new CVEs are published".
+W: Enhanced scanning through Inspector covers language libraries as well as OS packages, continuously rechecks stored images, and reports to Security Hub, meeting all three requirements with a registry setting.
+X: B=Basic scanning: it only reports OS package issues, and a monthly manual scan leaves a window of up to a month in which new CVEs go unnoticed.
+C=Tag immutability: this protects a tag from being re-pointed, which supports traceability. It does not scan anything or find vulnerabilities.
+D=Pull-through cache: it caches upstream images inside ECR. It does not evaluate the vulnerabilities of what is cached or pushed.
+T: Language-package coverage and continuous rescan of stored images require ECR enhanced scanning with Amazon Inspector; basic scanning is a point-in-time OS check.
+V: Amazon ECR, Amazon Inspector, AWS Security Hub
+
+@ DOP-C02 D6 T6.2 advanced use-case
+S: A company deploys Lambda functions with CI/CD pipelines. After a compromised developer laptop was used to upload a modified package, the security team requires that only code built by the official pipeline can run in production. Even administrators must not be able to deploy unsigned packages to production functions. Which solution enforces this?
+A: Sign artifacts with an AWS Signer profile in the pipeline and attach a Lambda code signing configuration set to enforce
+B: Enable versioning and Object Lock on the S3 bucket that holds deployment packages
+C: Require multi-factor authentication for every IAM principal that has lambda:UpdateFunctionCode
+D: Turn on AWS_IAM authentication for the Lambda function URL so that only SigV4-signed HTTP requests from authorized callers can reach the function
+K: A
+G: ## Code signing for Lambda
+AWS Signer produces a cryptographic signature for a code package using a **signing profile**. Lambda can verify that signature at deployment time.
+- A **code signing configuration** is attached to a function. It names the allowed signing profiles and sets a policy for artifacts that fail validation: warn only, or **enforce**, which rejects the deployment.
+- The check happens in Lambda when code is created or updated, regardless of which user or role calls the API. An administrator who tries to upload an unsigned zip is rejected too, although permissions to change or remove the configuration itself should also be restricted with IAM or an SCP.
+## What the alternatives protect
+Controls on storage, on identity or on invocation do not check whether the code being deployed came from the trusted build. Only signature validation ties the package to the pipeline's signing profile.
+W: Signing in the pipeline plus a code signing configuration in enforce mode means Lambda accepts only packages signed with the approved profile. A laptop-built, unsigned package is rejected, even when the caller has administrative permissions.
+X: B=Object Lock and versioning: this keeps objects from being changed after upload, but a malicious package uploaded as a new object is still valid input for deployment. It does not prove where the package was built.
+C=MFA on UpdateFunctionCode: a compromised laptop can already hold an MFA-authenticated session, and MFA does not verify the package's origin.
+D=Function URL authentication: it controls who can invoke the function over HTTP. It says nothing about the integrity of the deployed code.
+T: To allow only pipeline-built code in Lambda, sign with AWS Signer and enforce a code signing configuration; identity and storage controls do not verify the package origin.
+V: AWS Lambda, AWS Signer
+
+@ DOP-C02 D6 T6.2 advanced use-case
+S: A company shares an SSE-KMS encrypted S3 data lake with roughly 70 AWS accounts in its organization, and new accounts join regularly. The customer managed key lives in a central security account. Analysts in the member accounts get AccessDenied when they read objects, and the security team does not want to edit the key policy each time an account is added. Which TWO changes give member accounts access with the least ongoing effort? (Select TWO)
+A: Add a statement to the key policy that allows kms:Decrypt for all principals with a Condition StringEquals on aws:PrincipalOrgID set to the organization ID
+B: Attach identity-based policies in the member accounts that allow kms:Decrypt on the key ARN for the analyst roles
+C: Add an SCP to the organization that allows kms:Decrypt on the key ARN so that member accounts inherit access
+D: Create a KMS grant for every member account with a Lambda function that runs after each account is created
+E: Change the S3 buckets to SSE-S3 encryption, which needs no key permissions in other accounts
+K: A,B
+G: ## Cross-account KMS access needs both sides
+A KMS key policy is the primary access control for the key. For a principal in another account, access requires an allow in the key policy of the key's account **and** an allow in the caller's own account through an IAM policy. Neither one alone is enough.
+## Avoiding per-account edits
+Naming every account in the key policy means a policy change for every new account. Organization-wide access can be granted with a condition on `aws:PrincipalOrgID`, which matches principals from any account currently in the organization, including accounts that join later.
+- In the key policy, allow the needed KMS actions, scoped with `aws:PrincipalOrgID`.
+- In each member account, an identity-based policy lets the analyst role use the key. That policy can be deployed centrally, for example with StackSets, when accounts are created.
+W: A=Org-scoped key policy statement: kms:Decrypt is allowed for any principal from the organization, so new accounts automatically pass the key-owner side without further edits.
+B=Identity-based policy in members: the caller's account must also allow the action on the key, and this can be part of the standard account baseline.
+X: C=SCP: SCPs only restrict what an account may do and never grant access to a key in another account, so the key policy would still deny the request.
+D=Grant per account: grants can work, but the automation has to be built and operated for every new account, which is the ongoing effort the team wants to avoid.
+E=SSE-S3 switch: changing encryption throws away key control, audit through key usage logs and the compliance reason for using a customer managed key.
+T: Cross-account KMS use needs an allow on both sides; use aws:PrincipalOrgID in the key policy so new organization accounts are covered automatically.
+V: AWS KMS, AWS Organizations, Amazon S3
+
+@ DOP-C02 D6 T6.2 advanced use-case
+S: A CloudFormation template creates an Amazon RDS for PostgreSQL instance. The database master password must never appear in the template, in stack parameters or in the pipeline's logs, it must be rotated automatically, and the application should retrieve it at runtime. Which template design meets these requirements with the LEAST effort?
+A: Set ManageMasterUserPassword to true so RDS creates and rotates the master credentials in Secrets Manager for the application to read
+B: Define a NoEcho parameter for the password and pass its value from the pipeline as a parameter override
+C: Reference an SSM Parameter Store SecureString parameter through a dynamic reference and replace the value manually when it is due
+D: Generate a random password in the template with a Lambda-backed custom resource and output the value from the stack so the application can read it
+K: A
+G: ## Managed master user passwords
+With RDS **managed master user password**, RDS itself generates the master password and stores it in a secret in AWS Secrets Manager, encrypted with a KMS key. RDS also rotates it on a schedule, so no person or template ever holds the value.
+- In CloudFormation, the DB instance property `ManageMasterUserPassword: true` turns it on. You then do not specify `MasterUserPassword`.
+- The application is granted `secretsmanager:GetSecretValue` on the secret that RDS creates and reads the credentials at runtime.
+## What other approaches leave behind
+Approaches that pass a value in, whether through a parameter or a secure string, still require someone to know or set the password and give no rotation. Custom resource output would place the value in stack outputs.
+W: ManageMasterUserPassword gives a generated password stored in Secrets Manager with automatic rotation, and neither the template, the parameters nor the logs ever contain it. The application only needs permission to read the secret.
+X: B=NoEcho parameter: it hides the value in the console and API output, but the pipeline still has to hold and pass the password. There is also no rotation.
+C=SecureString dynamic reference: the value is not in the template text, but someone created it and must replace it manually, so rotation is not automatic.
+D=Custom resource with output: putting the value in a stack output exposes it to anyone who can read the stack, and you would have to build rotation yourself.
+T: For RDS, use the managed master user password (ManageMasterUserPassword) so credentials are generated, rotated and stored in Secrets Manager without touching the template.
+V: Amazon RDS, AWS Secrets Manager, AWS CloudFormation
+
+@ DOP-C02 D6 T6.2 advanced use-case
+S: A company has 80 accounts across four Regions with a mix of EC2 instances managed by Systems Manager. Security requires weekly patching in maintenance windows tied to each environment, consistent patch baselines, and a central compliance view. New accounts must be covered automatically, and the team wants to avoid creating maintenance windows and associations in every account and Region. Which approach should be used?
+A: Create a Quick Setup patch policy that targets OUs and Regions, with the schedule and baselines defined in the policy
+B: Deploy a Lambda function to each account that calls SendCommand with AWS-RunPatchBaseline weekly and stores the results in a local DynamoDB table per account
+C: Use EC2 Auto Scaling instance refresh to replace every instance weekly with a new AMI, and skip Patch Manager
+D: Enable Amazon Inspector in all accounts and use its findings to trigger manual patching by each application team
+K: A
+G: ## Patch Manager at organization scale
+Systems Manager Patch Manager applies patches according to a **patch baseline** and a schedule. Setting up baselines, maintenance windows and associations in every account and Region by hand does not scale.
+- **Quick Setup** is a Systems Manager capability that deploys configuration across an organization from one place. Its **patch policy** defines baselines, the schedule and scan or install operations, and targets OUs and Regions.
+- New accounts that fall in a targeted OU receive the configuration automatically.
+- Patch compliance data is shown centrally for the accounts and Regions the policy covers.
+W: A Quick Setup patch policy defines the baseline, schedule and scope once, and applies it to the selected OUs and Regions, including future accounts. No per-account maintenance windows are needed and compliance is visible centrally.
+X: B=Custom Lambda per account: this rebuilds what Patch Manager already does and leaves the team to deploy, monitor and aggregate results for every account, with local tables making the central view harder.
+C=Weekly instance refresh: replacement can be a valid immutable pattern, but it applies only to Auto Scaling fleets, ignores instances that are not in a group, and gives no patch baseline or compliance reporting.
+D=Inspector findings plus manual patching: Inspector detects vulnerabilities, it does not patch. Relying on manual work by each team defeats the requirement of weekly automated patching.
+T: For organization-wide patching with new-account coverage and central compliance, use a Quick Setup patch policy for Patch Manager.
+V: AWS Systems Manager, Amazon Inspector
+
+@ DOP-C02 D6 T6.3 advanced use-case
+S: A security team in a delegated administrator account needs to answer ad hoc questions such as "which EBS volumes across all 90 organization accounts and all enabled Regions are unencrypted?" AWS Config recording is already enabled in every account and Region. The answers must come from current resource configuration, without exporting data or maintaining a query pipeline. Which solution fits?
+A: Create an organization-wide AWS Config aggregator in the delegated administrator account and run advanced queries against the aggregated configuration data
+B: Run Amazon Athena queries over the organization trail's log files in S3 to find volumes created without encryption
+C: Use AWS Resource Explorer with an aggregator index to search for all EBS volumes in every account and read the encryption attribute from each search result
+D: Query the Security Hub findings API for each account and Region and merge the results in a script
+K: A
+G: ## Config aggregators and advanced queries
+AWS Config records the configuration of supported resources, including the properties of each resource such as whether a volume is encrypted.
+- A **configuration aggregator** collects that data from many accounts and Regions into one. An organization aggregator can be created in the management account or a delegated administrator for Config and includes all accounts in the organization.
+- **Advanced queries** use a SQL-like syntax (for example `SelectAggregateResourceConfig`) to filter and project resource properties across the aggregator.
+## Why other sources answer different questions
+Logs tell you what API calls happened. Search indexes tell you a resource exists. Findings tell you what a check reported. Only Config holds the current configuration attributes.
+W: An organization aggregator gathers configuration items from every account and Region, and advanced queries can filter them on the encryption property. The result is the present state, with no data to export or pipelines to maintain.
+X: B=Athena over CloudTrail: logs show past API calls, and older volumes or changes made through other means may not appear at all. It reconstructs state indirectly and needs partitioning and maintenance.
+C=Resource Explorer: it is a search index that locates resources by name, tag or type across accounts, not a configuration store, so it is not the tool for filtering on configuration attributes such as encryption.
+D=Security Hub findings per account: findings exist only for checks that are enabled and failing, and querying each account and Region separately reproduces the manual work the team wants to avoid.
+T: To query current resource configuration across an organization, use a Config aggregator (organization scope) with advanced queries.
+V: AWS Config, AWS Organizations
+
+@ DOP-C02 D6 T6.3 advanced tradeoff
+S: A security team administers AWS Security Hub CSPM for 120 accounts through a delegated administrator. Account owners have been disabling controls locally, so the enabled standards and controls differ from account to account. The team wants to define which standards and controls are enabled for each OU centrally, have the setting applied to new accounts, and stop member accounts from changing it. Which approach should the team choose?
+A: Use Security Hub central configuration to create configuration policies that specify standards and controls, and associate them with OUs or accounts
+B: Use a StackSet to run a Lambda function in every account that enables and disables controls on a schedule
+C: Write an SCP that denies the securityhub:UpdateStandardsControl action in member accounts and let each account enable its standards on its own
+D: Enable automatic enabling of new controls and let each account owner decide which standards to keep
+K: A
+G: ## Central configuration in Security Hub
+When Security Hub is used with Organizations, the delegated administrator can decide how the service is configured in member accounts.
+- With **central configuration**, the administrator creates **configuration policies** that state whether Security Hub is enabled, which standards are enabled, and which controls are enabled or disabled.
+- A policy is associated with the organization root, OUs or individual accounts, and applies in all linked Regions. New accounts inherit the policy of their OU.
+- Accounts under central configuration are marked as centrally managed, and their owners cannot change the settings locally.
+## Compared to other approaches
+Scripts or SCPs can approximate parts of this, but they do not define which standards and controls are on, and they add moving parts that need to be maintained.
+W: Configuration policies define the standards and controls once per OU, apply to new accounts as they join, and prevent local changes because the accounts are centrally managed.
+X: B=Scheduled Lambda per account: the settings drift between runs, someone must write and secure the function, and it fights the local changes instead of preventing them.
+C=SCP alone: an SCP could block updates, but the standards still would not be enabled consistently, since each account would enable its own. It also enforces nothing about which controls the OU should have.
+D=Auto-enable new controls: it only adds newly released controls to enabled standards. Owners can still disable existing controls or standards, so the drift continues.
+T: For consistent, non-bypassable Security Hub settings per OU, use central configuration policies from the delegated administrator.
+V: AWS Security Hub, AWS Organizations
+
+@ DOP-C02 D6 T6.3 advanced use-case
+S: A company sets up IAM Access Analyzer to find resources such as S3 buckets, KMS keys and IAM roles that are accessible from outside the organization. Several partner accounts are known and approved, and the team wants only unexpected external access to appear as active findings. Which TWO actions accomplish this? (Select TWO)
+A: Create an analyzer with the organization as the zone of trust, in the management account or a delegated administrator account for Access Analyzer
+B: Create archive rules that automatically archive findings matching the approved partner account IDs
+C: Create an analyzer with the account as the zone of trust in every member account and compare the results manually each week
+D: Enable an unused access analyzer, which reports external principals with access to each resource
+E: Add an SCP that denies the approved partner accounts from being named in any resource policy
+K: A,B
+G: ## Zone of trust
+IAM Access Analyzer's external access analyzers use a **zone of trust**: the account or organization you consider trusted. Access from principals outside it is reported as a finding.
+- An analyzer with the **organization** as zone of trust treats every account of the organization as trusted, so sharing between your own accounts produces no findings, and all findings appear in one place. It is created in the management account or in a delegated administrator.
+- **Archive rules** automatically archive new and existing findings matching criteria, such as the ID of a known partner account, so that the active list holds only what needs review.
+## Unused access is a different analyzer
+An unused access analyzer reports permissions, roles and credentials that were not used within a tracking period, which is an entirely different question.
+W: A=Organization analyzer: cross-account sharing inside the organization is trusted, and outside access is reported centrally without one analyzer per account.
+B=Archive rules: findings for the approved partners are archived automatically, leaving unexpected access as the active findings.
+X: C=Account-level analyzers: every other account in the organization would appear as external, creating noise, and manual weekly comparison replaces automation with effort.
+D=Unused access analyzer: it finds unused permissions and credentials, not external principals, so it does not address this requirement.
+E=SCP denying partners: SCPs cannot inspect the principals in resource policies this way, and it would remove legitimate partner access instead of monitoring it.
+T: For external access findings, use an organization-scope analyzer and archive rules for approved partners; unused access analysis is a separate analyzer type.
+V: IAM Access Analyzer, AWS Organizations
+
+@ DOP-C02 D6 T6.3 advanced use-case
+S: A company deploys every application with CloudFormation. Auditors require recurring evidence that deployed resources match their templates, and the security team wants stacks that have drifted to appear as noncompliant in the same place as other compliance findings, without building scheduled jobs. Which solution meets this requirement?
+A: Enable the AWS Config managed rule cloudformation-stack-drift-detection-check with an IAM role that allows drift detection
+B: Create an EventBridge scheduled rule that invokes a Lambda function to call DetectStackDrift for every stack and then writes the results to an S3 bucket
+C: Enable termination protection on every stack so that drifted resources cannot be removed
+D: Configure CloudTrail data events for CloudFormation so that resource changes are logged for review
+K: A
+G: ## Drift detection as a compliance signal
+CloudFormation drift detection compares the actual configuration of stack resources with the template. Running it by hand or on a custom schedule gives point-in-time answers that are not part of an audit trail.
+- AWS Config offers a managed rule that evaluates whether stacks have drifted. The rule runs drift detection with a role you supply (the cloudformationRoleArn parameter, trusted by config.amazonaws.com) and marks stacks with drift as noncompliant.
+- Because it is a Config rule, results appear next to other compliance data, can be aggregated across accounts, and can feed notifications or remediation.
+## What does not fit
+Options that only log or protect do not measure drift. Custom schedulers do, but you have to build and operate them.
+W: The Config managed rule for stack drift runs the detection with the supplied role and records compliant or noncompliant per stack, so the evidence sits with other compliance results and needs no scheduler.
+X: B=Custom scheduler: this works technically, but the team must write, run and secure the function, and store results in a separate location. The requirement was to avoid scheduled jobs.
+C=Termination protection: it stops stack deletion. It does not detect changes made outside CloudFormation.
+D=CloudTrail data events for CloudFormation: CloudFormation stack operations are management events, and logs of activity are not a comparison of configuration with the template.
+T: Use the Config managed rule for CloudFormation stack drift to get recurring, aggregatable drift compliance without a custom scheduler.
+V: AWS Config, AWS CloudFormation
+
+@ DOP-C02 D6 T6.3 advanced use-case
+S: A company runs Amazon EKS clusters in many accounts and wants to detect threats inside running containers, such as reverse shells or connections to command-and-control servers. The team does not want to deploy and update a monitoring agent manually on every cluster. Which solution should the DevOps engineer choose?
+A: Enable GuardDuty EKS Runtime Monitoring with automatic agent management, so GuardDuty deploys and updates its agent as an EKS add-on
+B: Enable GuardDuty EKS audit log monitoring only, which analyzes the Kubernetes audit log for suspicious API activity on the control plane
+C: Enable Amazon Inspector for ECR images and rely on vulnerability findings to reveal running attacks
+D: Enable VPC Flow Logs on the cluster subnets and analyze rejected connections with Athena
+K: A
+G: ## Two GuardDuty sources for EKS
+- **EKS audit log monitoring** analyzes the Kubernetes control plane audit logs and finds suspicious API activity, such as anonymous access or unusual role changes.
+- **Runtime Monitoring** uses a security agent on the nodes to observe operating system, file and network events inside containers and processes. It can detect behavior such as shells launched in containers and connections to known malicious addresses.
+## Managing the agent
+With automatic agent management, GuardDuty deploys and updates the agent for supported clusters, using an EKS add-on, and it can be enabled organization-wide by the delegated administrator. Teams do not need to install or upgrade the agent themselves.
+W: Runtime Monitoring sees process and network activity inside containers, which is where reverse shells and command-and-control behavior show up, and automatic agent management removes the manual installation and updates.
+X: B=Audit log monitoring only: it observes the Kubernetes API but has no view of what processes run inside the containers, so it would miss many in-container attacks.
+C=Inspector on images: it reports known vulnerabilities in packages, which does not indicate running attacks or suspicious behavior.
+D=Flow logs with Athena: flow logs only show accepted and rejected network flows, they do not show process behavior, and reading them by hand adds work.
+T: Threats inside running EKS containers need GuardDuty Runtime Monitoring; automatic agent management removes manual agent deployment.
+V: Amazon GuardDuty, Amazon EKS
+
+@ DOP-C02 D6 T6.3 advanced tradeoff
+S: The security team has contracted a penetration-testing firm whose scanner runs from known IP addresses in a workload account for the next two weeks. GuardDuty generates many port probe findings caused by this scanning. The team wants these expected findings out of the active list, but wants to keep a record of them for the audit and continue to receive findings for all other activity. Which action should be taken?
+A: Create a GuardDuty suppression rule with filters for the scanner's IP and finding type, so matches are archived
+B: Add the scanner's IP addresses to a GuardDuty trusted IP list so that no findings are generated for that scanning traffic in this Region
+C: Disable GuardDuty in the workload account for the two weeks and enable it again afterward
+D: Review each finding by hand, archive it with the API and keep a spreadsheet of the archived findings
+K: A
+G: ## Suppression rules versus trusted IP lists
+Both mechanisms reduce noise from expected activity, but they behave differently.
+- A **suppression rule** applies filter criteria (for example finding type and remote IP address) to new findings and automatically archives the matches. The findings are still generated, stay searchable and exportable, and do not appear in the active list.
+- A **trusted IP list** tells GuardDuty to treat certain IP addresses as safe, so it does not generate findings for activity that involves them. There is no record of what was suppressed.
+## Choosing for an audit
+When a record of the suppressed activity has to exist, archive with a rule rather than stop generating findings.
+W: The suppression rule limits the archive to the scanner and the finding types it causes. The findings still exist for the audit, and all other findings stay active.
+X: B=Trusted IP list: activity involving those IPs is not reported at all, so the audit record would be missing and any real attack from a listed address would be hidden as well.
+C=Disable GuardDuty: this creates a two-week blind spot for the entire account and loses detection of real threats, far more than the scanner traffic.
+D=Manual archiving: it works for a handful of findings, but at scanner volume the process is slow and error-prone, and a spreadsheet is a weak audit trail compared with automatic rules.
+T: To hide expected findings but keep an audit record, use GuardDuty suppression rules (auto-archive); trusted IP lists stop findings from being generated.
+V: Amazon GuardDuty

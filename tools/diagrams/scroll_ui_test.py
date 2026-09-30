@@ -32,7 +32,9 @@ with sync_playwright() as p:
         ok(f"[{scheme}] bar is compact ({bh:.0f}px)", bh<=48)
         pg.screenshot(path=str(pathlib.Path(tempfile.gettempdir(), f"scroll_{scheme}.png")))
         # answer a question while scrolled -> score appears in bar
-        card=pg.locator(".qcard").nth(5); card.scroll_into_view_if_needed(); card.locator(".choice").first.click(); pg.wait_for_timeout(300)
+        card=pg.locator(".qcard").nth(5); card.scroll_into_view_if_needed(); card.locator(".choice").first.click()
+        try: pg.wait_for_function("(document.getElementById('examBarScore').textContent||'').includes('/')", timeout=5000)
+        except Exception: pass
         ok(f"[{scheme}] bar shows score", "/" in pg.inner_text("#examBarScore"))
         pg.click("#examBarChange"); pg.wait_for_timeout(100); settle(pg)
         ct=pg.evaluate("document.getElementById('chipRow').getBoundingClientRect().top")

@@ -1,0 +1,333 @@
+# SCS-C03 detailed explanations (explanation-only rewrites; letters are the published ones)
+
+@ Q001846 explain
+G: ## Scan versus Install in Patch Manager
+AWS Systems Manager Patch Manager runs the `AWS-RunPatchBaseline` document on managed nodes. Its `Operation` parameter decides what happens:
+- **Scan** compares the node against its patch baseline and reports which approved patches are missing. Nothing is installed and nothing is rebooted, so it is safe to run at any time.
+- **Install** downloads and applies the missing approved patches and, depending on `RebootOption`, reboots the node. It also reports compliance afterward, but only because it has already changed the system.
+## Separating "know" from "change"
+Compliance reporting and change control have different schedules. A common pattern is a daily Scan (for example through a State Manager association or a patch policy in Quick Setup) plus an Install task registered in a maintenance window, such as Sunday 02:00-06:00. The compliance dashboard then shows missing patches every day, while servers are only modified and rebooted during the approved window.
+W: Daily Scan plus Sunday Install: Scan updates patch compliance data every day without touching the instances, and the Install operation runs only inside the Sunday maintenance window, which satisfies both the reporting and the change-window requirements.
+X: A=Install from user data: user data runs only at first launch by default, and even when configured to run on every boot it patches whenever an instance starts rather than inside the Sunday window, and gives no daily compliance view for instances that keep running.
+B=Daily Install: Install does report compliance, but it also applies patches and can reboot instances every day, which breaks the rule that changes happen only in the Sunday maintenance window.
+D=Scan only: Install does not depend on Session Manager; both operations run through Run Command and the SSM Agent. Scanning alone would report missing patches forever without ever fixing them.
+T: Use Scan for daily visibility and schedule Install in a maintenance window; running Install daily reports compliance but also changes and reboots servers outside the window.
+
+@ Q001847 explain
+G: ## What Amazon Inspector scans in Lambda
+Amazon Inspector has several scan types that are turned on separately per account (or centrally through a delegated administrator):
+- **Lambda standard scanning** looks at the function's deployment package and layers for third-party packages with known CVEs, for example an old `requests` library in a Python function.
+- **Lambda code scanning** analyzes the application code you wrote for code-level issues such as injection flaws, data leaks, missing encryption or weak cryptography. It builds on standard scanning and works only for supported runtimes.
+- Other scan types cover EC2 instances and container images in Amazon ECR.
+## Why findings can be missing
+Enabling Inspector does not automatically mean every scan type is active. If only EC2 and ECR scanning (or only Lambda standard scanning) are activated, no code-level Lambda findings will ever appear. A function on a runtime that code scanning does not support also produces no code findings. The account's Inspector settings show which scan types are active.
+W: Code scanning enabled for supported runtimes: code-level findings come only from the Lambda code scanning feature, which must be activated in Inspector and applies to supported runtimes, so the team should check that setting and the functions' runtimes.
+X: A=AdministratorAccess on the execution role: Inspector reads function code and metadata through its own service-linked role, not through the function's execution role, so broadening that role adds risk and changes nothing about scanning.
+B=Invoked once per second: there is no invocation-rate requirement; Inspector covers functions invoked or updated in the last 90 days, and rescans them when their code or layers change or when new vulnerabilities are published.
+C=Only EC2 and ECR: Amazon Inspector does support AWS Lambda, with both standard (package) scanning and code scanning, alongside EC2 and ECR.
+T: Inspector's Lambda code scanning is its own scan type that must be activated for supported runtimes; Inspector does scan Lambda, and execution role permissions have nothing to do with it.
+
+@ Q001848 explain
+G: ## Two scanning modes in Amazon ECR
+Amazon ECR can scan container images for known vulnerabilities (CVEs) in two ways, configured at the registry level:
+- **Basic scanning** is built into ECR. It checks the operating system packages in an image (for example `openssl` from the base Debian or Alpine layer), either on push or when you start a manual scan. It is a point-in-time result.
+- **Enhanced scanning** is provided by Amazon Inspector. It covers OS packages and programming language packages (for example Python `pip`, Node.js `npm` or Java libraries) and can scan continuously: when a new CVE is published, Inspector re-evaluates images already in the repository and creates new findings without another push.
+## Example
+An image pushed in January with a clean basic scan stays "clean" in basic mode even if a critical CVE in its bundled `log4j` jar is disclosed in March. With enhanced continuous scanning, a finding for that image appears in Inspector and ECR once the CVE is known.
+W: Basic is OS at push; enhanced is OS plus language packages, continuously: this matches how the modes work, with enhanced scanning adding language package coverage and ongoing rescans through Amazon Inspector.
+X: B=Coverage reversed: basic scanning focuses on OS packages; language package coverage (pip, npm, Maven and similar) is what enhanced scanning adds.
+C=Identical except price: they differ in coverage (OS only versus OS and language packages), in timing (point-in-time versus continuous), and in where findings appear (ECR versus Amazon Inspector and ECR).
+D=Enhanced one-time, basic continuous: this is backwards; basic scanning runs on push or on demand, while enhanced scanning offers continuous rescanning as new vulnerabilities are published.
+T: Enhanced ECR scanning (Amazon Inspector) adds language packages and continuous rescans; basic scanning checks only OS packages at push or on demand.
+
+@ Q001849 explain
+G: ## IMDS and SSRF
+The Instance Metadata Service (IMDS) answers at `169.254.169.254` from inside an EC2 instance. It exposes instance data and, if a role is attached, temporary role credentials. In a server-side request forgery (SSRF) attack, an attacker tricks an application into fetching an internal URL such as `http://169.254.169.254/latest/meta-data/iam/security-credentials/` and returns the response.
+## Hardening levels
+- **IMDSv2 required** (`HttpTokens=required`): every request needs a session token obtained with a `PUT`, which blocks most simple SSRF tricks.
+- **Hop limit** (`HttpPutResponseHopLimit`, 1 to 64): a value of 1 stops the token from reaching containers or proxies one hop away.
+- **Endpoint disabled** (`HttpEndpoint=disabled`): the instance gets no metadata answers at all.
+These settings can be changed on running instances with `ModifyInstanceMetadataOptions` or set in a launch template. If a workload never uses IMDS, disabling it leaves nothing for SSRF to steal from that endpoint.
+W: Disable the metadata endpoint: with `HttpEndpoint=disabled`, IMDS stops responding on these instances, which removes the SSRF target entirely; the workload does not query IMDS after boot, so nothing it needs is lost.
+X: B=IMDSv2 as the maximum: IMDSv2 is strong, but it is not the strongest option, and IMDS can be disabled per instance; when nothing needs metadata, turning it off leaves less exposure than requiring tokens.
+C=Hop limit 0: the hop limit accepts values from 1 to 64, so 0 is not a valid setting; even 1 still allows requests from the instance itself, which is where SSRF happens.
+D=Security group rule to 169.254.169.254: security groups have no deny rules, and security group rules do not evaluate traffic to the instance metadata service at all, so no such rule could block it.
+T: When a workload never needs instance metadata, disable the endpoint; IMDSv2 and hop limits reduce SSRF risk but still leave IMDS reachable.
+
+@ Q001850 explain
+G: ## Stateful security groups, stateless network ACLs
+- A **security group** is stateful. If an outbound connection is allowed, the reply traffic is allowed back automatically, no inbound rule needed.
+- A **network ACL** is stateless. It checks every packet on its own, so the reply must match an inbound rule too.
+## Where the reply really goes
+When the server calls `https://api.example.com`, the packet leaves from an ephemeral source port (for example `10.0.1.15:49152`) to destination port 443. The reply comes back from source port 443 to destination port 49152. NACL rules match the destination port, so an inbound rule for port 443 does not match this reply. Linux, Windows, NAT gateways and load balancers use different ephemeral ranges, which is why a common rule is inbound TCP `1024-65535`.
+- Outbound rule: TCP 443 to `0.0.0.0/0` (request).
+- Inbound rule: TCP 1024-65535 from `0.0.0.0/0` (replies).
+Without the inbound ephemeral rule, the request leaves, the reply is dropped at the subnet boundary, and the call times out.
+W: Inbound ephemeral ports on the NACL: the API's replies are addressed to the server's ephemeral port, and the stateless NACL only allows inbound 443, so the replies are dropped and the connection times out.
+X: A=The API's own NACL: the external API is not in the company's VPC and its network is not the problem shown here; the company's own NACL allows only inbound 443, so replies addressed to ephemeral ports are dropped on the company's side whatever the API allows.
+C=Security group inbound rule for replies: security groups are stateful, so replies to an allowed outbound connection are accepted automatically without an inbound rule.
+D=NACLs ignore outbound-initiated traffic: network ACLs evaluate every packet entering or leaving the subnet, including replies to connections the instance started.
+T: NACLs are stateless, so replies need an inbound ephemeral-port rule; security groups track connections and need no rule for return traffic.
+
+@ Q001851 explain
+G: ## The return path through a NAT gateway
+A private instance at `10.0.2.20` opens HTTPS to an internet server. The NAT gateway rewrites the source to its own address, the server replies to the NAT gateway, and the NAT gateway translates the reply back to `10.0.2.20` on the instance's original ephemeral port, for example 51000.
+## Why the NACL drops it
+The private subnet's network ACL is stateless and matches on destination port:
+- Outbound request: destination port 443, so the outbound 443 rule allows it.
+- Inbound reply: source port 443, destination port 51000. The inbound rule for port 443 does not match, so the default deny rule drops it.
+The fix is an inbound rule such as TCP `1024-65535` from `0.0.0.0/0` (the reply's source is the internet server, whose address is preserved on the way back). Packet captures showing the NAT gateway forwarding the reply toward the subnet prove the NAT and internet path works; the drop happens at the subnet boundary.
+W: Missing inbound ephemeral-port rule: the replies arrive at the subnet addressed to ephemeral ports, and the stateless NACL only allows inbound 443, so they are discarded before reaching the instances.
+X: A=NAT route to the internet gateway missing: requests reach the internet and the NAT gateway receives and forwards the replies, which could not happen if its subnet had no route to the internet gateway.
+C=NACLs not allowed with NAT routes: every subnet always has a network ACL, and NACLs work normally in subnets that route through a NAT gateway; they just need rules for both directions.
+D=Security group inbound 443: security groups are stateful, so replies to outbound connections are allowed automatically; an inbound 443 rule would only matter for connections started from outside.
+T: The reply to an outbound HTTPS call targets an ephemeral port, so a stateless NACL needs an inbound ephemeral rule, while the stateful security group needs none.
+
+@ Q001852 explain
+G: ## Two policies on the private S3 path
+A **gateway VPC endpoint** for S3 adds a prefix-list route so S3 traffic from the VPC stays on the AWS network. Two independent policies can lock it down:
+- **Endpoint policy** (on the VPC endpoint): limits which S3 actions and resources any principal in the VPC can reach through the endpoint, for example only `arn:aws:s3:::corp-data` and `arn:aws:s3:::corp-data/*`. Even if an instance role is later given `s3:*` on `*`, requests to other buckets through the endpoint are denied.
+- **Bucket policy** (on the bucket): a `Deny` with the condition `StringNotEquals` on `aws:SourceVpce` set to `vpce-0abc...` rejects requests that do not come through that endpoint.
+## Why both
+The endpoint policy controls what leaves the VPC; the bucket policy controls where the bucket accepts requests from. A broadened IAM role, a new endpoint or a credential used from outside the VPC is each blocked by at least one layer. That is defense in depth.
+W: Endpoint policy plus aws:SourceVpce bucket policy: the endpoint policy restricts the VPC to the approved bucket regardless of IAM role changes, and the bucket policy restricts the bucket to that endpoint, giving two independent controls.
+X: A=NACL deny on S3 IP ranges: S3 IP ranges are shared by all buckets in a Region and change over time, so an IP-based NACL cannot distinguish the company bucket from any other bucket.
+B=IAM role only: endpoint policies can name specific buckets and objects, and relying only on the role fails the requirement because the role may later be broadened.
+C=NAT gateway instead of the endpoint: sending S3 traffic through a NAT gateway uses the public S3 endpoint, removes the endpoint policy control and the aws:SourceVpce condition, and adds data processing cost.
+T: Lock the private S3 path from both sides, with an endpoint policy naming the bucket and a bucket policy requiring aws:SourceVpce; IAM alone fails as soon as the role is broadened.
+
+@ Q001854 explain
+G: ## Allow-only versus allow-and-deny
+- **Security groups** attach to network interfaces and contain only allow rules. Anything not allowed is denied implicitly, but you cannot write "deny 203.0.113.50" while also allowing `0.0.0.0/0` on port 443. Each resource can also have different security groups.
+- **Network ACLs** attach to subnets and support both allow and deny rules, evaluated in order from the lowest rule number; the first match wins.
+## Blocking one attacker for a whole subnet
+To block `203.0.113.50` for every resource in a public subnet, add inbound rule number 50 `DENY all traffic from 203.0.113.50/32` to the subnet's NACL, placed before the existing allow rules (for example rule 100 allowing 443). Because the NACL sits at the subnet boundary, it applies to every instance, load balancer node and interface in that subnet, whatever security groups they use. Adding a matching outbound deny also stops replies to that address.
+W: NACL deny rule for the IP: a numbered deny rule placed before the allow rules blocks that source at the subnet boundary for every resource, which security groups cannot do because they only contain allow rules.
+X: A=Deny rule in every security group: security groups have no deny rules, and editing every group would still leave any resource with a different group unprotected.
+B=WAF rule: AWS WAF inspects HTTP and HTTPS requests only for supported resources such as ALB, CloudFront and API Gateway, so it cannot block all traffic, including non-web ports, to every resource in the subnet.
+D=Security groups support deny: they do not; security groups are allow-only, so they are not interchangeable with NACLs for blocking a specific address.
+T: To block one IP for a whole subnet, use a low-numbered NACL deny rule; security groups are allow-only and WAF covers only web traffic on specific resources.
+
+@ Q001855 explain
+G: ## How Transit Gateway segmentation works
+A transit gateway routes between attachments using route tables. Each attachment has two independent settings:
+- **Association**: which single route table is used to look up routes for traffic coming from that attachment.
+- **Propagation**: which route tables automatically learn that attachment's CIDR.
+With the default settings, every attachment associates with and propagates into the default route table, so every VPC learns every other VPC's route: a full mesh.
+## Segmenting a PCI VPC
+Create separate route tables, for example `rt-pci` and `rt-general`:
+- Associate the PCI attachment with `rt-pci`, which contains only approved routes (such as shared services or an inspection VPC).
+- Associate non-PCI attachments with `rt-general` and do not propagate the PCI CIDR into it.
+Now a non-PCI VPC has no route to the PCI CIDR, so traffic is dropped at the transit gateway even if a security group is too open. Disabling default association and propagation on the transit gateway prevents new attachments from joining the mesh by accident.
+W: Shared, fully propagated route table: with every attachment associated with and propagating into one table, all VPCs have routes to each other; giving the PCI attachment its own route table with only approved routes restores segmentation.
+X: A=Permissive security group: security groups can add a layer, but the audit found that any VPC can route to the PCI VPC; the design intent was network segmentation, and the shared route table is what breaks it.
+B=Transit Gateway cannot segment: separate route tables with controlled association and propagation are the standard way to segment VPCs on a transit gateway, so peering is not required.
+C=Appliance mode: appliance mode keeps both directions of a flow on the same Availability Zone for stateful inspection appliances; it does not create or enforce segmentation.
+E=Disable propagation account-wide: propagation is configured per attachment and route table, not as one account switch, and removing all propagated routes would break legitimate connectivity instead of isolating only PCI.
+T: Transit Gateway segmentation comes from separate route tables with deliberate association and propagation; one shared default table creates a full mesh.
+
+@ Q001856 explain
+G: ## What an interface endpoint changes
+AWS APIs such as Secrets Manager (`secretsmanager.us-east-1.amazonaws.com`) are public endpoints by default. Even over Direct Connect, reaching a public endpoint depends on routing and filtering being right; one bad route could send traffic toward the internet.
+An **interface VPC endpoint** (AWS PrivateLink) puts network interfaces with private IPs in your subnets. With private DNS on, the service name resolves to those IPs, so calls stay inside the VPC and the AWS network. Combine it with an endpoint policy and a condition like `aws:SourceVpce` in resource or identity policies to structurally require the private path.
+## The cost side
+- An hourly charge for each endpoint in each Availability Zone where it has an interface.
+- A per-GB data processing charge.
+- One network interface (and private IP) per subnet used, plus security groups to manage.
+Every service needs its own endpoint, so costs grow with the number of services and AZs.
+W: Private path, per-AZ fees and ENIs: the endpoint gives a structural, non-internet path to the API that can be enforced by policy, and the trade-off is hourly per-AZ and per-GB charges plus endpoint network interfaces to operate.
+X: A=No security gain: the endpoint removes the dependency on a public endpoint and enables endpoint policies and aws:SourceVpce conditions, which is a structural control rather than monitoring.
+B=No API charges: the service's own API pricing still applies, and the endpoint adds its own hourly and data processing charges; it does not remove costs.
+C=Decommission Direct Connect: interface endpoints and Direct Connect coexist, and on-premises clients can even reach interface endpoints over Direct Connect through the VPC.
+T: Interface endpoints give a structurally private path to AWS APIs at the price of per-AZ hourly fees, data processing fees and ENIs; they add cost rather than remove it.
+
+@ Q001857 explain
+G: ## IAM Identity Center for workforce access
+AWS IAM Identity Center is the recommended way to give employees access across an AWS Organization.
+- **Identity source**: connect an external IdP (Okta, Microsoft Entra ID, and similar) through SAML 2.0, with SCIM to sync users and groups automatically.
+- **Permission sets**: templates of policies (for example `ReadOnly` or `DataAnalystAccess`) that Identity Center turns into IAM roles in each assigned account.
+- **Assignments**: group X gets permission set Y in accounts 1, 5 and 12.
+- **Applications**: Identity Center can also act as the IdP for SAML 2.0 business applications.
+## The user experience
+An employee signs in once with corporate credentials, opens the AWS access portal, and sees every account and role they are assigned, plus configured applications. They receive short-term credentials; there are no IAM users or long-term keys in the 40 accounts. Adding a new account means adding an assignment, not configuring federation again.
+W: Identity Center with an external IdP and permission sets: it provides single sign-on to all 40 accounts and third-party SAML applications, with access defined centrally and roles created automatically in each account.
+X: A=SAML provider in each account: this works technically but requires creating and updating the IdP trust and roles in 40 accounts by hand, which is the heavy administrative overhead the team wants to avoid.
+C=IAM users plus switch role: this provisions IAM users with passwords and possibly access keys, does not use the corporate IdP for sign-on, and does not cover SAML applications.
+D=Managed Microsoft AD with RDP bastions: RDP to Windows bastions is server access, not federated access to the AWS console, APIs or SAML applications.
+T: For single sign-on across many accounts and SAML apps, use IAM Identity Center with the corporate IdP and permission sets instead of per-account SAML or IAM users.
+
+@ Q001858 explain
+G: ## Assignment and provisioning in IAM Identity Center
+A permission set is only a template stored in IAM Identity Center. Access in a member account exists only after the permission set is **provisioned** there:
+- Provisioning creates an IAM role in the account named like `AWSReservedSSO_DataAnalystAccess_1a2b3c...`, with a trust policy for the Identity Center SAML provider.
+- Creating an account assignment normally starts provisioning, but it can still be in progress or fail (for example because of a policy error, or an attached customer managed policy name that does not exist in that account).
+- Changes to a permission set reach accounts only after it is reprovisioned.
+## Troubleshooting
+In the console, the permission set's **Accounts** view shows the provisioning status per account, and failed provisioning can be retried with **Update in accounts** or the `ProvisionPermissionSet` API. Once the role exists, the account appears in the AWS access portal for the assigned group members.
+W: Permission set not provisioned: without successful provisioning, the IAM role does not exist in the member account, so the portal has nothing to show; checking the provisioning status and reprovisioning fixes it.
+X: A=IdP sync within 5 minutes: SCIM sync timing could delay a new member, but the scenario says the group assignment appears correctly, and a missing account for all members fits a provisioning problem better than a short sync delay.
+B=Account not a delegated administrator: delegated administration only lets a member account manage Identity Center; normal target accounts receive assignments without being delegated administrators.
+D=Users only, no groups: Identity Center fully supports assigning permission sets to groups, which is the recommended practice.
+T: A permission set gives access only after it is provisioned as an IAM role in the account; check provisioning status before blaming groups or the IdP.
+
+@ Q001859 explain
+G: ## Two ways to federate into many accounts
+- **Per-account SAML federation**: in each account you create an IAM SAML identity provider from your IdP's metadata, create roles that trust it, and configure the IdP to send role claims. With 25 accounts, every new role or policy change must be repeated in each account and in the IdP.
+- **IAM Identity Center**: you define a permission set once, for example `SecurityAudit` with a session duration and policies, and assign it to groups in chosen accounts. Identity Center creates the matching IAM role in each account and updates all of them when the permission set is reprovisioned.
+## What stays the same
+Both approaches give users temporary credentials through a role; neither requires IAM users. The difference is who maintains the roles: you, account by account, or Identity Center, centrally.
+W: Permission-set roles synced to assigned accounts: Identity Center creates and updates the roles in all assigned accounts from one definition, which removes the per-account role and trust maintenance of hand-built SAML federation.
+X: A=Per-account SAML unsupported: IAM fully supports SAML 2.0 identity providers in each account; this is a documented federation method, just harder to maintain at scale.
+C=No IAM roles in member accounts: Identity Center still works through IAM roles; it creates `AWSReservedSSO_` roles in each account from the permission sets.
+D=Only method for temporary credentials: per-account SAML federation also issues temporary credentials through `AssumeRoleWithSAML`, so this is not a differentiator.
+T: Identity Center's advantage is central management: one permission set becomes roles in every assigned account, while per-account SAML needs roles maintained by hand in each account.
+
+@ Q001860 explain
+G: ## What a permission set becomes in each account
+When a permission set is provisioned to an account, IAM Identity Center creates an IAM role there, under the path `/aws-reserved/sso.amazonaws.com/` and named like `AWSReservedSSO_PowerUser_9f8e...`. Its policies are copied from the permission set. From then on, IAM in that account evaluates the role like any other role.
+## Updating and customizing
+- Editing a permission set does not change the roles immediately. The changes reach each account when the permission set is **reprovisioned** (in the console, **Update in accounts**, or the `ProvisionPermissionSet` API). Accounts not yet updated keep the old permissions.
+- These roles are managed by Identity Center. Editing them directly in IAM is not supported, and those changes can be overwritten the next time the permission set is provisioned.
+- To tailor access per account, use separate permission sets, customer managed policy references, or a permissions boundary in the permission set.
+W: Per-account IAM roles, reprovision to update: permission sets are materialized as managed roles in each account, so updates appear only after reprovisioning, and the local edit is not supported and may be overwritten.
+X: A=Local role edits recommended: directly modifying `AWSReservedSSO_` roles is not the supported customization path, and provisioning can replace those edits with the permission set's contents.
+B=Management account only: permission sets can be assigned and provisioned to any account in the organization, which is the main purpose of the feature.
+C=Evaluated live by Identity Center: Identity Center does not evaluate permissions at request time; IAM in each account evaluates the provisioned role's policies, which is why unprovisioned changes are not visible.
+T: A permission set is copied into a managed IAM role per account; reprovision after changes and customize through permission sets, not by editing the role.
+
+@ Q001861 explain
+G: ## How ABAC with Identity Center works
+Attribute-based access control (ABAC) grants access by matching tags rather than listing resources.
+- In IAM Identity Center, **attributes for access control** map user attributes (from the IdP or the identity store) to session tags, for example `CostCenter = 1234`.
+- When the user signs in, the role session carries that tag, readable in policies as `aws:PrincipalTag/CostCenter`.
+- The permission set's policy must compare it with the resource tag, for example a condition `StringEquals` on `aws:ResourceTag/CostCenter` equal to `${aws:PrincipalTag/CostCenter}`.
+## Common mistakes
+Passing the tag is only half of ABAC. If the permission set still contains a broad statement (such as a managed policy granting `ec2:*` on `*`) or the condition compares the wrong key, the tag is present but nothing enforces it. Some actions also do not support resource tag conditions, so those need separate handling.
+W: Policies compare aws:PrincipalTag/CostCenter with the resource tag: ABAC enforcement lives in the permission set policies, so the first check is that every allow is conditioned on matching tags and no broader statement grants access anyway.
+X: B=MFA at sign-in: MFA strengthens authentication, but it has no effect on which cost center's resources an authenticated session can reach.
+C=AWS Config rules for the tag: Config rules can detect missing or incorrect tags after the fact, but they do not decide whether an API request is allowed.
+D=Management account: whether the account is the management account does not change how tag conditions in permission set policies are evaluated in the target accounts.
+T: ABAC works only if policies actually compare the principal tag with the resource tag; passing the attribute as a session tag does nothing by itself.
+
+@ Q001862 explain
+G: ## Two separate Cognito components
+- A **user pool** is a user directory. It handles sign-up, sign-in with email and password, MFA and account recovery, and issues JSON Web Tokens: an ID token, an access token and a refresh token. These tokens prove who the user is but are not AWS credentials.
+- An **identity pool** exchanges a trusted token (from a user pool or another IdP) for temporary AWS credentials by assuming an IAM role for authenticated users.
+## Per-user S3 folders
+The identity pool gives each user a stable identity ID such as `us-east-1:1a2b-...`. The authenticated role can use it in a policy variable, for example allowing `s3:GetObject` and `s3:PutObject` on `arn:aws:s3:::app-uploads/${cognito-identity.amazonaws.com:sub}/*`. Every user then gets short-lived credentials that only reach their own prefix, and the app calls S3 directly with the AWS SDK.
+W: User pool plus identity pool: the user pool provides sign-up, sign-in and MFA, and the identity pool turns the user's token into temporary, least-privilege IAM credentials scoped to that user's folder.
+X: A=Identity pool with unauthenticated identities only: this skips sign-up and sign-in entirely, so users are never authenticated and cannot be tied to their own folder reliably.
+B=User pool ID token as AWS credentials: a user pool token is a JWT that proves identity; S3 requires signed requests with AWS credentials, which only come through an identity pool or STS.
+C=IAM Identity Center with a SAML app: Identity Center is for workforce users accessing AWS accounts and business applications, not for customer sign-up in a mobile app.
+T: For app users who need AWS access, a user pool authenticates them and an identity pool issues scoped temporary credentials; user pool tokens are not AWS credentials.
+
+@ Q001863 explain
+G: ## How an identity pool gets AWS credentials
+After sign-in, the app sends the user pool token to the identity pool (`GetId`, then `GetCredentialsForIdentity`). The identity pool picks a role and calls `AssumeRoleWithWebIdentity` on the user's behalf. That call succeeds only if:
+- The role's **trust policy** allows the principal `cognito-identity.amazonaws.com` with action `sts:AssumeRoleWithWebIdentity` (plus `sts:TagSession` if principal tags are used), and has conditions matching this pool: `cognito-identity.amazonaws.com:aud` equal to the identity pool ID and `cognito-identity.amazonaws.com:amr` equal to `authenticated`.
+- The **role mapping** resolves to a valid role. With rules-based mapping, the claim name and value in the rule must match the token exactly; if no rule matches and ambiguous role resolution is set to deny, the request fails.
+## Example
+A trust policy copied from another environment still contains the old identity pool ID in the `aud` condition, so every assume attempt is rejected even though sign-in works.
+W: Role trust for cognito-identity and role mapping: a "role cannot be assumed" error after successful sign-in points to a trust policy that does not allow this identity pool, or rule-based mapping that selects the wrong role or none.
+X: A=Client secret on the app client: a client secret affects how the app authenticates to the user pool, and sign-in already works; it plays no part in the identity pool assuming the role.
+C=CloudFront in front of the hosted UI: the hosted UI domain setup does not affect the identity pool's STS call, and tokens are already being issued successfully.
+D=Same account as the S3 bucket: an identity pool can issue credentials for a role that accesses resources in other accounts through normal cross-account policies; the failure is at role assumption, before any S3 call.
+T: When identity pool credentials fail after a good sign-in, check the role trust policy (cognito-identity principal, aud and amr conditions) and the role mapping rules.
+
+@ Q001864 explain
+G: ## The three user pool tokens
+After sign-in through the hosted UI (managed login), a Cognito user pool returns three tokens:
+- **ID token** (JWT): describes the user with claims such as `email` and `cognito:groups`, for the app itself to display or personalize.
+- **Access token** (JWT): carries `scope` and group claims and is meant for authorizing calls to APIs, for example sent as `Authorization: Bearer <access token>` to an API Gateway authorizer or a backend that validates the JWT. It is short-lived, typically about an hour.
+- **Refresh token**: long-lived and encrypted, so the app cannot read its contents; the app sends it only to the Cognito token endpoint to get new ID and access tokens. Its lifetime can be configured, for example 30 days.
+## Keeping users signed in
+Setting the refresh token validity to 30 days lets the SPA silently renew short-lived access tokens without asking for the password again. Only the short-lived access token travels to the API, which limits damage if one leaks.
+W: Access token for the API, refresh token for renewal: the API authorizes requests with the access token's scopes, and the refresh token (valid for 30 days) obtains new tokens so users stay signed in without reentering passwords.
+X: A=Refresh token on every API call: the refresh token is meant only for the Cognito token endpoint; sending a long-lived token to every API request increases exposure, and APIs do not validate it as a bearer token.
+B=ID token as AWS credentials: the ID token is a JWT about the user, not an AWS access key, secret and session token; AWS credentials come from an identity pool.
+C=STS session token from the user pool: user pools issue JWTs, not STS credentials; STS session tokens come from role assumption, for example through an identity pool.
+T: Send the short-lived access token to APIs and use the refresh token only with Cognito to renew it; ID tokens identify users and are not AWS credentials.
+
+@ Q001865 explain
+G: ## Where a trusted tenant claim comes from
+For ABAC with a Cognito identity pool, a token claim can be mapped to a **principal tag** on the IAM session (identity pool **attributes for access control**). IAM policies then use it, for example `dynamodb:LeadingKeys` in a `ForAllValues:StringEquals` condition set to `${aws:PrincipalTag/tenant_id}`, so a user reaches only items whose partition key is their tenant.
+That is only safe if the claim cannot be set by the user.
+- A custom attribute that the app client can write, such as `custom:tenant_id`, can be changed by the user through `UpdateUserAttributes`.
+- A **Pre Token Generation** Lambda trigger runs inside Cognito before tokens are issued. It can look up the user's tenant in a trusted store (for example a DynamoDB table populated by the SaaS backend) and add a `tenant_id` claim to the token.
+## Flow
+User signs in, the trigger adds `tenant_id=acme`, the identity pool maps the claim to the principal tag, and the IAM policy limits DynamoDB access to `acme` items.
+W: Pre Token Generation claim mapped to a principal tag: the Lambda trigger sets the TenantID from a trusted source inside Cognito, and the identity pool passes it as a principal tag that IAM conditions can enforce.
+X: A=One IAM role per tenant without tags: separate roles per tenant do not scale to many tenants, need custom mapping logic for each, and drop the ABAC approach the requirement asks for.
+B=TenantID in local storage as a header: DynamoDB authorization uses IAM, not custom headers, and a value stored on the client is fully under the user's control.
+C=User-set custom:tenant_id: if users can set the attribute at sign-up, they can choose another tenant's ID, which defeats tenant isolation.
+T: Tenant isolation needs a claim the user cannot edit, such as one added by a Pre Token Generation trigger, mapped to a principal tag; a user-writable attribute is not trustworthy.
+
+@ Q001866 explain
+G: ## SAML 2.0 federation to the AWS console without Identity Center
+Three pieces must fit together:
+- **IAM SAML identity provider**: created in the AWS account by uploading the AD FS federation metadata XML, which carries the issuer and signing certificate.
+- **IAM roles that trust it**: the trust policy allows `sts:AssumeRoleWithSAML` for the SAML provider ARN, usually with the condition `SAML:aud` equal to `https://signin.aws.amazon.com/saml`.
+- **AD FS relying party trust** for AWS with claim rules that send `https://aws.amazon.com/SAML/Attributes/Role` (a role ARN and provider ARN pair, often derived from AD group names) and `https://aws.amazon.com/SAML/Attributes/RoleSessionName` (for example the user's email).
+## Sign-in flow
+The employee opens the AD FS sign-in page, authenticates with corporate credentials, and AD FS posts a signed assertion to the AWS sign-in endpoint. AWS validates it against the SAML provider, lets the user pick a role, and opens the console with temporary credentials. No IAM users exist.
+W: SAML provider, trusting role and Role claims: the IAM SAML provider trusts AD FS, the role trusts the provider, and the Role and RoleSessionName claims tell AWS which role to assume, which is the complete SAML 2.0 console federation setup.
+X: A=IAM OIDC provider for AD FS metadata: an IAM OIDC provider serves web identity token exchanges (`AssumeRoleWithWebIdentity`) and does not read SAML metadata; AD FS console federation uses the SAML sign-in endpoint and an IAM SAML provider.
+C=IAM user per employee: creating users means managing separate AWS passwords and keys, which is the opposite of federation, and SAML is not a password policy setting.
+D=AD FS calling CreateUser: automatically creating IAM users still produces long-term identities in AWS; federation issues temporary role sessions without any IAM users.
+T: Direct SAML federation needs an IAM SAML provider, a role that trusts it, and IdP claims naming the role; OIDC providers and IAM users are different mechanisms.
+
+@ Q001867 explain
+G: ## Time windows in a SAML assertion
+A SAML assertion is signed and time-limited. It contains timestamps such as `IssueInstant`, `NotBefore` and `NotOnOrAfter`, usually only a few minutes apart. AWS compares them with its own clock when the assertion arrives.
+## What clock skew does
+If the IdP server's clock is wrong, it stamps assertions with a time window that does not line up with real time.
+- IdP clock behind by 10 minutes: an assertion created "now" says it expires in 5 minutes of IdP time, which is already in the past for AWS, so AWS reports it as expired.
+- IdP clock ahead: the assertion may look "not yet valid".
+Intermittent failures often mean one node in an IdP farm drifted, or time sync to NTP is unreliable, so only requests handled by that node fail. The fix is to synchronize the IdP servers to a reliable time source, such as NTP.
+W: Clock skew on the IdP: assertions carry short validity windows based on the IdP's clock, so a drifting clock makes freshly issued assertions look expired to AWS even though users sign in promptly.
+X: B=MFA not enforced: MFA settings change how users authenticate at the IdP, not the timestamps in the assertion, so they would not produce an expired assertion error.
+C=Maximum session duration too high: the role's maximum session duration limits how long the resulting console session can last; a high value never makes a new assertion appear expired.
+D=Metadata in the wrong Region: IAM SAML providers are global resources in the account, not tied to a Region, so there is no wrong Region to upload them to.
+T: "Assertion expired" right after sign-in points to IdP clock skew against the assertion validity window, not to session duration or MFA settings.
+
+@ Q001868 explain
+G: ## Keyless CI/CD with OIDC federation
+GitHub Actions can issue a signed OIDC token for each workflow run. AWS can trust that token instead of stored access keys:
+- In IAM, create an OIDC identity provider for `https://token.actions.githubusercontent.com` with audience `sts.amazonaws.com`.
+- Create a role whose trust policy allows `sts:AssumeRoleWithWebIdentity` from that provider, with conditions such as `token.actions.githubusercontent.com:aud` equal to `sts.amazonaws.com` and `token.actions.githubusercontent.com:sub` equal to `repo:my-org/my-app:ref:refs/heads/main`.
+- In the workflow, grant `id-token: write` and use the `aws-actions/configure-aws-credentials` action with the role ARN.
+## Why the sub condition matters
+Without a `sub` condition, any repository on GitHub able to get a token for this audience could try to assume the role. Scoping to the organization, repository and branch or environment limits it to the intended workflow. Each run receives temporary credentials that expire, so there is nothing long-lived to leak.
+W: GitHub OIDC provider with sub and aud scoped trust: the workflow exchanges its short-lived OIDC token for temporary role credentials, and the trust conditions restrict the role to the intended repository and branch.
+X: B=Access keys as GitHub secrets: encryption at rest does not change that these are long-lived keys that must be rotated and can be exfiltrated from logs or compromised workflows.
+C=Root user access keys: root access keys should not exist at all; embedding them in YAML exposes unrestricted control of the account to anyone who can read the repository.
+D=IAM user with rotated password: a password is for console sign-in, not for API calls, and an IAM user still means long-term credentials for the runner.
+T: CI/CD pipelines should federate with OIDC and assume a tightly scoped role instead of storing any long-term keys, even encrypted ones.
+
+@ Q001869 explain
+G: ## Federating workloads with OIDC
+A Kubernetes cluster can act as an OIDC issuer: it signs service account tokens with a key published at a discovery URL (`/.well-known/openid-configuration` and a JWKS endpoint). To let a pod in an external cluster use AWS:
+- Make the cluster's issuer discovery documents reachable by AWS and register the issuer URL as an **IAM OIDC identity provider**.
+- Create a role whose trust policy allows `sts:AssumeRoleWithWebIdentity` from that provider, with a condition on `sub`, for example `system:serviceaccount:payments:api-sa`, and on `aud`.
+- The pod calls `AssumeRoleWithWebIdentity` with its projected service account token and receives temporary credentials.
+## SAML versus OIDC here
+SAML 2.0 federation is built around browser-based sign-in, where an IdP posts an assertion for a human user. Workloads such as pods and CI jobs already hold OIDC JWTs, so OIDC federation fits them directly and needs no Identity Center.
+W: OIDC issuer registered with AssumeRoleWithWebIdentity: the cluster's service account tokens are OIDC JWTs, so registering the issuer as an IAM OIDC provider and trusting the service account's sub claim gives the pod temporary credentials.
+X: A=Both require Identity Center: IAM SAML and OIDC identity providers work in any account on their own; Identity Center is a separate workforce sign-in service and is not a prerequisite.
+B=OIDC not for workloads: OIDC federation is the common workload pattern, used by EKS IAM roles for service accounts, GitHub Actions and other CI systems.
+C=OIDC only for Cognito: IAM accepts tokens from any compliant OIDC issuer registered as an identity provider, not just Cognito user pools.
+T: Workloads that hold OIDC tokens, such as Kubernetes service accounts, federate with an IAM OIDC provider and AssumeRoleWithWebIdentity; SAML is for browser sign-in by people.
+
+@ Q001870 explain
+G: ## What STS checks in AssumeRoleWithWebIdentity
+When a pipeline calls `sts:AssumeRoleWithWebIdentity`, STS verifies the token signature against the registered OIDC provider, then evaluates the role's **trust policy**. A typical trust policy contains:
+- `Principal`: the federated provider ARN, such as `arn:aws:iam::111122223333:oidc-provider/token.actions.githubusercontent.com`.
+- `Action`: `sts:AssumeRoleWithWebIdentity`.
+- `Condition`: `StringEquals` on `<issuer>:aud` (for example `sts.amazonaws.com`) and `StringEquals` or `StringLike` on `<issuer>:sub` (for example `repo:org/app:ref:refs/heads/main`).
+## Typical mismatch
+The trust policy allows `sub` = `repo:org/app:ref:refs/heads/main`, but the job runs in a GitHub environment, so the token's `sub` is `repo:org/app:environment:prod`. The strings do not match and STS returns AccessDenied. Comparing the decoded token claims with the conditions, or using `StringLike` with a narrow wildcard, fixes it.
+W: Trust conditions do not match aud and sub: with a correct provider, AccessDenied on the assume call means the role's trust policy conditions do not match the claims in the presented token.
+X: A=Access key instead of session token: `AssumeRoleWithWebIdentity` is called with the OIDC token and needs no AWS credentials at all, so access keys play no part in this error.
+C=Permissions policy lacks an Allow: the permissions policy governs what the role can do after it is assumed; a missing Allow would cause AccessDenied on later service calls, not on the assume call.
+D=Provider in a different partition: the scenario states the provider was created correctly, and a trust policy referencing a provider in the account is the normal setup; claim mismatches are far more common.
+T: AccessDenied on AssumeRoleWithWebIdentity with a valid provider means the trust policy's aud or sub conditions don't match the token; permissions policies only matter after the role is assumed.

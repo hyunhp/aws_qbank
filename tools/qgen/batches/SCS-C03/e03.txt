@@ -1,0 +1,345 @@
+# SCS-C03 detailed explanations, chunk e03 (explanation-only rewrites; letters are the published ones)
+
+@ Q001821 explain
+G: ## What S3 Block Public Access does
+S3 Block Public Access (BPA) is a set of four switches that override bucket policies and ACLs:
+- `BlockPublicAcls` and `IgnorePublicAcls` stop new public ACLs and ignore existing ones.
+- `BlockPublicPolicy` rejects bucket policies that would grant public access.
+- `RestrictPublicBuckets` limits a bucket with a public policy to AWS service principals and authorized users in the owner account.
+Set at the **account level**, the switches apply to every existing and future bucket in the account at once. Set at the bucket level, they apply to one bucket.
+## Two ways to contain an exposure
+- **Account-level BPA**: one API call (`PutPublicAccessBlock` on S3 Control) and every public path in the account is closed. Nothing has to be written per bucket.
+- **Targeted deny statement** in one bucket's policy: precise, and it can even block specific non-public cross-account principals, but someone has to write, test and apply it for each affected bucket.
+Example: a marketing bucket that serves public images through a static website endpoint stops working the moment account-level BPA is turned on.
+W: Fast containment, wider blast radius: account-level BPA closes public access on every bucket immediately, but any workload that relies on public access (public website buckets, public downloads, anonymous partners) breaks too, so inventory legitimate public uses before or right after turning it on.
+X: B=Only per bucket: BPA exists at the account level (through S3 Control) as well as at the bucket level, so there is no such limit.
+C=Evaluation order: an explicit deny in a bucket policy always wins no matter how BPA is set, and BPA ignores non-public cross-account grants that a deny can still block. The two controls complement each other; neither makes the other redundant.
+D=Only new buckets: account-level BPA applies to all buckets in the account, existing and future. That is exactly why it is fast for containment and why it can break existing public uses.
+T: Account-level BPA trades precision for speed: it shuts every public path in one step but also cuts off legitimate public buckets, while a targeted deny is narrow but slower to roll out.
+
+@ Q001822 explain
+G: ## What BPA blocks and what it does not
+S3 Block Public Access decides whether a bucket's ACLs or policy count as **public** (granting access to everyone or anonymous users). It removes that public access. It does not revoke access that an authorized identity already has.
+## How pre-signed URLs work
+A pre-signed URL is a normal `GetObject` request signed in advance with the credentials of an IAM user or role that is allowed to read the object. Anyone holding the URL can use it until:
+- the expiry time in the URL (`X-Amz-Expires`) passes, or
+- the signing credentials stop being valid, for example because the access key is deactivated or the role session expires or is revoked.
+S3 evaluates the request as the **signer**, not as an anonymous caller, so BPA treats it as authorized access, not public access. In CloudTrail data events the request shows the signer's identity, with the external party's IP address as the source.
+Example: a URL signed an hour ago with a 7-day expiry keeps working after BPA is enabled until the signer's key is disabled.
+W: Pre-signed URLs keep working: the external party is presenting URLs signed by a permitted principal, which BPA does not block. Deactivate the signer's access keys or revoke its role sessions, and deny the requests in the bucket policy if needed.
+X: A=Stale CloudTrail cache: CloudTrail does not replay old events as new ones; each data event has the real event time, so entries timestamped after the change are real requests.
+C=24-hour propagation: BPA changes take effect quickly (at most a short eventual-consistency delay), not over 24 hours, and a delay would not explain requests that carry a valid signature.
+D=Same-account role: BPA indeed never blocks authorized access by the owner account's own principals, but the calls come from an external party, so a same-account role does not explain them; access that continues from outside after the change points to URLs signed by a permitted principal.
+T: BPA removes public access, not authorized access; pre-signed URLs keep working until they expire or the signer's credentials are revoked.
+
+@ Q001823 explain
+G: ## From finding to action
+Security Hub sends new and updated findings to Amazon EventBridge on the default event bus automatically (in Security Hub CSPM the detail type is `Security Hub Findings - Imported`). An EventBridge rule can match a pattern such as a specific control ID and severity and start a target.
+## Why Step Functions for multi-step remediation
+AWS Step Functions runs a state machine: ordered steps with retries, error handling and a visible execution history. A remediation for a public bucket might be:
+- a Lambda task that calls `PutBucketAcl` with a private ACL (or turns on bucket-level BPA),
+- an SNS `Publish` task that notifies the security team,
+- a task that calls the ticketing system's API to open a ticket,
+- a final step that updates the finding's workflow status to `RESOLVED`.
+Each step is retried and logged, and a failure in one step (for example the ticketing API is down) does not silently drop the others. Security Hub also integrates with ticketing tools such as Jira Service Management and ServiceNow (for example through the AWS Service Management Connector), which the workflow can use instead of a custom API call.
+W: EventBridge plus Step Functions: EventBridge catches the matching Security Hub findings automatically, and the state machine performs the fix, notification and ticket as one tracked workflow with no analyst in the loop, which fits well-understood, low-risk finding types.
+X: B=Email every finding: email only informs people; an analyst still has to read and fix each finding by hand, which is the manual step the team wants to remove.
+C=Config auto-remediation only: AWS Config remediation runs an Automation runbook when a Config rule reports a resource noncompliant. It is driven by Config evaluations rather than Security Hub findings, and on its own it does not orchestrate notification plus ticket creation as one workflow.
+D=Manual console review: reviewing and fixing each finding by hand is the slow, error-prone process the automation is meant to replace.
+T: Security Hub finding to EventBridge rule to Step Functions gives automatic, multi-step remediation; email or console review keeps humans doing the work.
+
+@ Q001824 explain
+G: ## Automated response and its risk
+GuardDuty findings flow into EventBridge, and a rule can start a Step Functions workflow that, for example, attaches a deny-all policy to an IAM role, deactivates access keys or moves an EC2 instance into an isolation security group. These actions stop an attacker in seconds, but they also stop the real workload.
+Detection is never perfect. A GuardDuty finding can be a **false positive** or benign activity, for example a new, legitimate admin tool calling unusual APIs or a vulnerability scanner the team runs itself.
+## Adding a human approval
+Step Functions supports a callback pattern (`.waitForTaskToken`): the workflow pauses, sends the token to an approver (by email via SNS, or a chat tool), and resumes only when someone approves or rejects.
+- Collect evidence and snapshot volumes automatically.
+- Ask for approval before destructive steps such as revoking production credentials or isolating a production instance.
+- Auto-approve only well-understood, low-impact finding types.
+W: False positives with no check: with no approval gate, a wrong or benign finding can revoke credentials and isolate instances that production depends on, causing an outage that is self-inflicted; a human approval step catches those cases before the disruptive action runs.
+X: B=One Lambda per execution: a Step Functions state machine can call any number of Lambda functions and other services in sequence, in parallel or in loops.
+C=GuardDuty not in EventBridge: GuardDuty publishes every finding to EventBridge automatically; that is the normal way to trigger automated response.
+D=No CloudTrail logging: Step Functions API calls and the IAM or EC2 API calls the workflow makes are recorded in CloudTrail, and each execution also has its own execution history.
+T: Fully automated containment is fast but acts on false positives too; gate the destructive steps with human approval.
+
+@ Q001825 explain
+G: ## How a permissions boundary works
+A permissions boundary is a managed policy attached to an IAM user or role that sets the **maximum** permissions that identity can have. It does not grant anything by itself.
+The effective permissions are the **intersection** of the identity-based policy and the boundary (explicit denies anywhere still win):
+- identity policy allows `iam:PutRolePolicy`, boundary allows it: allowed
+- identity policy allows it, boundary does not: denied with `AccessDenied`
+- boundary allows it, identity policy does not: denied
+Boundaries are often required by the platform team so that roles created by developers cannot escalate privileges.
+## Applying that here
+The Lambda execution role has `iam:PutRolePolicy` in its identity policy, but the boundary does not include it, so every call fails. The narrow fix is to add the action to the boundary, ideally scoped with a `Resource` pattern to the roles the function may quarantine, for example `arn:aws:iam::111122223333:role/app-*`.
+W: Add the action to the boundary: the boundary is what blocks the call, so allowing `iam:PutRolePolicy` there (scoped to the target roles) restores the function's ability to attach the deny policy while keeping the guardrail in place.
+X: A=Remove the boundary: it would work, but it throws away the guardrail that limits what this highly privileged function can do, and policy often forbids creating roles without it.
+B=Boundaries for users only: permissions boundaries can be attached to IAM users and IAM roles, and a Lambda execution role is an IAM role, so the boundary applies.
+C=AdministratorAccess: adding a broader identity policy changes nothing, because the effective permissions are still capped by the boundary, and it violates least privilege.
+T: Effective permissions are identity policy AND boundary; when the boundary blocks an action, add that action to the boundary rather than removing it or granting more.
+
+@ Q001826 explain
+G: ## What the root user is
+Every AWS account has one root user: the email address and password used to create it. It has full access to the account and a few tasks only it can perform (such as changing the account's support plan or closing the account). The root user cannot be deleted while the account exists.
+GuardDuty reports root API use as `Policy:IAMUser/RootCredentialUsage`; `PenTest:IAMUser/...` finding types instead flag calls from penetration-testing systems such as Kali Linux. Either one alongside unexpected root sign-ins in CloudTrail is a strong signal.
+## Responding to suspected root compromise
+- **Reset the root password** and make sure the account email mailbox is under your control.
+- **Delete any root access keys**; root should never have long-term keys.
+- **Confirm or re-register MFA** on root, removing any device you do not recognize.
+- **Review CloudTrail** for root activity (`userIdentity.type` = `Root`): new IAM users or keys, changed billing or contact details, new Regions in use, and disabled logging.
+- Then remove whatever the attacker created, such as IAM users, access keys and roles.
+In AWS Organizations, centralized root access management can also remove root credentials from member accounts.
+W: Reset, remove keys, MFA, investigate: these steps cut off every way the attacker could still sign in or call APIs as root, and the CloudTrail review finds persistence (new users, keys, roles) that must be removed next.
+X: A=Delete the root user: the root user cannot be deleted while the account exists; you can only secure it or remove its credentials.
+C=SCP as the only step: SCPs do not restrict the management account at all, and even in a member account an SCP alone leaves the stolen password, any root keys and any persistence the attacker created in place.
+D=Identity Center locks root: IAM Identity Center manages workforce users and permission sets; it has no mechanism to detect or lock the root user.
+T: For suspected root compromise, rotate the credential (password), remove keys, enforce MFA and investigate in CloudTrail; root cannot be deleted and an SCP is not enough.
+
+@ Q001827 explain
+G: ## How Systems Manager reaches an instance
+The SSM Agent on the instance makes **outbound HTTPS (port 443)** connections to the Systems Manager endpoints (`ssm`, `ssmmessages`, `ec2messages`). Session Manager and Run Command then work over that agent-initiated channel; no inbound port such as 22 is needed.
+The agent also needs AWS credentials, normally from the instance profile role (for example with `AmazonSSMManagedInstanceCore`).
+## Isolating but keeping access
+A common forensic isolation pattern:
+- Replace the instance's security groups with an **isolation security group** that has no inbound rules and only allows outbound TCP 443 to the SSM interface VPC endpoints (or their prefix list or subnet range).
+- Keep the instance profile attached so the agent can authenticate.
+- Snapshot EBS volumes and capture memory before changing anything else.
+The attacker loses all other network paths, and responders can still run collection commands.
+W: Allow only HTTPS to SSM endpoints: the instance can no longer talk to anything else, but the SSM Agent can still reach the Systems Manager endpoints, so Session Manager and Run Command keep working for evidence collection.
+X: B=Remove all rules: with no outbound rules the SSM Agent cannot open its HTTPS connections, so Session Manager stops working along with everything else.
+C=Detach the instance profile: removing the role takes away the credentials the SSM Agent normally uses to authenticate, so management breaks; it does not give Systems Manager any way to bypass network isolation.
+D=Disable the network interface: cutting the network entirely also cuts the agent's only channel to Systems Manager, so remote forensic commands become impossible.
+T: Isolate with a security group that allows only HTTPS egress to the SSM endpoints and keep the instance role, so the host is quarantined but still manageable.
+
+@ Q001828 explain
+G: ## How managed rule groups work
+An AWS WAF managed rule group, such as `AWSManagedRulesSQLiRuleSet` (the SQL database group), contains several individual rules, for example one that inspects the request body for SQL injection. When a request matches a rule, the rule's action (normally Block) applies.
+## Rule action overrides
+In the web ACL you can override the action of a single rule inside the group without touching the others:
+- set the noisy rule to **Count**: matching requests are counted, labeled and logged but not blocked;
+- all the other rules in the group keep blocking.
+You can then add a custom rule after the group that matches the rule's label and blocks it except when the known-good field is present, which restores protection for everything except the false-positive pattern. Review WAF logs first to see exactly which rule matched the `SELECT_PLAN` requests.
+W: Override one rule to Count: this stops only the rule that misfires on the JSON body, keeps every other SQL injection rule blocking, and still records matches so the team can refine the exception with labels.
+X: A=Remove the whole group: that ends the false positives but also removes all SQL injection protection, which violates the requirement to keep it for other traffic.
+B=Shield Advanced instead of WAF: Shield Advanced adds DDoS protection and response support; it does not inspect request bodies for SQL injection, so it cannot replace WAF rules.
+C=Change scope to REGIONAL: a CloudFront distribution can only use a web ACL with CLOUDFRONT scope, and the scope does not change how rules match; the same rule would fire on the same body.
+T: Fix a managed-rule false positive by overriding just that rule (Count plus a label-based exception), not by removing the whole rule group.
+
+@ Q001829 explain
+G: ## Shield Standard versus Shield Advanced
+- **Shield Standard** is automatic and free for every AWS customer. It protects against common network and transport layer (layer 3 and 4) attacks.
+- **Shield Advanced** is a paid subscription for specific protected resources (CloudFront, Route 53, Global Accelerator, load balancers, Elastic IPs). It adds:
+- access to the **Shield Response Team (SRT)** 24/7 during attacks (requires Business or Enterprise support),
+- **proactive engagement**: when Route 53 health checks associated with a protected resource become unhealthy during a detected event, the SRT contacts you,
+- **DDoS cost protection**: credits for scaling charges caused by a DDoS attack on protected resources,
+- detailed attack metrics and automatic application layer mitigation with AWS WAF.
+Example: a retailer protects its CloudFront distribution and ALB, associates health checks, and adds its emergency contacts to enable proactive engagement.
+W: Shield Advanced with proactive engagement: it is the only option that includes 24/7 SRT expertise, contact from AWS when health checks show impact, and cost protection for attack-driven scaling.
+X: A=GuardDuty Runtime Monitoring: it detects threats such as suspicious processes in workloads; it offers no DDoS response team, proactive contact or scaling credits.
+C=WAF Bot Control: a managed rule group that labels and blocks bot traffic; useful against some layer 7 floods, but it includes no expert support or cost protection.
+D=Shield Standard: free and automatic layer 3/4 protection, but no SRT access, no proactive engagement and no cost protection.
+T: Human DDoS experts, proactive contact and cost protection come only with Shield Advanced; Shield Standard is basic automatic protection.
+
+@ Q001830 explain
+G: ## How OAC reaches S3
+Origin Access Control (OAC) makes CloudFront sign its requests to the S3 origin with SigV4 as the **CloudFront service principal** `cloudfront.amazonaws.com`. The bucket policy allows that principal with a condition `AWS:SourceArn` equal to the distribution ARN, so only this distribution can read.
+## Why KMS needs its own permission
+With SSE-KMS, reading an object requires two permissions: `s3:GetObject` from the bucket policy and `kms:Decrypt` on the key. The key policy is evaluated separately from the bucket policy, so allowing CloudFront in the bucket policy is not enough.
+Add a key policy statement such as:
+- `Principal`: `{"Service": "cloudfront.amazonaws.com"}`
+- `Action`: `kms:Decrypt` (plus `kms:Encrypt` and `kms:GenerateDataKey*` if CloudFront also uploads)
+- `Condition`: `StringEquals` on `AWS:SourceArn` = `arn:aws:cloudfront::111122223333:distribution/EDFDVBD6EXAMPLE`
+W: Key policy for CloudFront: granting `kms:Decrypt` to the CloudFront service principal, limited to this distribution with `AWS:SourceArn`, lets CloudFront decrypt the SSE-KMS objects and ends the 403s.
+X: B=Re-enable OAI: it is the other way around; OAI does not support SSE-KMS objects, and OAC was designed to support them.
+C=Disable default encryption: this only affects new uploads; existing objects stay encrypted with the KMS key and still fail, and it weakens security for no reason.
+D=Viewer certificate permissions: the ACM certificate secures TLS between viewers and CloudFront; it has no role in decrypting S3 objects with KMS.
+T: OAC with SSE-KMS needs two grants: the bucket policy and a KMS key policy statement for `cloudfront.amazonaws.com` scoped by `AWS:SourceArn`.
+
+@ Q001831 explain
+G: ## Domain filtering without decryption
+When a client opens a TLS connection, the first message (ClientHello) carries the **Server Name Indication (SNI)**: the host name it wants, in clear text. A firewall can read the SNI and drop the connection before any encrypted data flows, without terminating or decrypting TLS.
+## Network Firewall rule groups
+- **Stateless** rules look at single packets (IPs, ports, protocol). They cannot see host names.
+- **Stateful** rules track connections and can inspect application fields. A **domain list** rule group lists domains (for example `.malware-c2.example`) and a type (allow list or deny list); it matches the TLS SNI for HTTPS and the `Host` header for HTTP.
+Example: a deny list with `.badsite.example` drops `https://cdn.badsite.example` at the handshake, whatever IP address the domain currently resolves to.
+W: Stateful domain-list rules on SNI: they identify the destination domain from the TLS handshake and drop the connection right there, which is exactly block by domain without decrypting.
+X: A=Stateless IP rules: stateless rules see only addresses and ports, not domain names, and malicious domains change IPs often, so an IP list is always behind.
+B=Flow logs dropping flows: VPC Flow Logs only record traffic metadata after the fact; they cannot drop or block anything.
+C=CloudFront WAF web ACL: a CLOUDFRONT-scope web ACL protects inbound requests to a CloudFront distribution; it cannot be associated with a VPC and does not see outbound traffic.
+T: To block outbound domains at the TLS handshake without decryption, use Network Firewall stateful domain-list rules that match the SNI.
+
+@ Q001832 explain
+G: ## The two web ACL scopes
+Every AWS WAF web ACL has a **scope** that you choose when you create it, and it can only be associated with resources of that scope:
+- **CLOUDFRONT** scope: for CloudFront distributions (and Amplify apps). CloudFront is global, so these web ACLs are managed in US East (N. Virginia), `us-east-1`, and API or CLI calls must target that Region.
+- **REGIONAL** scope: for Application Load Balancers, API Gateway REST APIs, AppSync APIs, Cognito user pools and similar resources, created in the **same Region** as the resource.
+Example: a web ACL for an ALB in `us-west-2` is REGIONAL in `us-west-2`; a web ACL for a distribution is CLOUDFRONT scope, created through `us-east-1`. The scope cannot be changed later, so a web ACL created with the wrong scope must be recreated.
+W: CLOUDFRONT scope for the distribution, REGIONAL in us-west-2 for the ALB: each web ACL matches its resource type and location, so both associations succeed.
+X: A=Automatic scope from tags: AWS WAF never picks a scope; you set `Scope` explicitly when creating the web ACL, and tags play no part.
+B=Both CLOUDFRONT scope: a CLOUDFRONT-scope web ACL cannot be associated with an ALB; load balancers need a REGIONAL web ACL in their Region.
+D=Both REGIONAL in us-west-2: a REGIONAL web ACL cannot be associated with a CloudFront distribution, which is exactly the failure the team hit.
+T: CloudFront needs a CLOUDFRONT-scope web ACL managed in us-east-1; regional resources need a REGIONAL web ACL in their own Region.
+
+@ Q001833 explain
+G: ## What DDoS cost protection covers
+Shield Advanced includes **DDoS cost protection**: if a DDoS attack against a resource you have added as a Shield Advanced **protected resource** makes your usage spike, AWS can credit the extra charges. Typical examples:
+- CloudFront, Global Accelerator and Route 53 hosted zone usage charges,
+- Elastic Load Balancing and EC2 scaling charges for protected load balancers and Elastic IP addresses.
+To be covered, the origin resources whose usage spikes should also be added as protections, not just the distribution in front of them.
+## How it works in practice
+- The resource must be explicitly protected (subscribing is not enough; each resource is added as a protection).
+- The spike must be caused by a DDoS event on that resource.
+- You request the credit through AWS Support after the event, and AWS reviews it.
+Example: a distribution and its ALB origin are both Shield Advanced protections; an HTTP flood makes the Auto Scaling group behind the ALB double for six hours, and the attack-driven charges can be submitted for a credit.
+W: Protected resource plus DDoS cause: eligibility depends on the charges coming from a DDoS attack against a resource covered by Shield Advanced protection, and the credit is requested through Support.
+X: B=Enterprise Support and a BAA: a Business Associate Agreement is a HIPAA contract and has nothing to do with Shield; cost protection does not depend on signing one or on having Enterprise Support.
+C=Health checks disabled: Route 53 health checks are used for detection and proactive engagement; disabling them is never a condition for cost protection.
+D=Written pre-approval of the architecture: the Shield Response Team (formerly the DDoS Response Team) does not have to approve your architecture in writing before an attack for charges to qualify.
+T: Shield Advanced cost protection credits scaling charges only when a DDoS attack hits a resource that was added as a Shield Advanced protection.
+
+@ Q001834 explain
+G: ## Two kinds of CloudFront edge code
+- **CloudFront Functions**: lightweight JavaScript that runs at every edge location with sub-millisecond startup. They handle only the **viewer request** and **viewer response** events, have no network access and no request body, and cost a fraction of Lambda@Edge.
+- **Lambda@Edge**: full Lambda functions (Node.js or Python) that run at regional edge caches, can call external services and read the body, with more memory and time but higher latency and cost. They can run on viewer or origin events.
+## Where headers get added
+To add a header to every response a viewer receives, the code must run on **viewer response**, which fires for cache hits and misses. An origin event fires only on cache misses.
+Example: a function on viewer response sets `strict-transport-security`, `x-content-type-options: nosniff` and `content-security-policy`. A CloudFront **response headers policy** can also add these headers with no code at all.
+W: CloudFront Function on viewer response: simple header manipulation fits its limits, it runs on every response including cache hits, and it has the lowest latency and cost of the edge compute options.
+X: A=Lambda@Edge on origin request: origin request fires only on cache misses and changes the request sent to the origin, not the response to the viewer; Lambda@Edge also costs more and adds latency.
+C=API Gateway Lambda authorizer: an authorizer decides whether an API Gateway request is allowed; it does not run at CloudFront edges or add response headers to every page.
+D=WAF custom response with Block: a custom response is only returned for requests WAF blocks; it cannot add headers to the normal responses that viewers receive.
+T: For lightweight header changes on every response, use a CloudFront Function on viewer response (or a response headers policy), not Lambda@Edge.
+
+@ Q001836 explain
+G: ## Why stateful firewalls need symmetric flows
+A stateful firewall keeps a table of connections. It must see **both directions** of a TCP flow (SYN, SYN-ACK, data, FIN) to track it. If the reply arrives at a different firewall endpoint that never saw the start of the connection, that endpoint has no state for it and drops or flags the packets.
+## How Transit Gateway picks an AZ
+By default a transit gateway sends traffic to a VPC attachment through an elastic network interface in the **same Availability Zone** as the source. For a flow between two spoke VPCs in different AZs, the request can enter the inspection VPC in AZ-a and the reply in AZ-b, so the two directions reach different firewall endpoints.
+**Appliance mode** on the inspection VPC's attachment changes this: the transit gateway hashes each flow (source and destination addresses and ports) and uses the same AZ for both directions for the life of the flow.
+Example: `aws ec2 modify-transit-gateway-vpc-attachment --options ApplianceModeSupport=enable`.
+W: Enable appliance mode: it keeps both directions of each flow on the same AZ's firewall endpoint, so Network Firewall sees complete sessions and stops dropping long-lived connections, while keeping two AZs for resilience.
+X: B=Single AZ firewall: forcing everything through one AZ removes the asymmetry but makes the firewall a single point of failure and adds cross-AZ traffic cost, so it trades availability for a problem appliance mode fixes directly.
+C=Stateless rules instead: stateless rules would stop the drops only by giving up connection tracking and application inspection, which is the reason for deploying a stateful firewall.
+D=More capacity units: rule group capacity limits how many rules a group can hold; it has nothing to do with which endpoint receives the return traffic.
+T: Stateful inspection behind a transit gateway needs appliance mode on the inspection VPC attachment so each flow stays in one AZ.
+
+@ Q001837 explain
+G: ## OAI versus OAC in the bucket policy
+The two CloudFront origin access methods authenticate to S3 as different principals, so the bucket policy must name the right one:
+- **OAI** (legacy): a special CloudFront user, referenced as `arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity E1ABCDEXAMPLE`.
+- **OAC** (current): CloudFront signs requests as the service principal `cloudfront.amazonaws.com`. The policy allows `s3:GetObject` for that principal with `Condition` `StringEquals` `AWS:SourceArn` = the distribution ARN.
+If the distribution now uses OAC but the bucket policy still allows only the OAI, S3 sees a request from a principal it does not trust and returns 403 for every object. The console shows the policy to copy after you choose OAC; it must be applied to the bucket (or merged into the existing policy) before the switch.
+W: Bucket policy still names the OAI: CloudFront is now signing as the service principal, which the policy does not allow, so every request is denied until the OAC statement with `AWS:SourceArn` is added.
+X: A=Versioning incompatible: OAC works with versioned buckets; versioning only keeps older copies of objects and does not affect who may read them.
+B=No HTTPS with OAC: OAC does not change the viewer protocol; distributions using OAC serve HTTPS normally, and CloudFront signs its origin requests with SigV4.
+C=Needs a public bucket: OAC exists so the bucket can stay private with Block Public Access on; a policy for a service principal scoped to one distribution is not public access.
+T: After moving from OAI to OAC, update the bucket policy to allow `cloudfront.amazonaws.com` with an `AWS:SourceArn` condition, or every request gets 403.
+
+@ Q001838 explain
+G: ## How SSRF steals credentials
+Server-side request forgery (SSRF) tricks an application into fetching a URL the attacker chooses. With **IMDSv1**, a simple `GET http://169.254.169.254/latest/meta-data/iam/security-credentials/<role>` returns the instance role's temporary credentials, so one GET is enough.
+## What IMDSv2 changes
+- The caller must first send a `PUT` to `/latest/api/token` with a TTL header to get a session token, then send that token in a header on every request. Typical SSRF flaws can only make GET requests without custom headers.
+- A `PUT` carrying `X-Forwarded-For` (typical of proxies) is rejected.
+- The token response uses an IP **hop limit** (`HttpPutResponseHopLimit`). With `1`, it cannot leave the instance's own network stack; containers behind a Docker bridge add one hop, so they need `2`.
+Example: `aws ec2 modify-instance-metadata-options --http-tokens required --http-put-response-hop-limit 2` on container hosts, and hop limit `1` elsewhere.
+W: IMDSv2 with hop limit 2 only where needed: requiring tokens blocks the GET-only SSRF path, and a hop limit of 2 on container hosts keeps IMDS reachable for the containers while other instances keep the stricter limit of 1.
+X: A=Security group rule: traffic to the link-local metadata address never passes through security groups, so no security group rule can block or allow it.
+B=Rotate every 15 minutes: instance role credentials are already temporary and rotated by AWS; stolen credentials still work until they expire, and a scheduled Lambda does nothing about the SSRF path itself.
+C=Disable IMDS entirely: it stops SSRF, but the containers that legitimately rely on IMDS for credentials and metadata break, which the requirement rules out.
+T: IMDSv2 (session tokens) defeats typical SSRF; raise the hop limit to 2 only on hosts whose containers need IMDS.
+
+@ Q001839 explain
+G: ## The IMDSv2 hop limit
+With IMDSv2 a process first calls `PUT /latest/api/token` and uses the returned token on later requests. The token response is sent with an IP time-to-live equal to `HttpPutResponseHopLimit`. Each network hop decrements it, and at 0 the packet is dropped.
+- A process on the host: 0 hops, so a limit of `1` works.
+- A container on Docker's default **bridge** network: traffic is routed and NATed through the `docker0` bridge, which is one extra hop, so the token response never arrives with a limit of `1`.
+This is deliberate: a hop limit of 1 keeps tokens from being forwarded beyond the instance.
+## The fix
+Set the hop limit to `2` on the instances (or launch templates) that run bridge-networked containers that need IMDS:
+`aws ec2 modify-instance-metadata-options --instance-id i-0abc --http-tokens required --http-put-response-hop-limit 2`
+IMDSv2 stays enforced; only the reach of the token response grows by one hop.
+W: Raise the hop limit to 2: the extra bridge hop is why only containers fail, and a limit of 2 lets the token response reach them while keeping IMDSv2 required.
+X: A=Security group to 169.254.169.254: security groups do not apply to instance metadata traffic, and host processes on the same instance already reach IMDS fine, which rules out a network rule.
+C=Containers cannot use IMDSv2: current AWS SDKs in containers use IMDSv2 normally once the token response can reach them; hardcoded static keys would be a serious step backwards.
+D=Token TTL too short: the token TTL (up to 6 hours) is unrelated to network hops, and disabling IMDSv2 would reopen the SSRF risk the rollout was meant to close.
+T: Containers on a bridge network add one hop, so IMDSv2 with hop limit 1 fails for them; set the hop limit to 2 where containers need IMDS.
+
+@ Q001841 explain
+G: ## Two ECR scanning modes
+Amazon ECR offers two image scanning configurations per registry:
+- **Basic scanning**: scans an image on push or when you start a manual scan, looking for vulnerabilities in **operating system packages** only. It does not rescan stored images on its own when new CVEs appear.
+- **Enhanced scanning**: ECR hands scanning to **Amazon Inspector**. Inspector scans both operating system packages and **programming language packages** (for example Java JARs, Python and Node.js dependencies), and in continuous mode it rescans images automatically whenever a new CVE is added to its database.
+## How enhanced scanning is used
+- Enable it at the registry level with scan filters for which repositories use continuous scanning versus scan on push.
+- Findings appear in Inspector and ECR, with severity and fixed-in versions, and are sent to EventBridge and Security Hub.
+Example: a new CVE for a Log4j version is published; Inspector flags every stored image containing that JAR without anyone re-pushing it.
+W: ECR enhanced scanning with Inspector: it covers both OS and language-level dependencies and continuously rescans when new CVEs are published, meeting every requirement.
+X: A=GuardDuty Malware Protection: it looks for malicious files (for example on EC2 volumes and in S3 objects), not known CVEs in the package versions inside container images.
+C=Config conformance packs: AWS Config checks resource configuration, such as whether a repository has scan on push turned on; it does not scan image contents for vulnerabilities.
+D=Basic scanning on push: it covers operating system packages and only scans when an image is pushed or a scan is requested, so it misses both language dependencies and newly published CVEs.
+T: For continuous CVE scanning of OS and application dependencies in ECR images, enable enhanced scanning powered by Amazon Inspector.
+
+@ Q001842 explain
+G: ## Patch Manager building blocks
+AWS Systems Manager Patch Manager uses a few pieces:
+- **Patch baseline**: approval rules that decide which patches are approved, filtered by classification and severity (for example `Security` / `Critical`), with an **auto-approval delay** in days after release. AWS provides predefined baselines, which cannot be edited; you create **custom baselines** for your own rules.
+- **Patch groups** (tag `Patch Group`), or Quick Setup patch policies, map instances to a baseline.
+- **Maintenance windows** schedule when `AWS-RunPatchBaseline` runs with `Scan` or `Install`.
+- **Compliance** data per instance shows installed, missing and failed patches.
+## Meeting a 3-day SLA
+Example: a custom baseline approves `Critical` security patches after 0 days; a maintenance window runs `Install` for them every day or two, while a second, monthly window installs the rest. Patch compliance reporting shows each instance's status for auditors.
+W: Custom baseline with severity-based approval, patch groups and windows: it approves critical patches quickly enough for the 3-day deadline, installs other patches in the monthly window, and produces per-instance compliance data for audits.
+X: A=Config remediation installs patches: AWS Config records and evaluates configuration; its remediation runs a runbook against noncompliant resources and has no patch approval rules, release delays or maintenance schedules.
+B=Default baseline cannot be customized: the predefined baselines are fixed (several wait 7 days before approving critical patches), but you can create custom baselines with any severity rules, so the claimed limitation is not a reason to stay with defaults.
+D=Monthly SSH updates: manual work misses the 3-day critical deadline, does not scale and produces no reliable audit trail per instance.
+T: Patch SLAs come from custom patch baselines (severity plus approval delay) combined with patch groups and maintenance windows, with Patch Manager compliance as the audit report.
+
+@ Q001843 explain
+G: ## What Amazon Inspector does
+Amazon Inspector is AWS's vulnerability management service. It automatically and continuously scans:
+- **EC2 instances** (through the SSM Agent or agentless snapshot scanning) for OS and language package CVEs and network reachability,
+- **ECR container images**, including language dependencies,
+- **Lambda functions** and their layers for vulnerable packages (and, with code scanning, code flaws).
+When a new CVE is published, Inspector re-evaluates existing resources without a new scan request.
+## Using it across an organization
+A **delegated administrator** account in AWS Organizations can enable Inspector for all member accounts and see every finding in one place. Filtering findings by vulnerability ID, for example `CVE-2026-12345`, lists every affected resource. The **Inspector score** adjusts the CVSS score using context such as network reachability, so internet-exposed resources rank higher.
+W: Inspector with an organization delegated administrator: it already holds CVE findings for EC2, ECR and Lambda in all 50 accounts, can be filtered by the new CVE within hours, and ranks results with network exposure.
+X: A=Config advanced queries: Config can query resource configuration (and SSM inventory data if recorded), but it has no CVE data, no view of image layers and no exposure-based scoring.
+B=GuardDuty Malware Protection: it looks for malware on EC2 volumes and in S3 objects; it does not map package versions to CVEs.
+D=Macie automated discovery: Macie finds sensitive data such as personal data in S3 objects; it does not look at software vulnerabilities.
+T: "Which of our resources have this CVE, ranked by exposure" across an organization is Amazon Inspector with a delegated administrator.
+
+@ Q001844 explain
+G: ## The attack chain
+- The web app had an SSRF flaw, so the attacker could make it fetch any URL.
+- With **IMDSv1** allowed, a single GET to `http://169.254.169.254/latest/meta-data/iam/security-credentials/<role>` returned the instance role's temporary credentials.
+- The attacker used those credentials from outside to read the S3 bucket the role could access.
+The weak link to remove is the middle step: credentials obtainable with one forged GET.
+## Enforcing IMDSv2 everywhere
+- Set `HttpTokens=required` in launch templates and on running instances (`modify-instance-metadata-options`).
+- Set account-level defaults for new instances (`ModifyInstanceMetadataDefaults`).
+- Use an SCP or IAM condition on `ec2:MetadataHttpTokens` to deny launches without IMDSv2, and `ec2:RoleDelivery` to reject calls made with credentials taken from IMDSv1.
+Also scope the role to least privilege and fix the SSRF flaw itself.
+W: Require IMDSv2 in launch templates and on running instances: IMDSv2 needs a PUT for a session token plus a token header on every request, which a typical SSRF cannot produce, so the credential theft path is closed across the account.
+X: A=Rotate root credentials: the attacker never touched the root user; they used the instance role's credentials, so rotating root changes nothing.
+B=Block Public Access everywhere: the data was read with valid role credentials, which is authorized access, not public access, so BPA would not have stopped it.
+C=Long-term keys in code: replacing temporary role credentials with static keys makes things worse: keys in code leak easily and never expire.
+D=Deny all inbound: the site is public-facing and needs inbound traffic, and the SSRF arrived through normal web requests, so blocking inbound only takes the application offline.
+T: SSRF-driven credential theft is stopped by requiring IMDSv2 across the account, not by touching root, S3 public access settings or network inbound rules.
+
+@ Q001845 explain
+G: ## The problem with the node role
+On EKS worker nodes, every pod can normally reach the instance metadata service and get the **node instance role** credentials. If the node role holds the permissions of every workload on the node, any compromised pod gets all of them.
+## How IRSA works
+IAM Roles for Service Accounts (IRSA) links a Kubernetes service account to an IAM role:
+- The cluster has an **OIDC provider** registered in IAM.
+- Each role's trust policy allows `sts:AssumeRoleWithWebIdentity` from that provider for one specific service account, for example `system:serviceaccount:payments:payments-api`.
+- The service account is annotated with `eks.amazonaws.com/role-arn`, and pods using it get a projected token; AWS SDKs exchange it for that role's credentials.
+Pods on EC2 nodes and Fargate can use it. To stop pods falling back to the node role, also limit pod access to IMDS (for example hop limit 1 with IMDSv2). EKS Pod Identity is a newer alternative with a similar model.
+W: Pod-level least privilege, more roles to manage: each workload gets exactly its own role, but the team now creates and maintains many roles, trust policies and service account annotations, often per cluster.
+X: A=Fargate only: IRSA works for pods on EC2 managed and self-managed nodes as well as on Fargate.
+B=Requires privileged pods: IRSA only mounts a service account token and sets environment variables; pods do not need privileged mode or extra Linux capabilities.
+D=No IAM roles and no trade-off: IRSA is built on IAM roles, one per workload, so it adds roles to manage rather than removing them.
+T: IRSA buys per-pod least privilege at the cost of managing more IAM roles and trust policies; it is not free and not limited to Fargate.

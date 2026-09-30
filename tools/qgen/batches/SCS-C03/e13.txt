@@ -1,0 +1,229 @@
+# SCS-C03 detailed explanations, e13 (explanation-only rewrites; letters are the published ones)
+
+@ Q004029 explain
+G: ## Preventive and detective controls for AMIs
+A hardened ("golden") AMI is an image the security team has patched and configured. To make sure workloads use only those images you combine two kinds of control:
+- **Preventive**: a policy that makes the `ec2:RunInstances` call fail when the image is not approved. In an IAM policy or a service control policy (SCP), a `Deny` on the image resource with a condition such as `ec2:ImageId` (a list of approved AMI IDs) or `ec2:Owner` (the account that publishes the golden images) blocks any other image, and an SCP applies to every principal in the member accounts.
+- **Detective**: a check that finds anything that slipped through, for example instances that existed before the policy or were launched from an exempt account. AWS Config has managed rules such as `approved-amis-by-id` and `approved-amis-by-tag` that mark running instances from other images as NON_COMPLIANT.
+## Example
+An SCP denies `ec2:RunInstances` on `arn:aws:ec2:*::image/*` unless `ec2:Owner` equals the image-factory account ID. A Config rule then reports the few older instances still running on unapproved images so they can be rebuilt.
+W: D=IAM or SCP launch conditions: the launch request itself is evaluated against the approved AMI IDs or owner, so an unapproved image is refused before any instance exists.
+E=AWS Config AMI rules: they continuously evaluate running instances and flag those launched from images outside the approved list, catching exceptions the preventive policy missed.
+X: A=Monthly email reminder: an email relies on people remembering and choosing to comply; nothing stops or records a launch from an unapproved image.
+B=Disabling CloudTrail: turning off the API audit log removes the evidence of who launched what and does nothing to restrict which AMI is used, so it weakens security.
+C=Tags added after launch: a tag written after the instance is running only describes it; the unapproved image has already been used, and tags can be edited or omitted.
+T: Enforce approved AMIs with a policy condition on RunInstances (prevent) plus Config rules on running instances (detect); reminders and after-the-fact tags enforce nothing.
+
+@ Q004030 explain
+G: ## Account vending with a security baseline
+In a multi-account organization, new accounts are created often. Each one needs the same baseline: CloudTrail and Config enabled, GuardDuty membership, a break-glass role, logging to the central archive and so on. Doing this by hand drifts quickly.
+- **AWS Control Tower Account Factory** creates accounts in a landing zone and enrolls them in the chosen OU, so the OU's controls apply at once. Customizations add your own resources: Account Factory Customization (blueprints), Customizations for Control Tower (CfCT) or Account Factory for Terraform (AFT).
+- **CloudFormation StackSets with service-managed permissions** can target an OU with **automatic deployment** turned on. When an account joins that OU, StackSets deploys the stack instances to it; when it leaves, they can be removed.
+## Example
+A StackSet that creates an IAM access analyzer and a security-audit role targets the `Workloads` OU with automatic deployment in two Regions. Every account moved into that OU receives both resources within minutes, with no human step.
+W: Control Tower Account Factory or StackSets auto-deployment: both apply the baseline as part of account creation or OU membership, so every new account gets the same configuration automatically and consistently.
+X: A=Manual engineer checklist: it depends on someone performing each step correctly for every account; steps get skipped, and there is a window where the account runs without a baseline.
+C=Email to account owners: owners may ignore it or configure things differently, and nothing verifies or enforces that the baseline was applied.
+D=Stack only in the management account: a stack creates resources only in the account and Region where it is deployed, so member accounts get nothing; service-managed StackSets also do not deploy to the management account itself.
+T: Automate the baseline at account creation (Account Factory customizations or StackSets auto-deployment to an OU) instead of relying on people or a stack in a single account.
+
+@ Q004031 explain
+G: ## Enforcing MFA with a conditional deny
+The global condition key `aws:MultiFactorAuthPresent` is `true` when the request was signed with credentials obtained after an MFA sign-in (console session, or temporary credentials from `sts:GetSessionToken` with an MFA code). It is **absent** for requests signed with long-term access keys.
+The standard pattern attaches a policy to all IAM users (usually through a group):
+- `Effect: Deny` with `NotAction` listing only the self-service actions a user needs to set up MFA, such as `iam:CreateVirtualMFADevice`, `iam:EnableMFADevice`, `iam:ListMFADevices`, `iam:ResyncMFADevice`, `iam:GetUser`, `iam:ChangePassword` and `sts:GetSessionToken`.
+- Condition `BoolIfExists` on `aws:MultiFactorAuthPresent` = `false`, so the deny also matches when the key is missing.
+## Example
+A new user signs in with only a password. Every call except the MFA-setup actions is denied. After registering a device and signing in again with MFA, the deny no longer matches and the user's normal permissions apply. Because an explicit deny overrides any allow, this works regardless of other attached policies.
+W: IAM deny unless MFA present, with exceptions: it blocks every action across all services for users without MFA while leaving just enough permissions for them to register and use their own MFA device.
+X: A=S3 bucket policies requiring MFA: a bucket policy governs only that bucket's S3 requests; EC2, IAM, KMS and every other service stay usable without MFA.
+B=Monthly reminder email: it asks users to enable MFA but does not stop a user without MFA from performing any action.
+D=CloudWatch dashboard of MFA status: it only shows who lacks MFA; it neither blocks actions nor forces enrollment.
+T: MFA is enforced by an explicit deny on `aws:MultiFactorAuthPresent` (with `BoolIfExists` and MFA-setup exceptions), not by per-service policies, reminders or dashboards.
+
+@ Q004032 explain
+G: ## Session tags for ABAC with federation
+Attribute-based access control (ABAC) grants permissions by comparing tags: a policy allows an action when the caller's tag matches the resource's tag, for example `aws:ResourceTag/Department` equals `${aws:PrincipalTag/Department}`.
+Federated users have no IAM user to carry tags, so the identity provider sends the attributes at sign-in as **session tags**:
+- In the SAML assertion, an attribute named `https://aws.amazon.com/SAML/Attributes/PrincipalTag:Department` with value `Finance` becomes the session tag `Department=Finance` on the assumed-role session.
+- The role's trust policy must allow `sts:TagSession` in addition to `sts:AssumeRoleWithSAML`.
+- Tags can be marked transitive (`TransitiveTagKeys`) so they survive role chaining.
+## Example
+When the IdP moves a user from Finance to HR, the next sign-in carries `Department=HR`, and access follows automatically without editing any IAM policy. Tag keys in these conditions are compared case-insensitively, but values are case-sensitive, so `finance` and `Finance` differ.
+W: SAML session tags: the IdP passes the department as a principal tag on each federated session, which ABAC policies can read through `aws:PrincipalTag`.
+X: B=Tags on the SAML provider resource: tags on the IAM SAML provider object describe that configuration object, not the individual users who sign in through it, so they cannot differ per department.
+C=Security group tags on an instance: they label a network resource, not the person's identity, and are never attached to the federated user's session.
+D=Manually set IAM user tags: federated users sign in through a role and have no IAM user; creating and tagging users by hand in each account defeats federation and drifts from the corporate directory.
+T: For federated ABAC, the IdP sends attributes as session tags in the SAML assertion; tags on providers, network resources or manual IAM users do not describe the signed-in person.
+
+@ Q004033 explain
+G: ## The confused deputy problem with third parties
+A SaaS vendor serves many customers from one AWS account. Each customer creates a role the vendor can assume, and gives the vendor the role ARN. The risk: another customer of the same vendor could enter **your** role ARN in their settings, and the vendor (the "deputy") would assume your role on their behalf, because your trust policy only checks that the caller is the vendor's account.
+## How the external ID fixes it
+- The vendor generates a unique **external ID** for each customer and shows it in that customer's setup screen.
+- Your trust policy allows `sts:AssumeRole` from the vendor's account only with the condition `sts:ExternalId` equal to your value.
+- The vendor always passes the external ID it stored for the customer who configured the ARN. If a different customer enters your ARN, the vendor passes that customer's ID, the condition fails, and the call is denied.
+## Example
+Trust policy condition: `"StringEquals": {"sts:ExternalId": "a1b2-customer-4471"}`. The external ID is not a secret password; it is an identifier that ties the role to one customer relationship.
+W: Unique external ID in the trust policy: the vendor can assume the role only when acting for the customer that owns this external ID, which stops other customers from steering the vendor into your account.
+X: A=Full administrator access: it maximizes the damage a confused or compromised vendor could do and adds no check on whose behalf the vendor is acting.
+C=Shared IAM user access keys: long-term keys never expire unless rotated, can leak and be used from anywhere, and still do not tie use to your customer relationship.
+D=Role assumable by any principal: a trust policy with a wildcard principal lets any AWS account try to assume the role, which is the opposite of preventing misuse.
+T: Cross-account roles for third parties need an `sts:ExternalId` condition so the vendor can assume them only on behalf of the right customer.
+
+@ Q004034 explain
+G: ## Cross-service confused deputy
+When an AWS service acts for you, a resource policy often grants a **service principal** such as `sns.amazonaws.com`. Without more conditions, that grant means "SNS may send here" for any SNS topic in any account. Someone else could subscribe your queue to their topic and SNS would deliver messages on their behalf.
+The global condition keys that bind the service to your resource are:
+- `aws:SourceArn`: the ARN of the resource the service is acting for, for example `arn:aws:sns:us-east-1:111122223333:orders`.
+- `aws:SourceAccount`: the account that owns that resource, useful when the ARN is not known in advance or covers many resources.
+## Example
+The SQS queue policy allows `sqs:SendMessage` to `sns.amazonaws.com` with `"ArnEquals": {"aws:SourceArn": "arn:aws:sns:us-east-1:111122223333:orders"}`. Only the `orders` topic can deliver; a topic with the same name in another account has a different ARN and is refused.
+W: aws:SourceArn or aws:SourceAccount: these keys identify which resource or account the service principal is acting for, so the queue accepts SNS deliveries only from the intended topic.
+X: A=aws:SecureTransport false: that condition matches plain HTTP requests; used in an allow it permits unencrypted traffic, and it says nothing about which topic is calling.
+B=aws:RequestedRegion for all Regions: it checks the Region the API call targets; listing every Region restricts nothing and does not identify the source topic.
+C=aws:MultiFactorAuthPresent for SNS: service principals do not sign in with MFA, so the key is not present in their requests; it cannot bind the service to a specific topic.
+T: Grants to service principals should be scoped with `aws:SourceArn` or `aws:SourceAccount`; transport, Region and MFA keys do not identify the resource the service acts for.
+
+@ Q004035 explain
+G: ## Policies that grant versus policies that limit
+IAM evaluation combines several policy types. Some **grant** permissions; others only set a **maximum**, so an action must also be allowed by a granting policy.
+- Grant: identity-based policies (attached to users, groups, roles), resource-based policies (bucket policies, key policies, queue policies) and access control lists (for example S3 ACLs).
+- Limit only: **service control policies (SCPs)** in AWS Organizations cap what principals in member accounts can do; **permissions boundaries** cap what one IAM user or role can do. Resource control policies and session policies also act as limits.
+## Example
+A role has an identity policy allowing `s3:*`, and its permissions boundary allows only `s3:GetObject`. The effective permission is only `s3:GetObject`: the intersection. If the identity policy allowed nothing, the boundary alone would give no access, because it never grants. An SCP behaves the same way at account level: allowing `ec2:*` in an SCP does not give anyone EC2 access.
+W: C=Service control policies: they define the maximum permissions for principals in member accounts of an organization and never grant access themselves.
+E=Permissions boundaries: attached to an IAM user or role, they cap the permissions that identity policies can grant, and on their own allow nothing.
+X: A=Access control lists: S3 and similar ACLs grant access to other accounts or groups, so they add permissions rather than only limiting them.
+B=Resource-based policies: a bucket or key policy can grant access directly, including cross-account, so it is a granting policy.
+D=Identity-based policies: these are the main way permissions are granted to users, groups and roles.
+T: SCPs and permissions boundaries set a ceiling (effective access is the intersection), while identity policies, resource policies and ACLs grant access.
+
+@ Q004036 explain
+G: ## IAM for Kubernetes workloads on EKS
+Pods need AWS credentials to call services such as S3 or DynamoDB. Least privilege means each workload gets its own role, not a role shared by everything on the node. EKS offers two ways to map a Kubernetes **service account** to an IAM role:
+- **EKS Pod Identity**: install the Pod Identity Agent add-on, then create an association of namespace + service account to a role whose trust policy trusts `pods.eks.amazonaws.com`. No OIDC provider is needed, and the same role can be reused across clusters.
+- **IAM roles for service accounts (IRSA)**: register the cluster's OIDC issuer as an IAM identity provider, annotate the service account with `eks.amazonaws.com/role-arn`, and the SDK calls `sts:AssumeRoleWithWebIdentity` with the projected token.
+Both deliver short-lived, automatically refreshed credentials only to pods using that service account.
+## Example
+The `billing/invoice-writer` service account maps to a role allowing `s3:PutObject` on one bucket; the `web` pods on the same node cannot use it.
+W: EKS Pod Identity or IRSA: each service account maps to its own IAM role with temporary credentials, so permissions are scoped per workload rather than per node.
+X: B=Shared node instance role: every pod on the node can obtain the node role's credentials, so all workloads get the union of permissions and cannot be separated.
+C=Cluster creator credentials in pods: they belong to a person with broad cluster and AWS rights; copying them into pods gives every workload far more access than it needs and ties it to one human identity.
+D=IAM user keys in Kubernetes secrets: long-term keys do not rotate automatically and can be read by anyone with access to the secret, and one user per workload does not scale.
+T: Per-workload AWS access on EKS comes from mapping service accounts to roles with Pod Identity or IRSA, not from node roles or stored long-term keys.
+
+@ Q004037 explain
+G: ## Resource control policies (RCPs)
+AWS Organizations has two kinds of authorization guardrails:
+- **SCPs** limit what your **principals** can do, anywhere.
+- **RCPs** limit what can be done to your **resources**, by any principal, including principals from other accounts. They apply to resources in member accounts for supported services such as S3, STS, KMS, SQS and Secrets Manager.
+Like SCPs, RCPs never grant access. If a bucket policy accidentally allows `"Principal": "*"`, an RCP that denies access to principals outside the organization still wins, because an explicit deny in any policy overrides an allow.
+## Example
+An RCP attached at the root denies `s3:*` when `aws:PrincipalOrgID` is not `o-exampleorg`, with an exception when `aws:PrincipalIsAWSService` is true so AWS services writing logs still work. A developer who makes a bucket public by mistake does not expose data to outsiders. RCPs do not apply to resources in the management account.
+W: Resource control policies: they set an organization-wide maximum on access to resources, so a data perimeter blocking external principals holds even when an individual resource policy is too permissive.
+X: A=Tag policies: they standardize tag keys and allowed values across accounts; they do not evaluate or deny requests from external principals.
+C=Backup policies: they define AWS Backup plans, schedules and retention for resources; they have no effect on who can access a resource.
+D=AI services opt-out policies: they control whether AWS AI services may store and use your content for service improvement; they are not access controls.
+T: To cap access to resources for everyone, including external principals and misconfigured resource policies, use RCPs; tag, backup and AI opt-out policies are management policies, not authorization guardrails.
+
+@ Q004038 explain
+G: ## S3 Object Lock retention modes
+S3 Object Lock stores objects in a write-once-read-many (WORM) model. It works on versioned buckets and protects a specific object version until its retain-until date.
+- **Governance mode**: most users cannot delete or overwrite the version, but a principal with `s3:BypassGovernanceRetention` can remove the lock by sending the bypass header. Useful for testing retention or protecting against accidents.
+- **Compliance mode**: no one, including the account root user, can delete the locked version or shorten its retention period until it expires. Retention can be extended but not reduced. This is what regulations such as SEC 17a-4 style requirements expect.
+- A **legal hold** is separate: it has no end date and stays until removed.
+## Example
+Set default retention on the bucket to compliance mode, 7 years. Each new object version is then locked for 7 years; a `DeleteObjectVersion` call from the root user fails with Access Denied. Choose the period carefully: the only way to remove such objects early is to close the account.
+W: Object Lock in compliance mode: locked versions cannot be deleted or have their retention shortened by any user, including root, for the full seven years.
+X: A=S3 Lifecycle expiration rules: expiration removes objects (or adds delete markers) after a period; it causes deletion rather than preventing it.
+B=Versioning without MFA Delete: a deletion leaves older versions, but anyone with `s3:DeleteObjectVersion` can still permanently remove them, and versioning can be suspended.
+C=Object Lock governance mode: users granted `s3:BypassGovernanceRetention`, and the root user, can override the lock, so it does not meet "anyone, including root".
+T: Only Object Lock compliance mode makes versions undeletable by everyone, including root; governance mode can be bypassed with a permission.
+
+@ Q004039 explain
+G: ## Why SSE-KMS gets expensive and how Bucket Keys help
+With SSE-KMS, S3 normally asks AWS KMS for a new data key for each object it encrypts (`GenerateDataKey`) and calls `Decrypt` on reads. Every call is a billable KMS request and counts toward KMS request quotas, so millions of uploads mean millions of KMS calls.
+**S3 Bucket Keys** change this:
+- S3 obtains a short-lived bucket-level key from KMS and uses it inside S3 to create unique data keys for many objects.
+- KMS is called only when that bucket-level key is refreshed, which can cut KMS request traffic by up to 99%.
+- Objects stay encrypted under your KMS key, so key policies and audit still apply; CloudTrail shows the bucket ARN rather than each object ARN in the encryption context.
+## Example
+Enable Bucket Key in the bucket's default encryption settings (`BucketKeyEnabled: true`). New uploads use it; existing objects pick it up only when copied or re-encrypted. Policies that check `kms:EncryptionContext` for object ARNs must be updated to the bucket ARN.
+W: S3 Bucket Keys: a bucket-level key generates per-object data keys inside S3, so far fewer KMS requests are made while the data stays protected by the same KMS key.
+X: B=S3 Object Lambda: it runs Lambda code to transform objects as they are retrieved; it adds processing on reads and does nothing to reduce KMS calls on uploads.
+C=S3 Access Points: they give named endpoints with their own access policies for shared datasets; each request through them still uses KMS the same way.
+D=S3 Select: it filters rows inside an object on read to return less data (and is no longer offered to new customers); it does not change how objects are encrypted on upload.
+T: High KMS request costs from SSE-KMS are cut with S3 Bucket Keys; access points, Object Lambda and Select change how data is accessed, not how often KMS is called.
+
+@ Q004040 explain
+G: ## Key material origin in AWS KMS
+Every KMS key has key material, the secret bits used for cryptography. Usually KMS generates it inside its HSMs. With a **customer managed key** created with origin `EXTERNAL`, you generate the material in your own HSM or key management system and import it ("bring your own key"):
+- Call `GetParametersForImport` to get a wrapping public key and import token, wrap your material, then `ImportKeyMaterial`.
+- You can set an expiration date on the imported material, after which KMS deletes it.
+- You can call `DeleteImportedKeyMaterial` at any time; the key becomes unusable **immediately**, without the 7 to 30 day waiting period that `ScheduleKeyDeletion` requires. Re-importing the same material restores it.
+## Example
+A bank must prove its keys were generated in its on-premises HSM and be able to revoke them instantly. It imports the material into a customer managed key; in an incident it deletes the material, and new requests to decrypt data under that key fail until the same material is reimported.
+W: Customer managed key with imported material: you control where the key material originates and can delete it immediately with `DeleteImportedKeyMaterial`.
+X: A=AWS managed keys: KMS generates their material for the service (`aws/s3`, `aws/ebs`); you cannot import material into them or delete them.
+B=SSE-S3 managed keys: S3 creates and manages these keys entirely; they are not KMS keys in your account and offer no control over material origin or deletion.
+D=AWS owned keys: they live in AWS service accounts, are not visible or controllable in your account, and cannot use your own key material.
+T: Bring-your-own key material with immediate revocation means a customer managed KMS key with imported material; AWS managed, AWS owned and SSE-S3 keys are generated and controlled by AWS.
+
+@ Q004041 explain
+G: ## How KMS key deletion works
+Deleting a KMS key is destructive: data encrypted under it can never be decrypted again. So KMS never deletes immediately. `ScheduleKeyDeletion` puts the key in **Pending deletion** for a waiting period of 7 to 30 days (default 30). During that time the key cannot be used, and `CancelKeyDeletion` restores it.
+Two controls reduce the risk of an accidental or malicious deletion:
+- **Prevent**: allow `kms:ScheduleKeyDeletion` only to a small key-administration role in key policies, and add an SCP that denies it to everyone else in the organization.
+- **Detect**: CloudTrail records every `ScheduleKeyDeletion` call; an EventBridge rule on that event (or a CloudWatch alarm on a metric filter) notifies the security team so they can cancel in time.
+## Example
+A developer runs a cleanup script that schedules deletion of a production key. The SCP denies the call for that role. If an admin role makes the same mistake, the EventBridge rule pages on-call, who runs `CancelKeyDeletion` within the 30-day window.
+W: C=Restrict ScheduleKeyDeletion: key policies and SCPs limit the deletion action to a few trusted administrators, so most principals cannot start a deletion at all.
+E=Alarm on ScheduleKeyDeletion events: CloudTrail captures the request and an alert lets the team cancel the deletion during the waiting period.
+X: A=kms:* for all developers: it lets everyone schedule deletion, disable keys and change key policies, greatly increasing the chance of an accident.
+B=Minimum seven-day waiting period: shortening the window leaves less time to notice and cancel a mistaken deletion; a longer period, such as the 30-day default, is safer.
+D=Key IDs only in developers' notes: where IDs are recorded has no effect on who can delete a key, and it makes keys harder to track and audit.
+T: Protect KMS keys by limiting `kms:ScheduleKeyDeletion` (key policies and SCPs) and alerting on it so it can be cancelled during the waiting period.
+
+@ Q004042 explain
+G: ## Automatic in-transit encryption on Nitro instances
+The AWS Nitro System offloads networking to dedicated hardware. On supported Nitro-based instance types, that hardware automatically encrypts traffic between instances using AEAD algorithms with 256-bit keys.
+- No application, TLS or configuration change is needed; the work is done by the Nitro hardware, not the instance CPU.
+- Both instances must be supported types, and the traffic must stay on the AWS network within the VPC or between peered VPCs without passing through a virtual network device or service such as a load balancer or transit gateway.
+- Supported types include many current families (for example C5n, M6i and R6i); the EC2 documentation lists them.
+## Example
+Two `m6i.large` instances in the same VPC exchange database replication traffic over plain TCP. Nitro encrypts it on the wire without the application changing. For traffic that crosses a load balancer or transit gateway, or leaves AWS, you still need TLS or a VPN.
+W: Nitro automatic encryption: supported Nitro-based instance types encrypt traffic between each other in hardware, meeting the requirement without application changes.
+X: A=Encryption only through NAT: a NAT gateway translates addresses for outbound internet traffic; it does not encrypt anything and is not used for instance-to-instance traffic in a VPC.
+B=No options exist: supported Nitro instances already encrypt in transit automatically, and applications can also use TLS, so the statement is false.
+C=Public IP addresses required: public IPs change how traffic is addressed, not whether it is encrypted; Nitro encryption works with private IPs inside the VPC.
+T: For instance-to-instance traffic without code changes, choose supported Nitro instance types, which encrypt in transit automatically; NAT and public IPs provide no encryption.
+
+@ Q004043 explain
+G: ## Governed self-service with AWS Service Catalog
+Service Catalog lets a central team publish approved infrastructure as **products** (CloudFormation or Terraform templates) grouped into **portfolios** that are shared with specific users, groups, roles or accounts.
+- Templates embed the security baseline: encryption enabled, logging on, approved instance types, no public access.
+- A **launch constraint** names an IAM role that Service Catalog assumes to provision the product. Developers need permission only to launch the product, not to create the underlying resources directly.
+- **Template constraints** restrict parameter values, for example only `t3` or `m6i` instance sizes.
+## Example
+The platform team publishes a "Secure S3 data bucket" product. Developers launch it from the console; Service Catalog uses the launch role to create a bucket with Block Public Access, SSE-KMS and access logging. Developers cannot create buckets outside the product because their own IAM permissions do not allow `s3:CreateBucket`.
+W: Service Catalog with launch constraints: developers can deploy only the approved products, and the launch role provisions them with the built-in security configuration without giving developers broad permissions.
+X: B=Resource Groups with tags: they group existing resources for viewing and bulk operations; they do not control what developers can deploy.
+C=Route 53 private hosted zones: they provide DNS names inside VPCs and have nothing to do with approving infrastructure templates.
+D=Trusted Advisor cost checks: they recommend cost savings for resources already running; they do not restrict or package what developers deploy.
+T: Approved, preconfigured infrastructure for self-service is Service Catalog with launch constraints; grouping, DNS and advisory tools do not govern deployments.
+
+@ Q004044 explain
+G: ## Continuous compliance evidence
+Auditors want proof that controls operated throughout a period, not a one-time screenshot. Two services produce that evidence automatically:
+- **AWS Audit Manager** maps your AWS usage to a framework (for example CIS, PCI DSS, SOC 2 or a custom one). An **assessment** continuously collects evidence from sources such as AWS Config, Security Hub CSPM, CloudTrail and API snapshots, organizes it per control, and produces an assessment report for the auditor.
+- **AWS Config conformance packs** deploy a set of Config rules (and optional remediations) as one unit. Config records configuration changes and compliance results over time, so you can show a resource's compliance history for the audit period.
+## Example
+A team runs a PCI DSS assessment in Audit Manager scoped to its payment accounts. Evidence from a PCI conformance pack's rule evaluations and CloudTrail activity is collected automatically throughout the year; at year end the team exports the assessment report with the collected evidence.
+Note: AWS Audit Manager has been closed to new customers since April 30, 2026; existing customers can keep using it, and AWS points new users to AWS Config conformance packs.
+W: B=Config conformance packs: they continuously evaluate resources against a packaged set of rules and keep compliance history, which is evidence that controls held over time.
+E=Audit Manager assessments: they automatically collect and organize evidence per control of a chosen framework and produce reports for auditors.
+X: A=Lightsail snapshots: they are backups of Lightsail instances and disks; they show nothing about whether controls operated.
+C=Amazon Polly: it converts text to speech and has no role in compliance evidence.
+D=AWS Artifact reports only: Artifact provides AWS's own audit reports and agreements covering AWS's side of the shared responsibility model, not evidence about the customer's own controls.
+T: Customer control evidence over time comes from Audit Manager and Config conformance packs; Artifact covers AWS's own compliance, not yours.

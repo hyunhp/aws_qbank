@@ -1,0 +1,340 @@
+# SCS-C03 detailed explanations, e10 (explanation-only rewrites; letters are the published ones)
+
+@ Q003952 explain
+G: ## Why exposed access keys are an emergency
+An IAM access key pair (`AKIA...` access key ID plus secret) is a long-term credential. Anyone who copies it from a public repository can call AWS APIs as that user until the key is deactivated or deleted. Automated scanners find leaked keys within minutes, so the first priority is to stop the key working.
+## A sensible order of steps
+- **Contain:** run `UpdateAccessKey` with status `Inactive` (or deactivate it in the console). Deactivating rather than deleting lets you reactivate it briefly if a critical workload breaks while you rotate.
+- **Investigate:** search CloudTrail event history or your trail for events where `userIdentity.accessKeyId` equals the leaked key. Look for new IAM users, new keys, launched instances, changed policies or data access.
+- **Eradicate and recover:** issue a new key to legitimate consumers (or better, move them to roles), delete the old key, and undo anything the attacker created.
+Example: the key was pushed at 09:00; CloudTrail shows `CreateUser` and `RunInstances` from an unknown IP at 09:07, so those resources are removed too.
+W: Deactivate, then investigate: deactivating the key immediately blocks every API call made with it, and CloudTrail then shows exactly what was done with the key while it was exposed so you can clean up.
+X: B=Rename the IAM user: the access key is tied to the user's unique ID, not its name, so an attacker holding the key keeps full access after a rename.
+C=Email the user: a reminder changes future behavior but leaves the leaked key active, so the attacker can keep using it while you wait.
+D=Change only the console password: console passwords and access keys are separate credentials; resetting the password does nothing to programmatic access with the leaked key.
+T: A leaked access key stays valid until you deactivate it, so contain first by deactivating the key, then use CloudTrail to find and undo what it was used for.
+
+@ Q003953 explain
+G: ## Role credentials cannot be "deleted" one by one
+When someone assumes an IAM role, AWS STS issues temporary credentials (access key, secret and session token) that stay valid until they expire, from 15 minutes up to the role's maximum session duration (at most 12 hours). There is no API to cancel one specific session token.
+## How session revocation works
+IAM evaluates policies on every request, so you can add a policy that denies requests from any session issued before a certain moment. The IAM console's **Revoke active sessions** action does this by attaching an inline policy (named `AWSRevokeOlderSessions`) with a condition like:
+- `"Condition": {"DateLessThan": {"aws:TokenIssueTime": "2026-09-30T10:00:00Z"}}` with `"Effect": "Deny"` on `"Action": "*"`.
+Every token issued before that time is now refused, while legitimate users simply assume the role again to get fresh credentials.
+- Also fix how the attacker got the credentials (instance, pipeline or trust policy), otherwise they can assume the role again.
+W: Revoke active sessions: a Deny policy conditioned on `aws:TokenIssueTime` invalidates every existing session token for the role immediately, without deleting the role or breaking future legitimate sessions.
+X: A=Wait for expiry: role sessions last at most 12 hours, not 36, and waiting gives the attacker that entire window to keep acting with valid credentials.
+B=Rename the role: IAM does not let you rename a role, and even recreating it under another name would not be the intended containment step; the fix is to deny the already-issued tokens.
+D=Rotate the role's access keys: roles have no long-term access keys to rotate; they only hand out temporary STS credentials, so there is nothing to rotate here.
+T: Stolen role credentials are killed with a Deny on `aws:TokenIssueTime` (Revoke active sessions), not by waiting for expiry or looking for keys the role never had.
+
+@ Q003954 explain
+G: ## From finding to action automatically
+Amazon GuardDuty publishes every new finding (and updates to existing ones) to Amazon EventBridge as an event with `source` `aws.guardduty` and `detail-type` `GuardDuty Finding`. An EventBridge rule can match on fields such as `detail.severity` and `detail.type` and send matching events to targets.
+- Severity bands: Low (1.0-3.9), Medium (4.0-6.9), High (7.0-8.9) and Critical (9.0-10.0). A rule with a numeric filter `>= 7` catches High and Critical findings.
+- Typical targets: an AWS Lambda function or a Systems Manager Automation runbook that isolates an instance (swap its security group to one with no rules), snapshots its volumes, or deactivates a user's access key; plus an SNS topic to notify the on-call team.
+Example: a `CryptoCurrency:EC2/BitcoinTool.B!DNS` finding arrives, the rule invokes a runbook, and within a minute the instance is quarantined and its EBS volumes are snapshotted for forensics.
+W: EventBridge rule to Lambda or SSM Automation: findings arrive as events in near real time, and the rule triggers the same tested containment steps every time, without waiting for a human.
+X: B=Weekly manual review: an attacker gets up to a week of undisturbed activity, and nothing is contained automatically.
+C=Wall dashboard: a display shows findings but takes no action, and it only helps if someone happens to be looking at it.
+D=Developers watch the console: relying on people to notice findings is slow and inconsistent, and it does not contain anything.
+T: Automated containment means GuardDuty findings flowing through EventBridge into Lambda or SSM Automation, not humans reading reports or screens.
+
+@ Q003955 explain
+G: ## What Amazon Detective is for
+Amazon Detective helps with the **investigation** step after something has been detected. It automatically collects data such as CloudTrail management events, VPC Flow Logs, GuardDuty findings and EKS audit logs, and builds a **behavior graph**: entities (IP addresses, IAM roles and users, EC2 instances, accounts) linked by their activity over time.
+- From a GuardDuty finding you can pivot into Detective and see, for example, which roles an unusual IP address used, which API calls it made and whether that activity is new compared with a normal baseline.
+- Timelines and visualizations let responders answer "when did this start, what else did it touch" without writing log queries by hand.
+Example: a role shows `UnauthorizedAccess` from a new country; Detective shows the same IP also called `ListBuckets` and `GetObject` with two other roles in the past week.
+W: Amazon Detective: its behavior graph links IPs, API calls and resources over time, which is exactly the visual, correlated investigation the responders need.
+X: B=AWS Artifact: it is a portal for downloading AWS compliance reports and agreements, and it holds no data about activity in your account.
+C=AWS WAF logs: they record individual HTTP requests evaluated by a web ACL, a narrow data source without links to IAM activity or other resources.
+D=Amazon Inspector: it scans EC2, container images and Lambda for software vulnerabilities and network exposure; it does not analyze who did what during an incident.
+T: GuardDuty detects, Detective investigates by visualizing the related entities and activity over time; Inspector and Artifact solve different problems.
+
+@ Q003956 explain
+G: ## Responding to a public S3 bucket
+Two things must happen: stop further exposure and find out what was actually accessed.
+- **Contain:** turn on S3 Block Public Access for the bucket (ideally also at account level), which overrides public ACLs and public bucket policies, then remove the statement that granted `"Principal": "*"` so the configuration is correct even if Block Public Access is later changed.
+- **Investigate:** object-level reads such as `GetObject` appear only in CloudTrail **data events** (if a trail or event data store was logging them) and in S3 server access logs (if enabled). Look for requests from unknown IP addresses or anonymous principals during the exposure window.
+- Keep the bucket and its objects: they are the evidence and may be needed by the business. Amazon Macie can then tell you whether the exposed objects contained sensitive data.
+Example: access logs show 4,000 `GET` requests from one external IP in the two hours the bucket was public, so the affected objects and data owners can be identified.
+W: B=Block Public Access and fix the policy: this closes the exposure immediately and corrects the root cause in the bucket policy.
+E=Review data events and access logs: object-level logs are the only way to learn which objects were read, when and by whom.
+X: A=Disable CloudTrail: stopping logging destroys visibility during the incident and hinders the investigation; it prevents nothing the attacker does.
+C=Delete the bucket: deleting destroys both the evidence and business data, and removing the public access achieves containment without that loss.
+D=Wait a month: delay allows more data to be taken and may miss breach-notification deadlines; response should start immediately.
+T: For an exposed bucket, close access with Block Public Access and a fixed policy, then use CloudTrail data events and access logs to see what was read, never delete evidence or disable logging.
+
+@ Q003957 explain
+G: ## Practicing incident response safely
+Runbooks that are never exercised usually fail on the day they are needed. AWS guidance recommends regular simulations, from tabletop discussions to technical game days.
+- Use a dedicated non-production (sandbox) account so real data and customers are never at risk.
+- Define scope, rules of engagement, success criteria and who is informed before the test begins.
+- Simulate the event with canary credentials or a deliberately created test user, and let detection tools (GuardDuty, CloudTrail, alarms) fire as they would in reality.
+- Afterwards, record lessons learned and update runbooks and automation.
+Example: a test IAM user's key is used from an unusual IP in the sandbox account; the team measures time to detect, time to deactivate the key and whether the runbook was complete.
+W: Planned simulation in a non-production account: a defined scope and runbooks let the team measure its response realistically while guaranteeing that no real data or production credentials are ever at risk.
+X: A=Unannounced peak-hour production test: it risks real outages and customer impact, and unannounced activity can trigger a genuine incident response or be confused with a real attack.
+B=Leak real production credentials: this creates an actual breach; public repositories are scanned by attackers within minutes, so the "test" gives real attackers access.
+D=Disable security tools: detection is part of what is being tested, and turning it off both hides the result and leaves the environment unprotected.
+T: Test incident response with planned, scoped simulations in isolated accounts, never by creating real exposure or blinding your own detection.
+
+@ Q003958 explain
+G: ## Forensic analysis of an EBS volume
+An EBS snapshot is a point-in-time copy of a volume. Working from the snapshot leaves the original untouched and gives a preserved piece of evidence.
+Typical workflow:
+- Take the snapshot (often automatically during containment) and tag it with the case number.
+- Share it with a dedicated forensics account. For an encrypted snapshot, the KMS key must be a customer managed key shared with that account; snapshots encrypted with the default `aws/ebs` key must first be copied and re-encrypted with a shareable key.
+- In the forensics account, create a volume from the snapshot and attach it (preferably read-only mounted) to an analysis instance in an isolated VPC with no internet access and tightly limited access.
+Example: `snap-0abc` is shared to account 222222222222, restored as a new volume and mounted at `/mnt/evidence` on a forensic workstation that has no route to the internet.
+W: Share to a forensics account and analyze a copy on an isolated instance: the original evidence is preserved, any malware on the volume cannot reach production, and access is controlled by a separate account.
+X: B=Remount on the compromised instance: that instance is untrusted and may be controlled by the attacker, who could alter or delete evidence and any tools you run there.
+C=Attach to a production web server: it risks spreading malware into production and changes the evidence through normal file access on a busy system.
+D=Download to a personal laptop: it moves evidence to an unmanaged device over the internet, breaks chain of custody and may expose sensitive data.
+T: Analyze compromised volumes as snapshot copies in a separate, isolated forensics account, never on production or personal systems.
+
+@ Q003959 explain
+G: ## Why you rebuild instead of cleaning
+Once an attacker has run code on an instance, you cannot be sure what else was changed: new users, cron jobs, modified binaries, kernel modules or backdoors. Removing what you found leaves what you did not find.
+The safer pattern follows immutable infrastructure:
+- Keep the compromised instance isolated (or its snapshots) for forensics.
+- Launch a replacement from a known-good, fully patched AMI, ideally through the same launch template or Auto Scaling group used normally.
+- Rotate every secret the old instance could read: database passwords, API keys, and any credentials stored on disk; review the instance role's permissions.
+- Fix the entry point (missing patch, open port, weak credential) so the new instance is not compromised the same way.
+W: Rebuild from a known-good, patched AMI with rotated credentials: the new instance has no hidden persistence, and rotated secrets mean anything the attacker copied no longer works.
+X: A=Manually clean and return to service: manual cleanup can easily miss persistence mechanisms, so the attacker may still control the instance when it goes back into production.
+B=Restart after removing suspicious files: a reboot keeps the same disk, including any persistence you did not find, and does not address stolen credentials.
+D=Clone the compromised instance: an image of the compromised system copies the backdoors to every new instance, spreading the compromise.
+T: A compromised instance is replaced from a trusted, patched image with new credentials, never cleaned or cloned.
+
+@ Q003960 explain
+G: ## Shared responsibility during an incident
+AWS secures the cloud itself: data centers, hardware, the network, and the virtualization layer. The customer secures what they run in the cloud.
+For Amazon EC2 (an infrastructure service) the customer controls and is responsible for:
+- the guest operating system, its patches and its configuration
+- applications, security groups, IAM permissions and data
+- detecting, investigating and responding to incidents inside the instance
+AWS does not log in to customer instances and does not see their contents. It may notify you about abuse reports or detected issues (for example through the AWS Health Dashboard or email), and with a qualifying paid AWS Support plan you can get guidance, but the actions inside the instance are yours.
+Example: a web server is defaced; the customer isolates it, analyzes logs and snapshots, and rebuilds it. AWS would only act for issues in its own infrastructure.
+W: The customer investigates and responds within their instances: under the shared responsibility model the guest OS, applications and data on EC2 belong to the customer, so incident response inside them is the customer's job.
+X: A=AWS restores data for free: AWS does not automatically back up the contents of your instances; backups exist only if you create them (for example with AWS Backup or EBS snapshots).
+B=No one is responsible: EC2 is an infrastructure service, not a fully managed one, and responsibility for what runs on it rests clearly with the customer.
+C=AWS patches and investigates the guest OS: AWS has no access to the guest OS of EC2 instances; patching and investigating it is the customer's responsibility.
+T: For EC2, AWS secures the infrastructure while the customer owns the guest OS and therefore the investigation and response inside it.
+
+@ Q003961 explain
+G: ## Investigating a tampered Lambda function
+Every change to a function's code or configuration is an API call recorded by CloudTrail as a management event: code updates appear as `UpdateFunctionCode` and configuration changes as `UpdateFunctionConfiguration`, and CloudTrail records both with an API version suffix appended to the event name (for example `UpdateFunctionCode20150331v2`), so search with a prefix match. The event shows who called it (`userIdentity`), from which IP and when.
+## Lambda versions make rollback easy
+Publishing a version creates an immutable snapshot of code and configuration (for example `my-func:7`). An alias such as `prod` points to one version, so rollback is just pointing the alias back to the last known-good version, or redeploying that code from your trusted pipeline.
+Afterwards, contain the root cause: remove `lambda:UpdateFunctionCode` from principals that do not need it, rotate the credentials that were used, and consider code signing so only signed packages can be deployed.
+W: A=Review CloudTrail for UpdateFunctionCode: it identifies who changed the code, when and from where, which is needed to scope the incident and find the compromised identity.
+E=Roll back and restrict update permissions: restoring a known-good version removes the malicious code, and tightening who can update functions stops the attacker from changing it again.
+X: B=Grant the function administrator access: it gives any malicious code in the function full control of the account, making the incident far worse.
+C=Disable CloudWatch Logs: the function's logs are evidence of what the malicious code did; disabling them removes visibility and does not stop the code.
+D=Increase memory: memory is a performance setting and leaves the deployed code unchanged, so the malicious code keeps running.
+T: For a tampered function, use CloudTrail to find who changed it, then roll back to a trusted version and lock down update permissions.
+
+@ Q003962 explain
+G: ## What makes backups ransomware-resistant
+Ransomware operators who gain administrator access usually try to delete or encrypt the backups before they encrypt production data. Backups therefore need to be out of the attacker's reach and proven to restore.
+- **Immutability:** AWS Backup Vault Lock in compliance mode (a WORM setting) prevents anyone, including the root user, from deleting recovery points or shortening their retention once the lock is in effect. S3 Object Lock provides the same idea for objects.
+- **Isolation:** copy backups to a vault in a separate account (and often a separate Region) controlled by a small security team, so compromising the workload account does not give access to the copies.
+- **Tested restores:** regular restore tests (for example with AWS Backup restore testing) confirm the data is usable and show how long recovery takes.
+Example: nightly EBS and RDS backups are copied to a locked vault in a dedicated backup account; a monthly restore test rebuilds the database and checks it.
+W: C=Immutable backups with tested restores: attackers cannot delete or alter immutable recovery points, and restore tests prove recovery will actually work within the required time.
+E=AWS Backup with Vault Lock in a separate account: account isolation keeps backups out of reach of a compromised workload account, and Vault Lock stops even privileged users from deleting them.
+X: A=Backups on developers' laptops: laptops are unmanaged, easily lost and often infected themselves, and they cannot hold or quickly restore large cloud datasets.
+B=Same-account backups with full admin access: an attacker with admin rights in that account can delete the backups before encrypting the data.
+D=No backups, rely on the attacker's keys: paying gives no guarantee of a working decryption key and leaves the company with no independent way to recover.
+T: Ransomware recovery depends on immutable, account-isolated backups that are regularly tested, not on backups the attacker can reach.
+
+@ Q003963 explain
+G: ## Where request inspection happens
+Security groups and network ACLs work at layers 3 and 4: they allow or deny traffic by IP address, protocol and port. They cannot see the HTTP request itself.
+AWS WAF is a layer 7 web application firewall attached to CloudFront, Application Load Balancers, API Gateway REST APIs, AppSync and a few other resources. It reads each request's URI, query string, headers and body and applies rules.
+- **Managed rule groups** such as the SQL database rule group (`AWSManagedRulesSQLiRuleSet`) detect SQL injection patterns without writing your own signatures.
+- **Bot Control** (`AWSManagedRulesBotControlRuleSet`) identifies and manages common and targeted bots, for example allowing search engine crawlers while blocking scrapers.
+Example: a request with `?id=1' OR '1'='1` hits the ALB; the web ACL matches the SQLi rule and returns HTTP 403 before the application ever sees it.
+W: AWS WAF with managed rules and Bot Control: WAF inspects the content of HTTP requests, so managed SQLi rules block injection payloads and Bot Control classifies and blocks automated traffic.
+X: A=Security groups on port 443: they only allow traffic by port and source IP; malicious SQL inside an HTTPS request on port 443 passes straight through.
+C=Network ACLs denying unknown sources: NACLs match IP ranges and ports and cannot read request content, and denying all unknown sources would block legitimate public users.
+D=Daily Flow Log analysis: flow logs record connection metadata only (no HTTP content), and daily review finds problems after the fact instead of blocking them.
+T: SQL injection and bots are layer 7 problems, so they are stopped by AWS WAF, not by layer 3/4 controls like security groups and NACLs.
+
+@ Q003964 explain
+G: ## Shield Standard versus Shield Advanced
+- **AWS Shield Standard** is automatic and free for all customers. It protects against common network and transport layer DDoS attacks (such as SYN floods and UDP reflection) on AWS edge and Regional infrastructure.
+- **AWS Shield Advanced** is a paid subscription for specific protected resources (CloudFront, Route 53 hosted zones, Global Accelerator, ALB, Classic Load Balancer, Elastic IPs). It adds:
+- enhanced detection and mitigation, including automatic application layer mitigation using AWS WAF
+- attack visibility and diagnostics, and health-based detection with Route 53 health checks
+- **cost protection:** service credits for scaling charges caused by a DDoS attack
+- 24/7 access to the Shield Response Team (SRT), which requires a qualifying paid AWS Support plan
+- AWS WAF and Firewall Manager usage for protected resources included at no extra cost
+W: AWS Shield Advanced: it is the only option that combines enhanced DDoS protection, cost protection for attack-driven scaling and 24/7 access to AWS DDoS experts.
+X: A=Amazon Inspector: it scans workloads for software vulnerabilities and unintended network exposure; it does not mitigate DDoS traffic.
+C=Amazon GuardDuty: it detects threats from logs and can flag an instance that appears to be taking part in a denial-of-service attack, but it does not absorb attacks, offer cost protection or provide a response team.
+D=AWS Shield Standard: it gives baseline protection only; it has no cost protection, no SRT access and no advanced application layer mitigation.
+T: Cost protection and 24/7 DDoS expert support come only with Shield Advanced; Shield Standard is the free baseline.
+
+@ Q003965 explain
+G: ## Why the origin must be locked down
+CloudFront often carries AWS WAF rules, geo restrictions and caching. If users can reach the ALB directly by its DNS name, they bypass all of that. The goal is for the ALB to accept only requests that came through your distribution.
+## Two complementary layers
+- **Network layer:** AWS publishes the managed prefix list `com.amazonaws.global.cloudfront.origin-facing` containing CloudFront's origin-facing IP ranges. Referencing it in the ALB security group allows only CloudFront servers to connect, and AWS keeps the list up to date.
+- **Application layer:** the prefix list admits traffic from any CloudFront distribution, including someone else's. So CloudFront adds a secret custom origin header (for example `X-Origin-Verify: <random value>`), and an ALB listener rule forwards only requests with the correct value; everything else gets a fixed 403. Rotate the value periodically, for example with Secrets Manager.
+A newer alternative is CloudFront VPC origins: the ALB is internal and sits in a private subnet, and CloudFront reaches it through a connection it creates into your VPC. CloudFront still has a path to the ALB; only the internet does not.
+W: D=Secret custom header checked at the ALB: it proves the request passed through your specific distribution, which the IP-based rule alone cannot do.
+E=CloudFront managed prefix list in the security group: it restricts connections to CloudFront's origin-facing IP ranges and is maintained by AWS, so direct internet access to the ALB is blocked.
+X: A=Allow 0.0.0.0/0 on 443: anyone on the internet can connect to the ALB directly and bypass CloudFront and its WAF rules.
+B=Disable TLS to the origin: it exposes traffic between CloudFront and the ALB to interception and does nothing to limit who can reach the ALB.
+C=Private subnet with no route to CloudFront: if CloudFront has no path to the ALB, the application stops working entirely; even with VPC origins, a private ALB works only because CloudFront is given a path into the VPC. Restricting the origin means allowing only CloudFront, not blocking everyone.
+T: Lock an ALB origin to CloudFront with both the CloudFront origin-facing prefix list (network) and a secret header check (your distribution only).
+
+@ Q003966 explain
+G: ## Central firewall policy with AWS Firewall Manager
+In a multi-account organization, configuring AWS WAF web ACLs one account at a time leads to drift and gaps. AWS Firewall Manager solves this from a delegated administrator account in AWS Organizations.
+- You create a **policy** (for example an AWS WAF policy with required rule groups) and choose its scope: the whole organization, specific OUs or accounts, and resource types such as ALBs and CloudFront distributions, optionally filtered by tags.
+- Firewall Manager applies the web ACL to all in-scope resources and, with auto remediation on, attaches it automatically to **new** resources and accounts as they appear.
+- It reports non-compliant resources. Prerequisites include AWS Organizations and AWS Config enabled in the member accounts.
+Firewall Manager can also manage Shield Advanced protections, security groups, Network Firewall and Route 53 Resolver DNS Firewall policies.
+W: AWS Firewall Manager: it deploys WAF policies centrally across accounts and automatically covers newly created ALBs and distributions, which is exactly the consistency requirement.
+X: B=AWS Config aggregator: it collects configuration and compliance data from many accounts for viewing, but it does not create or attach WAF rules.
+C=AWS Artifact: it provides AWS compliance reports and agreements and has no ability to manage firewall rules.
+D=Amazon Detective: it investigates security findings using behavior graphs and does not deploy or enforce any protections.
+T: Consistent WAF rules across accounts, including new resources, means Firewall Manager; Config only reports and Detective only investigates.
+
+@ Q003967 explain
+G: ## How Session Manager gives access without SSH
+AWS Systems Manager Session Manager opens an interactive shell (or port forwarding) to an instance through the SSM Agent running on it.
+- The agent makes **outbound** HTTPS connections to the Systems Manager service, so the instance needs no inbound ports, no public IP and no bastion host. Private subnets reach the service through interface VPC endpoints (`ssm`, `ssmmessages`) or a NAT gateway.
+- Access is controlled by IAM: a user needs permission for `ssm:StartSession` on the specific instances (tags can scope this). No SSH keys are distributed.
+- Sessions can be logged to CloudWatch Logs or an S3 bucket (optionally KMS-encrypted), and each session start is recorded in CloudTrail.
+Example: the security group for the app servers has **no** inbound rules, yet an admin runs `aws ssm start-session --target i-0123abcd` and every command typed is saved to CloudWatch Logs.
+W: Session Manager with session logging: it provides shell access over outbound agent connections, uses IAM instead of SSH keys, and records session activity for auditing.
+X: A=Public IPs and shared SSH keys: it exposes instances to the internet, and shared keys make it impossible to tell which admin did what or to revoke one person's access.
+C=Bastion with SSH open to the internet: it still requires an open inbound port and key management, and the bastion itself becomes a prime attack target.
+D=RDP open to 0.0.0.0/0: exposing RDP to the whole internet invites brute-force attacks and gives no built-in session logging.
+T: For keyless, portless and audited shell access, use Session Manager instead of SSH, bastions or open RDP.
+
+@ Q003968 explain
+G: ## IMDSv1, IMDSv2 and SSRF
+The instance metadata service at `169.254.169.254` provides, among other things, the temporary credentials of the instance role. With **IMDSv1** a simple GET request returns them, so a server-side request forgery (SSRF) bug that makes the application fetch an attacker-chosen URL can leak the credentials.
+**IMDSv2** requires a session token obtained with a `PUT` request and sent in a header on every request. Most SSRF bugs can only make GET requests without custom headers, so they fail.
+## Enforcing it
+- On the instance or launch template, set `HttpTokens` to `required` so IMDSv1 calls are refused. Account-level defaults can also require it for new launches.
+- In an SCP or IAM policy, deny `ec2:RunInstances` when `ec2:MetadataHttpTokens` is not `required`, so nobody can launch non-compliant instances. The `ec2:RoleDelivery` key can additionally deny API calls made with instance role credentials that were retrieved through IMDSv1 (a Deny with `NumericLessThan` `2.0`).
+W: C=HttpTokens required: this makes the metadata service reject tokenless IMDSv1 requests on those instances and on anything launched from the templates.
+E=SCP or IAM condition at launch: a Deny based on `ec2:MetadataHttpTokens` prevents anyone from launching instances that still allow IMDSv1, enforcing the rule across accounts.
+X: A=Allow IMDSv1 for legacy apps without review: it leaves exactly the SSRF-exploitable path open on those instances, which defeats the requirement.
+B=Hop limit of 64: a higher hop limit lets metadata responses travel farther (for example out of containers), increasing exposure; the default of 1, or 2 for containers, is the secure choice.
+D=Remove IAM roles from all instances: workloads then need long-term keys stored on disk, which is less secure and does nothing to enforce IMDSv2.
+T: Enforce IMDSv2 with `HttpTokens=required` on instances and templates plus a launch-time policy condition, not by weakening hop limits or removing roles.
+
+@ Q003969 explain
+G: ## Automated patching with Systems Manager
+AWS Systems Manager Patch Manager scans managed instances for missing patches and installs them.
+- A **patch baseline** defines which patches are approved, for example security updates with Critical or Important severity, auto-approved 7 days after release.
+- **Maintenance windows** (or Quick Setup patch policies) define when scanning and installing run, such as every Sunday 02:00-04:00, with rate controls so only part of the fleet updates at a time.
+- Results feed Systems Manager **Compliance**, showing each instance as compliant or non-compliant with its baseline and listing missing patches. The data can be aggregated across accounts or sent to AWS Security Hub CSPM.
+Instances need the SSM Agent and an instance profile that allows Systems Manager (for example the `AmazonSSMManagedInstanceCore` managed policy).
+W: Patch Manager with maintenance windows: patching runs on a defined schedule against an approved baseline, and the compliance data shows which instances are up to date.
+X: A=Manual SSH updates by each team: timing and results vary by team, nothing is centrally reported, and it requires inbound SSH access.
+B=CloudFront in front of the fleet: CloudFront caches and delivers content; it does not touch the operating systems or install patches on instances.
+C=Yearly replacement without patching: instances stay vulnerable for up to a year, and nothing reports compliance in between.
+T: Scheduled patching plus compliance reporting on EC2 is Systems Manager Patch Manager driven by maintenance windows.
+
+@ Q003970 explain
+G: ## Scanning images before they run
+Amazon ECR can use Amazon Inspector **enhanced scanning**. Inspector scans images on push and keeps rescanning them continuously as new CVEs are published, covering operating system packages and many programming language packages.
+- Findings carry severities (Critical, High, Medium, ...) and are available through the Inspector API and as EventBridge events.
+- A **pipeline gate** is a stage in the CI/CD process (for example in CodePipeline or another CI tool) that checks the image's findings and stops the deployment if any Critical finding exists. Inspector can also scan images directly inside CI/CD before they are pushed.
+Example: an image tagged `v2.3` is pushed; Inspector reports a Critical OpenSSL CVE; the gate fails and ECS keeps running `v2.2` until the base image is updated.
+W: Inspector enhanced scanning with a pipeline gate: images are scanned on push and continuously, and the gate enforces the rule that only images without critical findings are deployed.
+X: A=Yearly scan, deploy regardless: new CVEs appear daily, and deploying whatever the scan says ignores the requirement to block critical findings.
+B=Deploy first, scan later: vulnerable images are already running in production before anyone knows, which is exactly what the gate is meant to prevent.
+C=Trust any public registry without scanning: public images can contain outdated packages or even malware, and without scanning there is nothing to base the gate on.
+T: Block vulnerable images before deployment by combining Inspector scanning in ECR with a pipeline gate on Critical findings.
+
+@ Q003971 explain
+G: ## Filtering egress by domain name
+Many egress requirements are written as domains ("instances may reach only `*.amazonaws.com` and `api.partner.com`"), but the IP addresses behind those names change often, so IP-based rules cannot express them reliably.
+AWS Network Firewall is a managed stateful firewall deployed in firewall subnets, with route tables sending VPC egress traffic through its endpoints.
+- A stateful **domain list** rule group allows or denies traffic by domain. It inspects the TLS Server Name Indication (SNI) for HTTPS and the `Host` header for HTTP.
+- An allow list plus a default drop means anything not on the list is blocked.
+- In a multi-VPC design, one inspection VPC behind a transit gateway can filter egress for all VPCs.
+Route 53 Resolver DNS Firewall is a useful complement that blocks DNS lookups for unapproved domains.
+W: AWS Network Firewall with domain allow lists: it enforces outbound access by domain name at the network level and blocks everything not explicitly approved.
+X: A=Security groups with domain rules: security group rules reference CIDR ranges, prefix lists or other security groups; they cannot match domain names.
+B=Network ACLs with domain rules: NACLs match only IP ranges, protocols and ports, so they cannot filter by domain either.
+C=Route 53 public hosted zone records: a public hosted zone publishes DNS records for domains you own; it does not inspect or block traffic leaving your VPC.
+T: Domain-based egress control needs a layer 7 aware service like Network Firewall; security groups and NACLs only understand IPs and ports.
+
+@ Q003972 explain
+G: ## Private S3 access with a gateway endpoint
+An S3 **gateway endpoint** adds a route to the VPC's route tables with the S3 prefix list (`pl-xxxxxxxx`) as the destination. Traffic from instances to S3 in that Region then stays on the AWS network and needs no internet gateway, NAT gateway or public IP. Gateway endpoints for S3 have no hourly or data processing charge.
+## Limiting which buckets are reachable
+Every VPC endpoint can have an **endpoint policy**. By default it allows everything, so an instance could still copy data to any bucket in the world, including an attacker's. A restrictive policy closes that path:
+- allow `s3:*` only on `arn:aws:s3:::company-data` and `arn:aws:s3:::company-data/*`, or
+- allow only buckets owned by your accounts using the `s3:ResourceAccount` condition.
+Bucket policies can add the reverse check with `aws:SourceVpce`, so the buckets accept requests only through the endpoint.
+W: D=Endpoint policy allowing only company buckets: it limits what can be reached through the endpoint, preventing data exfiltration to buckets outside the company.
+E=S3 gateway endpoint: it gives private instances a route to S3 that never uses the internet.
+X: A=NAT gateway for S3 traffic: the traffic leaves through the internet gateway to S3's public endpoints, violating the no-internet requirement, and a NAT gateway cannot restrict buckets.
+B=Second internet gateway: a VPC can have only one internet gateway attached, and an internet gateway is by definition an internet path.
+C=Public IPs on instances: it makes the instances internet-facing and sends S3 traffic over the internet path, with no control over which buckets are used.
+T: Private S3 access is a gateway endpoint; restricting it to your own buckets is the endpoint policy.
+
+@ Q003973 explain
+G: ## Allow-only versus allow-and-deny controls
+- **Security groups** are stateful and attached to network interfaces. They contain only allow rules: whatever is not allowed is implicitly denied, but you cannot write "deny 203.0.113.0/24" while allowing everyone else.
+- **Network ACLs** are stateless and attached to subnets. Each rule has a number, and rules are evaluated from the lowest number up; the first match wins. Rules can **allow or deny**.
+Example: to block an abusive range while keeping a public site open, add inbound rule 90 `DENY 203.0.113.0/24 all traffic` before rule 100 `ALLOW 0.0.0.0/0 TCP 443`. Traffic from the range hits rule 90 and is dropped at the subnet boundary.
+Because NACLs are stateless, remember to allow return traffic (ephemeral ports) for flows you permit. For internet-facing web apps, AWS WAF IP set rules are another way to block ranges at layer 7.
+W: Network ACL deny rules: NACLs are the VPC control that supports explicit deny rules, and they apply at the subnet level to all traffic entering or leaving it.
+X: A=Endpoint policies: they control which principals, actions and resources can be used through a VPC endpoint, not which source IP ranges may enter a subnet.
+C=Route table entries: routes decide where traffic is sent next; they do not filter traffic arriving from a source range.
+D=Security group rules: security groups support only allow rules and are applied per network interface, so they cannot explicitly deny one range.
+T: When you need an explicit deny for an IP range at the subnet, use a network ACL; security groups can only allow.
+
+@ Q003974 explain
+G: ## Finding unintended network paths
+Network Access Analyzer is a VPC feature that analyzes your network configuration to find paths that do not meet your requirements.
+- You define a **Network Access Scope**, for example: "any path from an internet gateway to subnets tagged `data=sensitive`". AWS also provides built-in scopes such as all internet gateway ingress.
+- The analyzer evaluates route tables, security groups, network ACLs, load balancers, peering, transit gateways and other components with automated reasoning. It does not send any packets.
+- Each finding shows the full path, component by component, so you can see which rule or route creates the exposure.
+Example: a finding shows internet gateway to a public NLB to an instance in a sensitive subnet, caused by a security group that allows `0.0.0.0/0` on port 5432.
+It is related to Reachability Analyzer, which instead checks whether one specific source can reach one specific destination.
+W: Network Access Analyzer: it searches all network paths against a scope you define and reports every unintended route from the internet to sensitive subnets.
+X: A=Amazon Macie: it discovers sensitive data in S3 buckets and reports bucket access settings, but it does not analyze VPC routing or network paths to subnets.
+C=CloudWatch Synthetics canaries: they run scripted tests against endpoints you already know about, so they cannot discover paths you have not thought of.
+D=AWS Budgets alerts: they notify about spending against a budget and have nothing to do with network reachability.
+T: To discover unintended network paths across VPCs, define a Network Access Scope in Network Access Analyzer rather than testing known endpoints.
+
+@ Q003977 explain
+G: ## Two ways to limit request floods on API Gateway
+- **Usage plans with API keys:** a usage plan sets a steady-state rate (requests per second), a burst limit and optionally a quota (per day, week or month) for each API key associated with it. A client that exceeds its rate gets HTTP 429 Too Many Requests, so one noisy customer cannot consume the whole API's capacity. API keys identify clients for metering; they are not a replacement for authentication.
+- **AWS WAF rate-based rules:** a web ACL associated with the REST API stage counts requests per source IP (or another aggregation key such as a header) over a rolling time window and blocks sources that exceed the threshold. Blocking happens before API Gateway invokes the backend.
+Stage and method throttling settings add an overall ceiling on top of both.
+Example: key `partner-a` is limited to 50 requests per second with a burst of 100, and a WAF rule blocks any single IP that sends more than 2,000 requests in 5 minutes.
+W: D=WAF rate-based rules: they automatically block client IPs (or other keys) that exceed a request threshold, stopping floods before they reach the backend.
+E=Usage plans with per-key throttling: they cap each API key's request rate and burst, so a single client cannot overwhelm the API.
+X: A=Remove authentication: it makes the API easier to abuse, since anyone can call it anonymously, and it does nothing to limit request rates.
+B=Increase Lambda memory: more memory makes each invocation faster but does not reduce the number of requests, and it raises cost during a flood.
+C=Disable CloudWatch logging: it removes visibility into who is flooding the API and has no effect on the traffic itself.
+T: Protect an API from per-client floods with WAF rate-based rules and usage plan throttling, not by changing compute or removing controls.
+
+@ Q003978 explain
+G: ## Private content with CloudFront
+By default anyone who knows a CloudFront URL can fetch the content. To limit access to authorized users, CloudFront supports signed requests:
+- **Signed URLs** add a policy, signature and key pair ID to one URL, with an expiry time and optionally an allowed IP range. Good for individual files, such as one download.
+- **Signed cookies** carry the same kind of policy in cookies, which suits granting access to many files, such as a whole premium video library.
+Your application checks that the user is a paying subscriber, then signs with a private key whose public key is in a **trusted key group** on the cache behavior. CloudFront verifies the signature and expiry and rejects requests without a valid signature with HTTP 403.
+For an S3 origin, also use origin access control (OAC) so users cannot bypass CloudFront by requesting objects from S3 directly.
+Example: after login, the app sets signed cookies valid for 1 hour for `/premium/*`; non-subscribers receive 403.
+W: Signed URLs or signed cookies: only requests carrying a valid signature issued by your application after verifying the subscription are served, so non-paying users are refused.
+X: A=Real-time logs to Kinesis: they record requests within seconds of them happening, which helps analysis, but they cannot allow or block anyone.
+C=Compression for text files: it reduces transfer size and speeds up delivery; it has no access control function.
+D=Origin Shield: it adds a caching layer to reduce load on the origin; every viewer is still served without any authorization check.
+T: Restricting CloudFront content to authorized users means signed URLs or signed cookies; logging, compression and Origin Shield do not control access.

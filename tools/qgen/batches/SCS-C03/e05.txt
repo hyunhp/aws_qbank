@@ -1,0 +1,340 @@
+# SCS-C03 detailed explanations (explanation-only rewrites; letters are the published ones)
+
+@ Q001871 explain
+G: ## How "force MFA" policies work
+IAM cannot switch a user into an "MFA required" mode. Instead you attach a policy that **denies** requests made without MFA. The condition key `aws:MultiFactorAuthPresent` is `true` only when the session was authenticated with MFA (console sign-in with MFA, or temporary credentials from `sts:GetSessionToken` with an MFA code).
+## The bootstrap problem
+A brand-new user has no MFA device yet. If every action is denied without MFA, the user cannot even register a device, so they are locked out. The standard pattern therefore:
+- Uses a Deny with `NotAction` listing the self-service actions, such as `iam:CreateVirtualMFADevice`, `iam:EnableMFADevice`, `iam:ListMFADevices`, `iam:ResyncMFADevice`, `iam:GetUser` and `sts:GetSessionToken`.
+- Adds the condition `BoolIfExists` `aws:MultiFactorAuthPresent` = `false`, so it also catches long-term access keys where the key is missing.
+- Scopes the allowed IAM actions to the caller's own user with `arn:aws:iam::*:user/${aws:username}`.
+Once the user signs in again with MFA, the Deny no longer matches and their normal permissions apply.
+W: Deny without MFA, with MFA setup exceptions: the deny blocks everything except the few actions a user needs to register their own MFA device, so new users can bootstrap and then get full access once MFA is present in the session.
+X: A=Root account MFA inherited: MFA on the root user protects only the root user's sign-in. IAM users do not inherit it; each user needs their own device and a policy that enforces it.
+B=Deny everything without MFA: with no exceptions, a user without a device cannot call `iam:CreateVirtualMFADevice` or `iam:EnableMFADevice`, so they can never satisfy the condition and are locked out.
+C=Organization-wide SCP denying iam:*: this blocks all IAM actions for every principal in member accounts regardless of MFA status, including the MFA setup calls, and does nothing to require MFA for other services.
+T: Enforcing MFA needs a bootstrap exception: deny everything without MFA except the self-service actions that let a user enroll a device.
+
+@ Q001872 explain
+G: ## Two places to put an MFA condition
+- An **identity-based policy** is attached to a user, group or role in one account. It applies only to the principals it is attached to, and anyone with IAM admin rights in that account can edit or detach it.
+- A **service control policy (SCP)** in AWS Organizations is attached to the root, an OU or an account. It sets the maximum permissions for every IAM user and role (including the root user) in the affected member accounts. Account admins cannot remove it. SCPs do not affect the management account or service-linked roles.
+## SCPs filter, they do not grant
+An SCP never gives anyone a permission. A request must still be allowed by an identity or resource policy; the SCP can only take away. SCPs support `Condition` blocks, so a Deny with `BoolIfExists` `aws:MultiFactorAuthPresent` = `false` works there.
+Example: an SCP on the Production OU denying sensitive actions without MFA applies to every principal in every production account, while an identity policy would have to be attached, and kept attached, in each account.
+W: SCPs apply uniformly but never grant: an SCP enforces the MFA requirement across all accounts in the OU and cannot be removed by account admins, but it only limits access; identity policies must still grant the permissions.
+X: A=SCPs grant permissions: SCPs only define the maximum available permissions. An Allow in an SCP does not give access by itself, so it cannot be "stronger" by granting more.
+B=Condition not usable in SCPs: SCPs support conditions with global keys such as `aws:MultiFactorAuthPresent`; MFA-enforcing SCPs are a common pattern.
+C=Identity policies apply organization-wide: identity policies attach to individual principals in a single account. Nothing in them spreads automatically across an organization.
+T: An SCP is a uniform, admin-proof ceiling across accounts that never grants access; an identity policy is per principal and editable by account admins.
+
+@ Q001873 explain
+G: ## Why codes can be relayed
+With TOTP (authenticator apps or hardware tokens) and SMS, the user reads a code and types it in. A phishing site that looks like the AWS sign-in page can collect the password and the code and immediately replay both to the real site. Shorter code lifetimes do not help, because the relay happens within seconds.
+## What FIDO2/WebAuthn changes
+A FIDO2 security key or passkey holds a private key registered for a specific site. At sign-in, the browser passes the origin it is actually talking to, and the key signs a challenge tied to that origin.
+- On the real AWS sign-in page, the signature is valid.
+- On a look-alike domain, the key either finds no credential for that origin or produces a signature the real site rejects.
+Nothing the user can read and retype exists, so there is nothing to relay. AWS IAM and the root user support FIDO2 security keys and passkeys as MFA.
+W: FIDO2/WebAuthn security keys: the authentication is cryptographically bound to the legitimate origin, so a relay site cannot obtain a response that AWS will accept.
+X: A=Hardware TOTP kept in a safe: physical protection of the token does not matter; the administrator still types a six-digit code into whatever page is in front of them, and a phishing proxy can relay it in real time.
+B=SMS codes: an SMS code is typed by the user just like TOTP, so it is equally relayable, and it adds SIM-swap and interception risks.
+D=15-second virtual TOTP: a real-time relay forwards the code within a second or two, well inside any code lifetime, so shorter windows do not stop the attack.
+T: Only origin-bound MFA (FIDO2/WebAuthn, passkeys) resists real-time phishing; any code a human can type can be relayed.
+
+@ Q001874 explain
+G: ## Requiring MFA only for sensitive actions
+You do not have to force MFA on every call. A targeted Deny statement lists only the high-risk actions, for example `s3:DeleteBucket`, `iam:PutRolePolicy`, `iam:AttachUserPolicy`, `cloudtrail:StopLogging` and `cloudtrail:DeleteTrail`, and denies them when MFA is missing. Everything else, such as `s3:GetObject` or `ec2:Describe*`, keeps working normally.
+## Why BoolIfExists
+The key `aws:MultiFactorAuthPresent` is not present at all in requests signed with long-term access keys.
+- `Bool` `aws:MultiFactorAuthPresent` = `false` does not match when the key is absent, so an access-key caller would slip past the Deny.
+- `BoolIfExists` treats a missing key as a match, so the Deny applies both when MFA is false and when there is no MFA information.
+Users who need these actions from the CLI obtain MFA-backed temporary credentials with `sts:GetSessionToken` or assume a role with MFA.
+W: Deny sensitive actions without MFA using BoolIfExists: MFA is required exactly where the risk is, read-only work is unaffected, and callers using long-term keys cannot bypass the condition.
+X: A=Boundary granting iam:* with MFA: a permissions boundary grants nothing and caps everything it omits, so a boundary allowing only `iam:*` would block all S3 and CloudTrail actions, read-only ones included; adding and removing boundaries per user type is fragile and does not express "MFA for these actions only".
+B=Config rules that reverse actions: AWS Config evaluates after the change happened. A deleted bucket or a stopped trail cannot always be undone, and the gap is exactly what an attacker needs.
+C=MFA for every API call: this meets the security goal but violates the stated requirement that routine read-only operations work without MFA.
+T: Put the MFA condition on a Deny for the sensitive actions only, and use BoolIfExists so requests without MFA context are also caught.
+
+@ Q001875 explain
+G: ## The order of IAM policy evaluation
+For every request, AWS gathers all applicable policies: identity policies, resource policies, permissions boundaries, session policies, SCPs and RCPs. Evaluation starts with one question: does **any** of them contain an explicit Deny matching this request?
+- If yes, the request is denied, and nothing else is considered.
+- If no, each limiting layer (SCP, RCP, boundary, session policy) must allow the action, and an identity or resource policy must grant it.
+## Example
+Here the identity policy allows `s3:*`, the bucket policy allows the role, the boundary allows `s3:*`. The SCP on the account contains `"Effect": "Deny", "Action": "s3:DeleteObject"`. Because an explicit Deny exists, `DeleteObject` fails, while `GetObject` and `PutObject` still succeed.
+W: Denied, explicit Deny wins: an explicit Deny in any applicable policy, including an SCP, overrides every Allow, so the delete fails.
+X: A=Denied only cross-account: an SCP applies to all principals in the member account no matter where the target bucket lives; the same-account case is denied too.
+B=Allowed by majority: IAM does not count votes. One explicit Deny is enough to refuse the request regardless of how many policies allow it.
+C=Resource policy overrides SCP: a bucket policy can grant access, but it cannot override an explicit Deny from an SCP that applies to the calling principal.
+T: In IAM evaluation an explicit Deny anywhere ends the decision; allows only matter when no Deny applies.
+
+@ Q001876 explain
+G: ## What a permissions boundary does
+A permissions boundary is a managed policy attached to an IAM user or role as a ceiling. It grants nothing by itself. The user's effective permissions are the **intersection** of what the identity policy allows and what the boundary allows.
+## Example
+- Identity policy: allows `dynamodb:PutItem` on `arn:aws:dynamodb:us-east-1:111122223333:table/Orders`.
+- Boundary: allows `dynamodb:GetItem` and `dynamodb:Query` on all tables.
+The intersection contains no `PutItem`, so the call fails with AccessDenied even though the identity policy allows it. Recent AccessDenied messages often state that no permissions boundary allows the action. The fix is to add `dynamodb:PutItem` (for that table) to the boundary, if the boundary owner agrees it should be permitted.
+W: The boundary omits PutItem: effective permissions are the overlap of identity policy and boundary, so an action missing from the boundary is denied despite the identity policy allowing it.
+X: B=Boundaries only for roles: permissions boundaries can be attached to both IAM users and IAM roles (not groups), so the user's boundary is a valid cause.
+C=Boundary must duplicate the policy: the boundary only needs to include the actions that should be allowed; it can be broader than the identity policy. It does not have to match it exactly.
+D=DynamoDB does not support boundaries: boundaries are part of IAM policy evaluation and apply to requests to any service, including DynamoDB.
+T: Allowed by the identity policy is not enough when a boundary is attached; the action must be in both.
+
+@ Q001877 explain
+G: ## Delegating role creation safely
+Letting developers call `iam:CreateRole` is risky: they could create a role with `AdministratorAccess` and assume it, escalating their own privileges. Permissions boundaries solve this.
+## The pattern
+- The platform team creates a managed policy, for example `DevBoundary`, that lists the maximum permissions any developer-created role may have.
+- The developers' policy allows `iam:CreateRole`, `iam:PutRolePolicy` and `iam:AttachRolePolicy` only with the condition `iam:PermissionsBoundary` equal to the ARN of `DevBoundary`.
+- It denies changing or removing that boundary (`iam:DeleteRolePermissionsBoundary`, editing the `DevBoundary` policy itself).
+Whatever policies developers attach, the role can never do more than the boundary allows, and they cannot create roles without it.
+W: Require a specific permissions boundary on created roles: the `iam:PermissionsBoundary` condition makes the boundary mandatory, so every delegated role is capped at a fixed maximum regardless of the policies developers attach.
+X: A=AdministratorAccess and trust: this gives developers unlimited power, including creating roles far beyond their own access, which is the exact risk to prevent.
+B=Resource policies instead: IAM roles do support permissions boundaries, and resource-based policies are attached to resources, not used to limit what a new role can do.
+C=Config rules only: detection after creation leaves a window in which an over-privileged role exists and can be used; the requirement is to guarantee it never happens.
+T: Delegated role creation is made safe by forcing a permissions boundary via the iam:PermissionsBoundary condition, not by detecting violations later.
+
+@ Q001878 explain
+G: ## Cross-account role assumption needs two permissions
+When a principal in Account A calls `sts:AssumeRole` on a role in Account B, both sides must agree:
+- **Trust policy** on the role in Account B: it must name the principal, for example `arn:aws:iam::111111111111:root` (the whole account) or a specific role or user ARN.
+- **Identity policy** on the caller in Account A: it must allow `sts:AssumeRole` on `arn:aws:iam::222222222222:role/Target`.
+Trusting the account (`:root`) means "Account B delegates the decision to Account A's administrators". Account A then decides which of its principals may assume the role by granting `sts:AssumeRole` in their identity policies. Without that grant, the call fails with AccessDenied even though the trust policy is correct.
+W: Caller lacks sts:AssumeRole: the trust policy is only half the check; the engineer's identity policy in Account A must also allow assuming that role ARN.
+X: A=Bucket policy needed: S3 bucket policies control access to a bucket and play no part in `sts:AssumeRole` authorization.
+B=Organizations required: cross-account role assumption works between any AWS accounts; AWS Organizations is not a prerequisite.
+C=Trust must list the user ARN: trusting the account root principal is valid and common; it delegates the choice of which principals can assume the role to Account A's identity policies.
+T: Cross-account AssumeRole needs the role's trust policy in the target account and an sts:AssumeRole allow on the caller in the source account.
+
+@ Q001879 explain
+G: ## Policies that limit versus policies that grant
+- **SCPs** (AWS Organizations) cap the permissions of all principals in member accounts. They never grant anything.
+- **Permissions boundaries** cap a single IAM user or role. They never grant anything either.
+- **Resource-based policies** (S3 bucket policies, KMS key policies, SQS queue policies, role trust policies) are attached to a resource and can **grant** access to principals, including principals in other accounts.
+Any of these policy types can contain an explicit Deny, which always wins.
+## Example
+An SCP allowing only `s3:*` and `ec2:*` does not let anyone use S3; an identity or resource policy must still grant it. A bucket policy granting `s3:GetObject` to a role in another account does give access, as long as the caller's own policies also allow it and no SCP or boundary blocks it.
+W: SCPs and boundaries only cap, resource policies grant: SCPs and boundaries define maximum permissions, while resource-based policies are one of the two policy types that actually give access.
+X: A=Boundaries at org level, SCPs per principal: this is reversed. SCPs attach at the organization, OU or account level; boundaries attach to individual users and roles.
+B=Only resource policies can Deny: identity policies, SCPs, boundaries, session policies and resource policies can all contain explicit Deny statements.
+D=Interchangeable everywhere: they have different scopes and effects (organization ceiling, principal ceiling, resource grant), and not every service supports resource-based policies.
+T: SCPs and boundaries limit what is possible; identity and resource policies grant what is allowed.
+
+@ Q001880 explain
+G: ## Two sides of cross-account S3 access
+When a role in Account B reads from a bucket in Account A, the request crosses an account boundary, so both accounts must allow it:
+- **Account A (resource owner)**: the bucket policy names the role as principal, for example `arn:aws:iam::222222222222:role/Reader`, and allows `s3:GetObject` on `arn:aws:s3:::data-bucket/reports/*`. To list only that prefix, it can also allow `s3:ListBucket` on the bucket with a condition `s3:prefix` = `reports/`.
+- **Account B (caller)**: the role's identity policy allows the same actions on the same ARNs.
+If the objects use SSE-KMS with a customer managed key, the key policy in Account A and the role's policy in Account B must also allow `kms:Decrypt`.
+Naming the exact role and prefix is least privilege: nobody else in Account B and no other prefix is exposed.
+W: Bucket policy plus matching identity policy: the bucket policy grants the specific role access to the prefix, and the identity policy in Account B lets that role use the grant; both are required for cross-account requests.
+X: A=Shared IAM user keys: long-term keys passed between accounts are hard to rotate and audit and break the principle of each account using its own identities.
+B=Public bucket with obscure keys: this exposes the data to anyone on the internet; unguessable names are not access control.
+D=Bucket policy only: for a cross-account request, the caller's account must also allow the action. Without an identity policy in Account B the role is denied.
+T: Cross-account S3 access needs the bucket policy to grant the role and the role's own policy to allow the action.
+
+@ Q001881 explain
+G: ## KMS key policies are the starting point
+Every KMS key has exactly one key policy, and unlike most resources, **IAM policies alone cannot give access to a KMS key**. The key policy must either:
+- Name the principal directly, for example allow `kms:Decrypt` for `arn:aws:iam::111122223333:role/App`, or
+- Delegate to IAM with the statement that allows the account principal `arn:aws:iam::111122223333:root` to use `kms:*`. This is part of the default key policy and makes IAM policies in that account effective.
+## What went wrong
+The team replaced the default key policy with a custom one that lists only some administrators and does not include the account-root delegation statement. The role's IAM Allow for `kms:Decrypt` is then ignored, and the call fails with AccessDeniedException.
+W: Key policy neither grants nor delegates: without a key policy statement naming the role or enabling IAM policies for the account, the identity policy's allow has no effect.
+X: B=IAM ignored for KMS: IAM policies do work for KMS once the key policy delegates to the account; they are not ignored in general.
+C=SCP must allow kms:Decrypt: SCPs never grant permissions; they can only restrict. An SCP change cannot make up for a missing key policy grant.
+D=KMS has no resource policies: the key policy is a resource-based policy, and it is mandatory for every KMS key.
+T: KMS access starts with the key policy: if it neither names the principal nor enables IAM policies, IAM allows do nothing.
+
+@ Q001882 explain
+G: ## Guarding a bucket against policy mistakes
+A bucket policy can grant access to any AWS principal. If someone later adds a statement like `"Principal": {"AWS": "*"}` or names an outside account by mistake, the data is exposed. A **Deny** statement that checks the caller's organization closes that gap.
+## aws:PrincipalOrgID
+This global condition key contains the organization ID (for example `o-a1b2c3d4e5`) of the account the calling principal belongs to.
+- Add a Deny for `s3:*` with `StringNotEquals` `aws:PrincipalOrgID` = your ID.
+- Because explicit Deny beats any Allow, a later over-broad Allow cannot reach principals outside the organization.
+- AWS service principals have no organization ID, so add an exception such as `aws:PrincipalIsAWSService` if services like CloudTrail must write to the bucket.
+At scale the same guardrail can be applied centrally with a resource control policy (RCP) in AWS Organizations.
+W: Deny when PrincipalOrgID does not match: an explicit Deny on the bucket blocks every principal outside the organization, even if another statement in the same policy mistakenly allows it.
+X: A=S3 Versioning: versioning keeps old object versions for recovery; it does not restrict who can read or write the bucket.
+B=Block Public Access only: it blocks anonymous and public grants, but a policy granting a specific external AWS account is not public and would still work.
+D=Rely on external accounts' IAM policies: you do not control other accounts' policies, and their admins could grant themselves access that your bucket policy allows.
+T: To keep a bucket inside your organization regardless of later mistakes, add an explicit Deny on aws:PrincipalOrgID to the bucket policy.
+
+@ Q001883 explain
+G: ## KMS grants
+A **grant** is a KMS permission object attached to a single key that allows a grantee principal to perform specific operations, such as `Encrypt`, `Decrypt` or `GenerateDataKey`.
+- Created with `CreateGrant` and removed with `RetireGrant` or `RevokeGrant`, without touching the key policy.
+- Can be narrowed with constraints, for example allowing use only with a specific encryption context such as `{"tenant": "user-123"}`.
+- Take effect quickly; a grant token returned by `CreateGrant` can be passed on the next call to use the grant before it has fully propagated.
+AWS services such as Amazon EBS and Amazon RDS use grants internally for exactly this kind of short-lived, delegated key use.
+## Why not edit the key policy
+A key policy is a single document with a size limit. Rewriting it for every request creates race conditions between concurrent updates, grows the policy, and risks breaking access for everyone if one update is wrong.
+W: KMS grants via the API: grants give temporary, narrowly scoped permission on one key and are created and retired programmatically at high frequency without editing the key policy.
+X: A=Edit the key policy per request: concurrent edits can overwrite each other, the policy has a size limit, and a bad edit can lock out other users of the key.
+B=SCP updated per request: SCPs cannot grant permissions, apply to whole accounts rather than one end user, and are organization guardrails not meant for per-request changes.
+C=Grants not supported: grants are a core KMS access mechanism alongside key policies and IAM policies.
+T: For temporary, programmatic, fine-grained key access, use KMS grants instead of repeatedly rewriting the key policy.
+
+@ Q001884 explain
+G: ## Cross-account KMS use
+A KMS key belongs to one account, and its key policy decides who outside that account may use it. For a Lambda role in Account B to call `kms:Decrypt` on a key in Account A:
+- **Key policy in Account A**: must allow Account B or the specific role, for example principal `arn:aws:iam::222222222222:role/LambdaExec`, for the needed actions.
+- **Identity policy in Account B**: the role must allow `kms:Decrypt` on the full key ARN, such as `arn:aws:kms:us-east-1:111111111111:key/1234abcd-...`.
+Cross-account calls must use the key ARN or alias ARN, not just the alias name, because a bare alias is resolved in the caller's own account.
+If the key policy trusts only Account B's root, Account B's admins then decide which roles get access through identity policies, which is still two-sided.
+W: Key policy allowing B plus the role's identity policy: cross-account use requires the resource owner to trust the external principal and the caller's own policy to allow the action on that key.
+X: B=SCP in Account A granting access: SCPs never grant permissions, and an SCP in Account A does not govern principals in Account B at all.
+C=Only the key policy: for a cross-account request, the caller's account must also allow the action; without an identity policy the role is denied.
+D=Only the role's identity policy: IAM policies in Account B cannot give access to a key owned by Account A; the key policy must allow it.
+T: Cross-account KMS use needs both the key policy in the owner account and an identity policy on the caller.
+
+@ Q001885 explain
+G: ## Attribute-based access control (ABAC)
+With ABAC you write a few policies that compare attributes instead of listing resources. The attributes are tags:
+- **Principal tags**: tags on the role, or session tags attached when a user federates in. The IdP sends the user's project, for example `Project=Phoenix`.
+- **Resource tags**: tags on the resources, for example an EC2 instance tagged `Project=Phoenix`.
+A policy then allows actions when `aws:ResourceTag/Project` equals `${aws:PrincipalTag/Project}`. One role and one policy serve all 200 projects; a new project needs only tags on its users and resources.
+## Supporting pieces
+- The role's trust policy must allow `sts:TagSession` so the IdP can pass session tags.
+- A policy should also require the tag on create (`aws:RequestTag/Project`) and prevent users from changing Project tags, or they could re-tag resources to gain access.
+- Check that each service and action you use supports tag-based conditions.
+W: ABAC with session tags: the IdP's project attribute becomes a principal tag, and one policy comparing it to resource tags covers every project without per-project policies.
+X: A=Role per project listing ARNs: 200 roles and policies must be created and updated whenever resources change, which is the overhead the company wants to avoid.
+B=One account per project: separate accounts give strong isolation but add large operational overhead for 200 projects and are not needed to scope access by project.
+D=Resource policies listing every engineer: many services lack resource policies, policy size limits are quickly reached, and every staffing change needs edits across many resources.
+T: When permissions follow an attribute like project, tag principals and resources and write one ABAC policy instead of one per project.
+
+@ Q001886 explain
+G: ## ABAC for multi-tenant isolation
+In a shared environment where each customer's resources carry a tag such as `project=acme`, ABAC lets one policy enforce isolation for all tenants:
+- Engineers get a principal tag for their assigned project (on the role, or as a session tag from the IdP).
+- The policy allows actions only when `aws:ResourceTag/project` equals `${aws:PrincipalTag/project}`.
+- Creation actions require `aws:RequestTag/project` to match the principal's tag, and tag-editing actions are denied, so nobody can move a resource into another project.
+## Why it scales
+Adding the 301st project means tagging its resources and the engineers assigned to it. No new roles, no policy edits. With a role per project, every new project adds a role, a policy and assignment work, and the number of roles grows without limit.
+W: A few ABAC policies matching tags: principal and resource project tags are compared at request time, so isolation holds for any number of projects with a fixed, small set of policies.
+X: A=Role and policy per project: this works functionally but grows linearly with projects, which is exactly the maintenance burden to avoid at hundreds of projects.
+B=Resource policies listing every engineer: not all resources support resource policies, size limits are reached quickly, and each assignment change requires editing many policies.
+D=One broad policy for all: this removes the isolation requirement entirely; every engineer could reach every tenant's resources.
+T: Multi-tenant isolation at scale comes from comparing principal and resource tags (ABAC), not from multiplying roles.
+
+@ Q001888 explain
+G: ## RBAC versus ABAC in AWS
+- **RBAC**: each team/project combination gets its own role with a policy listing its resources. With 50 teams and 20 projects, that can mean hundreds of roles, and every new project means new roles and policy changes.
+- **ABAC**: principals and resources carry tags (`Team`, `Project`), and a few policies compare them, for example allowing access when `aws:ResourceTag/Project` equals `${aws:PrincipalTag/Project}`.
+## What ABAC changes day to day
+- A new project needs tags on its resources and people, not new policies.
+- Moving someone to another team means changing their tag or IdP attribute.
+- Explicit Deny statements, permissions boundaries and SCPs still work with ABAC.
+ABAC works with plain IAM roles and session tags, as well as with IAM Identity Center attributes for access control. Its downside is that tag governance becomes security-critical, so tag editing must be controlled.
+W: ABAC scales by tagging: access follows attributes, so growth is handled by tagging, while RBAC needs a new role or policy for every team/project combination.
+X: A=RBAC always needs fewer policies: at scale RBAC needs more roles and policies, one per combination; ABAC keeps a small fixed set.
+C=ABAC only with Identity Center: ABAC works with standard IAM roles, users and session tags; Identity Center is one convenient source of attributes, not a requirement.
+D=ABAC cannot use Deny: ABAC policies can include explicit Deny statements, for example to block tag changes, just like any IAM policy.
+T: ABAC grows by adding tags; RBAC grows by adding roles, which is why ABAC wins at hundreds of teams and projects.
+
+@ Q001889 explain
+G: ## Session tags from SAML
+When a user federates with `AssumeRoleWithSAML`, the IdP can include attributes that STS turns into **session tags**. The attribute name has a fixed format:
+- `https://aws.amazon.com/SAML/Attributes/PrincipalTag:CostCenter` with value `CC-4410` becomes the session tag `CostCenter=CC-4410`.
+- Session tags appear in policies as `aws:PrincipalTag/CostCenter`, just like role tags, and override a role tag with the same key for that session.
+- Optionally, `TransitiveTagKeys` keeps tags when the session chains into another role.
+## Requirements
+- The role's trust policy must allow both `sts:AssumeRoleWithSAML` and `sts:TagSession`.
+- An ABAC policy then allows access when `aws:ResourceTag/CostCenter` equals `${aws:PrincipalTag/CostCenter}`.
+Because the value comes from the IdP per user, many users with different cost centers can share one role.
+W: PrincipalTag SAML attribute as session tag: the IdP sends the cost center in the SAML assertion, STS attaches it to the session, and ABAC policies compare it with resource tags.
+X: B=No session tags from SAML: `AssumeRoleWithSAML` supports session tags, as do `AssumeRole`, `AssumeRoleWithWebIdentity` and `GetFederationToken`.
+C=S3 object tags on home folders: object tags describe objects, not the calling user, so they cannot carry the user's cost center into an IAM session.
+D=Tag roles manually: a role tag is the same for everyone who assumes that role, so users with different cost centers would need separate roles, and it ignores the IdP as the source of truth.
+T: To bring per-user IdP attributes into IAM policies, send them as SAML PrincipalTag attributes so STS applies them as session tags.
+
+@ Q001890 explain
+G: ## Application authorization versus AWS authorization
+IAM decides who can call AWS APIs. It is not designed for decisions inside your app, such as "can this manager approve expense #812?"
+## Amazon Verified Permissions
+Verified Permissions stores authorization rules as **Cedar** policies in a policy store. Your app calls `IsAuthorized` with the principal, action, resource and context, and receives Allow or Deny.
+Example Cedar policy:
+- `permit (principal in Role::"Manager", action == Action::"ApproveExpense", resource) when { resource.amount < 10000 && resource.department == principal.department };`
+Because policies live outside the code, changing the limit to 15,000 is a policy update, not a redeploy, and every service calling the same policy store gets the same answer. Decisions can be logged for audit.
+W: Verified Permissions with Cedar: fine-grained, attribute-based rules (amount, department) are stored centrally, evaluated by `IsAuthorized` for all services, and changed without redeploying code.
+X: A=AWS WAF custom rules: WAF inspects HTTP requests for patterns such as IPs, headers or SQL injection; it has no notion of managers, departments or expense amounts.
+B=Cognito groups mapped to roles: groups give coarse role membership but cannot express conditions like amount under 10,000 in the same department; the app code would still hold that logic.
+C=IAM policies per end user: IAM governs access to AWS resources, not business objects in your application, and managing IAM policies per app user does not scale.
+T: Business rules inside an application belong in Verified Permissions (Cedar), not in IAM, WAF or coarse user groups.
+
+@ Q001891 explain
+G: ## Externalizing authorization
+Scattered `if/else` checks make it hard to answer "who can share this document?" and require code changes for every rule change. The fix is a policy decision point outside the code.
+## How Verified Permissions fits
+- Define a schema with entity types such as `User`, `Document` and `Group`, and actions such as `view`, `edit` and `share`.
+- Write Cedar policies, for example permit `share` when `resource.owner == principal`, or `view` when `principal in resource.viewers`.
+- The app calls `IsAuthorized` (or `IsAuthorizedWithToken` with a Cognito or OIDC token) before each action and enforces the answer.
+Policies are in one place, can be reviewed and tested, and are changed without redeploying the application. The team can also use policy templates for per-document sharing.
+W: Verified Permissions with Cedar and IsAuthorized: document-level rules move out of the code into centrally managed policies that the application queries for each decision.
+X: A=IAM resource policies on database rows: documents in an app database are not AWS resources, so IAM policies cannot be attached to them or evaluated for them.
+C=GuardDuty findings: GuardDuty detects threats from logs and telemetry; it does not answer per-request authorization questions.
+D=WAF rules on request bodies: WAF filters HTTP traffic by patterns, but cannot know document ownership or sharing relationships.
+T: For app-level permissions like view, edit and share on documents, use Verified Permissions to centralize the logic outside the code.
+
+@ Q001892 explain
+G: ## Two layers of authorization
+A cloud-native application usually needs both:
+- **IAM** controls access to AWS APIs and resources. For example, the app's Lambda execution role may call `dynamodb:GetItem` on the `Orders` table.
+- **Amazon Verified Permissions** controls decisions within the application. For example, user Alice may view order #123 because she belongs to that customer account. These decisions concern app users and app objects that IAM does not know about.
+## How they work together
+The application code calls Verified Permissions (`IsAuthorized`) to decide whether an end user may perform an action. If allowed, the code uses its IAM role to read or write the data in AWS. The app's own call to Verified Permissions is itself authorized by IAM (`verifiedpermissions:IsAuthorized`).
+W: IAM for AWS APIs, Verified Permissions for the app: the two services cover different layers and complement each other.
+X: B=Verified Permissions replaces IAM: the application still needs IAM roles and policies to call AWS services, including Verified Permissions itself.
+C=Only for S3 access: Verified Permissions is a general authorization service for application resources and does not replace bucket policies.
+D=Mutually exclusive: they are designed to be used together in the same architecture, each at its own layer.
+T: IAM answers "can this workload call AWS?"; Verified Permissions answers "can this app user do this in the app?".
+
+@ Q001893 explain
+G: ## The structure of a Cedar policy
+Every Cedar policy has an effect and a scope:
+- **Effect**: `permit` or `forbid`.
+- **Scope**: `principal` (who), `action` (what) and `resource` (on what). Each can be a specific entity, such as `User::"alice"`, a group via `in`, or left open.
+- **Conditions**: optional `when { ... }` and `unless { ... }` clauses that test attributes and context, such as `context.mfa == true` or `resource.owner == principal`.
+## Example
+`permit (principal == User::"alice", action == Action::"view", resource in Folder::"reports") when { context.ip.isInRange(ip("10.0.0.0/8")) };`
+The decision is Deny by default, Allow if at least one permit matches, and Deny whenever any forbid matches.
+W: Principal, action, resource and optional conditions: a Cedar policy combines these to decide whether a permit or forbid applies to the request.
+X: B=IAM ARN and Region: Cedar policies reference application entities and actions defined in a schema, not IAM ARNs and Regions.
+C=Stack name and timestamp: CloudFormation stacks and deployment times have no role in Cedar policy structure.
+D=Security group and route table: these are VPC network controls, unrelated to application authorization decisions.
+T: A Cedar policy is permit or forbid over principal, action and resource, refined by when/unless conditions.
+
+@ Q001894 explain
+G: ## How Verified Permissions reaches a decision
+Evaluation is **default deny**: if no `permit` policy matches the request, the answer is Deny. Any matching `forbid` also produces Deny. So an unexpected Deny usually means the request did not look the way the policy expects.
+## Common mismatches
+- **Entity types and namespaces**: the policy says `MyApp::User::"alice"` but the request sends `User::"alice"`.
+- **IDs**: `alice` in the request versus `Alice` in the policy.
+- **Missing entities or parents**: a policy uses `principal in Group::"admins"`, but the request's entity list does not include that membership.
+- **Missing attributes or context**: a `when` clause checks `resource.owner`, but the attribute was not passed.
+The `IsAuthorized` response helps narrow this down: `determiningPolicies` is empty when no policy matched (an implicit Deny) and lists the forbid policy when one caused the Deny, and `errors` reports evaluation problems such as a policy referencing an entity or attribute that was not supplied. A schema and policy validation catch type mistakes before deployment.
+W: Check entity types and IDs against schema and policies: because unmatched requests are denied by default, verifying that the request uses the exact types, IDs, parents and attributes the policies expect is the right first step.
+X: B=Assume a service fault: an unexpected Deny is almost always a request or policy mismatch; opening a case before reviewing the inputs skips the obvious causes.
+C=SCPs control decisions: SCPs limit IAM permissions to call AWS APIs; they do not change the Allow or Deny that Verified Permissions returns for app policies.
+D=Recreate the policy store: this discards the policies without explaining the problem; Deny decisions can be diagnosed from the response and the request.
+T: Verified Permissions denies by default, so an unexpected Deny first means checking that the request's entities match what the policies expect.
+
+@ Q001895 explain
+G: ## Listener types on a Network Load Balancer
+An NLB offers layer-4 listeners such as TCP, TLS, UDP and TCP_UDP; it has no HTTP or HTTPS listeners.
+- A **TCP listener** forwards the byte stream without looking inside. If clients speak TLS, the encrypted session passes straight through, and the TLS handshake happens with the application on the instance.
+- A **TLS listener** terminates TLS at the NLB using an ACM certificate. It can open a new TLS connection to the target, but the traffic is decrypted inside the load balancer.
+## End-to-end encryption requirement
+"No intermediate decryption" rules out any listener that terminates TLS. With a TCP listener on port 443:
+- Certificates and private keys live on the instances.
+- The NLB cannot inspect or modify traffic, so the app handles TLS versions and ciphers.
+- To see the client IP, use client IP preservation or Proxy Protocol v2.
+W: TCP listener, TLS on the instances: the NLB passes the encrypted stream unchanged, so data stays encrypted from client to the application process.
+X: A=TLS listener that re-encrypts: re-encryption still means the NLB decrypts the traffic first, which violates the no-intermediate-decryption rule.
+C=SSL policy forcing TLS 1.2 termination: an SSL policy is only used with a TLS listener, and it still terminates TLS at the load balancer.
+D=HTTPS listener with stickiness: Network Load Balancers do not offer HTTPS listeners; that is an Application Load Balancer feature, and it would terminate TLS anyway.
+T: For true end-to-end TLS through an NLB, use a TCP listener and terminate TLS on the targets.

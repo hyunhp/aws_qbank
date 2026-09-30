@@ -1,0 +1,300 @@
+# SCS-C03 detailed explanations (explanation-only rewrites; letters are the published ones)
+
+@ Q001896 explain
+G: ## How ACM DNS validation works
+When you request a public certificate with DNS validation, ACM generates a unique CNAME record for each domain name, for example `_a1b2c3.app.example.com` pointing to a value under `acm-validations.aws`. ACM then repeatedly looks up that name in public DNS. As soon as the record resolves, ACM proves you control the domain and issues the certificate.
+## Why the account boundary matters
+ACM does not care which AWS account hosts the DNS zone; it only queries public DNS. The console's "Create records in Route 53" button, however, only works for hosted zones in the same account.
+- If the zone lives in another account, someone must copy the CNAME name and value into that account's hosted zone by hand (or with automation).
+- If nobody does, the lookup never succeeds and the request stays in **Pending validation** until ACM gives up (after 72 hours it moves to **Validation timed out**).
+W: Missing CNAME in the other account's zone: ACM validates by resolving the CNAME in public DNS. Creating the record in the authoritative hosted zone in the other account lets validation complete, and keeping the record in place also allows managed renewal later.
+X: A=Requests expire after 72 hours: ACM does time out an unvalidated request after about 72 hours, but that is the result of the missing record, not its cause. Requesting again without creating the CNAME would time out the same way.
+B=Email validation needed: DNS validation works across accounts because ACM only queries public DNS. Switching to email validation adds manual approvals and makes renewals depend on someone clicking links.
+C=Request in the zone's account: the certificate can be requested in any account; only the DNS record has to be placed in the authoritative zone.
+T: DNS validation depends only on the CNAME resolving publicly, so create the record in whichever account owns the hosted zone instead of changing validation method or account.
+
+@ Q001897 explain
+G: ## Where TLS terminates decides latency
+A TLS handshake takes round trips between client and server. If the server is in one Region and the user is on another continent, every handshake pays that long round trip.
+**Amazon CloudFront** terminates viewer TLS at edge locations close to users, then reuses warm, persistent connections back to the origins over the AWS network.
+- One distribution can have several origins: an S3 bucket for static files and an ALB for dynamic requests, chosen by cache behaviors such as `/static/*` and `/api/*`.
+- The custom domain (for example `www.example.com`) uses one ACM certificate attached to the distribution. CloudFront only reads ACM certificates from `us-east-1`, and ACM renews them automatically.
+W: CloudFront with a us-east-1 ACM certificate: TLS is terminated at the nearest edge location for every user worldwide, both origins sit behind one distribution, and a single managed certificate covers the custom domain.
+X: A=NLB in front of CloudFront: the order is backwards. CloudFront is the internet-facing edge service; an NLB is a Regional load balancer and cannot sit in front of CloudFront to terminate TLS at the edge.
+B=S3 website endpoint with HTTPS: S3 static website endpoints support HTTP only, and they would not serve the dynamic ALB content or terminate TLS near users.
+C=Regional ALBs with latency routing: this terminates TLS in the nearest Region, which is still far from many users, and needs a certificate in every Region instead of one central certificate.
+T: For global low-latency HTTPS with one certificate, put CloudFront in front of all origins and use an ACM certificate from us-east-1.
+
+@ Q001898 explain
+G: ## Public versus private certificates
+A **public certificate** from ACM chains to a publicly trusted root, so browsers trust it. Publicly trusted CAs must log every certificate they issue to **Certificate Transparency (CT) logs**, which anyone can search. That means hostnames like `payments.internal.example.com` become discoverable.
+A **private certificate** is issued by your own CA, created with **AWS Private CA**. Only systems you configure to trust that CA accept its certificates, and they are not written to public CT logs.
+- Private CA certificates can be issued through ACM, which can renew them automatically, or directly through the Private CA API for workloads such as ECS services or a service mesh.
+- Example: a root CA and a subordinate CA in Private CA issue certificates for `orders.svc.local`; each ECS task trusts the root CA bundle.
+W: AWS Private CA: it issues private certificates that are trusted only by systems configured to trust your CA and are not published to CT logs, which fits internal service-to-service TLS.
+X: A=Public certificates with DNS validation: public ACM certificates are publicly trusted and logged to CT logs, exactly what the organization wants to avoid. They also need names in a public domain.
+B=Email validation: the validation method only proves domain control. The result is still a public certificate that is publicly trusted and CT-logged.
+C=Self-signed via S3: self-signed certificates have no managed chain of trust, revocation or renewal, and copying private keys through a bucket is a weak distribution model.
+T: Internal-only TLS that must not appear in CT logs needs a private CA (AWS Private CA), not a public ACM certificate validated a different way.
+
+@ Q001899 explain
+G: ## Mutual TLS in API Gateway
+In normal TLS only the server proves its identity. With **mutual TLS (mTLS)**, the client also presents a certificate during the handshake, and the server checks that it chains to a CA it trusts.
+Amazon API Gateway supports mTLS on a **custom domain name** (for example `api.example.com`):
+- You upload a **truststore**: a PEM file containing your CA certificates, stored in an S3 bucket, and reference its `s3://` URI on the custom domain.
+- During the handshake, API Gateway rejects clients whose certificate is missing, expired or not signed by a CA in the truststore, before any request reaches your API.
+- The default `execute-api` endpoint should be disabled so clients cannot bypass the custom domain.
+W: Mutual TLS with an S3 truststore: API Gateway verifies every client certificate against the company's CA during the TLS handshake and refuses connections that do not present a valid one.
+X: A=Resource policy on VPC endpoint: this limits which network path can call the API, not which client identity is connecting. It never inspects a client certificate.
+C=Lambda authorizer with bearer token: it validates a token in the HTTP request after TLS is established. A bearer token is not a certificate and does not stop the TLS connection itself.
+D=WAF inspecting the handshake: AWS WAF evaluates HTTP requests after TLS has been terminated. It cannot see or verify client certificates during the handshake.
+T: Client-certificate authentication at the TLS layer is mTLS on an API Gateway custom domain with a truststore; tokens, WAF and resource policies act at other layers.
+
+@ Q001900 explain
+G: ## Which ACM certificates renew automatically
+ACM manages renewal for certificates it **issues**:
+- Public ACM certificates renew automatically when they are in use (associated with a service such as ELB or CloudFront) and domain validation still succeeds, for example the DNS validation CNAME is still in place.
+- Private certificates issued through ACM from AWS Private CA also renew automatically.
+**Imported certificates** are different. You bring a certificate and key from another CA; ACM stores them and lets you attach them to integrated services, but it cannot ask your CA for a new certificate. You must obtain a new certificate and reimport it (reimporting into the same ARN updates every attached listener).
+ACM sends expiration events to Amazon EventBridge and AWS Health beforehand, which you can use to alert on upcoming expiry.
+W: Imported certificate: ACM never renews imported certificates, so when it expired the NLB kept presenting it and clients failed the handshake.
+X: A=NLB listeners not eligible: NLB TLS listeners are an ACM-integrated service; ACM-issued certificates attached to them renew like any other.
+B=CloudFront only: managed renewal applies to ACM-issued certificates on every integrated service, including ALB, NLB and API Gateway, not only CloudFront.
+D=Renewal quota exceeded: there is no monthly renewal quota that silently skips renewals; ACM quotas limit how many certificates you request or import.
+T: ACM renews what it issues; imported certificates must be renewed and reimported by you, so monitor their expiry.
+
+@ Q001901 explain
+G: ## mTLS on an Application Load Balancer
+An ALB HTTPS listener can require client certificates. Two modes exist:
+- **Passthrough**: the ALB forwards the client certificate chain to targets in an HTTP header and lets the application decide.
+- **Verify**: the ALB itself validates the client certificate against a **trust store** during the handshake and rejects clients without a valid certificate.
+A trust store is an ELB resource created from a CA certificate bundle stored in S3 (optionally with certificate revocation lists). Because TLS still ends at the ALB, Layer 7 features keep working: host and path routing, header rules and authentication actions.
+Example: upload `internal-ca.pem` to S3, create a trust store from it, and set the HTTPS listener to mTLS verify mode.
+W: HTTPS listener with mTLS verify mode: the ALB checks each client certificate against the internal PKI's CA bundle in the trust store and still performs Layer 7 routing on the decrypted requests.
+X: A=WAF Authorization header rule: checking for a header says nothing about a client certificate; any client can add an `Authorization` header.
+B=TLS 1.3-only policy: a security policy controls protocol versions and ciphers for the server side of the handshake. It does not require or verify client certificates.
+C=Classic Load Balancer required: ALB supports mTLS natively, and a Classic Load Balancer has no trust store based client certificate verification and fewer Layer 7 routing features.
+T: ALB mTLS verify mode with a trust store authenticates clients by certificate while keeping Layer 7 routing; security policies and WAF header checks do not.
+
+@ Q001902 explain
+G: ## CloudFront is a global service with one certificate Region
+ACM certificates are Regional resources: a certificate requested in `eu-west-1` exists only there and can be used only by services in that Region.
+CloudFront is global, and it reads viewer certificates from ACM in **US East (N. Virginia), `us-east-1`** only. Its console and API list only certificates from that Region, no matter where the origin or the users are.
+- Fix: request a new public certificate for `app.example.com` in `us-east-1` (or import one there) and validate it. Use DNS validation so the certificate can renew automatically.
+- The `eu-west-1` certificate is still useful for a Regional service there, such as an ALB origin.
+W: Request or import in us-east-1: CloudFront can only attach ACM certificates from us-east-1, so a certificate there makes the domain selectable on the distribution.
+X: A=Attach to an ALB origin: that secures the connection between CloudFront and the origin. Viewers connecting to `app.example.com` on CloudFront still need a certificate on the distribution.
+C=Revalidate with email: the certificate is already issued; its validation method is not why it is missing from the list. Its Region is.
+D=Copy with the ACM API: ACM certificates are Regional and there is no ACM call that moves or copies an issued certificate to another Region. You request or import a separate certificate in us-east-1.
+T: CloudFront viewer certificates must live in ACM us-east-1; the fix is a certificate in that Region, not revalidating or moving the Regional one.
+
+@ Q001903 explain
+G: ## How a Site-to-Site VPN tunnel comes up
+Each AWS Site-to-Site VPN connection has two IPsec tunnels. Each tunnel is built by **IKE** negotiation:
+- **Phase 1** authenticates the peers (with the **pre-shared key** or a certificate) and agrees on encryption, integrity, Diffie-Hellman group and lifetime.
+- **Phase 2** agrees on the IPsec parameters that protect the actual traffic.
+If the customer gateway's pre-shared key, IKE version, algorithms or DH groups do not match one of the combinations allowed on the AWS tunnel options, the negotiation fails and the tunnel stays DOWN even though IKE packets are being sent.
+Troubleshooting: compare the device configuration with the downloaded configuration file, and enable VPN tunnel logs to CloudWatch Logs to see the IKE error.
+W: Mismatched PSK or IKE parameters: the gateway is sending IKE requests but no security association forms, which is the classic sign that authentication or proposal settings differ between the two ends.
+X: A=VGW needs an Elastic IP: AWS assigns public outside IP addresses to each tunnel endpoint automatically. You never attach an Elastic IP to a virtual private gateway.
+B=Multiple route tables: VPC route tables affect where traffic goes after the tunnel is up. They have no effect on IKE negotiation, and each subnet has only one associated route table anyway.
+C=Static routing instead of BGP: static routing is fully supported. Routing choice affects route exchange after the tunnel is up, not whether IKE succeeds.
+T: Tunnels that stay DOWN while IKE packets flow point to mismatched PSK or phase 1/2 settings, not to routing or addressing.
+
+@ Q001904 explain
+G: ## EBS encryption by default
+**EBS encryption by default** is an account setting that you turn on per Region. Once it is on:
+- Every new EBS volume and every snapshot copy is encrypted, even if the user or service calling `CreateVolume` or `RunInstances` did not ask for encryption.
+- You can choose the **default KMS key**. If you set it to a customer managed key, such as `alias/ebs-prod`, all those volumes use that key instead of the AWS managed key `aws/ebs`.
+- It does not change existing unencrypted volumes; those need a snapshot and encrypted copy.
+Services launching instances for you (Auto Scaling, EKS node groups and similar) also get encrypted volumes, as long as their roles can use the key. The key policy must allow them, for example the Auto Scaling service-linked role.
+W: Encryption by default with the CMK: it transparently encrypts every new volume in the Region with the chosen customer managed key, so nobody has to remember to request encryption.
+X: A=Tag policy requiring an Encrypted tag: tag policies standardize tag keys and values; a tag has no effect on whether data is encrypted.
+B=SCP denying unencrypted CreateVolume: it blocks calls instead of encrypting them, can break launches from tools that do not request encryption, and does not by itself select the required key.
+C=Config rule flagging unencrypted volumes: it is detective only; the unencrypted volume already exists when it is reported.
+T: To guarantee encryption with a specific key, make it the default (EBS encryption by default with that CMK) rather than denying or detecting afterwards.
+
+@ Q001905 explain
+G: ## KMS keys are Regional
+A KMS key exists in one Region, and its key material never leaves that Region (multi-Region keys are the explicit exception). An encrypted RDS snapshot in `us-east-1` is protected by a key in `us-east-1`, which services in `eu-west-1` cannot use.
+## How a cross-Region snapshot copy works
+When you copy an encrypted snapshot to another Region, RDS decrypts with the source key and re-encrypts the copy with a key in the destination Region. You must supply that key:
+- API or CLI: run the copy in the destination Region with `KmsKeyId` set to a key ARN or alias in `eu-west-1`, for example `arn:aws:kms:eu-west-1:111122223333:key/...`.
+- The caller needs permission to use both the source key and the destination key.
+If no destination key is specified, or an ID from the source Region is passed, the copy fails with a key error.
+W: Destination-Region KMS key: an encrypted cross-Region copy must be re-encrypted with a key that lives in eu-west-1, so specifying one fixes the error.
+X: A=Key policy allowing eu-west-1: a key policy controls who can use a key, not where it can be used. A single-Region key cannot be used by services in another Region, whatever the policy says.
+B=Encrypted snapshots cannot be copied: RDS supports cross-Region copies of encrypted snapshots, as long as a destination-Region key is given.
+C=Decrypt, copy, re-encrypt: RDS snapshots cannot simply be decrypted, and doing so would expose data and add work. The copy operation already re-encrypts with the destination key.
+T: Encrypted data crossing Regions needs a KMS key in the destination Region; source-key policies cannot make a Regional key usable elsewhere.
+
+@ Q001906 explain
+G: ## S3 Object Lock retention modes
+**S3 Object Lock** stores objects in a write-once-read-many (WORM) way on a versioned bucket. Each object version can have a retention period:
+- **Governance mode**: most users cannot delete or overwrite the version, but principals with `s3:BypassGovernanceRetention` can, by sending a bypass header. Useful for testing or internal policies.
+- **Compliance mode**: no one can delete the locked version or shorten its retention until it expires, not even the root user. The only way to remove the data early is to close the AWS account.
+Example: upload a document with `ObjectLockMode=COMPLIANCE` and a retain-until date 7 years ahead, or set it as the bucket's default retention.
+This meets regulations that require immutable records even if administrator or root credentials are stolen.
+W: Object Lock Compliance mode for 7 years: locked versions cannot be deleted or overwritten by any user, including root, until the retention date, which is exactly the requirement.
+X: A=Governance mode: users with the bypass permission, and the root user, can remove the lock, so compromised privileged credentials could still delete the data.
+B=Lifecycle to Deep Archive: lifecycle rules change storage class or expire objects; they provide no protection against deletion.
+D=Versioning with MFA Delete: the root user can still delete versions with an MFA device, and can disable MFA Delete, so it is not an absolute guarantee.
+T: When even root must not delete data before a date, use Object Lock Compliance mode; Governance mode and MFA Delete leave a privileged way out.
+
+@ Q001908 explain
+G: ## KMS key stores versus CloudHSM
+**AWS KMS** keeps key material in FIPS-validated HSMs that AWS operates as a multi-tenant fleet. Customers control who can use keys through key policies, but they do not own or manage the hardware.
+**AWS CloudHSM** gives you HSMs in a **cluster that is dedicated to you (single-tenant)** inside your VPC:
+- You create and manage the crypto users; AWS manages the hardware and patching but has no credentials to access your keys.
+- The HSMs are FIPS 140-2 or FIPS 140-3 Level 3 validated (depending on HSM type), and applications use standard interfaces such as PKCS#11, JCE or OpenSSL.
+- You are responsible for high availability (multiple HSMs across AZs) and for backing up access credentials.
+This fits rules requiring exclusive control of the hardware and key material.
+W: CloudHSM dedicated cluster: it provides single-tenant, FIPS Level 3 validated HSMs whose keys only the customer's crypto users can access, meeting the exclusive-control requirement.
+X: A=Secrets Manager with rotation: it stores and rotates secrets such as passwords, encrypted with KMS keys; it is not a hardware device for customer-controlled key material.
+C=KMS AWS managed key: AWS creates and manages these keys on the shared KMS fleet, and the customer cannot even manage their key policy.
+D=KMS customer managed key in the default store: the customer controls key policy, but the material still lives in the shared, AWS-operated KMS HSM fleet that the stem rules out.
+T: Exclusive, single-tenant control of HSMs means CloudHSM; any key in the default KMS key store lives on the shared, AWS-managed fleet.
+
+@ Q001909 explain
+G: ## KMS custom key stores
+A **custom key store** connects AWS KMS to key storage you control. The CloudHSM variant, an **AWS CloudHSM key store**, links KMS to your own CloudHSM cluster:
+- You create KMS keys with origin `AWS_CLOUDHSM`. Key material is generated in and never leaves your HSMs.
+- Applications keep calling the normal KMS APIs (`Encrypt`, `Decrypt`, `GenerateDataKey`), and access is still controlled with key policies, IAM and CloudTrail logging.
+- KMS performs cryptographic operations by sending them to your cluster, so the cluster must have at least two active HSMs in different Availability Zones.
+- It supports symmetric encryption keys, which is what AWS service integrations such as S3 or EBS use.
+W: CloudHSM-backed custom key store: it keeps the KMS API and key policies unchanged for applications while generating, storing and using key material only in the customer's CloudHSM cluster.
+X: A=AWS owned key: AWS owns and manages these keys in its own accounts; the customer cannot see, control or audit them, and they are not in customer hardware.
+C=PKCS#11 in every application: it meets the hardware requirement but abandons the KMS API and IAM-based key policies, forcing every application to be rewritten.
+D=Secrets Manager with CloudHSM-backed secret: Secrets Manager stores secrets and encrypts them with KMS; it does not offer HSM-backed keys or the KMS cryptographic API.
+T: KMS API plus customer-controlled HSMs means a CloudHSM custom key store, not rewriting apps against CloudHSM directly.
+
+@ Q001910 explain
+G: ## Key policies come first in KMS
+Every KMS key has a **key policy**, and it is the primary access control. IAM policies only work for a key if the key policy allows it.
+- The default key policy includes a statement giving the account root principal (`arn:aws:iam::111122223333:root`) `kms:*`. That statement **delegates** access to IAM: then IAM policies in the account can grant use of the key.
+- If a team replaces the default policy with one that lists only specific roles and removes that statement, IAM policies are ignored for that key, and even an administrator with `kms:Decrypt` on `*` gets `AccessDeniedException`.
+Check with the key's policy, and fix by adding the administrator's role as a principal or by restoring the IAM-delegation statement.
+W: Key policy does not allow the admin: without a key policy statement for the admin or the root statement enabling IAM delegation, the IAM permission for kms:Decrypt has no effect.
+X: A=MFA required for Decrypt: KMS does not require MFA by default. A policy could add an MFA condition, but nothing in the scenario suggests one.
+B=KMS ignores IAM entirely: IAM policies do grant access when the key policy delegates to the account, which is the default setup.
+D=Same OU as the creator: OUs group accounts in Organizations; they have no role in key authorization, and here everyone is in the same account.
+T: For KMS, the key policy must allow the principal or delegate to IAM; broad IAM admin permissions alone are not enough.
+
+@ Q001911 explain
+G: ## Encrypting an existing EBS volume
+An EBS volume's encryption state is fixed when the volume is created. There is no API to encrypt an existing volume in place. The standard path:
+- Create a snapshot of the unencrypted volume (the instance can keep running; for a consistent copy, pause writes briefly).
+- Copy the snapshot with encryption enabled and a KMS key, or create a new volume directly from the snapshot with encryption turned on.
+- Create the encrypted volume from that copy in the same Availability Zone.
+- Stop the application, detach the old volume, attach the new one at the same device name, and restart.
+Downtime is limited to the short swap. Example: `vol-0abc` becomes snapshot `snap-1`, then encrypted snapshot `snap-2`, then `vol-0def` which is attached as `/dev/xvdf`.
+W: Snapshot, encrypted copy, new volume, swap: this is the supported way to turn an unencrypted volume's data into an encrypted volume, with downtime only during the detach and attach.
+X: A=EnableKeyRotation: it rotates a KMS key's material for future encryptions; it is a KMS key setting and cannot encrypt a volume.
+C=Encryption by default then reboot: encryption by default affects only newly created volumes and copies; rebooting does not change an existing volume.
+D=modify-volume --encrypted: ModifyVolume changes size, type, IOPS and throughput; it has no option to encrypt an existing volume.
+T: Existing EBS volumes cannot be encrypted in place; create an encrypted copy through a snapshot and swap it in.
+
+@ Q001912 explain
+G: ## Encryption at rest on RDS is set at creation
+RDS storage encryption (`StorageEncrypted`) is chosen when an instance is created and cannot be switched on for an existing unencrypted instance. Encrypted instances also encrypt their automated backups, snapshots and read replicas.
+To migrate:
+- Take a manual snapshot of the unencrypted instance.
+- Copy the snapshot, choosing encryption and a KMS key (for example a customer managed key).
+- Restore a new DB instance from the encrypted snapshot.
+- Point the application at the new endpoint (or rename instances) and retire the old one.
+To shorten downtime you can replicate changes from the old instance to the new one (for example with AWS DMS) until the cutover.
+W: Snapshot, encrypted copy, restore: this is the supported path because an encrypted copy of the snapshot produces an encrypted instance when restored.
+X: A=Set StorageEncrypted on modify: RDS does not allow enabling storage encryption on an existing unencrypted instance; the setting is available only at creation or restore.
+C=Engine TDE: Transparent Data Encryption exists only for some engines (Oracle and SQL Server), protects data at the database level, and does not turn on RDS storage encryption for the instance.
+D=AWS Support in-place migration: there is no such service; the snapshot-and-restore process is the documented method.
+T: Unencrypted RDS instances are encrypted by restoring from an encrypted snapshot copy, never by modifying them in place.
+
+@ Q001913 explain
+G: ## Multi-Region KMS keys
+A normal KMS key lives in one Region, with a key ID and key material unique to that Region. Data encrypted with it in `us-east-1` cannot be decrypted by KMS in `eu-west-1`.
+**Multi-Region keys** are sets of interoperable keys:
+- You create a **primary** key, then **replica** keys in other Regions.
+- All of them share the same key ID (beginning with `mrk-`) and the same key material, so ciphertext produced in one Region can be decrypted in another without re-encrypting or calling back to the source Region.
+- Each replica is still a separate resource with its own key policy, grants and aliases.
+This fits multi-Region applications such as DynamoDB global tables, where each replica uses the key in its own Region and client-side encryption code can use the same key ID everywhere.
+W: Multi-Region keys: a primary plus replicas share key ID and material across Regions, giving consistent encryption and decryption for each global table replica.
+X: A=AWS managed keys: `aws/dynamodb` is a separate key in each Region with its own ID and material; they are not identical across Regions.
+B=Cross-Region grants: grants give principals permission on one key in its own Region; they cannot make a key usable from another Region or copy its material.
+D=Single-Region key via key policy: a key policy decides who can use a key, not where. A single-Region key can only be used by KMS in its home Region.
+T: Same key ID and material in several Regions exists only as multi-Region keys; policies and grants cannot extend a Regional key.
+
+@ Q001914 explain
+G: ## Secrets Manager rotation strategies
+Secrets Manager rotates a database secret with a Lambda rotation function. Two common strategies exist:
+- **Single user**: the function changes the password of one database user and updates the secret. Between the password change and clients picking up the new value, sign-ins with the old password can fail briefly.
+- **Alternating users**: the function uses two users, for example `app_user` and `app_user_clone`. Each rotation updates the user that is not currently in use and then switches the secret to it. The previously active credentials keep working until the next rotation.
+Alternating users needs a separate superuser secret that can change the other users' passwords. Rotation can be scheduled, for example every 30 days.
+W: Alternating-users rotation: the credentials in use stay valid while the other user is rotated, so applications never meet a rejected password during the switch.
+X: B=Email the DBA: manual, emailed passwords are insecure, not automatic, and cause downtime while the change is applied.
+C=Disable rotation, use IAM auth: this drops the stated requirement to rotate Secrets Manager credentials every 30 days, and it would require application and database changes.
+D=Single-user rotation: changing the one user's password in place can briefly break connections that still use the old password, so it cannot promise zero downtime.
+T: Zero-downtime rotation uses alternating users so the previous credential stays valid; single-user rotation has a short failure window.
+
+@ Q001915 explain
+G: ## Rotation functions need two network paths
+A Secrets Manager rotation Lambda function must be able to:
+- Connect to the **database** to change the password (for example port 3306 or 5432 on the RDS endpoint).
+- Call the **Secrets Manager API** to read and update the secret versions.
+For a database in private subnets, the function must be attached to the VPC (subnets and a security group that the RDS security group allows). Then, because the subnets have no internet route, it needs a **Secrets Manager interface VPC endpoint** (`com.amazonaws.<region>.secretsmanager`) or a NAT gateway to reach the API.
+Missing either path produces connection timeouts in the function's CloudWatch Logs, not permission errors.
+W: Function not in a VPC with a path to RDS and Secrets Manager: without VPC attachment, security group access and an endpoint or NAT, the function cannot open a connection and times out.
+X: A=KMS key rotation off: automatic rotation of the KMS key's material is unrelated to rotating a database password and would never cause connection timeouts.
+C=Missing GetRandomPassword permission: a missing IAM permission returns an AccessDenied error from Secrets Manager, not a failure to connect to the database host.
+D=Private subnets not supported: rotation functions routinely rotate databases in private subnets once they are attached to the VPC and have endpoint access.
+T: Rotation Lambda timeouts point to networking: the function must reach both the database and the Secrets Manager endpoint from inside the VPC.
+
+@ Q001916 explain
+G: ## Two ways Macie finds sensitive data
+Amazon Macie inspects S3 object contents for sensitive data such as names, addresses or credit card numbers.
+- **Sensitive data discovery jobs**: you choose buckets and objects to fully analyze, once or on a schedule. Thorough, but cost grows with the amount of data scanned.
+- **Automated sensitive data discovery**: Macie continuously selects representative samples of objects across all buckets, builds a sensitivity score per bucket, and shows which ones likely contain PII. Sampling keeps cost controlled at large scale.
+In an organization, a **Macie delegated administrator** account enables Macie and automated discovery for all members. Macie can publish its findings to AWS Security Hub, where they join other security findings.
+W: Automated discovery via delegated admin with Security Hub: sampling gives continuous, cost-controlled coverage of all 1,200 buckets, and findings flow centrally into Security Hub.
+X: A=GuardDuty S3 Protection: it analyzes S3 data events for suspicious access patterns; it does not look at object contents or identify PII.
+C=S3 Inventory: it lists objects and metadata such as size and encryption status; it does not inspect contents for sensitive data.
+D=Daily full classification jobs: scanning every object every day across 1,200 buckets is very costly and repeats work, conflicting with the cost requirement.
+T: Continuous, cost-controlled PII visibility across many buckets is Macie automated discovery, not repeated full scans or non-content tools.
+
+@ Q001917 explain
+G: ## Centralizing Macie with Organizations
+Macie integrates with AWS Organizations:
+- The management account designates a **delegated administrator** account for Macie, usually the security tooling account.
+- The delegated administrator can enable Macie in member accounts (including new accounts automatically), view their S3 inventory, and create sensitive data discovery jobs that analyze buckets owned by member accounts.
+- Findings from all accounts appear in the administrator account, and custom data identifiers and allow lists created there can be used in those jobs.
+Member account teams do not have to configure Macie themselves, and they cannot disable it without the administrator.
+W: Macie delegated administrator: one central account runs discovery jobs over member accounts' buckets and sees all findings, without per-account setup.
+X: A=Separate Macie per account plus SIEM: every team still configures Macie itself, and a SIEM only aggregates findings; it cannot run jobs centrally.
+B=Custom data identifier via RAM: custom data identifiers are not shared through AWS RAM, and sharing a detection pattern would not let anyone run jobs in other accounts.
+C=Config aggregators: they collect AWS Config configuration and compliance data; they do not collect Macie findings or run discovery jobs.
+T: Org-wide Macie management from one place is done through a delegated administrator, not per-account setup or other aggregation tools.
+
+@ Q001918 explain
+G: ## GuardDuty and Macie solve different problems
+**Amazon GuardDuty** is threat detection. It analyzes CloudTrail management and data events, VPC Flow Logs, DNS logs and other sources to spot malicious activity, for example:
+- `UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS` when EC2 role credentials are used from outside AWS.
+- API calls from known malicious IP addresses or unusual locations.
+**Amazon Macie** is data classification. It inspects the contents of S3 objects to find sensitive data such as PII and reports which buckets hold it, plus bucket-level issues like public access.
+Many organizations enable both and send findings to Security Hub, because one watches behaviour and the other watches data.
+W: GuardDuty for threats, Macie for PII: GuardDuty detects compromised credentials from activity patterns, while Macie discovers PII by inspecting S3 object contents.
+X: A=Swapped roles: GuardDuty does not read object contents for PII, and Macie does not analyze API activity for credential compromise.
+C=Config rules for both: Config evaluates resource configurations; it neither detects malicious use of credentials nor scans object contents.
+D=Identical and interchangeable: the two services use different data sources and produce different findings; neither can replace the other.
+T: Threats and compromised credentials belong to GuardDuty; sensitive data in S3 belongs to Macie.
+
+@ Q001919 explain
+G: ## Envelope encryption
+The KMS `Encrypt` API accepts at most **4 KB** of plaintext. It is designed for small secrets and data keys, not files. For larger data, use **envelope encryption**:
+- Call `GenerateDataKey` with your KMS key. KMS returns a data key in two forms: plaintext and encrypted under the KMS key.
+- Encrypt the 25 MB file locally with the plaintext data key (for example AES-256-GCM), then erase the plaintext key from memory.
+- Store the encrypted data key with the ciphertext, for example as object metadata or in the file header.
+To decrypt, call `Decrypt` on the small encrypted data key and use the returned key locally. The AWS Encryption SDK and S3 client-side encryption libraries implement this pattern.
+W: Envelope encryption: KMS protects only a small data key while the file itself is encrypted locally, so the size of the data never hits the 4 KB limit.
+X: A=Sign API: `Sign` creates a digital signature with an asymmetric key; it does not encrypt data, and it has its own small message limit.
+B=Quota increase: the 4 KB plaintext limit is a fixed limit of the API, not an adjustable quota.
+D=4 KB chunks with Encrypt: roughly 6,000 KMS calls per file adds latency, cost and throttling risk, and it is not the intended pattern when a single data key would do.
+T: KMS encrypts keys, not large files; use GenerateDataKey and encrypt the data locally.

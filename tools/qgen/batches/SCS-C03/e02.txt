@@ -1,0 +1,359 @@
+# SCS-C03 detailed explanations (explanation-only rewrites; letters are the published ones)
+
+@ Q001796 explain
+G: ## What an organization trail is
+A CloudTrail **organization trail** is created in the AWS Organizations management account (or by a delegated administrator for CloudTrail). It automatically logs events for every member account into one central S3 bucket, and new accounts are included as they join.
+## Who owns it
+The trail is a resource of the management account, not of each member account. Member accounts can see the trail (it appears in their CloudTrail console with a note that it belongs to the organization), but they cannot stop logging, change its settings or delete it.
+- This is by design: the people you want to audit should not be able to switch off their own audit log.
+- Even `AdministratorAccess` in a member account only grants rights over that account's own resources; the organization trail is not one of them.
+- Example: a member admin running `aws cloudtrail stop-logging --name org-trail` gets an access error, while the same call from the management account succeeds.
+W: Only the management or delegated admin account can manage it: the trail belongs to the organization's management account, so member-account permissions never reach it, no matter how broad they are.
+X: A=SCP allowing DeleteTrail: SCPs never grant permissions; they only set the maximum a member account may use. Adding an allow would not let a member account modify a trail it does not own.
+C=Daily modification quota: CloudTrail has no per-account daily quota on trail changes that would produce an authorization error. The error comes from ownership, not from a usage limit.
+D=AdministratorAccess lacks StopLogging: the `AdministratorAccess` managed policy allows `*` on `*`, which includes every CloudTrail action. The permission exists; the target trail is simply outside the member account's control.
+T: Organization trails are owned and controlled centrally, so member-account administrators can view them but cannot stop or delete them, whatever IAM or SCP settings they have.
+
+@ Q001797 explain
+G: ## How partitioned Athena tables find data
+Athena does not scan a bucket blindly. For a partitioned table it only reads the S3 prefixes that are registered as partitions in the table's metadata (the AWS Glue Data Catalog).
+CloudTrail writes logs under paths like `AWSLogs/111122223333/CloudTrail/us-east-1/2026/09/23/`. A table partitioned by Region and date needs one partition per Region per day.
+- If partitions were added once (for example when the table was built), later days exist in S3 but not in the catalog, so Athena returns zero rows for them.
+- CloudTrail paths are not in Hive `key=value` style, so `MSCK REPAIR TABLE` cannot discover them; you add them with `ALTER TABLE ... ADD PARTITION` on a schedule.
+- **Partition projection** removes this upkeep: you describe the partition ranges in table properties (for example dates from 2024 to `NOW`) and Athena computes the prefixes at query time.
+W: Missing partitions for new dates: old dates were registered and return results, new dates were never added. Adding the partitions, or switching to partition projection, makes last week's logs queryable.
+X: B=30-day limit: Athena has no age restriction on the data it queries; recent objects are read like any other once the table knows their location.
+C=Unsupported codec after 90 days: CloudTrail always delivers gzip-compressed JSON, which Athena reads natively, and it does not re-compress files over time. The symptom also affects new files, not old ones.
+D=Versioning blocks new objects: versioning keeps older versions of objects but the current version of every new object is readable normally. It has nothing to do with which prefixes Athena scans.
+T: A partitioned table only sees registered partitions, so data that exists in S3 but is missing from the catalog returns zero rows until you add partitions or use partition projection.
+
+@ Q001798 explain
+G: ## Default and custom flow log formats
+VPC Flow Logs write one record per flow as space-separated text. The **default format** (version 2) has 14 fields in a fixed order: `version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes start end action log-status`.
+A **custom format** lets you choose which fields appear and in what order, for example adding `pkt-srcaddr`, `pkt-dstaddr` and `tcp-flags`.
+## Why the table breaks
+Athena reads delimited text by position: the first value goes into the first column, the second into the second, and so on. If the table was created with the 14-field DDL but each line now has, say, 17 values in a different order, values land in the wrong columns and the extra fields have no column at all.
+- Example: if the custom format puts `pkt-srcaddr` fourth, the table's fourth column (`srcaddr`) shows the packet source, and everything after it shifts.
+The fix is to write the `CREATE TABLE` column list in exactly the same order as the flow log format string.
+W: Redefine the DDL to match the custom field order: once the column list mirrors the format string, every value lands in the right column and the extra fields become queryable.
+X: B=Convert to Parquet: changing the file format does not fix a table schema that lists the wrong columns; the conversion itself would still need the correct field order to map values.
+C=Glue crawler fixes it regardless: a crawler only infers a schema from sampled data; it does not repair the column mapping of a table you defined by hand, and inference on space-delimited flow log text is not guaranteed to produce the right names and types. You still need a schema that matches the format.
+D=Custom formats not queryable: Athena can query any flow log format as long as the table definition matches it; AWS documents this for custom formats.
+T: Athena maps delimited flow log fields by position, so a custom log format needs a table DDL whose columns follow the same order.
+
+@ Q001799 explain
+G: ## CloudTrail log file integrity validation
+When log file validation is enabled, CloudTrail creates a **digest file** every hour alongside the logs. Each digest lists the SHA-256 hash of every log file delivered in that hour, and it is signed with a private key held by CloudTrail. Each digest also contains the signature of the previous digest, forming a chain.
+## How you check it
+`aws cloudtrail validate-logs --trail-arn <arn> --start-time <time>` walks the chain:
+- verifies each digest's signature with CloudTrail's public key,
+- re-hashes each log file and compares it with the hash in the digest,
+- reports log files that were modified, deleted or are missing, and digests that were changed or removed.
+Because the digests are signed, an attacker who edits a log file cannot quietly update the hash to match. The check works only for periods when validation was on, which is the case here because it was enabled from creation.
+W: validate-logs for the time range: it proves cryptographically, file by file, whether any delivered log was changed or deleted, which is exactly the forensic question.
+X: A=Compare S3 ETags manually: an ETag is not a reliable content hash (it differs for multipart uploads and KMS-encrypted objects), the CloudTrail console does not list ETags, and someone with write access could change both the object and its metadata.
+C=Re-download Insights events: Insights events report unusual API call rates or error rates. They are separate records and say nothing about whether existing log files were altered.
+D=GuardDuty retroactive validation: GuardDuty analyzes events for threats; it does not check the integrity of CloudTrail log files in S3, historically or otherwise.
+T: Tampering questions about CloudTrail logs are answered by the signed digest chain, checked with `validate-logs`, not by threat detection services or object metadata.
+
+@ Q001800 explain
+G: ## Incident response order: contain, preserve, then clean up
+AWS incident response guidance separates the phases: first **contain** the threat so it stops spreading, then **preserve evidence**, then investigate, and only after that **eradicate** and recover.
+For an EC2 instance that is encrypting data:
+- **Contain**: replace its security groups with a quarantine security group that allows no traffic (or only a forensic workstation), so it cannot reach command-and-control servers or other hosts.
+- **Preserve**: take EBS snapshots of the attached volumes, and capture memory if needed, while the instance is still running. Tag the instance and snapshots to record the incident.
+- **Investigate**: analyze copies of the evidence, ideally in a separate forensics account, to learn how the attacker got in.
+Terminating or deleting first stops the damage too, but it destroys the evidence needed to find the root cause and prevent a repeat.
+W: Quarantine security group, EBS snapshot, then investigate: it stops network activity for this one instance while keeping disks and the running state available as evidence.
+X: A=Terminate immediately: termination deletes memory contents and, by default, the root volume, so the evidence of how the ransomware arrived is lost.
+B=Detach and delete the volumes: deleting volumes destroys the very data and evidence under investigation, and a rebuild without root cause may be reinfected the same way.
+D=Account-wide deny SCP: an SCP limits API calls, not traffic or processes already running on the instance, and it would stop every legitimate workload in the account.
+T: Contain the single instance with a quarantine security group and snapshot its volumes before investigating; destructive steps come only after evidence is safe.
+
+@ Q001801 explain
+G: ## What Amazon Detective does
+Amazon Detective is an investigation service. It automatically ingests data such as VPC Flow Logs, CloudTrail management events and GuardDuty findings (plus optional sources like EKS audit logs) and builds a **behavior graph** that links entities: EC2 instances, IAM roles and users, IP addresses and AWS accounts.
+For each entity it shows profile panels that answer investigation questions without writing queries:
+- which IP addresses an instance talked to and how much data moved,
+- which roles and users made API calls, from where,
+- how today's activity compares with the entity's own **baseline** over previous weeks.
+You typically pivot into Detective straight from a GuardDuty finding. GuardDuty says "something looks wrong"; Detective helps answer "what happened around it".
+W: Amazon Detective: its behavior graph gives ready-made views of network connections, role usage and activity versus baseline, with no queries to write.
+X: A=Amazon Macie: Macie discovers sensitive data such as PII in S3 buckets and flags bucket security issues; it does not analyze EC2 network or API behavior.
+B=Amazon Inspector: Inspector scans EC2 instances, container images and Lambda functions for software vulnerabilities and network exposure, not for past activity.
+C=AWS Config: Config records how resource configurations changed over time, such as security group rules, but not which IPs an instance talked to or how its API usage compares with normal.
+T: GuardDuty detects, Detective investigates with automatic baselines and relationships, Inspector finds vulnerabilities, Macie finds sensitive data, Config tracks configuration.
+
+@ Q001802 explain
+G: ## GuardDuty and Detective work together
+**GuardDuty** continuously analyzes logs and raises a finding, for example that an instance is talking to a known command-and-control IP. The finding describes that one event.
+**Amazon Detective** keeps a behavior graph built from flow logs, CloudTrail and GuardDuty findings (retaining up to a year of data). From the finding you pivot into Detective to see context over time:
+- every IP address the instance connected to, with traffic volumes, before and after the finding,
+- how many API calls its role made and whether that changed,
+- which roles and users were involved and from which locations.
+This context shows when the compromise began, whether other resources were touched, and how far the attacker got.
+Neither service blocks traffic or changes resources. Containment is done separately, for example with EventBridge rules that trigger automation.
+W: Historical connections, API volume and role usage over time: this timeline across related entities is Detective's purpose and is not part of a single GuardDuty finding.
+X: B=CVE-based vulnerability report: CVE scanning of installed packages is Amazon Inspector's job; Detective does not scan software.
+C=Automatic quarantine: Detective is read-only analysis; it never changes security groups. Quarantine requires your own automation or manual action.
+D=Real-time blocking at VPC level: blocking an IP needs a network control such as a network ACL, AWS Network Firewall or Route 53 Resolver DNS Firewall; Detective does not enforce anything.
+T: GuardDuty tells you that something happened; Detective shows the history and relationships around it, and neither of them blocks or quarantines.
+
+@ Q001803 explain
+G: ## Why forensics should be automated
+When an instance is compromised, evidence disappears fast: memory is lost when the instance stops, and attackers may cover tracks. Manual response is slow and inconsistent between responders.
+## The Automated Forensics Orchestrator for Amazon EC2
+AWS published this as an AWS Solutions reference implementation that you deploy into your own accounts. A security finding (for example from GuardDuty, delivered through Security Hub and EventBridge) starts an AWS Step Functions workflow that:
+- isolates the instance with a restrictive security group,
+- captures memory using Systems Manager and snapshots the EBS volumes,
+- copies the evidence into a separate forensics account where it can be analyzed safely,
+- records each step, so every incident is handled the same way.
+The key idea is **preserve before remediate**: the instance is kept and isolated, not replaced, until evidence is collected.
+W: The Automated Forensics Orchestrator for EC2: it is built for exactly this chain of isolation, disk and memory capture and cross-account evidence storage, triggered by findings with no manual steps.
+X: A=Inspector rule that terminates: Inspector finds vulnerabilities and has no rules that act on instances; terminating would also destroy memory and possibly volume evidence.
+B=Config rule that rebuilds from the AMI: Config remediation fixes configuration drift; rebuilding replaces the compromised instance without isolating it or capturing its disk and memory.
+D=Auto Scaling health check replacement: Auto Scaling terminates unhealthy instances and launches new ones, which throws away the evidence, and a compromised instance usually still passes health checks.
+T: Repeatable, hands-off incident forensics means isolate and capture automatically with an orchestrated workflow, not replace or terminate the instance.
+
+@ Q001804 explain
+G: ## How evidence reaches a forensics account
+The snapshot is created in the account that owns the instance, but the evidence must end up in a different, forensics account. That requires two permissions to line up:
+- **Cross-account access**: the workflow assumes an IAM role, or shares the snapshot (`ModifySnapshotAttribute` with `createVolumePermission`) with the forensics account, which then copies it.
+- **Encryption keys**: an encrypted EBS snapshot can be shared only if it uses a **customer managed KMS key**, and the key policy must let the forensics account use the key. Snapshots encrypted with the default `aws/ebs` key cannot be shared at all; they must first be copied with a customer managed key.
+## Reading the symptom
+Isolation and snapshot creation both happen in the source account and both succeeded, so the trigger and the local permissions work. Only the step that crosses the account boundary failed, which points to that role or key policy.
+W: Cross-account role or KMS key policy misconfigured: the failure happened exactly at the hand-off between accounts, where a trust policy, snapshot sharing permission or KMS key grant is needed.
+X: B=Severity below the rule's threshold: if the EventBridge rule had filtered out the finding, the workflow would not have started, yet isolation and the snapshot did happen.
+C=VPC Flow Logs disabled: flow logs record network traffic and play no part in creating, sharing or copying snapshots.
+D=No SSM Agent: the agent is needed for memory capture commands on the instance; it does not affect sharing an EBS snapshot, which is an EC2 API operation.
+T: When local steps succeed but the evidence never arrives in the forensics account, check the cross-account role and the KMS key policy of encrypted snapshots.
+
+@ Q001805 explain
+G: ## What a tabletop exercise is for
+A **tabletop exercise** is a discussion-based simulation. A facilitator describes a scenario step by step (for example, "an access key appears on a public repository and new EC2 instances start in an unused Region"), and participants say what they would do and who they would call.
+Its value is testing the **people and process**, not the tools:
+- Who has authority to disable a production credential?
+- When do legal, communications and management get involved?
+- Who can reach the account owner at 2 a.m.?
+To test real readiness, the room must include everyone who would act in a real incident: security, cloud operations, application owners, legal, communications and leadership. Gaps such as unclear approvals or missing contacts become visible only when these people walk through decisions together.
+W: Cross-functional participants walking decisions and escalations: this is what reveals whether the organization, not just the runbook, can respond.
+X: A=Pre-filled report template: filling in the expected findings in advance removes the uncertainty the exercise is meant to test; responders simply confirm the answer.
+B=Complete list of IAM permissions: knowing the principal's permissions helps scope impact during a real incident, but it is technical input and does not test escalation or decision making.
+C=CloudFormation template to recreate the environment: rebuilding infrastructure supports hands-on simulations, but a tabletop is discussion-based, and the template tests nothing about people.
+T: Tabletop exercises test people, roles and decisions across teams; technical artifacts support response but do not prove organizational readiness.
+
+@ Q001806 explain
+G: ## Blast radius in containment
+Containment should stop the attacker while touching as little else as possible. An SCP that denies everything in the account stops the attacker, but also every application in that account.
+## Revoking a role's sessions precisely
+Temporary credentials from `AssumeRole` cannot be recalled one by one; they stay valid until they expire. Removing the role's permissions would stop them, but it also breaks every legitimate user of the role. IAM solves this with a deny based on the condition key `aws:TokenIssueTime`:
+- The IAM console's **Revoke active sessions** action attaches an inline policy to the role that denies all actions when `aws:TokenIssueTime` is earlier than now.
+- Every session issued before that moment is blocked immediately; new, legitimate sessions still work.
+- You can add a targeted deny on the principal or in the S3 bucket policy to block the exfiltration path directly.
+Other roles, users and workloads in the account are unaffected.
+W: Targeted deny with aws:TokenIssueTime: it blocks only the compromised principal's existing sessions and actions, so containment is fast and production keeps running.
+X: A=Account-wide deny SCPs off-peak: the blast radius is the same whenever it is applied, and waiting for off-peak hours delays containment while the data is still leaving.
+B=Disable CloudTrail: turning off logging removes the evidence of what the attacker is doing and does nothing to stop them. Attackers often try this themselves.
+C=Delete the bucket: deleting destroys the data and the evidence (objects, versions and bucket settings) and does not remove the attacker's credentials.
+T: Contain with the narrowest effective control, such as revoking the compromised principal's sessions with `aws:TokenIssueTime`, instead of shutting down the whole account.
+
+@ Q001807 explain
+G: ## Shield Standard and Shield Advanced
+**AWS Shield Standard** is automatic and free, protecting against common network and transport layer attacks. **Shield Advanced** is a paid subscription for resources such as CloudFront, Route 53, Global Accelerator, Application Load Balancers and Elastic IPs. It adds:
+- **Shield Response Team (SRT)** access 24/7 during attacks (requires a qualifying paid AWS Support plan), including help writing AWS WAF rules, and optional proactive engagement when health checks show impact,
+- **DDoS cost protection**: credits for scaling charges caused by an attack,
+- attack visibility and event reporting, and **automatic application layer mitigation** that creates AWS WAF rules for you.
+## Why this matters for a playbook
+Relying only on manual scaling and WAF edits means the team must diagnose a Layer 7 flood under pressure and pay for the extra capacity. Shield Advanced gives the playbook defined escalation (engage the SRT), expert help and financial protection.
+W: Event management, cost protection and SRT access: these give the playbook expert support, a clear escalation step and protection from attack-driven scaling costs.
+X: B=Replaces the playbook: Shield Advanced is a tool the playbook uses; you still need documented roles, escalation and communication steps.
+C=Rebuilds EC2 instances: Shield Advanced mitigates attack traffic; it does not terminate or rebuild instances, and a DDoS does not compromise the instance itself.
+D=Removes the need for WAF rules: Layer 7 mitigation is done with AWS WAF rules, including the ones Shield Advanced creates automatically; a web ACL is required for that.
+T: Shield Advanced strengthens a DDoS playbook with SRT help, visibility and cost protection, but it complements AWS WAF and a written response plan rather than replacing them.
+
+@ Q001808 explain
+G: ## How Detective builds history
+When an account is added to a Detective behavior graph, Detective starts ingesting that account's data (flow logs, CloudTrail management events, GuardDuty findings and optional sources) **from that moment on**. It does not go back and import older logs.
+- Detective then keeps up to a year of data, so history grows over time.
+- Baselines for "normal" behavior also need time to form; Detective needs a period of data before comparisons are meaningful.
+- Example: a member account joined the graph five days before the finding. Detective can show only those five days, so the analyst cannot see when the suspicious activity actually began.
+This is why AWS recommends enabling Detective across the organization early, before an incident, and automatically for new accounts.
+W: Account joined Detective recently: the behavior graph covers only data ingested since the account was added, so a new member has little history before the finding.
+X: A=Requires Macie: Macie is not a Detective data source; Detective builds its graph from flow logs, CloudTrail and GuardDuty without it.
+B=Needs a prior GuardDuty finding: Detective ingests activity for all member accounts continuously, whether or not they have had findings.
+D=No S3 support: Detective can investigate GuardDuty findings that involve S3 buckets, and in any case a missing data type would not explain thin history across the account's network and API activity as a whole.
+T: Detective history starts when an account starts sending data to the behavior graph, so enable it organization-wide before you need it.
+
+@ Q001809 explain
+G: ## The requirements
+The scenario lists every step of an EC2 forensic response and asks for it **automated and out of the box**:
+- trigger on a specific high-severity GuardDuty finding type,
+- isolate the instance by changing security groups,
+- capture EBS snapshots and memory,
+- store evidence in a separate, restricted forensics account.
+## The Automated Forensics Orchestrator for Amazon EC2
+AWS published this as an AWS Solutions reference implementation. Findings are routed through Amazon EventBridge (from Security Hub) to an AWS Step Functions state machine that runs Lambda functions and Systems Manager commands for isolation, disk snapshot, memory acquisition and transfer to the forensics account. It is deployed from AWS-provided infrastructure-as-code templates, so you do not have to build the workflow yourself.
+Building the same thing from Config rules or Systems Manager documents is possible, but it is custom work, not an out-of-the-box answer.
+W: Automated Forensics Orchestrator via EventBridge and Step Functions: it already implements finding-driven isolation, disk and memory capture and cross-account evidence storage.
+X: B=SSM Automation run manually: runbooks can perform steps, but a person must start them, which fails the "no manual intervention" requirement.
+C=Config custom rules with Lambda remediation: Config evaluates resource configuration, not GuardDuty findings, and you would have to write all the forensic capture logic yourself.
+D=Inspector with automated remediation: Inspector finds software vulnerabilities and exposures; it does not respond to GuardDuty findings or capture memory and disk evidence.
+T: For hands-off EC2 forensics triggered by GuardDuty, use the purpose-built orchestrator instead of assembling manual runbooks or configuration rules.
+
+@ Q001810 explain
+G: ## Where response time is lost
+Most delay in real incidents is not technical; it is people looking for information: which account, which role, who can approve. In a ransomware case every minute lets more data be encrypted.
+## What a good runbook contains
+A **runbook** is a step-by-step procedure for one type of incident. To remove guesswork it should list:
+- the exact account IDs (workload, security, forensics),
+- the role ARNs to assume, such as `arn:aws:iam::444455556666:role/IR-Responder`, and how to get access,
+- the named approvers for isolation or shutdown and how to reach them,
+- the commands or automation to run for each step.
+Keeping runbooks in version control lets the team review changes, and rehearsing them in exercises keeps them current as accounts and people change.
+W: Versioned runbooks with exact accounts, roles and approvers: responders act immediately instead of searching, and the drill's specific failure points are removed.
+X: A=Search documentation during incidents: searching is precisely what cost 40 minutes; general AWS documentation does not know the company's accounts or approvers.
+B=More GuardDuty protection plans: better detection finds more threats but does nothing to speed up the response after something is detected.
+C=AdministratorAccess everywhere: broad standing access enlarges the attack surface and still does not tell responders which account to use or who approves isolation.
+T: Response speed comes from preparation: specific, tested, version-controlled runbooks, not broader permissions or more detection.
+
+@ Q001811 explain
+G: ## Standing versus just-in-time access
+- **Standing access**: a role or user always holds the permissions. Nothing needs approval, so responders act immediately.
+- **Just-in-time (JIT) access**: permissions are granted only when requested and approved, for a limited time, then removed automatically.
+## The tradeoff
+Standing admin access is always available to anyone who steals the credentials, and to a malicious insider, which is exactly the threat this playbook covers. The permanently available privileges are attack surface every day, even though incidents happen rarely.
+JIT reduces that exposure: most of the time nobody holds the elevated rights. On AWS it can be built with IAM Identity Center permission sets and time-bound assignments, for example with the AWS temporary elevated access management (TEAM) solution, and each elevation is requested, approved and logged. A small number of tightly monitored break-glass credentials is kept for when the approval path itself fails.
+W: Faster response but a permanently larger attack surface: standing access removes approval delays at the cost of powerful privileges that can be abused at any time.
+X: A=More auditable: audit logs record API calls either way, and JIT adds records of who requested and approved access, so standing access is not inherently more auditable.
+B=Identity Center cannot grant temporary elevation: IAM Identity Center assignments can be added and removed on demand, and AWS publishes a solution that uses it for time-bound elevated access.
+C=Removes the need for MFA: break-glass and privileged roles should require MFA regardless; standing access makes strong authentication more important, not less.
+T: Standing privileged access trades a permanently larger attack surface for speed; just-in-time, approved and time-bound elevation keeps speed while limiting exposure.
+
+@ Q001812 explain
+G: ## Reading the attack pattern
+An EC2 instance role gets temporary credentials from the instance metadata service. A GuardDuty finding about instance credentials (for example credentials used from outside the instance) suggests an attacker obtained them.
+The follow-up API calls tell you what the attacker wants:
+- `iam:CreateAccessKey` creates long-term keys that keep working after the role's temporary credentials expire.
+- `iam:AttachUserPolicy` gives those users more permissions.
+Together this is **persistence and privilege escalation**: the attacker builds a way back in that does not depend on the instance.
+## Next containment steps
+- Revoke the role's existing sessions (deny for `aws:TokenIssueTime` before now).
+- Find and deactivate any keys and users created, and detach added policies.
+- Narrow the role's permissions; an application role rarely needs IAM write access.
+W: Stolen role credentials used for persistence: the timing after the credential finding and the specific IAM write calls point to an attacker securing long-term access.
+X: A=Benign configuration drift: configuration drift does not create access keys or attach policies in a sudden burst right after a credential finding; ignoring it leaves the attacker's new keys active.
+B=Read-only role so calls came from another account: CloudTrail and Detective attribute the calls to this role's sessions, so they were made with its credentials; nothing in the evidence points to another account, and an application role with IAM write rights is itself part of the problem.
+D=False positive because no IAM correlation: Detective's behavior graph includes CloudTrail API activity for roles and links it with GuardDuty findings, which is exactly what surfaced this spike.
+T: An instance role suddenly creating access keys and attaching policies after a credential finding means stolen credentials being used for persistence; revoke sessions and remove what was created.
+
+@ Q001813 explain
+G: ## What the tabletop revealed
+The exercise did its job: it found that responders did not know **where** to act (which account owns the forensics bucket) or **how** to get there (which role ARN to assume). In a real ransomware incident those minutes let more data be encrypted.
+## Fixing the plan
+The fix is to put that exact information into the runbook, and keep it current:
+- account IDs and names for the forensics, security and workload accounts,
+- bucket names, such as the forensics evidence bucket,
+- role ARNs and the command or console link to assume them, for example `aws sts assume-role --role-arn arn:aws:iam::444455556666:role/ForensicsResponder`,
+- who owns each item, and a review date.
+The next tabletop then verifies the gap is closed. Access stays least-privilege; only the information becomes easy to find.
+W: Current account IDs, ARNs and role names in the runbook: it removes the exact confusion found in the exercise without changing access controls.
+X: B=Remove the forensics account requirement: a separate forensics account protects evidence from the attacker and keeps investigation isolated; removing it weakens the response to fix a documentation gap.
+C=Permanent AdministratorAccess: broad standing access creates new risk and still does not tell responders which account or bucket holds evidence.
+D=Search documentation during the incident: AWS documentation cannot contain the company's own account IDs and role ARNs, and searching live is the delay the exercise exposed.
+T: When an exercise shows responders lacked specific details, write those exact accounts, ARNs and roles into the runbook rather than widening permissions or removing controls.
+
+@ Q001814 explain
+G: ## Credentials created from an access key
+An IAM user's long-term access key (`AKIA...`) can be used directly for API calls, and also to create temporary credentials, for example with `sts:GetSessionToken`. Those temporary credentials keep working until they expire, even after the original key is turned off.
+## Correct order for an exposed key
+- **Deactivate** the key first (`aws iam update-access-key --status Inactive`). It stops working at once and can be re-enabled if needed; deleting can wait until the investigation is finished.
+- **Revoke sessions**: attach a deny policy for requests whose `aws:TokenIssueTime` is before now, which blocks any temporary credentials the attacker made.
+- Then investigate with CloudTrail: what did the key do, which resources were created (such as the EC2 instances in the unfamiliar Region), and clean them up.
+Rotating other credentials and reviewing the user's permissions follows.
+W: Deactivate the key, then revoke sessions: this cuts off both the long-term key and any temporary credentials derived from it while keeping the evidence.
+X: B=Enable Config to track future activity: Config records resource configuration changes; it does not stop the attacker, and API activity is already in CloudTrail.
+C=Delete the IAM user: deletion is irreversible and removes the user's keys, policies and group memberships that help scope what the attacker could do (CloudTrail history remains, but the configuration is gone); deactivating the key contains the threat just as fast and can be undone.
+D=Rotate the root password: the root user was not involved; changing its password does nothing about the exposed IAM user key.
+T: For an exposed access key, deactivate it first and revoke sessions issued with it; delete and clean up only after evidence is collected.
+
+@ Q001815 explain
+G: ## Why activity continues after deactivation
+Deactivating an access key blocks new requests signed with that key within seconds. It does **not** invalidate temporary credentials that were already created from it, for example with `sts:GetSessionToken` (valid up to 36 hours for an IAM user) or by assuming a role.
+An attacker who created such sessions before the key was turned off can keep making API calls. GuardDuty sees these calls and attributes them to the same principal.
+## Revoking the existing sessions
+Attach an explicit deny for all actions with a condition that `aws:TokenIssueTime` is earlier than the time of containment. For a role, the IAM console's **Revoke active sessions** does this for you. Explicit deny always wins, so all older sessions stop working, while new legitimate ones are unaffected.
+W: STS sessions predate deactivation, so deny by aws:TokenIssueTime: temporary credentials issued earlier remain valid until they expire, and an explicit deny on their issue time is how to cut them off.
+X: B=False positives because deactivation ends sessions: deactivating a key leaves existing temporary credentials valid, so the findings reflect real activity.
+C=Findings lag by hours: GuardDuty usually produces findings within minutes of the activity, and the calls here are ongoing, not old events being reported late.
+D=Deactivation takes 24 hours: a key status change takes effect almost immediately; IAM changes propagate in seconds, not a day.
+T: Deactivating a key does not kill sessions already created from it; add a deny on `aws:TokenIssueTime` to revoke them.
+
+@ Q001816 explain
+G: ## How instance profile credentials work
+An EC2 **instance profile** attaches a role to an instance. The instance metadata service hands out temporary credentials for that role, and AWS rotates them automatically before they expire.
+Software on the instance (or an attacker who copied them) holds the credentials in memory or on disk. They are valid until their expiry time, no matter what later happens to the instance's configuration.
+## Two different effects
+- **Removing the instance profile** stops the metadata service from providing new credentials. Credentials already retrieved, including any copied off the instance, stay valid until they expire.
+- **Revoking sessions** with a deny on `aws:TokenIssueTime` makes every credential issued before now useless immediately, wherever it is used.
+Good containment usually does both: revoke sessions to kill stolen credentials, and remove or replace the profile so the instance cannot get new ones.
+W: Removing the profile does not revoke cached credentials: already-issued temporary credentials remain usable until expiry, so removing the profile alone leaves stolen credentials working.
+X: A=Functionally identical: one stops future credential issuance on the instance, the other invalidates credentials already issued; they solve different parts of the problem.
+C=Deny policy is the only supported way: the statement is too absolute; responders also use other controls, such as removing the role's permissions or restricting where credentials can be used, and the options are typically combined.
+D=Removing the profile invalidates existing credentials: temporary credentials cannot be recalled by changing the instance; they stay valid until they expire unless a deny policy blocks them.
+T: Detaching an instance profile only stops new credentials; to neutralize credentials already stolen, revoke the role's sessions with a deny on `aws:TokenIssueTime`.
+
+@ Q001817 explain
+G: ## Isolation that keeps evidence
+For forensics you want the instance **cut off from the network but still running**, because memory holds running processes, network connections, encryption keys and malware that exists only in RAM.
+## Security groups as an isolation tool
+Security groups are attached to each network interface. Replacing the instance's groups with an **isolation security group** that has no inbound or outbound rules (or only rules for a forensic workstation) blocks new traffic for this one instance without affecting others.
+- Security groups are stateful and track connections, so an already open connection can keep flowing. AWS guidance is to first apply a group that allows all traffic (which makes connections untracked) and then switch to the isolation group, so existing sessions are cut too.
+- Then take EBS snapshots and memory captures while it runs.
+W: Isolation security group with the instance left running: it blocks command-and-control traffic for this instance only while memory and disks stay intact for analysis.
+X: A=Terminate and restore from an AMI: termination destroys memory and, by default, the root volume, so the evidence of the compromise is lost.
+B=Stop the instance: stopping clears memory, removing the in-RAM evidence the team wants to analyze later.
+C=Black-hole route: route tables apply to the whole subnet, so every instance there is affected, and routes do not stop traffic to other hosts inside the same VPC.
+T: To isolate one instance while preserving evidence, swap its security groups for an isolation group and keep it running; do not stop, terminate or change subnet routing.
+
+@ Q001818 explain
+G: ## Security groups belong to network interfaces
+An EC2 instance can have several **elastic network interfaces (ENIs)**, possibly in different subnets. Each ENI has its own list of security groups. Changing the groups on one interface does not change them on the others.
+- Example: `eth0` in subnet A has the isolation group, but `eth1` in subnet B still has its original group allowing outbound HTTPS. Traffic simply leaves through `eth1`.
+- Attackers with EC2 permissions can attach an extra ENI to create exactly this kind of back door.
+## Complete isolation
+- List every interface on the instance (`aws ec2 describe-network-interfaces` filtered by `attachment.instance-id`).
+- Apply the isolation security group to each one, or detach the extra interfaces after recording their details as evidence.
+- Revoke the instance role's sessions as well, since network isolation does not stop credentials already taken.
+W: Check every ENI and isolate each one: the security group change covered only the primary interface, so the attacker's secondary interface kept a working path out.
+X: A=Disable the instance profile: removing the role limits API access but does not block network traffic leaving through the second interface.
+B=Nothing further because security groups cover all paths: security groups apply per interface; an interface with a permissive group still passes traffic.
+D=Restart the instance: a reboot does not change security group assignments, and a stop and start clears memory evidence while the second interface keeps its permissive group.
+T: Security groups apply per network interface, so isolation must cover every ENI attached to the instance.
+
+@ Q001819 explain
+G: ## Security groups versus network ACLs for isolation
+- A **security group** is attached to an instance's network interfaces. It filters all traffic to and from that interface, including traffic from other instances in the same subnet.
+- A **network ACL** is attached to a subnet and filters only traffic **crossing the subnet boundary**. Traffic between two instances in the same subnet never passes through it.
+- A **route table** also applies to the whole subnet.
+## Why that matters here
+The compromised instance shares its subnet with 20 others. Swapping its security groups for an **isolation security group** (no rules, or only a forensic workstation) cuts it off from everything, including its 20 neighbors, while the others keep working. It keeps running, so memory is preserved.
+Because security groups track connections, AWS recommends first applying an allow-all group (making flows untracked) and then the isolation group so existing connections also drop.
+W: Replace its security groups with an isolation group: the control applies to this instance alone and blocks traffic to neighbors in the same subnet too.
+X: A=Stop and detach volumes: stopping loses memory, which the team needs for forensics.
+B=Remove the NAT gateway route: the route change affects all 21 instances and only blocks outbound internet traffic, leaving movement inside the VPC open.
+C=NACL deny rules for the instance's IP: NACLs filter only traffic entering or leaving the subnet, so the instance can still reach the other 20 instances in its own subnet, and stateless rules must be written carefully in both directions.
+T: To isolate a single instance, including from neighbors in its own subnet, change its security groups; NACLs and routes work at the subnet boundary.
+
+@ Q001820 explain
+G: ## How S3 public access is controlled
+A bucket becomes public through a bucket policy with `"Principal": "*"` or through ACLs. **S3 Block Public Access** is a setting at account and bucket level that overrides these: with `RestrictPublicBuckets` and `IgnorePublicAcls` on, public policies and ACLs stop granting access immediately.
+## Contain and preserve
+- Turn on Block Public Access to stop anonymous reads now.
+- Correct the bucket policy so it no longer grants public access.
+- Preserve evidence: S3 server access logs or CloudTrail data events showing the external IPs, bucket policy history in CloudTrail and Config, and the objects themselves. With S3 Object Lock enabled (it needs versioning), a **legal hold** prevents objects from being deleted or overwritten until it is removed.
+The data is protected and the investigation can show exactly what was read.
+W: Block Public Access, fix the policy and preserve evidence: it stops anonymous access at once, removes the cause, and keeps the logs and objects needed to scope the breach.
+X: A=Delete the bucket: deletion destroys the data and the evidence of what was exposed, and is irreversible.
+C=Default SSE-KMS encryption: default encryption applies only to objects written after the change; existing objects stay as they are and the public policy remains in place.
+D=Rotate the bucket's access keys: S3 buckets have no access keys; access comes from policies and ACLs, and the public readers here were anonymous.
+T: For a publicly exposed bucket, block public access and correct the policy immediately while preserving logs and objects; do not delete the evidence.

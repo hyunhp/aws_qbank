@@ -1,0 +1,341 @@
+# SCS-C03 detailed explanations, e12 (explanation-only rewrites; letters are the published ones)
+
+@ Q004004 explain
+G: ## Two TLS legs behind an ALB
+An Application Load Balancer terminates the client's TLS session on an HTTPS listener, inspects the HTTP request, and then opens a **second** connection to the target. Whether that second leg is encrypted depends only on the **target group protocol**.
+- Target group protocol `HTTP`: the ALB sends plaintext to the instance, container or IP target.
+- Target group protocol `HTTPS`: the ALB starts a new TLS session with the target, so traffic inside the VPC is encrypted too.
+## What the targets need
+Each target must listen with TLS, for example Nginx on port `443` with a certificate. The ALB does not validate the target certificate, so a self-signed or private CA certificate works; the certificate is there to encrypt the leg, not to prove identity to the ALB.
+Example: listener `HTTPS:443` with an ACM certificate forwards to target group `HTTPS:8443`, and the app on each instance serves TLS on `8443`.
+W: HTTPS target group with TLS targets: the ALB re-encrypts every request toward the targets, so data stays encrypted from client to ALB and from ALB to backend.
+X: A=HTTP target group, longer timeout: the timeout controls how long the ALB waits for a response; the backend leg is still plaintext HTTP.
+C=NAT gateway in the path: a NAT gateway translates addresses for outbound traffic and does not encrypt anything; it also is not how an ALB reaches targets in the VPC.
+D=TCP listener with no TLS: an ALB supports only HTTP and HTTPS listeners (TCP and TLS listeners belong to Network Load Balancers), and dropping TLS removes encryption instead of adding it.
+T: End-to-end encryption behind an ALB comes from an HTTPS target group plus TLS on the targets; the listener alone only protects the client leg.
+
+@ Q004005 explain
+G: ## Direct Connect is private, not encrypted
+AWS Direct Connect gives a dedicated network path between a data center and AWS, but the link itself does not encrypt traffic. Encryption must be added at layer 2 or layer 3.
+## Two ways to encrypt
+- **MACsec (IEEE 802.1AE)**: layer 2 encryption between the customer router and the AWS Direct Connect device. It is available only on dedicated connections at 10, 100 or 400 Gbps at supporting locations (not on 1 Gbps dedicated or any hosted connections) and is configured with a CKN/CAK pair.
+- **Site-to-Site VPN over Direct Connect**: IPsec tunnels run across the DX path. A classic setup uses a public VIF to reach the VPN endpoints' public IPs; a newer option runs a private IP VPN over a transit VIF to a transit gateway.
+Example: a 10 Gbps dedicated connection with MACsec enabled encrypts every frame on the link, while a hosted 1 Gbps connection that cannot use MACsec would use IPsec VPN on top instead.
+W: A=MACsec on dedicated connections: it encrypts frames on the physical link between the customer device and AWS, at line rate, for supported dedicated connections.
+E=Site-to-Site VPN over DX: IPsec tunnels carried over Direct Connect add encryption while keeping the consistent DX path.
+X: B=Public VIF with no VPN: a public VIF only provides reachability to AWS public endpoints over DX; nothing on it encrypts the packets.
+C=BGP communities: communities tag routes to control propagation scope and local preference; they change routing decisions, not confidentiality.
+D=Jumbo frames on the private VIF: jumbo frames raise the MTU (up to 9001 bytes on a private VIF) to improve throughput; they do not encrypt data.
+T: Direct Connect is private but plaintext; encrypt it with MACsec on supported dedicated links or run IPsec VPN over it.
+
+@ Q004006 explain
+G: ## S3 encryption options at rest
+Every new S3 object is encrypted at rest; since January 2023 S3 applies **SSE-S3** by default. The choice is about who controls the key and what is logged.
+- **SSE-S3**: S3 owns and manages the keys. There is no key policy to edit and no per-request key usage record in CloudTrail.
+- **SSE-KMS with a customer managed key**: the company creates the key in AWS KMS, writes its key policy, can disable or schedule deletion, and controls rotation. Every `GenerateDataKey` and `Decrypt` call S3 makes for the object is recorded in CloudTrail.
+Example: bucket default encryption `aws:kms` with key `arn:aws:kms:us-east-1:111122223333:key/...`; reading an object requires both `s3:GetObject` and `kms:Decrypt` on that key. S3 Bucket Keys can reduce KMS request costs without losing control.
+W: SSE-KMS with a customer managed key: the company controls the key policy and lifecycle, and KMS logs each use of the key in CloudTrail, which meets both requirements.
+X: B=SSE-S3: the keys are fully managed by S3, so the company cannot set a key policy, disable the key, or see per-use key logging.
+C=Client-side base64 encoding: base64 is a reversible encoding with no key; anyone can decode it, so it is not encryption.
+D=Object Lock governance mode: Object Lock protects object versions from deletion or overwrite (WORM); it has nothing to do with encryption keys.
+T: SSE-S3 already encrypts by default; choose SSE-KMS with a customer managed key when you need your own key policy and CloudTrail records of key use.
+
+@ Q004007 explain
+G: ## RDS encryption is set at creation
+Amazon RDS encryption at rest is chosen when an instance is created and covers the storage, automated backups, snapshots and read replicas. It cannot be switched on for an existing unencrypted instance.
+## The snapshot-copy path
+- Take a manual snapshot of the unencrypted instance.
+- Copy the snapshot and choose a KMS key during the copy; the copy is encrypted.
+- Restore a new DB instance from the encrypted copy.
+- Point applications to the new endpoint (or rename instances) and retire the old one.
+Example: `mydb` -> snapshot `mydb-snap` -> `copy-db-snapshot` with `--kms-key-id alias/rds-prod` -> restore `mydb-enc`. To shorten the cutover window, some teams replicate changes to the new instance before switching, for example with AWS DMS.
+W: Snapshot, encrypted copy, restore: copying a snapshot is where encryption can be added, and an instance restored from an encrypted snapshot is encrypted.
+X: A=Increase storage size: resizing storage changes capacity and IOPS only; it never changes the encryption setting.
+C=Enable Multi-AZ: the standby inherits the primary's encryption state, so an unencrypted primary gets an unencrypted standby.
+D=Encrypt in place from modify settings: RDS offers no in-place encryption option for an existing unencrypted instance; the setting is fixed at creation.
+T: An unencrypted RDS instance is encrypted by snapshot, encrypted snapshot copy, and restore to a new instance, not by any modify action.
+
+@ Q004008 explain
+G: ## Making backups immutable
+AWS Backup stores recovery points in **backup vaults**. **AWS Backup Vault Lock** adds WORM protection to a vault.
+- **Governance mode**: users with sufficient IAM permissions can still change or remove the lock; useful for testing.
+- **Compliance mode**: after a grace period (at least 72 hours) the lock becomes immutable. Nobody, including administrators and the root user, can delete recovery points before their retention ends, shorten retention, or remove the lock.
+Example: a lock with `MinRetentionDays=35` and `MaxRetentionDays=365` in compliance mode ensures every recovery point in the vault is kept at least 35 days, even if an attacker gains admin access.
+This protects against ransomware and insider deletion, a common exam requirement.
+W: Vault Lock in compliance mode: once the grace period ends, the lock cannot be changed and recovery points cannot be deleted early by anyone, which is exactly "even by administrators".
+X: B=S3 Intelligent-Tiering: it moves objects between access tiers to save cost; it adds no deletion protection.
+C=Descriptive snapshot names: a name is just metadata; any user with `ec2:DeleteSnapshot` can still delete the snapshot.
+D=Short retention in backup plans: retention decides when backups expire automatically; a short period makes data disappear sooner and does not stop manual deletion.
+T: Backups that even admins cannot delete require AWS Backup Vault Lock in compliance mode; governance mode and retention settings can be bypassed.
+
+@ Q004009 explain
+G: ## EBS encryption by default
+**EBS encryption by default** is an account setting per Region. When enabled, every new EBS volume created in that Region is encrypted with the default KMS key (`aws/ebs` or a chosen customer managed key), and snapshots of encrypted volumes are encrypted too. It must be enabled in each Region separately and does not change existing volumes.
+## Preventive guardrail with SCPs
+A **service control policy** can deny `ec2:CreateVolume` when the condition key `ec2:Encrypted` is `false`, and deny `ec2:RunInstances` for volumes that are not encrypted. This blocks anyone in member accounts from turning the default off and creating unencrypted volumes.
+Example: SCP statement `Deny ec2:CreateVolume` with `"Bool": {"ec2:Encrypted": "false"}` attached to the workloads OU.
+W: D=Encryption by default in each Region: new volumes are encrypted automatically, and snapshots taken from them inherit that encryption.
+E=SCP denying unencrypted volumes: the organization guardrail prevents unencrypted volume creation even if someone disables the default setting.
+X: A=Large instance types only: instance size does not affect encryption; volumes on any instance are encrypted or not based on the volume setting.
+B=Rename with "encrypted": a name or tag is metadata; it does not change how data is stored.
+C=Disable snapshots: removing snapshots destroys the ability to recover data and still leaves volumes unencrypted.
+T: Turn on EBS encryption by default per Region and back it with an SCP that denies unencrypted volume creation.
+
+@ Q004010 explain
+G: ## DynamoDB encryption at rest
+All DynamoDB tables are encrypted at rest. The only choice is which KMS key protects the table:
+- **AWS owned key** (default): no charge, but the key is invisible in the account and its use is not logged in the account's CloudTrail.
+- **AWS managed key** `aws/dynamodb`: visible in the account and its use is logged, but its key policy cannot be changed.
+- **Customer managed key**: created and managed by the company. It controls the key policy, can disable the key to cut off access, and sees each KMS call in CloudTrail.
+Example: create key `alias/orders-ddb`, then set table encryption to that key; auditors can review key usage events in CloudTrail and restrict usage with the key policy.
+W: Customer managed KMS key: it is the only DynamoDB option where the company both manages the key (policy, enable/disable, rotation) and can audit its use.
+X: B=DynamoDB Streams: Streams capture item-level changes for consumers such as Lambda; they do not change which key encrypts the table.
+C=TTL on every item: TTL deletes items after an expiry time; it controls data lifetime, not encryption.
+D=Client-side base64: base64 is a keyless reversible encoding, so it provides no confidentiality and no key to manage or audit.
+T: For a DynamoDB key the company controls and audits, pick a customer managed KMS key, not the default AWS owned key.
+
+@ Q004011 explain
+G: ## Rotation strategies in Secrets Manager
+AWS Secrets Manager rotates database credentials with a rotation function (managed rotation for supported databases, or a Lambda function). There are two strategies:
+- **Single user**: the password of one user is changed in place. Connections opening during the change can briefly fail.
+- **Alternating users**: Secrets Manager keeps two users (for example `app_user` and `app_user_clone`). Each rotation updates the user that is not currently active, then switches the secret to it. The previous credentials stay valid until the next rotation, so applications that read the secret keep working.
+Alternating users needs a separate superuser secret that can change the other user's password.
+Example: rotation every 30 days; applications call `GetSecretValue` (with caching) and always get a working username and password.
+W: Alternating users rotation: one valid credential set is always available while the other is being changed, so rotation happens automatically with no downtime.
+X: A=Environment variables: they are static configuration; nothing rotates them, and a change needs redeployment or restart.
+C=Manual changes and restarts: manual rotation is error-prone and the restart itself is the downtime the requirement forbids.
+D=Hard-coded password: changing it requires a code change and deployment, so automatic rotation is impossible and the password is exposed in source.
+T: Zero-downtime automatic credential rotation is Secrets Manager with the alternating users strategy, which keeps the old credentials valid during the switch.
+
+@ Q004012 explain
+G: ## Two policies must agree for cross-account KMS
+A KMS key lives in one account. For a principal in another account to use it, **both** sides must allow the action:
+- **Key policy** (key owner account): a statement allowing the external account or the specific role, for example `arn:aws:iam::222233334444:role/Reader`, to call `kms:Decrypt`.
+- **IAM policy** (external account): the role's identity policy must allow `kms:Decrypt` on the key ARN, because the external account's admin decides what its own principals may do.
+If either one is missing, the call is denied.
+## What does not happen
+The key material does not leave KMS; the external role sends ciphertext to KMS and gets plaintext back. Only customer managed keys can be shared this way, because AWS managed key policies cannot be edited.
+Example: owner account 111122223333 key policy allows `kms:Decrypt` for `Reader`; the `Reader` role policy allows `kms:Decrypt` on `arn:aws:kms:us-east-1:111122223333:key/...`.
+W: A=Key policy grants kms:Decrypt: the key owner must explicitly trust the external role (or account) in the key policy.
+E=External role's IAM policy allows kms:Decrypt: the external account must also grant its role permission to use that key ARN.
+X: B=Share the key material: KMS keys are used by calling KMS; the material stays inside KMS HSMs and sharing it is neither needed nor how cross-account access works.
+C=Make the key public: allowing any AWS account would break least privilege; the requirement is one role with decrypt only.
+D=Convert to an AWS managed key: keys cannot be converted, and AWS managed keys cannot be used across accounts because their key policies cannot be changed.
+T: Cross-account KMS use needs an allow in the key policy of the owner account and in the IAM policy of the calling role.
+
+@ Q004013 explain
+G: ## Shared vs dedicated HSMs
+AWS KMS stores keys in FIPS-validated HSMs that AWS operates on behalf of many customers. That is enough for most workloads, but some regulations require **single-tenant** HSMs under the customer's exclusive control.
+- **AWS CloudHSM** gives dedicated HSMs in the customer's VPC. The customer manages HSM users and keys; AWS manages hardware but cannot access the keys.
+- **KMS custom key store (CloudHSM key store)**: KMS keys whose material is generated and stored in the customer's CloudHSM cluster, so services integrated with KMS (S3, EBS, RDS) can still use them.
+Example: a bank creates a CloudHSM cluster with two HSMs in different AZs, connects it as a custom key store, and encrypts S3 data with a KMS key backed by that store.
+W: CloudHSM or a CloudHSM-backed custom key store: both keep key material in single-tenant HSMs the customer exclusively controls, and the key store option keeps KMS integration with other services.
+X: B=SSE-S3 managed keys: S3 owns these keys; the customer neither controls them nor gets dedicated hardware.
+C=AWS managed KMS keys: AWS creates and manages them in the shared KMS service, and the customer cannot even edit their key policies.
+D=Secrets Manager secrets: Secrets Manager stores secret values encrypted with KMS keys; it is not an HSM and gives no single-tenant key control.
+T: Single-tenant HSMs under exclusive customer control means CloudHSM, directly or as a KMS custom key store.
+
+@ Q004014 explain
+G: ## Finding PII in S3 with Macie
+**Amazon Macie** inspects S3 objects with managed and custom data identifiers to find sensitive data such as names, credit card numbers or passport numbers. It also produces policy findings about bucket security, such as public access.
+## Organization-wide setup
+- In AWS Organizations, designate a **delegated administrator** account (usually the security account) for Macie.
+- The administrator enables Macie for member accounts and runs automated sensitive data discovery or targeted discovery jobs across all their buckets.
+- Findings go to EventBridge and can be published to Security Hub (now called AWS Security Hub CSPM), giving one view next to GuardDuty and Inspector findings. Macie's publication settings decide whether policy findings, sensitive data findings, or both are sent.
+Example: the security account sees a finding `SensitiveData:S3Object/Personal` for a bucket in a member account and triages it centrally.
+W: Macie with delegated administrator and Security Hub: Macie is the AWS service that discovers PII in S3, the delegated administrator covers all accounts, and the integration sends findings to Security Hub.
+X: A=Config rules on bucket encryption: they report whether encryption is configured; they never read object contents, so they cannot find PII.
+C=Inspector EC2 scanning: Inspector finds software vulnerabilities and network exposure in EC2, container images and Lambda, not personal data in S3 objects.
+D=GuardDuty malware protection for EC2: it scans EBS volumes for malware; it does not classify sensitive data in S3.
+T: PII discovery across S3 in all accounts is Macie with a delegated administrator, feeding findings to Security Hub.
+
+@ Q004015 explain
+G: ## Fetch secrets at runtime, not at build time
+If a secret is baked into code or configuration, every rotation requires a new deployment. With **AWS Secrets Manager**, the Lambda function reads the current value when it needs it, so rotation is transparent.
+- Store the API key as a secret, optionally with a rotation function.
+- The function's execution role gets `secretsmanager:GetSecretValue` on that secret (and `kms:Decrypt` if a customer managed key is used).
+- Cache the value in the execution environment for a short time, for example with the AWS Parameters and Secrets Lambda Extension or a caching client, to reduce latency and API calls.
+Example: cache TTL of 5 minutes; after rotation, functions pick up the new key within minutes without redeploying.
+W: Secrets Manager at runtime with caching: the function always reads the current secret, so rotation needs no redeploy, and caching keeps it fast and cheap.
+X: B=Email the key after rotation: email is an insecure channel and does not deliver the new key to the running function.
+C=Function description field: the description is plain metadata visible to anyone with read access to the function and is not designed for secrets or rotation.
+D=Hard-code and redeploy: hard-coding exposes the key in source and violates the "without redeploying" requirement by definition.
+T: To rotate a secret without redeploying Lambda, fetch it from Secrets Manager at runtime and cache it briefly.
+
+@ Q004016 explain
+G: ## What encryption context does
+An **encryption context** is a set of non-secret key-value pairs passed to KMS on `Encrypt` or `GenerateDataKey`, for example `{"tenant":"acme"}`. KMS binds it to the ciphertext as additional authenticated data.
+- `Decrypt` succeeds only if the exact same context is supplied; a different tenant value fails.
+- The context appears in CloudTrail, which helps auditing.
+- Key policies can require it with conditions such as `kms:EncryptionContext:tenant`.
+Example: a multi-tenant app encrypts each record with context `tenant=acme`; a bug that tries to decrypt it with `tenant=globex` gets an `InvalidCiphertextException` instead of the data.
+The context is not secret, so do not put sensitive values in it.
+W: Encryption context: it cryptographically binds the ciphertext to the tenant values, so decryption only works when the same context is supplied.
+X: B=Automatic key rotation: rotation creates new key material on a schedule; it does not tie ciphertext to a tenant.
+C=Grants only: grants delegate permission to use a key; they can add encryption context constraints, but the binding itself comes from the encryption context, not the grant.
+D=Key aliases: an alias is a friendly name pointing to a key; it does not change what is needed to decrypt.
+T: Use KMS encryption context to make decryption depend on the same tenant values used at encryption time.
+
+@ Q004017 explain
+G: ## How secrets leak from code
+Secrets leak when they are written into places many people or systems can read: source files, `.env` files, CI logs, chat. Once in Git history, removing the file later does not remove the secret; it must be rotated.
+## Two complementary controls
+- **Keep secrets out of code**: store them in AWS Secrets Manager or Systems Manager Parameter Store `SecureString` parameters, encrypted with KMS and read at runtime with IAM permissions.
+- **Detect mistakes early**: scan commits and pipelines for secret patterns (for example pre-commit hooks such as `git-secrets`, or secret scanning in the repository or CI service) and fail the build when a secret is found.
+Example: a pipeline step scans every pull request; a committed access key pattern blocks the merge and triggers rotation.
+W: B=Secrets Manager or Parameter Store: secrets live in a managed, encrypted store and code only references them by name, so there is nothing sensitive to commit.
+E=Scan repositories and pipelines: automated scanning catches secrets that slip into commits or build output before they spread.
+X: A=Share in team chat: chat history is widely readable and retained, so it becomes another leak location.
+C=Commit .env files: committing credentials puts them in Git history for everyone with repository access, which is the leak itself.
+D=Print secrets in build logs: build logs are stored and viewed by many people and tools, exposing the value in plaintext.
+T: Prevent secret leaks by storing secrets in a managed secret store and scanning code and pipelines for anything that slips through.
+
+@ Q004018 explain
+G: ## TLS versions on API Gateway
+Clients connect to an API over TLS, and the **security policy** decides which TLS versions and cipher suites the endpoint accepts.
+- On an API Gateway **custom domain name**, you choose the security policy, for example `TLS_1_2`, so TLS 1.0 and 1.1 clients are rejected. For REST APIs, newer enhanced policies (names starting with `SecurityPolicy_`) add stricter options, such as TLS 1.3 only, FIPS or post-quantum cipher suites.
+- To make sure clients cannot bypass the custom domain, you can disable the default `execute-api` endpoint.
+Example: custom domain `api.example.com` with an ACM certificate and security policy `TLS_1_2`; the default endpoint is disabled so all traffic uses the enforced policy.
+The other API settings shown affect request handling, not the transport protocol.
+W: Custom domain security policy at TLS 1.2 or higher: the security policy is the setting that controls which TLS versions the API endpoint negotiates.
+X: B=Request validator: it checks request parameters and body against a model after TLS is established; it cannot reject old TLS versions.
+C=Usage plan with throttling: usage plans limit request rates and quotas per API key; they have no effect on TLS negotiation.
+D=Larger integration timeout: the timeout governs how long API Gateway waits for the backend; it has nothing to do with the client's TLS version.
+T: Enforce modern TLS on API Gateway with the custom domain's security policy (and disable the default endpoint), not with request-level features.
+
+@ Q004019 explain
+G: ## Landing zones and Control Tower
+A **landing zone** is a pre-configured multi-account environment built with security and governance from day one. **AWS Control Tower** builds and manages one on top of AWS Organizations.
+- Creates foundational accounts: a **Log Archive** account for centralized CloudTrail and Config logs, and an **Audit** account for security teams.
+- Applies **controls** (guardrails): preventive controls implemented with organization policies such as SCPs, detective controls implemented with AWS Config rules, and proactive controls checked before resources are provisioned.
+- **Account Factory** creates new accounts that are enrolled with the same baseline.
+Example: a new workload account created through Account Factory automatically sends its logs to Log Archive and is covered by the OU's controls.
+W: AWS Control Tower: it sets up a governed multi-account landing zone with guardrails and centralized logging as part of the initial setup.
+X: B=AWS Resource Groups: it groups resources by tags or CloudFormation stacks for viewing and operations; it creates no accounts, guardrails or log archive.
+C=AWS Service Catalog: it lets users launch approved products from portfolios; it can be part of a landing zone but does not build accounts, controls and centralized logging by itself.
+D=AWS Budgets: it tracks and alerts on cost and usage; it provides no security guardrails or logging.
+T: A governed multi-account start with guardrails and centralized logging is AWS Control Tower's landing zone.
+
+@ Q004020 explain
+G: ## Preventing tampering with security services
+Service control policies (SCPs) in AWS Organizations set the maximum permissions for member accounts. A deny in an SCP applies to every IAM user and role in those accounts, including administrators and the root user; it does not apply to the management account.
+Typical actions to deny:
+- GuardDuty: `guardduty:DeleteDetector`, `guardduty:DisassociateFromAdministratorAccount`, `guardduty:UpdateDetector`.
+- Security Hub: `securityhub:DisableSecurityHub`, `securityhub:DisassociateFromAdministratorAccount`.
+- CloudTrail: `cloudtrail:StopLogging`, `cloudtrail:DeleteTrail`, `cloudtrail:UpdateTrail`.
+A condition such as `aws:PrincipalArn` can exempt a dedicated security automation or break-glass role.
+Example: an SCP on the root OU denies these actions for everyone except `arn:aws:iam::*:role/SecurityAdmin`.
+W: SCPs denying disable and delete actions: they block the calls before they happen in every member account, even for account administrators.
+X: B=Monthly audit report: a report only reveals tampering after the fact; the services could be off for weeks.
+C=Read-only IAM users: creating extra read-only users does not reduce the permissions of existing administrators who can still disable the services.
+D=CloudWatch dashboards: dashboards visualize status; they neither prevent the change nor enforce anything.
+T: To stop member accounts from disabling security services, use preventive SCP denies, not reports or dashboards.
+
+@ Q004021 explain
+G: ## Delegated administrator
+The Organizations management account should be used as little as possible, because its permissions cannot be restricted by SCPs. Many security services let it register a **delegated administrator**: a member account, usually a dedicated security or audit account, that manages the service for the whole organization.
+- Supported services include GuardDuty, Security Hub, Macie, Inspector, Detective, AWS Config and Firewall Manager (as its administrator account).
+- From that account, the security team enables the service in new accounts automatically, views all findings and manages settings.
+Example: the management account runs `EnableOrganizationAdminAccount` for GuardDuty with the security account ID; from then on the security team works only in the security account.
+W: Delegated administrator per service: it moves day-to-day management of each security service out of the management account into a dedicated security account, organization-wide.
+X: B=IAM users in every account: long-term users in each account multiply credentials and still give no central, organization-wide view.
+C=Email notifications only: notifications inform people but do not let the security account configure or manage the services.
+D=Share the root user: sharing root credentials violates least privilege and accountability; root should be locked away with MFA.
+T: Run security services from a dedicated account by registering it as the delegated administrator, not by using the management account.
+
+@ Q004022 explain
+G: ## Restricting Regions with an SCP
+A Region-restriction SCP denies API calls whose `aws:RequestedRegion` is not in an approved list. Global services such as IAM, Organizations, Route 53, CloudFront and AWS Support are served from specific endpoints (often `us-east-1`), so they must be excluded, typically with `NotAction`.
+Example pattern:
+- `Effect: Deny`, `NotAction: ["iam:*","organizations:*","route53:*","cloudfront:*","support:*", ...]`
+- `Resource: "*"`
+- `Condition: {"StringNotEquals": {"aws:RequestedRegion": ["eu-west-1","eu-central-1"]}}`
+An exemption for a specific automation role can be added with `aws:PrincipalArn`. AWS Control Tower offers a Region deny control that uses the same approach.
+Because it is an SCP, it applies to all principals in every member account and cannot be changed by those accounts.
+W: SCP with aws:RequestedRegion and global service exemptions: it centrally blocks unapproved Regions in all accounts while keeping global services usable.
+X: A=Wiki page: documentation informs but enforces nothing; anyone can still launch resources in other Regions.
+B=CloudTrail alerts: alerts detect usage after it happens; they do not prevent it.
+C=Independently written IAM policies: separate per-account policies drift, and local administrators can change or remove them.
+T: Approved Region enforcement across accounts is an SCP on `aws:RequestedRegion` that exempts global services.
+
+@ Q004023 explain
+G: ## Policy as code for templates
+Security checks on infrastructure as code are cheapest before deployment ("shift left"). Two common tools for CloudFormation:
+- **AWS CloudFormation Guard (`cfn-guard`)**: an open-source policy-as-code tool. You write rules such as "every `AWS::S3::Bucket` must have encryption and block public access", and it validates templates against them.
+- **cfn-nag**: an open-source linter that looks for insecure patterns, such as security groups open to `0.0.0.0/0` or IAM policies with `*` actions.
+In a pipeline, a validation stage runs these tools and **fails** on violations, so the insecure template never reaches the deploy stage.
+Example: `cfn-guard validate --data template.yaml --rules s3.guard` returns a non-zero exit code on a violation, and the pipeline stops.
+W: Guard or cfn-nag in the pipeline with fail on violations: templates are checked automatically before deployment, so misconfigurations are blocked instead of deployed.
+X: A=Remove security requirements: this makes templates pass by removing the checks themselves, which increases risk.
+C=Deploy first, let Config detect: Config catches problems only after the resource exists, leaving an exposure window in production.
+D=Manual review only after incidents: this is reactive; the misconfiguration has already been exploited by the time anyone looks.
+T: Catch template misconfigurations before deployment with policy-as-code checks that fail the pipeline, not with post-deployment detection.
+
+@ Q004024 explain
+G: ## Approvals and evidence in a pipeline
+Two needs appear in regulated delivery pipelines: **only approved artifacts** should reach production, and there must be **proof of who approved**.
+- **Manual approval action** in AWS CodePipeline pauses the pipeline before the production stage. Who can approve is controlled with IAM: only the approver group gets `codepipeline:PutApprovalResult` on that action.
+- **Evidence**: CodePipeline execution history shows which revision passed which stage, and CloudTrail records each `PutApprovalResult` call with the approver's identity and time.
+Example: a `ProdApproval` stage allows only the `SecurityApprovers` role to approve; auditors check CloudTrail for the approver of release 1.4.2.
+Separation of duties means the person who writes the change is not the person who approves it.
+W: C=Execution history and CloudTrail approval records: together they show which artifact moved through the pipeline and who approved it, creating the audit trail.
+E=Manual approval restricted to a security approver group: IAM restricts who can approve, so only reviewed and tested artifacts reach production.
+X: A=Deploy from laptops: this bypasses the pipeline, its tests and its approval gate, and leaves no reliable record.
+B=Disable CloudTrail: removing API logging destroys the evidence of who approved or changed anything.
+D=Self-approval: developers approving their own work breaks separation of duties.
+T: Gate production with a restricted manual approval and keep evidence in pipeline history and CloudTrail.
+
+@ Q004025 explain
+G: ## Continuous compliance with AWS Config
+**AWS Config** records resource configurations and evaluates them against **rules**. A rule runs when a resource changes or on a schedule and marks each resource `COMPLIANT` or `NON_COMPLIANT`.
+- Managed rules cover common checks, for example `encrypted-volumes` for EBS volumes or `ec2-ebs-encryption-by-default`.
+- **Organization rules** deploy a rule to all accounts from the management account or a delegated administrator.
+- **Conformance packs** bundle many rules (and optional remediations) into one deployable unit, and can also be deployed organization-wide.
+- An **aggregator** gives one view of compliance across accounts and Regions.
+Example: an organization conformance pack with `encrypted-volumes` flags any unencrypted EBS volume in any member account within minutes.
+W: Config organization rules or conformance packs: they continuously evaluate every resource in every account against rules such as EBS encryption.
+X: B=Trusted Advisor cost checks: cost optimization checks look for savings, such as idle resources; they are not a customizable compliance rule engine.
+C=CloudFront access logs: they record viewer requests to a distribution; they contain nothing about EBS configuration.
+D=SQS dead-letter queues: a DLQ holds messages that failed processing; it has no role in evaluating resource configuration.
+T: Continuous, rule-based evaluation of resource configurations across accounts is AWS Config with organization rules or conformance packs.
+
+@ Q004026 explain
+G: ## AWS's compliance documents vs your own evidence
+Under the shared responsibility model, auditors need proof that **AWS** runs its part securely. AWS provides that proof in **AWS Artifact**.
+- **Artifact Reports**: third-party audit reports and certifications about AWS, such as SOC 1, SOC 2, SOC 3, ISO 27001 certificates and PCI DSS attestations.
+- **Artifact Agreements**: agreements such as the Business Associate Addendum (BAA) for HIPAA.
+Reports are downloaded from the console, often after accepting terms, and handed to auditors.
+Example: an auditor asks for AWS's SOC 2 Type II report; the compliance team downloads it from AWS Artifact.
+Evidence about the company's own configuration is a different job, handled by services such as AWS Audit Manager (now in maintenance mode and closed to new customers) or AWS Config conformance packs.
+W: AWS Artifact: it is the self-service portal for AWS's own compliance reports and attestations, such as SOC and ISO.
+X: B=AWS Config: it records and evaluates the company's resource configurations; it does not host AWS's audit reports.
+C=Amazon Inspector: it scans the company's EC2, container images and Lambda for vulnerabilities; it provides no compliance attestations.
+D=AWS Audit Manager: it collects evidence about the customer's own environment mapped to frameworks; AWS's SOC and ISO reports come from Artifact.
+T: AWS's own compliance reports are in AWS Artifact; evidence about your own environment is collected with Audit Manager.
+
+@ Q004027 explain
+G: ## Automating audit evidence
+Preparing for audits by taking screenshots is slow and error-prone. **AWS Audit Manager** continuously collects evidence about the company's AWS usage and maps it to controls in a framework.
+- Prebuilt frameworks cover standards such as CIS AWS Foundations, PCI DSS, HIPAA and SOC 2, and custom frameworks can be created.
+- Evidence sources include AWS Config rule results, Security Hub CSPM control checks, CloudTrail activity and AWS API calls describing configuration.
+- An **assessment** gathers evidence over time; an **assessment report** packages it for auditors.
+Availability note: Audit Manager entered maintenance mode and has been closed to new customers since April 30, 2026; existing customers keep using it, and AWS points new users to AWS Config conformance packs (which cover fewer frameworks, for example no SOC 2).
+Example: a PCI DSS assessment automatically attaches Config results for encryption controls, so the auditor sees dated evidence rather than a spreadsheet.
+W: AWS Audit Manager: it continuously collects evidence from the company's accounts and maps it to controls in compliance frameworks for its own audits.
+X: A=Amazon Detective: it builds a behavior graph from logs and findings to investigate security incidents, not to gather compliance evidence.
+C=AWS Artifact: it provides AWS's own compliance reports and agreements, not evidence about the customer's environment.
+D=AWS Shield: it protects against DDoS attacks and has no audit evidence features.
+T: Continuous, framework-mapped evidence for your own audits is Audit Manager; AWS's reports come from Artifact.
+
+@ Q004028 explain
+G: ## Detecting and fixing drift
+Resources that were compliant at deployment can drift later through manual changes. Keeping them compliant needs continuous detection and fast correction.
+- **AWS Config rules with remediation**: a rule flags a non-compliant resource, and an associated remediation action (an AWS Systems Manager Automation runbook) fixes it, automatically if configured, with retries.
+- **Security Hub standards**: in AWS Security Hub CSPM (formerly Security Hub), standards such as AWS Foundational Security Best Practices or CIS run control checks continuously. Failed controls produce findings that EventBridge can route to SNS, a ticketing system, or Amazon Q Developer in chat applications.
+Example: an S3 bucket loses Block Public Access; the Config rule triggers the `AWS-DisableS3BucketPublicReadWrite` runbook, and the related Security Hub control failure alerts the team.
+W: C=Config rules with automatic remediation: non-compliant changes are detected and corrected by runbooks without waiting for a human.
+E=Security Hub standards with alerts: continuous control checks surface failures quickly so teams can respond.
+X: A=Disable Config: without the configuration recorder there is no record and no rule evaluation, so drift goes unseen.
+B=Everyone can change policies: broad permissions create more drift and remove accountability.
+D=Reviews every two years: drift can persist for years between reviews.
+T: Keep resources compliant after deployment by combining continuous checks (Config, Security Hub) with automated remediation.

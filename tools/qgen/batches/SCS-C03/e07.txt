@@ -1,0 +1,354 @@
+# SCS-C03 detailed explanations, batch e07 (explanation-only rewrites; letters are the published ones)
+
+@ Q001921 explain
+G: ## How Secrets Manager rotation works
+Rotation in AWS Secrets Manager is driven by a Lambda function. On each rotation, Secrets Manager invokes the function four times, once per step:
+- `createSecret`: generate a new credential and store it as a new version labelled `AWSPENDING`.
+- `setSecret`: register that new credential with the system that uses it (the database, or here the vendor's API).
+- `testSecret`: prove the pending credential actually works.
+- `finishSecret`: move the `AWSCURRENT` label to the new version; the old one becomes `AWSPREVIOUS`.
+## Built-in versus custom
+AWS provides rotation function templates mainly for database credentials, managed rotation for secrets that certain AWS services own, and managed external secrets for a small list of partner SaaS providers. For any other vendor you write the function yourself. Example: for a SaaS API key, `setSecret` calls the vendor's "create key" endpoint, `testSecret` makes a harmless authenticated call with the new key, and `finishSecret` can revoke the old key. You then turn on rotation with a schedule such as `rate(30 days)`.
+W: Custom rotation Lambda: Secrets Manager rotation is not limited to databases; any secret can rotate if you supply a function that implements the four steps against the vendor API, and Secrets Manager handles scheduling, versioning and staging labels.
+X: A=Parameter Store rotation: Systems Manager Parameter Store has no built-in rotation feature at all; you would have to build your own scheduler, so moving the key there loses capability rather than gaining it.
+B=Manual rotation only: the four-step Lambda contract is generic. The ready-made templates are mostly database-specific, but non-database secrets such as API keys can still be rotated automatically with your own function.
+D=AWS Config remediation: Config evaluates resource configuration and can run SSM Automation remediations, but it has no notion of rotating a secret value or talking to a vendor API, and it would bypass Secrets Manager versioning.
+T: Any secret type can rotate automatically in Secrets Manager; when no AWS-provided template or managed option covers it, you write the create/set/test/finish Lambda yourself.
+
+@ Q001922 explain
+G: ## How Secrets Manager encrypts secrets
+Secrets Manager always encrypts the secret value with an AWS KMS key using envelope encryption. You choose which key:
+- The **AWS managed key** `aws/secretsmanager` is used by default. AWS controls its key policy, so you cannot restrict or share it, and it cannot be used for secrets that other accounts must read.
+- A **customer managed key** is one you create in KMS. You write its key policy, can enable or disable it, rotate it and grant cross-account access.
+## Setting it up
+Pass the key when creating or updating the secret, for example `aws secretsmanager create-secret --name app/db --kms-key-id alias/regulated-secrets ...`. The key policy must let the principals that read the secret use `kms:Decrypt` (usually limited with `kms:ViaService` = `secretsmanager.<region>.amazonaws.com`).
+Every time Secrets Manager uses the key, a KMS event such as `Decrypt` or `GenerateDataKey` is written to CloudTrail, which gives the auditors their trail.
+W: Customer managed KMS key on the secret: Secrets Manager supports a customer managed key per secret in every commercial Region, and because the team owns the key policy, they control who can decrypt and see each use in CloudTrail.
+X: A=Always aws/secretsmanager: that key is only the default. The `KmsKeyId` parameter on create or update lets you pick a customer managed key.
+B=GovCloud only: choosing a customer managed key is a standard feature in commercial Regions, not something reserved for a special partition.
+D=Export and re-import: encrypting the value yourself adds a second, unmanaged layer and makes the secret unusable by services that read it directly; Secrets Manager already does the KMS encryption with the key you name.
+T: Secrets Manager defaults to `aws/secretsmanager`, but you can name any customer managed key per secret to own its policy and audit its use.
+
+@ Q001923 explain
+G: ## What drives the Macie bill
+For sensitive data discovery jobs, Amazon Macie charges by the amount of data it actually inspects (per GB). Other charges exist too: a monthly per-bucket charge for bucket inventory and monitoring, and, if automated discovery is on, charges for the objects it monitors and the data it samples. A job that re-reads every object in several multi-terabyte buckets every day pays to scan the same unchanged data again and again.
+## Ways to scan less but still see risk
+- **Sampling depth**: a job can analyze a percentage of eligible objects, for example 10%, which is often enough to show whether a bucket holds sensitive data.
+- **Object criteria**: include or exclude by prefix, file extension, size, tags or last-modified date, so a job skips log archives and only reads new data.
+- **Scheduled incremental jobs**: a scheduled job can skip existing objects and analyze only objects created or changed since the previous run.
+- **Automated sensitive data discovery**: Macie can continuously sample representative objects across the estate and build a sensitivity score per bucket, which usually inspects far less data than repeated full scans.
+W: Scheduled jobs with sampling and criteria: they keep ongoing visibility while cutting the bytes inspected, which is what Macie bills for, by reading only new or changed objects, only relevant prefixes, and only a sample.
+X: A=Disable Macie: bucket policies can restrict who writes, but they cannot inspect content, so the organization would lose all visibility into where sensitive data lives.
+B=Custom identifiers only: custom data identifiers are not free; charges depend on the data analyzed, not on which identifiers match it, and dropping managed identifiers would miss common data types.
+D=Move to Deep Archive: Macie does not analyze objects in archive storage classes, so this just hides the data from inspection, adds retrieval delays for the application, and removes the visibility the team wanted.
+T: Macie job cost follows the data inspected, so reduce scope with sampling, prefix and last-modified criteria and incremental schedules instead of switching visibility off.
+
+@ Q001924 explain
+G: ## Envelope encryption with KMS
+A KMS key never leaves AWS KMS, and the `Encrypt` API accepts at most 4 KB of plaintext per call. To encrypt data locally, you use a **data key**:
+- Call `GenerateDataKey` once. KMS returns the data key in two forms: plaintext and encrypted under your KMS key.
+- Use the plaintext data key in memory with a local cipher such as AES-GCM to encrypt as many items as you like, with no further KMS calls.
+- Store the encrypted data key next to the ciphertext and discard the plaintext copy when done.
+- To decrypt, send the encrypted data key to KMS `Decrypt`, get the plaintext data key back, and decrypt locally.
+## Example
+A service encrypts 500 config values at startup: one `GenerateDataKey` call, 500 local AES operations. Libraries such as the AWS Encryption SDK implement this pattern (and optional data key caching) for you.
+W: Envelope encryption with one GenerateDataKey: the service gets a usable plaintext data key once, encrypts items locally without calling KMS each time, and still depends on KMS `Decrypt` to unwrap the stored encrypted data key later.
+X: A=KMS Encrypt per item: this makes a network call for every item, which is exactly what the service wants to avoid, and adds latency and request quota pressure.
+B=Store raw key material: KMS keys are non-exportable by design, and even imported key material cannot be retrieved back; keeping raw key material in the application would also defeat the purpose of KMS.
+C=GenerateDataKeyWithoutPlaintext: this returns only the encrypted data key, so the service cannot encrypt anything until it calls `Decrypt`; it is meant for components that store a key for later use, not for immediate local encryption.
+T: Envelope encryption means one KMS call for a data key, then local encryption; `GenerateDataKeyWithoutPlaintext` defers the plaintext and so does not help encrypt right away.
+
+@ Q001925 explain
+G: ## SCPs and the root user
+A service control policy (SCP) sets the maximum permissions for principals in member accounts of AWS Organizations. Unlike IAM policies, SCPs do apply to a member account's **root user**, so they are the standard way to limit root.
+Two limits to remember:
+- SCPs never affect the **management account**, so that account needs other protections (MFA, no access keys).
+- SCPs do not grant anything; they only filter what IAM allows.
+## Example SCP
+A statement with `"Effect": "Deny"`, `"Action": "*"`, `"Resource": "*"` and a condition `"StringLike": {"aws:PrincipalArn": "arn:aws:iam::*:root"}` denies every action when the caller is a root user, while IAM users and roles, whose ARNs look like `arn:aws:iam::111122223333:role/...`, are unaffected.
+AWS also offers centralized root access management, which lets the organization remove root credentials from member accounts entirely; the SCP is still a useful guard.
+W: SCP denying all actions for the root principal ARN: attached to the member-account OUs, it blocks the root user of every member account, even with valid credentials, and matches no IAM user or role.
+X: A=IAM policy on root: you cannot attach IAM policies to the root user; it is not an IAM identity, which is why SCPs are needed.
+B=Permissions boundary on root: permissions boundaries attach only to IAM users and roles, not to the root user.
+C=Deny assuming OrganizationAccountAccessRole: that blocks one cross-account admin role, not the root user; root would keep full access.
+T: Only SCPs can restrict a member account's root user; use a Deny with `aws:PrincipalArn` matching `arn:aws:iam::*:root`, knowing the management account is never covered.
+
+@ Q001926 explain
+G: ## The three kinds of Control Tower controls
+AWS Control Tower groups its guardrails (now called controls) by behavior:
+- **Preventive** controls stop an action before it happens. They are implemented as SCPs (and, for some resource-side controls, resource control policies) attached to OUs. Example: "disallow changes to CloudTrail" denies `cloudtrail:StopLogging` and `DeleteTrail` for member accounts.
+- **Detective** controls find non-compliant resources after they exist. They are implemented as AWS Config rules deployed to each enrolled account, and results appear in the Control Tower dashboard. Example: flag S3 buckets without the required encryption.
+- **Proactive** controls check resources while CloudFormation is creating them, using CloudFormation hooks, and fail the deployment if the resource does not comply.
+Controls also have guidance levels (mandatory, strongly recommended, elective), which is separate from how they are enforced.
+W: Preventive via SCPs, detective via Config rules: blocking CloudTrail from being disabled is an SCP deny, and reporting unencrypted buckets is a Config rule evaluation.
+X: B=Both proactive via hooks: hooks only act during CloudFormation provisioning; they cannot stop a console or CLI call to stop CloudTrail, and they do not scan existing buckets.
+C=Mechanisms swapped: Config rules can only evaluate and report, not block, and SCPs can only block, not report existing resources.
+D=Both detective: a detective control would only notice after CloudTrail was already disabled, while the scenario says the control stops the action.
+T: Preventive controls are SCPs that block, detective controls are Config rules that report, and proactive controls are CloudFormation hooks that check at deploy time.
+
+@ Q001927 explain
+G: ## OUs as policy boundaries
+In AWS Organizations, an organizational unit (OU) is a container for accounts, and SCPs attached to an OU apply to every account inside it and inside its child OUs. Policies are inherited downward only, and an account's effective permissions are the intersection of all SCPs from the root down to the account.
+## A typical Control Tower layout
+- **Security** OU: Log Archive and Audit accounts.
+- **Sandbox** OU: experimentation accounts with light SCPs, cut off from production networking (no Transit Gateway or RAM subnet shares to production) and holding no real customer data.
+- **Workloads/Prod** OU: production accounts with strict SCPs (Region limits, no disabling of logging, encryption requirements) and extra detective controls.
+Grouping accounts by the controls they need, rather than by team, is the key design rule: each OU gets one policy set that fits all its accounts.
+W: Separate Sandbox and Production OUs: each OU carries its own SCPs and Control Tower controls, so sandboxes stay permissive but isolated, and production gets strict, centrally enforced guardrails that account admins cannot remove.
+X: A=All under root with IAM: IAM policies are managed inside each account, so an account administrator could loosen them; nothing enforces the difference from the organization level.
+B=One OU with tags: SCPs on a shared OU apply to both environments equally, and tag conditions alone are easy to get wrong or change; mixing sandbox and production also blurs the network and data boundary.
+D=Sandbox nested under Production: the inherited production SCPs would make sandboxes as restrictive as production, defeating "minimal restrictions", and it signals that sandboxes belong to production.
+T: Put accounts that need different guardrails in different OUs; SCPs and Control Tower controls attach per OU and are inherited downward.
+
+@ Q001928 explain
+G: ## Why keep the management account quiet
+The management account can do things no other account can (it is never limited by SCPs, and it controls the organization). AWS recommends running as few workloads and as few people in it as possible.
+## Delegated administrator
+Many security services integrate with AWS Organizations and let the management account name a member account as **delegated administrator**. That account can then:
+- enable the service in all existing and new member accounts automatically,
+- manage settings centrally,
+- see all findings from every account and Region it aggregates.
+For GuardDuty and AWS Security Hub CSPM (the original Security Hub), the usual target is a dedicated **Security Tooling** (Audit) account. Example: `aws guardduty enable-organization-admin-account --admin-account-id 222233334444` run once from the management account; after that, the security team works only in 222233334444.
+W: Delegated administrator in Security Tooling: the team keeps one central view of all 40 accounts, gains auto-enable for new accounts, and no longer needs broad day-to-day access to the management account.
+X: A=Disable both services: CloudTrail records API activity but does not analyze it for threats or aggregate compliance checks; turning the services off removes detection instead of fixing the access model.
+B=Manage in each member account: this breaks centralized visibility and consistent settings, and a compromised member account could turn its own detection off.
+C=Scoped roles in management account: the team would still work inside the most powerful account; AWS guidance is to move this work out of it, not just narrow the roles.
+T: Name a Security Tooling account as delegated administrator for GuardDuty and Security Hub CSPM, so central security work happens outside the management account.
+
+@ Q001929 explain
+G: ## How SCPs are evaluated
+For an action in a member account to be allowed, every level from the organization root down to the account must allow it through its SCPs, and no SCP at any of those levels may deny it.
+- An explicit `Deny` in any SCP on the account's path always wins; an `Allow` elsewhere cannot override it.
+- An SCP only counts if it is attached to the root, an OU the account sits under, or the account itself. SCPs on a sibling OU do nothing.
+- The management account is never affected by SCPs.
+## Troubleshooting order
+If a deny seems ignored, first confirm where the account really lives and which SCPs are attached along that path (for example with `aws organizations list-parents` and `list-policies-for-target`). Common causes: the account was moved to another OU, the deny SCP is attached to a different OU, or the call came from the management account. Then check the condition itself, for example that `aws:RequestedRegion` uses `StringNotEquals`.
+W: Trace every SCP on the account's path: since a valid deny cannot be overridden, launches succeeding means the deny is not actually in effect for that account, most often because it is not attached anywhere on its path.
+X: B=SCPs only warn: SCPs are enforced authorization guardrails; a denied call fails with an access denied error, it is not merely logged.
+C=No aws:RequestedRegion in SCPs: Region restriction with `aws:RequestedRegion` is one of the most common SCP patterns and is documented by AWS.
+D=Allow overrides Deny: an explicit deny in any applicable SCP overrides all allows, including the second SCP that allows the automation role.
+T: In SCPs an explicit Deny always wins, so a deny that seems ignored usually is not attached to the account's actual OU path.
+
+@ Q001930 explain
+G: ## Organization trails
+An **organization trail** is a CloudTrail trail created in the management account (or a CloudTrail delegated administrator account) with the organization option turned on. CloudTrail then:
+- creates the trail in every member account automatically, including accounts that join later,
+- delivers all events to one S3 bucket, under prefixes such as `AWSLogs/o-exampleorg/111122223333/`,
+- prevents member accounts from changing or deleting the trail; they can only see it.
+## Central bucket setup
+The bucket lives in the Log Archive account, and its bucket policy allows `cloudtrail.amazonaws.com` to `PutObject`, usually restricted with `aws:SourceArn` set to the organization trail ARN. Add S3 Object Lock or tight bucket policies to make the logs tamper-resistant. AWS Control Tower builds exactly this arrangement during landing zone setup.
+W: Organization trail to the Log Archive bucket: one trail covers every current and future account with no per-account work, and member accounts cannot disable it.
+X: A=Trail in each account: this works technically, but every new account needs its own setup, and local administrators could stop or change their trail.
+B=Control Tower guardrails alone: controls only block or detect configuration changes; they do not create trails or deliver logs. Control Tower sets up logging through its landing zone, not through guardrails.
+D=Config aggregators: an aggregator collects AWS Config resource configuration and compliance data, not CloudTrail API event logs.
+T: One organization trail automatically logs every present and future member account to one central bucket, and members cannot turn it off.
+
+@ Q001931 explain
+G: ## Two kinds of permission ceiling
+Neither SCPs nor permissions boundaries grant access; both only set a maximum. An action must be allowed by the identity policy and must fall inside every applicable ceiling.
+- A **service control policy (SCP)** is attached to the organization root, an OU or an account, and caps every principal in the affected member accounts: IAM users, roles and the account root user. It does not affect the management account or service-linked roles.
+- A **permissions boundary** is a managed policy attached to one IAM user or role. It caps only that identity. It is commonly used for delegation: developers may create roles only if they attach a given boundary.
+## Example
+An SCP that denies `sagemaker:*` stops everyone in the sandbox accounts, including admins. A boundary allowing only `s3:*` and `lambda:*` attached to role `dev-ci` limits that role alone.
+W: SCPs cap whole accounts, boundaries cap one identity: the SCP applies to all principals in the member account, while a boundary applies only to the specific user or role it is attached to.
+X: A=Both grant permissions: neither grants anything; they only limit, so an identity policy is still needed.
+C=Boundaries on root: boundaries attach only to IAM users and roles; the root user can be limited only by SCPs.
+D=Functionally identical: they differ in scope (account versus identity), who manages them (organization versus account IAM), and which principals they reach.
+T: Both are ceilings, not grants: an SCP limits every principal in an account, a permissions boundary limits one IAM user or role.
+
+@ Q001932 explain
+G: ## Control Tower drift
+AWS Control Tower deploys its controls and baseline resources (SCPs, Config rules, roles, log buckets) and expects them to stay as it set them. When someone changes these resources outside Control Tower, the landing zone is in **drift**. Examples:
+- an SCP created by Control Tower is edited or detached in the Organizations console,
+- an enrolled account is moved to another OU directly in Organizations,
+- a control-managed role or bucket policy is changed by hand.
+The console can still show a control as enabled on the OU while the account no longer receives the policy. Drift is reported in the Control Tower console and through notifications to the Audit account.
+## Fixing it
+Re-register the OU, update or re-enroll the account, or reset the landing zone, depending on what drifted.
+## Scope of this control
+The mandatory control disallows encryption changes only on the S3 buckets that Control Tower itself created in the Log Archive account, not on every bucket in every account; other buckets need your own preventive or detective controls. Also, since January 2023 S3 encrypts all new objects with SSE-S3 at minimum, so "removing" default encryption in practice means reverting a bucket from SSE-KMS to the SSE-S3 default.
+W: Account drift: a preventive control is an SCP, so if a change it should block went through, the SCP is most likely not in effect for that account because something was changed outside Control Tower, and repairing the OU or account restores it.
+X: A=Only accounts created afterward: controls enabled on an OU apply to all enrolled accounts in it, existing and new.
+B=Only new resources: a preventive SCP evaluates each API call when it happens, so it blocks changes to existing resources as much as to new ones.
+D=Only detected, never prevented: Control Tower has preventive SCP-based controls that deny encryption changes on its log archive buckets, so prevention is available.
+T: When a preventive control seems ignored while the console says it is applied, suspect drift: something changed the SCP or account placement outside Control Tower.
+
+@ Q001933 explain
+G: ## Managed controls versus hand-written SCPs
+**AWS Control Tower controls** are a library of preventive (SCP-based), detective (Config rule) and proactive (CloudFormation hook) rules that AWS writes, tests and updates, and that you turn on per OU from the console or API. They give fast, consistent coverage across many accounts and show compliance in one dashboard, but each control is fixed: you choose from what exists and cannot rewrite its logic.
+**Custom SCPs** can express anything the SCP language allows, such as company-specific Region lists, tag rules or exceptions for break-glass roles. The price is that your team must write, test, version and update them as new services and actions appear.
+## They combine
+Control Tower OUs are normal Organizations OUs, so you can attach your own SCPs alongside the ones Control Tower manages (within the SCP-per-target quota). A common approach: baseline with Control Tower controls, then add a few custom SCPs for gaps.
+W: AWS-maintained but opinionated, combine with custom SCPs: this is the real tradeoff between lower maintenance and flexibility, and the two approaches work side by side.
+X: A=Cannot coexist: you can attach your own SCPs to Control Tower-managed OUs; you only avoid editing the SCPs Control Tower created, to prevent drift.
+B=Custom SCPs update themselves: it is the reverse; custom SCPs change only when your team edits them, while AWS maintains its managed controls.
+C=Custom SCPs never help: managed controls cannot cover every organization-specific rule, so custom SCPs are still needed for special requirements.
+T: Control Tower controls cut maintenance but are fixed rules; custom SCPs fill company-specific gaps, and most organizations use both.
+
+@ Q001934 explain
+G: ## VPC sharing with AWS RAM
+AWS Resource Access Manager (RAM) lets a VPC **owner** account share subnets with other accounts in the same organization, or with whole OUs.
+- **Participant** accounts can launch EC2 instances, RDS databases, Lambda functions and similar resources into the shared subnets.
+- Participants cannot create, change or delete the VPC, subnets, route tables, network ACLs or gateways; only the owner manages the network.
+- Each account still owns and pays for its own resources and security groups.
+## Example
+The networking account owns `vpc-0abc` with private subnets `10.20.1.0/24` and `10.20.2.0/24`. It creates a RAM resource share with those subnets and the `Workloads` OU as principal. Application accounts now see the subnets in their EC2 console and launch instances directly into them, with no peering and no copy of the VPC.
+W: Share subnets through AWS RAM: it gives application accounts launch access to centrally managed subnets without duplicating the VPC or granting them permission to change the network.
+X: A=SCPs granting subnet access: SCPs never grant permissions, and they cannot make a subnet in one account visible in another.
+B=Account Factory recreating the VPC: that duplicates the VPC in every account, which is exactly what the team wants to avoid, and it creates many separate networks to manage.
+C=Cross-account roles to modify the VPC: this gives application teams control over the shared network itself, the opposite of central management.
+T: AWS RAM VPC sharing lets many accounts launch into one centrally owned VPC while only the owner can change the network.
+
+@ Q001935 explain
+G: ## Code signing for Lambda
+**AWS Signer** signs code with a signing profile you control. For Lambda, a signing job takes the zip from S3 and writes a signed copy with a signature over the package.
+A Lambda **code signing configuration** lists the allowed signing profiles and a policy for failed checks:
+- `Enforce`: reject any deployment whose package is unsigned, signed by a profile not on the list, or signed with an expired or revoked profile.
+- `Warn`: allow a mismatched, expired or revoked signature but record a CloudWatch metric and CloudTrail entry.
+A package altered after signing fails the integrity check and is always rejected, whichever policy is set.
+## In a pipeline
+CodeBuild builds the zip, a step calls `aws signer start-signing-job` with the pipeline's profile, and the deploy stage updates the function. Because the production function has a code signing config set to `Enforce`, a package that was modified in the artifact bucket, or uploaded by someone outside the pipeline, fails the signature check and is rejected at deployment.
+W: AWS Signer with an enforced code signing config: the signature proves the package came from the trusted profile and has not changed, and Lambda itself refuses anything else for production.
+X: A=Default pipeline role: IAM roles control who can call APIs, but they do not verify that a package is unchanged or came from the trusted build.
+B=Public bucket with logging: a public bucket lets anyone read or potentially tamper with artifacts, and logs only show access after the fact; they do not block a modified package.
+D=S3 Versioning: versioning keeps older copies of objects but does not stop someone with write access from uploading a new malicious version, and deployments take the latest one.
+T: Integrity and origin of Lambda code come from signing (AWS Signer) plus an `Enforce` code signing config, not from storage settings or IAM alone.
+
+@ Q001936 explain
+G: ## The two StackSets permission models
+A CloudFormation StackSet deploys one template as stack instances in many accounts and Regions.
+- **Self-managed permissions**: you create `AWSCloudFormationStackSetAdministrationRole` in the admin account and `AWSCloudFormationStackSetExecutionRole` in every target account yourself, then target account IDs. New accounts need the role before they can be targeted.
+- **Service-managed permissions**: available with AWS Organizations trusted access. You target OUs, and CloudFormation creates the needed roles in member accounts for you.
+## Automatic deployment
+With service-managed permissions you can turn on **automatic deployment**. When an account joins a targeted OU, CloudFormation deploys the stack instances to it; optionally, when an account leaves, its stacks are removed or retained. Example: target the `Workloads` OU in `us-east-1` and `eu-west-1`, and every new workload account gets the logging role and GuardDuty detector within minutes.
+W: Service-managed with automatic deployment: it targets OUs, needs no hand-made roles in member accounts, and deploys the baseline to accounts added to the OU later.
+X: A=Service-managed cannot target OUs: the reverse is true; targeting OUs is a feature of service-managed permissions, while self-managed targets account IDs.
+B=Self-managed auto-extends: self-managed StackSets have no automatic deployment, and each new account needs the execution role created manually first.
+D=Either model: only service-managed StackSets integrate with Organizations to detect accounts joining an OU.
+T: Use service-managed StackSets with automatic deployment to push a baseline to every current and future account in an OU without creating roles by hand.
+
+@ Q001937 explain
+G: ## How Service Catalog separates user and provisioning rights
+In AWS Service Catalog, administrators build **products** (CloudFormation templates) and group them into **portfolios**. End users get access to a portfolio and can launch its products.
+A **launch constraint** attaches an IAM role (or a local role name) to a product in a portfolio. When a user launches the product, Service Catalog uses that role to create the stack, not the user's own credentials.
+## Example
+The role `sc-rds-launch` has `rds:CreateDBInstance`, subnet group and KMS permissions. Developers only need permissions to use Service Catalog, such as the `AWSServiceCatalogEndUserFullAccess` policy, plus access to the portfolio. They can provision an approved RDS database with the settings in the template, but if they call `rds:CreateDBInstance` directly, it is denied.
+Other constraint types exist too: template constraints limit parameter values, and notification constraints send stack events to SNS.
+W: Launch constraint with an IAM role: provisioning runs with the more privileged role attached to the product, so developers can self-serve without holding RDS create permissions themselves.
+X: A=Portfolio sharing: sharing makes a portfolio available to other accounts or organization units, but it does not change which credentials perform the provisioning.
+B=TagOptions: they manage allowed tag keys and values on provisioned products; they have nothing to do with who holds the create permissions.
+C=Stack policies: a CloudFormation stack policy protects resources in an existing stack from update actions; it does not grant provisioning rights or separate them from the user.
+T: A Service Catalog launch constraint lets users launch approved products while a separate role holds the powerful provisioning permissions.
+
+@ Q001938 explain
+G: ## Shift-left checks for infrastructure as code
+Problems in a CloudFormation template are cheapest to stop before anything is deployed. Static analysis tools read the template and fail the build when rules are broken:
+- **cfn-guard** (AWS CloudFormation Guard) is an open-source policy-as-code tool; you write rules such as "every `AWS::S3::Bucket` must have `BucketEncryption`" or "IAM policies must not use `Action: *` with `Resource: *`".
+- **cfn-nag** is an open-source linter with built-in security rules for overly permissive IAM and unencrypted resources.
+## In CodePipeline
+Add a CodeBuild action right after the source stage whose buildspec runs, for example, `cfn-guard validate -d template.yaml -r rules.guard`. A non-zero exit code fails the stage, so the deploy stage never runs and the developer sees which rule broke. Proactive controls or CloudFormation Guard Hooks can add a second check at deploy time.
+W: Early CodeBuild stage running cfn-guard or cfn-nag: it rejects bad templates automatically in the pipeline, before any resource is created.
+X: A=Security Hub findings in production: Security Hub CSPM reports misconfigurations only after the resources exist, so the risky policy or bucket is already live.
+C=Drift detection: drift detection compares deployed resources with the template; if the template itself is insecure, there is no drift and nothing is flagged.
+D=SCP denying CreateStack: blocking all stack creation for manual review is not automatic and stops good deployments as well as bad ones; an SCP also cannot inspect template content.
+T: Catch insecure templates with policy-as-code (cfn-guard, cfn-nag) in a build stage before deploy; post-deployment tools only find the problem afterward.
+
+@ Q001939 explain
+G: ## The two roles behind self-managed StackSets
+With self-managed permissions, CloudFormation uses a chain of two roles:
+- In the **administrator** account, `AWSCloudFormationStackSetAdministrationRole` is assumed by CloudFormation. Its policy lets it call `sts:AssumeRole` on the execution role in targets.
+- In each **target** account, `AWSCloudFormationStackSetExecutionRole` must exist, trust the administrator account (or its administration role), and hold the permissions to create the template's resources.
+If the second role is missing, misspelled or does not trust the admin account, stack instance creation fails with an error that CloudFormation cannot assume the role.
+## Example
+A newly created account 444455556666 has no execution role yet. Deploying AWS's sample execution-role template in that account, with the admin account ID as the trusted account, fixes the error. Service-managed StackSets avoid this step by creating roles through Organizations.
+W: Missing execution role in the target account: the admin role exists, so the failing step is assuming `AWSCloudFormationStackSetExecutionRole` in the new account, which has not been created or does not trust the admin account.
+X: A=Target must be the management account: self-managed StackSets can deploy to any AWS account, even outside the organization, as long as the execution role exists there.
+C=Template syntax error: template problems show up as validation or resource creation errors, not as a failure to assume a role.
+D=Only the management account's OU: self-managed StackSets target account IDs and do not depend on OU placement; service-managed StackSets target OUs across the organization.
+T: Self-managed StackSets need an execution role in every target account that trusts the admin account; a new account without it produces assume-role errors.
+
+@ Q001940 explain
+G: ## Two permission layers for encrypted S3 objects
+Reading an object encrypted with SSE-KMS needs two things:
+- **S3 permission**: `s3:GetObject`, from the role's IAM policy and, for cross-account access, the bucket policy.
+- **KMS permission**: `kms:Decrypt` on the key that encrypted the object. For a caller in another account, the **key policy** must allow that account or role, and the caller's IAM policy must also allow the key.
+If only the S3 part is in place, S3 returns access denied because it cannot decrypt the object for that caller.
+## Cross-account CodePipeline
+The pipeline in Account A stores artifacts in its artifact bucket encrypted with a KMS key. For Account B's role to download them, the pipeline must use a **customer managed key** (the AWS managed `aws/s3` key cannot be shared across accounts), and that key's policy must allow Account B's role `kms:Decrypt` (and usually `kms:DescribeKey`).
+W: Key policy allowing the cross-account role to decrypt: with `s3:GetObject` already granted, the missing piece is KMS, so the artifact key policy must let the Account B role use the key.
+X: B=No cross-account support: CodePipeline supports cross-account actions through roles in the target account and a customer managed KMS key for artifacts.
+C=Disable versioning: versioning has no effect on cross-account permissions; CodePipeline artifact buckets typically keep versioning on.
+D=Public bucket: making pipeline artifacts public is a serious exposure, and public access still would not grant use of the KMS key needed to decrypt them.
+T: Cross-account reads of SSE-KMS objects need both S3 access and `kms:Decrypt` in the key policy; with S3 already allowed, fix the key policy.
+
+@ Q001941 explain
+G: ## Tag standards in Service Catalog
+A **TagOption** is a key and value pair managed in AWS Service Catalog, such as `CostCenter=CC-1001`. Administrators create TagOptions for each approved value and associate them with a portfolio or product. When users launch the product, they must pick from those values, and Service Catalog applies the tag to the provisioned product and its resources. Users cannot type a value that is not on the list.
+## Controlling who sees which portfolio
+A portfolio is visible only to principals that are granted access to it: the administrator associates IAM users, groups or roles with the portfolio. **Portfolio sharing** extends a portfolio to other AWS accounts or organization OUs, where local administrators grant their own principals access. Together these decide which people see which catalog of products.
+Example: the `Data` portfolio is shared with the `Analytics` OU and granted to the `analyst` role; its products carry TagOptions for `CostCenter`.
+W: TagOptions and portfolio sharing: TagOptions enforce tag values from an approved list, and portfolio access and sharing control which principals and accounts can see each portfolio.
+X: A=Notification and template constraints: notification constraints send stack events to SNS topics, and template constraints limit parameter values; neither controls portfolio visibility.
+B=Service actions and StackSets: service actions run SSM documents on provisioned products, and StackSets deploy stacks across accounts; neither provides approved tag lists or portfolio visibility.
+C=Launch constraints and stack policies: launch constraints set the provisioning role, and stack policies protect stack resources from updates; neither is about tag values or visibility.
+T: Service Catalog TagOptions standardize tag values, and portfolio access plus sharing decide who can see which products.
+
+@ Q001942 explain
+G: ## Why PassRole plus CreateRole is dangerous
+`iam:PassRole` lets a principal hand a role to a service, such as CloudFormation, Lambda or EC2. `iam:CreateRole` lets it create new roles. With both on `Resource: "*"`, a compromised build could create a role with `AdministratorAccess`, pass it to a service it controls, and act with admin rights: a classic privilege escalation.
+## Safer pattern
+- Give CodeBuild only `iam:PassRole` on one specific **CloudFormation service role**, with the condition `iam:PassedToService` = `cloudformation.amazonaws.com`.
+- CloudFormation uses that service role to create stacks, so the build role itself does not need broad IAM rights.
+- Require a **permissions boundary** on any role that gets created: allow `iam:CreateRole` only with the condition `iam:PermissionsBoundary` equal to an approved boundary ARN, and limit role names or paths, such as `arn:aws:iam::111122223333:role/app/*`.
+Even if a buildspec is tampered with, the roles it can create or pass stay inside the boundary.
+W: Scope PassRole and CreateRole with a boundary and a separate CloudFormation service role: the pipeline can still create the execution roles its stacks need, but can no longer create or pass anything more powerful.
+X: A=Remove all IAM permissions: the pipeline must pass a role to CloudFormation and create execution roles, so removing everything breaks deployments.
+B=AdministratorAccess: this makes the escalation risk worse; a compromised build would get full control of the account immediately.
+D=Disable CloudTrail for the role: this removes the audit trail needed to detect misuse and does nothing to reduce the permissions themselves.
+T: Limit role creation with a required permissions boundary and restrict PassRole to one CloudFormation service role, instead of wildcard IAM rights on the build role.
+
+@ Q001943 explain
+G: ## What drift means in CloudFormation
+**Drift** is the difference between the configuration a stack's template expects and the actual configuration of its resources, caused by changes made outside CloudFormation, for example someone editing a security group in the console.
+## Drift detection on a StackSet
+Running drift detection on a StackSet (`aws cloudformation detect-stack-set-drift`) checks the stack in every account and Region where the StackSet is deployed. Results are reported per stack instance:
+- `IN_SYNC`: resources match the template,
+- `DRIFTED`: at least one resource was changed or deleted, with property-level details (expected versus actual values),
+- the StackSet as a whole shows `DRIFTED` if any instance has drifted.
+Example: across 60 accounts, the auditor gets a list of the 3 instances where someone widened an IAM policy by hand. Drift detection only reports; you fix drift by updating the StackSet or reverting the changes.
+W: StackSets drift detection per stack instance: it compares each deployed stack instance in all 60 accounts with the StackSet template and shows exactly which resources changed.
+X: A=Automatic deployment: this deploys stacks to accounts that join a target OU; it does not check whether existing stacks were changed.
+B=Conformance packs only: AWS Config does have a managed rule that flags drifted stacks, but it is not the only way; CloudFormation's own drift detection works directly on the StackSet and shows property-level differences.
+C=Change sets: a change set previews what a template update would change; it compares a new template to the old one, not the real resources to the template.
+T: To find manual changes to resources deployed by a StackSet, run StackSet drift detection, which reports each stack instance as in sync or drifted.
+
+@ Q001944 explain
+G: ## Security standards in Security Hub CSPM
+AWS Security Hub CSPM (the original Security Hub, renamed when the new unified Security Hub was introduced) runs automated checks grouped into **security standards**. You can enable several at once, and a single control can belong to more than one standard. Key standards:
+- **AWS Foundational Security Best Practices (FSBP)**: AWS's own broad set of checks across many services, updated as new services and features appear.
+- **PCI DSS**: controls mapped to the Payment Card Industry Data Security Standard requirements (version 3.2.1 and version 4.0.1 are offered), for workloads that handle card data.
+- **CIS AWS Foundations Benchmark**: a smaller, community-agreed baseline focused on identity, logging and monitoring settings, offered in several versions.
+- **NIST SP 800-53 Rev. 5** (and NIST SP 800-171): for organizations following those frameworks.
+## Using them together
+A card processor typically enables PCI DSS for the regulatory mapping and FSBP for wider AWS coverage; CIS can be added as a third view. The controls are evidence to support an assessment; they do not make the company PCI compliant by themselves.
+W: PCI DSS plus FSBP, optionally CIS: PCI DSS maps checks to card-payment requirements, and FSBP adds broad AWS-specific best practice coverage.
+X: A=Only CIS: CIS is a general security baseline, not a card-payment standard, and it covers far fewer services than FSBP.
+B=Only FSBP: FSBP is AWS's best practice set; it is not a PCI DSS mapping, so the regulatory need would not be met.
+C=Duplicates Audit Manager: Audit Manager collects evidence for audits; Security Hub CSPM standards run continuous configuration checks. They complement each other.
+T: Enable the PCI DSS standard for regulatory mapping and FSBP for broad AWS coverage; standards can run side by side in Security Hub CSPM.
+
+@ Q001945 explain
+G: ## Conformance packs
+An AWS Config **conformance pack** is a collection of Config rules and optional remediation actions defined in one YAML template and deployed as a single unit. AWS publishes sample packs (for example, operational best practices for various frameworks), and you can write your own to match an internal baseline.
+## Organization conformance packs
+From the management account, or from a **delegated administrator** account for Config, you can deploy an **organization conformance pack**:
+- it is deployed to all member accounts in the organization (you can exclude some),
+- accounts that join later receive it automatically,
+- member accounts cannot delete or change it,
+- compliance results can be viewed centrally, for example with a Config aggregator.
+Example: `aws configservice put-organization-conformance-pack --organization-conformance-pack-name baseline --template-s3-uri s3://...` run from the Security Tooling account. Config recording must be enabled in each account for the rules to evaluate.
+W: Organization conformance pack from the delegated admin: one deployment pushes the same rule set to all 80 accounts, applies to new accounts automatically, and keeps work out of the management account.
+X: A=Manual rules per account: creating rules one by one in 80 accounts is slow, drifts over time, and misses new accounts unless someone remembers.
+B=Trusted Advisor: Trusted Advisor runs its own set of checks; it does not deploy or enforce AWS Config rules.
+C=Replicated by SCPs: SCPs only limit permissions; they cannot create Config rules or copy resources into other accounts.
+T: Organization conformance packs deploy one Config rule set to every current and future account from a single admin account.

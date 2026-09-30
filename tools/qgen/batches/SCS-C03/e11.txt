@@ -1,0 +1,352 @@
+# SCS-C03 detailed explanations, e11 (explanation-only rewrites; letters are the published ones)
+
+@ Q003979 explain
+G: ## Signing and verifying container images
+Image signing proves two things about a container image: who produced it and that it has not changed since. The build pipeline signs the image digest, and the signature is stored next to the image in the registry (for example Amazon ECR).
+- **AWS Signer** manages signing profiles and works with the open-source Notation client from the Notary Project to sign OCI images.
+- In Kubernetes, an **admission controller** (such as Kyverno, or OPA Gatekeeper with Ratify) intercepts every request to create a pod and checks that each image has a valid signature from a trusted profile.
+## Example
+A pod spec references `123456789012.dkr.ecr.us-east-1.amazonaws.com/payments@sha256:...`. The admission webhook looks up the signature, verifies it against the trusted Signer profile, and rejects the pod if the image is unsigned, signed by someone else, or modified. Nothing unapproved ever starts, even if someone runs `kubectl apply` by hand.
+W: Signer plus admission control: signatures give cryptographic proof of origin and integrity, and the admission controller enforces the check at the moment a pod is created, so unsigned or tampered images are blocked automatically.
+X: A=Any `latest` image from any registry: the `latest` tag is mutable and says nothing about who built the image; allowing any registry means anyone's image can run, the opposite of an approved-only policy.
+B=Copy files into running pods: this breaks immutable deployments, leaves no verifiable provenance for what was copied, and still gives no way to prove the running code was approved.
+D=Pull request comments: a comment is a human note, not a control. Nothing in the cluster checks it, so an unapproved image can still be deployed.
+T: Trust in container images comes from signing at build time and verifying at admission time, not from tags, manual steps or comments.
+
+@ Q003980 explain
+G: ## Code signing for Lambda
+Lambda code signing makes sure only code packaged by trusted publishers is deployed to a function.
+- In **AWS Signer**, the security team creates a signing profile and signs the `.zip` deployment package; Signer adds a signature to the package.
+- A **code signing configuration** lists the allowed signing profiles (allowed publishers) and a policy for failed checks: `Warn` (deploy but log) or `Enforce` (reject).
+- The configuration is attached to functions. On every `CreateFunction` or `UpdateFunctionCode`, Lambda checks that the package is signed by an allowed profile, has not been modified, and that the signature has not expired or been revoked.
+## Example
+A developer uploads a package they built locally. With `Enforce`, the deployment fails because the signature is missing. Administrators can also use the `lambda:CodeSigningConfigArn` condition key to require a code signing configuration on every function. Code signing applies to `.zip` packages, not container image functions.
+W: Code signing configuration with Signer profiles: it verifies the publisher and integrity of the package at deployment time and, in enforce mode, rejects anything the security team did not sign.
+X: B=Encrypted environment variables: KMS protects configuration values at rest; it does nothing to check who wrote or packaged the function code.
+C=Reserved concurrency of zero: this throttles every invocation so no code runs at all. It stops the workload instead of allowing only signed code.
+D=Shared layers: layers are a way to share libraries between functions. They do not verify signatures, and a layer itself can hold unapproved code.
+T: To allow only approved Lambda code, verify signatures at deployment with a code signing configuration; encryption or throttling do not prove where code came from.
+
+@ Q003981 explain
+G: ## How EC2 Image Builder works
+EC2 Image Builder automates creating, testing and distributing machine images (AMIs) and container images.
+- A **recipe** names the base image and an ordered list of **components**. Components are scripts that install software or apply hardening, such as AWS-managed STIG hardening components, or your own CIS-based settings.
+- A **pipeline** runs the recipe on a schedule or when the base image changes, launches a build instance, applies the components, runs test components, and snapshots the result.
+- A **distribution configuration** copies the finished AMI to other Regions and shares it with other accounts or the organization.
+## Example
+A monthly pipeline takes the latest Amazon Linux AMI, applies patches and a hardening component, runs tests, and publishes `golden-al2023-2026-09`. Launch templates then use only the approved golden AMI, so every new instance starts hardened in the same way, and vulnerability scanning of the image can be added to the pipeline.
+W: Image Builder with hardening components: it builds, tests and distributes hardened AMIs automatically and repeatably, so every instance starts from the same approved baseline.
+X: B=Macie on AMI metadata: Macie discovers sensitive data in S3 objects. It does not build images or apply operating system hardening.
+C=Lightsail snapshots: snapshots copy whatever state one Lightsail instance is in, including drift and unpatched software; there is no build, hardening or test step, and they target Lightsail rather than an EC2 image pipeline.
+D=AWS Backup plans: Backup protects volumes and instances for recovery. It restores what existed, it does not create new hardened images.
+T: Consistent hardened instances come from an automated image pipeline (Image Builder), not from backups or snapshots of existing servers.
+
+@ Q003982 explain
+G: ## Layers of isolation for a database tier
+A classic three-tier VPC puts web, application and database resources in separate subnets, and each layer adds a control.
+- **Private subnets**: a subnet is private when its route table has no route to an internet gateway. Resources there cannot be reached from the internet, and they have no public IPs.
+- **Security groups that reference other security groups**: instead of allowing a CIDR, the database security group allows the database port (for example `5432`) only from the application tier's security group `sg-app`. Any instance with `sg-app` can connect; nothing else can, even inside the VPC.
+## Example
+An RDS instance sits in two private subnets with `PubliclyAccessible` set to false. Its security group allows TCP 5432 from `sg-app` only. Administrators reach it through Systems Manager Session Manager port forwarding or a bastion inside the VPC, never over the internet.
+W: C=App-tier security group only: referencing the application security group limits connections to exactly the workloads that need the database and follows instances as they scale.
+E=Private subnets without internet routes: with no route to an internet gateway, the database cannot be reached from the internet at all.
+X: A=Share the subnet with every account: VPC sharing would let every account launch resources inside the database subnet, widening who is next to the data instead of isolating it.
+B=0.0.0.0/0 on the database port: this lets any source address try to connect, which removes the isolation entirely.
+D=Public IPs for administrators: public addresses make the database reachable from the internet; administrators should connect through private paths such as Session Manager or a VPN.
+T: Isolate a database with private subnets for routing and security-group references for who may connect, never with public IPs or open CIDRs.
+
+@ Q003983 explain
+G: ## Centralized inspection with a transit gateway
+East-west traffic is traffic between VPCs inside your own network. To inspect it in one place, route it all through an **inspection VPC**.
+- Each spoke VPC attaches to a **transit gateway**. The spoke route table sends all traffic to the inspection VPC attachment.
+- The inspection VPC holds **AWS Network Firewall** endpoints in each Availability Zone. Network Firewall supports stateful rules and Suricata-compatible IPS signatures, managed centrally (AWS Firewall Manager can push policies across accounts).
+- **Appliance mode** on the inspection VPC attachment keeps both directions of a flow on the same Availability Zone, so the stateful firewall sees the request and the reply.
+## Example
+VPC A (`10.1.0.0/16`) talks to VPC B (`10.2.0.0/16`). The packet goes spoke to transit gateway to the firewall endpoint to the transit gateway to VPC B, and the reply returns through the same firewall endpoint thanks to appliance mode.
+Network Firewall can now also attach natively to a transit gateway, so AWS manages the firewall's attachment without a separate inspection VPC. Both designs give central, managed inspection; peering, single instances and security groups do not.
+W: Network Firewall in an inspection VPC with appliance mode: all inter-VPC flows pass one managed, highly available IPS with one rule set, and appliance mode keeps stateful inspection symmetric.
+X: A=Peering mesh with NACLs allowing all: peering sends traffic directly between VPCs, so nothing passes a central inspection point, and allow-all NACLs add no inspection.
+B=One EC2 firewall in one AZ: a single instance is a single point of failure and a throughput bottleneck, and an AZ outage would cut or bypass inspection.
+C=Broad security group rules: security groups are stateful allow lists on ports and addresses; they do not inspect payloads for intrusion signatures, and broad rules open access further.
+T: Central east-west IPS means routing every VPC through a Network Firewall inspection VPC on a transit gateway, with appliance mode for symmetric flows.
+
+@ Q003984 explain
+G: ## Route 53 Resolver DNS Firewall
+Every VPC has the Route 53 Resolver (the `.2` address, for example `10.0.0.2`), which answers DNS queries from workloads. **DNS Firewall** filters those queries.
+- A **domain list** holds domains, either your own or AWS managed lists of known malware, botnet command-and-control and similar threat domains.
+- A **rule group** pairs domain lists with actions: `ALLOW`, `ALERT` or `BLOCK`. A block can return `NODATA`, `NXDOMAIN` or an override answer.
+- Rule groups are associated with VPCs, and Firewall Manager can apply them across accounts.
+## Example
+Malware on an instance tries to resolve `bad-c2.example`. The domain is on an AWS managed threat list, so DNS Firewall returns `NXDOMAIN` and the malware cannot find its server. Query logs record the attempt for investigation.
+W: Route 53 Resolver DNS Firewall: it inspects outbound DNS queries from VPC workloads and blocks domains on managed or custom lists before a connection can start.
+X: B=DNSSEC signing keys: DNSSEC signs your public hosted zones so resolvers can verify your answers are authentic; it does not filter what your workloads look up.
+C=Latency routing: this routing policy picks the lowest-latency Region for your own records. It does not block queries for other domains.
+D=Health checks: health checks monitor your endpoints and drive failover; they have no role in filtering outbound DNS.
+T: To stop workloads from resolving malicious domains, filter queries with Resolver DNS Firewall; DNSSEC, routing policies and health checks deal with your own records.
+
+@ Q003985 explain
+G: ## Zero-trust access with AWS Verified Access
+AWS Verified Access gives users access to internal applications without a VPN. Each request is checked against policy before it reaches the app.
+- **Trust providers** supply context: an identity provider (IAM Identity Center or an OIDC provider) for who the user is, and a device management provider for device posture.
+- **Access policies** are written in Cedar and can require, for example, a group membership and a compliant device.
+- Verified Access sits in front of the application (such as an internal load balancer) and evaluates every request, not just the first sign-in.
+## Example
+A policy allows the HR portal only when the user is in the `hr` group and the laptop reports a healthy posture. If the device later falls out of compliance, the next request is denied, even though the user signed in earlier. Access logs record each decision.
+W: AWS Verified Access: it provides VPN-less access to private apps and evaluates identity and device signals on each request, which is exactly the zero-trust requirement.
+X: A=CloudFront: CloudFront is a content delivery network that caches and serves content at the edge; it does not evaluate user identity and device posture against a policy for every request.
+B=Route 53: Route 53 resolves names to addresses. DNS has no concept of user identity or device health.
+D=Direct Connect: Direct Connect is a dedicated network link between a data center and AWS; it connects networks and performs no per-user or per-device checks.
+T: Per-request identity and device checks for internal apps without a VPN is AWS Verified Access, not networking or content delivery services.
+
+@ Q003986 explain
+G: ## Workforce single sign-on with IAM Identity Center
+IAM Identity Center is the AWS service for employee access to many AWS accounts and applications.
+- Connect an **external identity provider** (such as Microsoft Entra ID or Okta) through SAML 2.0, and optionally sync users and groups with SCIM. Users sign in with corporate credentials, and the IdP enforces MFA (Identity Center's own MFA settings apply when its built-in directory or Active Directory is the identity source).
+- **Permission sets** define access (for example `ReadOnly` or `DBAdmin`). Assigning a group plus a permission set to an account creates a role in that account.
+- Users open the **AWS access portal**, pick an account and role, and get short-lived credentials for the console or CLI.
+## Example
+The `Finance-Analysts` group is assigned `ReadOnly` in 40 accounts. A new analyst added to the group in the IdP can reach all 40 after one sign-in; removing them in the IdP removes access everywhere.
+W: IAM Identity Center with an external IdP: one corporate sign-in with MFA gives role-based, temporary access across all accounts, and access is managed centrally by group.
+X: A=Same-password IAM users everywhere: this creates long-term credentials in every account, a shared password multiplies the damage of one leak, and offboarding requires touching every account.
+C=Shared root login: root has unrestricted access, cannot be limited by IAM policies, and sharing it removes individual accountability.
+D=Cognito user pools: Cognito authenticates users of your own applications; it is not the service for federating employees into the AWS Management Console across accounts.
+T: Employees reaching many AWS accounts with corporate SSO and MFA means IAM Identity Center; Cognito is for customers of your apps.
+
+@ Q003987 explain
+G: ## Cognito user pools and identity pools
+Amazon Cognito has two parts that are often used together.
+- A **user pool** is a user directory. It handles sign-up and sign-in, including social providers such as Google, Apple or Facebook, and issues JWT tokens.
+- An **identity pool** exchanges those tokens for **temporary AWS credentials** for an IAM role, so the app can call AWS services directly.
+- **Policy variables** make one role work for everyone. The variable `${cognito-identity.amazonaws.com:sub}` is replaced with the caller's unique identity ID.
+## Example
+The role policy allows `s3:GetObject` and `s3:PutObject` only on `arn:aws:s3:::app-data/${cognito-identity.amazonaws.com:sub}/*`. Every user gets the same role, but each can only reach their own prefix. For DynamoDB, the `dynamodb:LeadingKeys` condition can do the same for partition keys.
+W: User pools plus identity pools with policy variables: social sign-in, short-lived credentials, and per-user scoping from a single role policy.
+X: A=Shared role keys embedded in the app: roles do not have long-term keys to embed, and any credentials shipped in an app can be extracted and give every user the same access to all data.
+B=IAM users per app user: IAM users are meant for a small number of people and workloads, have account quotas, and long-term keys on devices are easy to leak.
+C=Per-user API keys in DynamoDB: custom API keys are not AWS credentials, so they cannot sign AWS requests, and storing them yourself adds another secret to protect.
+T: App users who need their own scoped AWS access sign in through a Cognito user pool and get temporary credentials from an identity pool, never embedded or long-term keys.
+
+@ Q003988 explain
+G: ## OIDC federation for CI/CD
+Many CI systems (GitHub Actions, GitLab and others) can issue a signed OIDC token for each job. AWS can trust that token instead of stored access keys.
+- Create an **IAM OIDC identity provider** for the CI issuer, for example `token.actions.githubusercontent.com` with audience `sts.amazonaws.com`.
+- Create a role whose **trust policy** allows `sts:AssumeRoleWithWebIdentity` from that provider, with conditions on the token claims such as the `sub` claim.
+- The job exchanges its token for temporary credentials that expire, typically after an hour.
+## Example
+The trust policy condition `token.actions.githubusercontent.com:sub` equals `repo:example-org/infra:ref:refs/heads/main`. Only jobs from the `infra` repository's main branch can assume the deploy role; a fork or another repository gets a token with a different `sub` and is refused. No secret is stored anywhere.
+W: OIDC federation to a scoped role: each run gets short-lived credentials, the trust policy limits which repository and branch can deploy, and there is no key to rotate or leak.
+X: B=Root access keys in CI variables: root keys are long-term and unrestricted; encrypting them in the CI system does not change that one leak compromises the whole account.
+C=Shared deployment IAM user: it still relies on long-term keys, and one identity for all repositories gives each repository more access than it needs and poor traceability.
+D=IAM user keys in the CI secret store: storing keys more safely still means long-term credentials exist and must be rotated, which the requirement rules out.
+T: For CI outside AWS, trust the CI system's OIDC token with a scoped role trust policy instead of storing any long-term access keys.
+
+@ Q003989 explain
+G: ## IAM Roles Anywhere
+IAM Roles Anywhere lets workloads outside AWS, such as on-premises servers, get temporary AWS credentials using X.509 certificates they already have.
+- A **trust anchor** points to your certificate authority: an AWS Private CA or an external CA certificate bundle.
+- A **profile** lists which roles can be assumed and can limit the session with policies and a duration.
+- Each role's trust policy trusts `rolesanywhere.amazonaws.com`, optionally with conditions on certificate attributes such as the subject.
+## Example
+A server holds a certificate issued by the corporate CA. It runs the AWS signing helper (`aws_signing_helper`), configured as a `credential_process` for the AWS CLI or SDK. The helper signs a request with the private key, Roles Anywhere validates the certificate against the trust anchor, and the server receives temporary credentials, by default valid for one hour.
+W: IAM Roles Anywhere with certificates from a trusted CA: servers prove identity with certificates they already manage and receive short-lived role credentials, so no long-term keys are stored.
+X: A=Cognito user pools for servers: user pools authenticate people using your apps; they are not a mechanism for servers to obtain IAM role credentials.
+B=EC2 metadata over the internet: the instance metadata service is a link-local address (`169.254.169.254`) reachable only from inside an EC2 instance, never from on-premises.
+D=IAM user keys rotated yearly: access keys are long-term credentials by definition, and rotating once a year leaves a long exposure window.
+T: For servers outside AWS, exchange X.509 certificates for temporary credentials with IAM Roles Anywhere instead of issuing IAM user keys.
+
+@ Q003990 explain
+G: ## Protecting the root user
+The root user is the identity created with the account. It has full access, and IAM policies cannot restrict it (SCPs can in member accounts).
+- **Strong sign-in**: enable MFA; phishing-resistant FIDO security keys or passkeys are preferred, and several MFA devices can be registered.
+- **No routine use**: do daily work with IAM Identity Center or roles, and keep root for the few tasks that need it.
+- **No access keys**: root access keys give full programmatic control. Delete any that exist; the IAM credential report shows them.
+- **Monitoring**: alert on root activity, for example an EventBridge rule on CloudTrail events where `userIdentity.type` is `Root`.
+## Example
+In AWS Organizations, centralized root access management can remove root credentials from member accounts entirely, and the management account can run privileged root tasks for a short time when needed.
+W: B=MFA and no daily use: MFA stops password-only takeover, and avoiding routine use limits how often the most powerful credentials are exposed.
+E=Delete root keys and monitor sign-ins: removing keys eliminates long-term programmatic root access, and alerts make any root use visible right away.
+X: A=Share the root password: sharing removes individual accountability and multiplies the chance the credentials leak.
+C=Disable CloudTrail: turning off logging hides misuse; it protects attackers, not the root user.
+D=Root access keys for automation: this creates long-term, unrestricted credentials stored in scripts; automation should use roles with scoped permissions.
+T: Lock the root user down (MFA, no keys, no routine use) and watch every root action, instead of sharing or using it.
+
+@ Q003991 explain
+G: ## Permissions boundaries for delegated role creation
+A **permissions boundary** is a managed policy attached to a user or role that sets the maximum permissions it can have. Effective permissions are the intersection: an action must be allowed by both the identity policy and the boundary.
+## Delegating safely
+Give developers `iam:CreateRole` and `iam:PutRolePolicy` only with a condition that the boundary is attached:
+- `"Condition": {"StringEquals": {"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/AppBoundary"}}`
+- Deny `iam:DeleteRolePermissionsBoundary` and changes to the boundary policy itself, so developers cannot remove or edit the cap.
+## Example
+`AppBoundary` allows only S3, DynamoDB and CloudWatch Logs. A developer creates a role and attaches `AdministratorAccess`. The role can still only use S3, DynamoDB and Logs, because anything outside the boundary is not effective.
+W: Required permissions boundaries: developers can create roles on their own, but every role is capped at the defined maximum, so no one can grant more than allowed or escalate privileges.
+X: A=Monthly security review: a review finds over-privileged roles weeks after they were created and used; it does not prevent anything.
+B=AdministratorAccess for developers: this lets developers grant any permission, including to themselves, which is exactly what must be avoided.
+C=Unlimited inline policies: without a cap, a developer can write a role policy with `*` actions and use it to escalate privileges.
+T: To let teams create roles safely, require a permissions boundary that caps the maximum permissions; reviews and admin rights do not prevent escalation.
+
+@ Q003992 explain
+G: ## How IAM policy evaluation combines policies
+For a request from a principal in a member account, AWS checks every applicable policy type:
+- **Explicit deny first**: if any policy (identity, resource, SCP, RCP, permissions boundary, session policy) has a matching `Deny`, the request is denied.
+- **SCPs as guardrails**: service control policies never grant permissions. They set the maximum for all principals in member accounts, including administrators and the root user of those accounts.
+- **Then allows**: the action must also be allowed by the identity or resource policy and not excluded by any guardrail.
+## Example
+A role has `s3:PutObject` on `*`. The organization attaches an SCP with `"Effect": "Deny", "Action": "s3:PutObject"` to the account. The upload fails with `AccessDenied`. The only way to change the result is to change the SCP. SCPs do not affect the organization's management account.
+W: Denied, explicit deny wins: the SCP deny applies to every principal in the account and overrides the identity policy's allow.
+X: B=Retried until a policy changes: evaluation is deterministic and immediate; AWS returns an access denied error and does not retry the request.
+C=Allowed for administrators: SCPs apply to all IAM users and roles in a member account, including administrators and the member account's root user.
+D=Identity policies take priority: no policy type overrides an explicit deny; an identity policy allow can only take effect when no deny applies.
+T: An explicit deny in an SCP beats any identity policy allow for every principal in the member account.
+
+@ Q003993 explain
+G: ## Attribute-based access control (ABAC)
+With ABAC, permissions are based on matching tags rather than on listing specific resources.
+- **Principal tags**: tags on an IAM role or user, or session tags passed from an identity provider (for example `project=phoenix`).
+- **Resource tags**: tags on the resource, such as an EC2 instance or Secrets Manager secret with `project=phoenix`.
+- A policy compares them with a condition such as `"StringEquals": {"aws:ResourceTag/project": "${aws:PrincipalTag/project}"}`.
+## Example
+One policy is attached to every developer role. A developer tagged `project=phoenix` can stop instances tagged `project=phoenix` but not those tagged `project=atlas`. When a new project starts, you tag new people and resources; no policy changes are needed. Also control who can set tags (with `aws:RequestTag` and `aws:TagKeys`), so users cannot retag resources to gain access.
+W: ABAC with `aws:PrincipalTag` and `aws:ResourceTag`: access follows matching project tags automatically, and one policy scales to any number of projects and resources.
+X: B=Security groups by project tag: security groups filter network traffic by protocol, port and source; they do not authorize API actions and cannot match user tags.
+C=Hand-written ARN lists per user: this can work at first but requires editing policies every time a resource or person changes, and it does not use tags at all.
+D=Public buckets with obscure names: public access means anyone who finds the name can read the data; obscurity is not access control.
+T: Matching principal and resource tags in policy conditions (ABAC) scales access by project; resource lists and network controls do not.
+
+@ Q003994 explain
+G: ## Application authorization with Amazon Verified Permissions
+Many apps hard-code rules such as "managers can approve expenses in their own department". Amazon Verified Permissions moves those rules out of the code.
+- Policies are written in **Cedar**, an open-source policy language, and stored in a **policy store** with a schema that describes entity types like `User` and `Expense`.
+- The application calls the `IsAuthorized` API with the principal, action, resource and context, and gets `ALLOW` or `DENY`.
+## Example
+A Cedar policy: `permit(principal in Role::"manager", action == Action::"approveExpense", resource) when { principal.department == resource.department };`
+When a manager in Sales tries to approve an HR expense, the call returns `DENY`. Changing the rule means updating the policy, not redeploying the app, and decisions can be logged for audit.
+W: Verified Permissions with Cedar: it evaluates fine-grained, attribute-based rules about the app's own users and resources, managed centrally outside the application code.
+X: A=CloudFront geo restrictions: they allow or block viewers by country; they know nothing about departments, roles or expense records.
+B=Network ACLs by department: NACLs filter packets by IP, port and protocol at the subnet level; they cannot read application data such as a department.
+D=IAM policies per end user: IAM governs access to AWS APIs by AWS principals, not business actions on the app's own records, and creating an IAM identity per app user does not scale.
+T: Business rules about who can do what inside your app belong in Verified Permissions (Cedar), not in IAM or network controls.
+
+@ Q003995 explain
+G: ## IAM Access Analyzer external access findings
+IAM Access Analyzer reads resource-based policies and uses automated reasoning to work out who outside a **zone of trust** can reach a resource.
+- The zone of trust is either one account or the whole organization. With the organization, access between member accounts is expected; access from any other account or the public creates a finding.
+- Supported resources include S3 buckets, IAM role trust policies, KMS keys, Lambda functions, SQS queues, Secrets Manager secrets and several others.
+## Example
+A delegated administrator account creates an organization analyzer. It reports that role `VendorAudit` trusts account `999988887777`, which is outside the organization, and that bucket `reports-archive` allows a principal from another company. Each finding can be archived as intended or fixed. Separate analyzers can also find unused access.
+W: Access Analyzer with the organization as zone of trust: it reports exactly the roles and buckets that grant access to principals outside the organization, across all member accounts.
+X: A=Trusted Advisor cost checks: cost optimization checks look for idle or oversized resources; they do not analyze resource policies for external principals.
+B=Inspector findings: Inspector finds software vulnerabilities and network exposure on workloads; it does not evaluate who is granted access by IAM or bucket policies.
+C=AWS Budgets alerts: Budgets tracks spend against thresholds and has no view of permissions.
+T: To find resources shared outside the organization, use IAM Access Analyzer with the organization as the zone of trust.
+
+@ Q003996 explain
+G: ## Right-sizing permissions from real usage
+Least privilege for existing roles means removing what they never use. IAM gives two data sources for that.
+- **Last accessed information**: for a role, user, group or policy, IAM shows when each service was last used, and for a subset of services the individual actions. The tracking period is up to 400 days. A service never used in that time is a strong candidate to remove.
+- **Access Analyzer policy generation**: point it at a CloudTrail trail and a date range (up to 90 days), and it produces a policy template with only the services and actions the role actually called, which you then refine with resource ARNs.
+## Example
+Role `reporting-app` has `AmazonS3FullAccess` and `AmazonDynamoDBFullAccess`. Last accessed data shows DynamoDB was never used, and policy generation shows only `s3:GetObject` and `s3:ListBucket` on one bucket, so the role gets a much smaller policy.
+W: B=Last accessed information: it shows which services and actions a role has not used, so unused permissions can be removed with confidence.
+E=Policy generation from CloudTrail: it builds a starting policy from the actions the role actually called, which replaces broad policies with specific ones.
+X: A=One role shared by all applications: the shared role must hold the union of every app's permissions, so each app gets far more than it needs.
+C=Wildcard actions: `s3:*` or `*` grants every action, including ones never needed, which is the opposite of least privilege.
+D=Temporary AdministratorAccess on all roles: this grants full access to every role, even briefly, which greatly increases risk and does not identify needed permissions.
+T: Least privilege for existing roles is driven by usage data: last accessed information and policy generation from CloudTrail, not broader access.
+
+@ Q003997 explain
+G: ## Role trust policies and external IDs
+Every IAM role has two policies with different jobs.
+- The **permissions policy** says what the role can do once assumed.
+- The **trust policy** says who can assume it. It is the resource policy on the role, evaluated when someone calls `sts:AssumeRole`.
+The **external ID** is a value the caller must pass in the `AssumeRole` request. It protects against the confused deputy problem, where a third party is tricked into using its access to your role on someone else's behalf.
+## Example
+The trust policy of role `AuditRead` in Account A has `"Principal": {"AWS": "arn:aws:iam::222233334444:role/Scanner"}` and `"Condition": {"StringEquals": {"sts:ExternalId": "a1b2c3-tenant-77"}}`. Only the `Scanner` role in Account B, passing that exact external ID, can assume it. Account B must also allow `sts:AssumeRole` on the role in the `Scanner` role's own policy.
+W: The role's trust policy: it names the allowed principal (the specific role in Account B) and requires `sts:ExternalId`, so no other caller, and no call without the ID, can assume the role.
+X: A=Unrelated IAM user's policy: a policy on some other identity only controls that identity; it cannot decide who may assume a role in Account A.
+B=S3 bucket policy: a bucket policy controls requests to that bucket, not calls to AWS STS to assume a role.
+D=Security group: security groups filter network traffic to network interfaces; role assumption is an API call authorized by IAM, not a network flow.
+T: Who can assume a role, and under what conditions such as an external ID, is set in the role's trust policy.
+
+@ Q003998 explain
+G: ## Cross-account access needs two allows
+When a principal in one account accesses a resource in another, AWS evaluates both sides.
+- **Resource side**: the bucket policy in the owning account must allow the external principal.
+- **Identity side**: the caller's own account must also allow the action through the role's identity policy.
+If either side is missing, the request is denied. Within a single account, one of the two is enough; across accounts, both are required.
+## Example
+Account A's bucket `shared-data` allows `s3:GetObject` for `arn:aws:iam::222233334444:role/Analytics`. The `Analytics` role in Account B has no S3 permissions, so `GetObject` fails with `AccessDenied`. Adding `s3:GetObject` on `arn:aws:s3:::shared-data/*` to the role's policy fixes it. If objects use SSE-KMS, the KMS key policy and the role must also allow decryption.
+W: Identity policy on the other account's role: the caller's account must also grant the action, so both the bucket policy and the role's policy allowing it are required for cross-account access.
+X: A=Make the bucket public: public access is not needed for cross-account access and would expose the data to everyone; Block Public Access should stay on.
+B=Use the other account's root user: any principal can be granted cross-account access, and using root is strongly discouraged; the missing piece is the identity policy.
+C=Standard-IA storage class: storage classes change cost and retrieval characteristics only; they have no effect on authorization.
+T: Cross-account access works only when the resource policy and the caller's identity policy both allow the action.
+
+@ Q003999 explain
+G: ## How AWS workloads get temporary credentials
+AWS compute services can hand an IAM role's short-lived credentials to your code, so no secret is stored in the application.
+- **EC2 instance profile**: a container for a role attached to an instance. The SDK reads credentials from the instance metadata service (preferably IMDSv2). AWS rotates them automatically before they expire.
+- **Lambda execution role**: Lambda assumes the role for each execution environment and provides the credentials to the function through environment variables such as `AWS_ACCESS_KEY_ID` and `AWS_SESSION_TOKEN`.
+- Similar mechanisms exist for ECS task roles and EKS Pod Identity.
+## Example
+A function writing to DynamoDB has an execution role allowing `dynamodb:PutItem` on one table. The code just creates an SDK client; the SDK finds the temporary credentials automatically. If they leak, they expire, typically within hours.
+W: B=Lambda execution roles: Lambda supplies the role's temporary credentials to the function automatically, with no stored keys.
+E=EC2 instance profiles: the instance obtains automatically rotated temporary credentials for the role from the metadata service.
+X: A=Root user access keys: these are long-term, unrestricted credentials that should not exist at all.
+C=Hard-coded API keys: keys in source code are static, long-term secrets that leak through repositories and builds.
+D=IAM user access keys: user access keys stay valid until someone rotates or deletes them, so they are long-term, not temporary.
+T: Workloads get temporary credentials from roles (instance profiles, execution roles); any access key that is stored is long-term.
+
+@ Q004000 explain
+G: ## The aws:PrincipalOrgID condition key
+`aws:PrincipalOrgID` holds the AWS Organizations ID (such as `o-a1b2c3d4e5`) of the account the calling principal belongs to. In a resource policy, it lets you allow or deny all principals of your organization without listing account IDs.
+## Example
+A bucket policy statement with `"Effect": "Deny"`, `"Principal": "*"`, `"Action": "s3:*"` and `"Condition": {"StringNotEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}}` denies every request from principals outside the organization. When accounts join or leave the organization, the policy is still correct with no edits.
+- Principals inside the organization still need an allow from their own identity policy or from the bucket policy.
+- AWS service principals do not belong to your organization, so a broad deny like this may need an exception (for example with `aws:PrincipalIsAWSService`) for services that write to the bucket.
+W: `aws:PrincipalOrgID` in the bucket policy: it ties access to membership in the organization, so only principals from the company's accounts can reach the bucket, and it stays correct as accounts change.
+X: B=`s3:x-amz-acl` public-read: this relates to granting public read through ACLs, which opens the bucket to everyone instead of restricting it.
+C=`aws:SourceIp` with home IPs: IP addresses change and do not identify the caller's organization; this is brittle and still lets anyone on those networks in.
+D=`aws:RequestedRegion`: this restricts which Region a request targets, not which organization the caller belongs to.
+T: To limit a resource to your organization's principals, use `aws:PrincipalOrgID`, not IP, Region or ACL conditions.
+
+@ Q004001 explain
+G: ## Just-in-time (temporary elevated) access
+Standing admin rights in production are risky: credentials that always work can always be misused. Just-in-time access grants elevation only when requested, approved and for a limited time.
+- IAM Identity Center provides the base: permission sets such as `ProdAdmin`, and account assignments that give short-lived credentials.
+- AWS documents temporary elevated access for Identity Center through validated partner solutions and the AWS open-source TEAM solution (Temporary Elevated Access Management). They create an assignment after approval and remove it automatically when the time window ends.
+## Example
+An engineer requests `ProdAdmin` for account `prod-payments` for two hours with a ticket number. A lead approves, the assignment is created, and the engineer signs in through the access portal. After two hours the assignment is removed, and CloudTrail plus the request record give a complete audit trail.
+W: Just-in-time access through IAM Identity Center: elevation requires a request and approval, is tied to the individual, and expires automatically, so nobody keeps standing production admin rights.
+X: A=Shared break-glass password in chat: the password is exposed to everyone in the channel, has no approval or expiry, and actions cannot be traced to a person.
+B=Permanent admin for every engineer: standing access violates least privilege and means any compromised engineer account is a production admin.
+D=IAM users deleted when remembered: creating long-term users by hand has no approval step, and relying on memory for removal leaves stale privileged accounts.
+T: Temporary production access should be requested, approved and automatically expiring (just-in-time via Identity Center), never shared or permanent.
+
+@ Q004002 explain
+G: ## Enforcing encryption in transit for S3
+S3 endpoints accept both HTTPS and plain HTTP. To require TLS, deny insecure requests in the bucket policy using the global condition key `aws:SecureTransport`, which is `true` when the request used TLS.
+## Example
+A statement with `"Effect": "Deny"`, `"Principal": "*"`, `"Action": "s3:*"`, resources `arn:aws:s3:::finance-data` and `arn:aws:s3:::finance-data/*`, and `"Condition": {"Bool": {"aws:SecureTransport": "false"}}`. Any HTTP request is rejected, even from principals otherwise allowed, because an explicit deny wins.
+- The `s3:TlsVersion` condition key can additionally require a minimum TLS version.
+- Encryption at rest is separate: since January 2023, S3 applies SSE-S3 to all new objects by default, but that does not protect data on the network.
+W: Deny when `aws:SecureTransport` is false: the bucket policy rejects every request that does not use TLS, which enforces encryption in transit for all clients.
+X: A=Transfer Acceleration: it routes uploads through edge locations for speed; it does not reject clients that connect without TLS.
+B=Default SSE-S3 encryption: this encrypts objects at rest after they arrive; it does not control whether the connection itself uses TLS.
+C=Versioning with MFA Delete: this protects against overwrites and deletions; it has nothing to do with how clients connect.
+T: TLS to S3 is enforced with a bucket policy deny on `aws:SecureTransport` = false; at-rest encryption does not cover data in transit.
+
+@ Q004003 explain
+G: ## Private certificates with AWS Private CA and ACM
+Internal services often need TLS certificates that browsers do not need to trust publicly, only your own clients do.
+- **AWS Private CA** hosts a managed private certificate hierarchy: a root CA and subordinate CAs whose keys are protected by AWS.
+- **AWS Certificate Manager (ACM)** can request private certificates from that CA (by passing the CA ARN), and it renews the private certificates it issued before they expire.
+- Clients trust the private root CA certificate, which you distribute to them.
+## Example
+The team creates root and subordinate CAs in Private CA. Services behind an internal Application Load Balancer use ACM private certificates for `orders.internal.example.com`, and ACM renews them automatically. For workloads that are not integrated with ACM, such as containers, certificates can be exported or issued from Private CA directly, and an EventBridge event on renewal can trigger redeployment.
+W: A=ACM for issuing and renewing: ACM requests private certificates from the CA and manages automated renewal, removing manual certificate handling.
+E=AWS Private Certificate Authority: it provides the managed private CA hierarchy that signs internal certificates.
+X: B=Self-signed certificates copied manually: every service has its own untrusted certificate, there is no common hierarchy, and expiry depends on people remembering to replace them.
+C=KMS keys as certificates: a KMS key is a cryptographic key, not an X.509 certificate with a name, validity and CA signature, so TLS clients cannot use it as one.
+D=DNSSEC key signing keys: these sign DNS zone data so resolvers can verify answers; they do not issue TLS certificates for services.
+T: Internal TLS from a private hierarchy with automatic renewal is AWS Private CA plus ACM, not self-signed certificates or unrelated keys.

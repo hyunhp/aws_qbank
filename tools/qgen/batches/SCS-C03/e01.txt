@@ -1,0 +1,351 @@
+# SCS-C03 detailed explanations e01 (explanation-only rewrites; letters are the published ones)
+
+@ Q001771 explain
+G: ## How GuardDuty findings reach other tools
+GuardDuty publishes every new finding (and updates to existing ones) as an event to Amazon EventBridge with source `aws.guardduty`. With a delegated administrator in AWS Organizations, findings from all member accounts also arrive in the administrator account, so one set of rules can cover 30 accounts.
+## Severity as a number
+Each finding has a numeric `detail.severity`: Low is 1.0-3.9, Medium 4.0-6.9, High 7.0-8.9 and Critical 9.0-10.0. EventBridge event patterns support **numeric matching**, for example:
+- `"severity": [{"numeric": [">=", 7]}]` sends High and Critical findings to an SNS topic that pages on-call.
+- `"severity": [{"numeric": ["<", 7]}]` in a second rule sends the rest to a ticketing target such as an SQS queue or a Lambda function that opens tickets.
+Both rules see the same event stream; only the target changes.
+W: EventBridge severity routing: two rules with numeric filters on `detail.severity` split one finding stream into an immediate paging path and a ticket path, centrally and without custom polling.
+X: B=Metric filter on a console log: GuardDuty does not write findings to a "console log" in CloudWatch Logs, so there is nothing for a metric filter to match.
+C=Generate only severe findings: GuardDuty has no setting to stop producing lower-severity findings, and the requirement still needs those findings to reach a ticket queue, so dropping them would break half the design.
+D=Security Hub built-in paging: Security Hub has no native on-call paging feature; it also relies on EventBridge rules (or integrations) to notify people.
+T: Route GuardDuty findings by severity with EventBridge numeric filters, not by trying to change what GuardDuty generates.
+
+@ Q001772 explain
+G: ## Where CloudTrail events can go
+A trail always delivers log files to an S3 bucket. Sending events to CloudWatch Logs is a **separate, optional** setting on the trail: you name a log group and an IAM role that CloudTrail uses to write to it.
+## How a metric filter works
+A CloudWatch Logs metric filter watches one log group. For every new log event in that group that matches the pattern (for example `{ $.userIdentity.type = "Root" && $.userIdentity.invokedBy NOT EXISTS }`), it adds to a custom metric; an alarm then watches the metric.
+- If no events are ingested into the log group, the filter has nothing to evaluate.
+- The CIS root-usage control therefore depends on the trail -> CloudWatch Logs integration, not just on a working trail.
+Here the trail is confirmed to deliver to S3 only, which is the classic gap.
+W: Trail not delivering to the log group: without CloudTrail's CloudWatch Logs integration pointed at that log group, the root login never appears there, so the filter never matches and the alarm cannot fire.
+X: A=Default value 0: the default value only fills periods with no matches; it does not stop a real match from publishing 1 and breaching the alarm.
+B=GuardDuty prerequisite: metric filters are a CloudWatch Logs feature that works on any log group; GuardDuty is an independent service and plays no part.
+C=Invalid pattern syntax: CloudWatch Logs validates filter patterns when the filter is created, and the stem's clue is that logging was verified only in S3, pointing to missing delivery rather than a pattern error.
+T: A metric filter can only see what reaches its log group; confirm the trail sends events to CloudWatch Logs, not only to S3.
+
+@ Q001773 explain
+G: ## Security Hub is a Regional service
+(Since December 2025 the original service is named AWS Security Hub CSPM; the features here are described as they work there.) Security Hub findings live in the Region where they were produced. With six Regions, an analyst would otherwise need to switch the console six times.
+## Cross-Region aggregation
+You pick one **aggregation Region** (home Region) and link the other Regions to it. Security Hub then replicates findings, finding updates, insights, control compliance status and security scores from linked Regions into the aggregation Region continuously.
+- The aggregation Region's console shows findings from all linked Regions, with the Region as a filterable field.
+- Updates made in the aggregation Region (for example workflow status) sync back to the source Region.
+- Combined with a delegated administrator, one view can cover many accounts and Regions.
+Example: link `eu-west-1`, `ap-northeast-2` and four others to `us-east-1`, and analysts work only in `us-east-1`.
+W: Cross-Region aggregation: a built-in, managed feature that keeps one Region's view current with no code, schedules or exports to maintain.
+X: A=Daily manual review: analysts still switch Regions every day, which is exactly the effort the company wants to remove, and it is slow and error-prone.
+B=Lambda forwarders with SNS: you would write, deploy and monitor code in six Regions and handle paging, failures and duplicates yourself, replicating a feature Security Hub already provides.
+D=S3 export plus QuickSight: requires building export jobs, data pipelines and dashboards and keeping them working, which is far more ongoing effort than turning on aggregation.
+T: For one multi-Region Security Hub view, enable cross-Region aggregation instead of building forwarders or exports.
+
+@ Q001774 explain
+G: ## Security Hub insights
+An **insight** (a Security Hub CSPM feature; the original service, formerly just called Security Hub) is a saved query over findings: a set of filters plus a **group by** attribute. Security Hub shows the result as grouped counts that update automatically as findings change.
+- **Managed insights** come predefined, such as resources with the most findings.
+- **Custom insights** are ones you define.
+Example custom insight:
+- Filters: `SeverityLabel` = `HIGH` (or higher), `ComplianceStatus` = `FAILED`, `RecordState` = `ACTIVE`.
+- Group by: `ResourceId`.
+The result ranks resources by how many matching findings each has, so the top 10 are the most affected resources. From a delegated administrator account, the insight covers findings from member accounts too.
+W: Custom insight grouped by resource ID: it is exactly a saved, auto-updating grouped view of filtered findings, which is what a "top resources" dashboard needs.
+X: A=Security standard: a standard runs controls and produces findings; it does not rank resources or group findings into a dashboard view.
+B=Automation rule: automation rules change fields on findings as they arrive (for example suppress or raise severity); they do not report or aggregate anything.
+D=Custom action: a custom action sends findings an analyst selects to EventBridge for processing; it is a trigger, not a view.
+T: "Group findings by an attribute and keep it current" is a Security Hub insight; actions and automation rules act on findings instead.
+
+@ Q001775 explain
+G: ## From finding to Slack
+GuardDuty emits every finding to EventBridge. An EventBridge rule with a pattern on `source` = `aws.guardduty` and numeric matching on `detail.severity` (`">=", 7`) picks only High and Critical findings.
+The rule's target is an SNS topic. AWS Chatbot (renamed Amazon Q Developer in chat applications in 2025) subscribes to that topic and posts each message into the configured Slack channel.
+## What happens to lower findings
+Nothing extra is needed for them. When the GuardDuty integration with Security Hub is enabled, all GuardDuty findings flow into Security Hub anyway, where the team reviews them periodically.
+- High and Critical (7.0 and above): EventBridge -> SNS -> Slack.
+- Everything: GuardDuty -> Security Hub for review.
+W: EventBridge severity filter to SNS and Chatbot: one rule selects only the severity range that matters and hands it to the managed Slack integration, with no code.
+X: B=Generate only high findings: GuardDuty has no switch to suppress generation below a severity, and the requirement explicitly keeps lower findings for review in Security Hub.
+C=Metric filter on a console audit log: GuardDuty findings are not written to a console audit log in CloudWatch Logs, so the metric filter has no data to watch.
+D=Security Hub default notifications: Security Hub has no built-in severity-threshold Slack notification; notifying Slack still requires an EventBridge rule or another integration.
+T: Filter by severity in an EventBridge rule and send it to SNS for Slack; let everything else flow into Security Hub.
+
+@ Q001777 explain
+G: ## What Malware Protection for EC2 does
+GuardDuty Malware Protection for EC2 scans the EBS volumes attached to EC2 instances (and to container workloads) for malware, without installing an agent.
+## GuardDuty-initiated scans
+When enabled, GuardDuty automatically starts a scan when it produces certain findings that suggest malware on an instance, for example backdoor or trojan finding types.
+- GuardDuty takes EBS snapshots of the attached volumes and scans copies in a GuardDuty service account, so the instance's performance is not affected.
+- Detected malware produces its own findings linked to the original one.
+- Snapshots can optionally be retained when malware is found, which helps forensics.
+- On-demand scans are also available for ad hoc checks.
+This matches the requirement: a scan starts on specific finding types with no manual step.
+W: Malware Protection for EC2: its GuardDuty-initiated scans automatically scan the instance's EBS volumes whenever suspicious findings appear.
+X: B=S3 Protection: it analyzes S3 data plane activity in CloudTrail for suspicious access patterns; it does not inspect EC2 disks.
+C=Inspector network reachability: this analyzes which ports and paths are reachable from networks; it looks at configuration, not file contents, and it is not triggered by GuardDuty findings.
+D=RDS Protection: it analyzes login activity on supported Amazon Aurora and RDS databases for anomalous access; it has nothing to do with EC2 volumes.
+T: Automatic malware scans of an EC2 instance's volumes after a suspicious finding come from GuardDuty Malware Protection for EC2.
+
+@ Q001778 explain
+G: ## Separate services, separate findings
+GuardDuty (threat detection), Macie (sensitive data in S3) and Inspector (vulnerabilities) each generate findings on their own, in their own console, format and severity scale.
+## What Security Hub adds
+Security Hub collects findings from these and other sources into one place and normalizes them into a common format (the AWS Security Finding Format in Security Hub CSPM; the newer Security Hub launched in December 2025 uses OCSF), so fields such as resource, severity and account mean the same thing across services.
+- Analysts can filter and group all findings together, for example "everything about instance `i-0abc...`".
+- Patterns that span services become visible, such as an Inspector critical vulnerability on the same instance GuardDuty says is talking to a malicious IP.
+Checking consoles one by one still works, but each analyst must mentally correlate across tools.
+W: No single normalized view: without Security Hub, findings stay in separate formats and consoles, so analysts work slower and cross-service connections are easier to miss.
+X: A=No findings without Security Hub: GuardDuty, Macie and Inspector produce findings independently; Security Hub only collects them.
+C=No IAM support in the consoles: every one of these services is controlled with IAM policies, just like Security Hub.
+D=24-hour history: GuardDuty keeps findings for 90 days, and Security Hub also removes findings after a retention period, so neither statement is correct.
+T: The cost of skipping Security Hub is correlation: separate consoles make cross-service patterns harder to see, not findings disappear.
+
+@ Q001779 explain
+G: ## Sparse metrics and alarm states
+A CloudWatch alarm has three states: `OK`, `ALARM` and `INSUFFICIENT_DATA`. The Lambda function here publishes `GuardDutyHighSeverityCount` only when a finding occurs, so most 5-minute periods have **no data points at all**.
+## Treat missing data
+Each alarm has a `TreatMissingData` setting:
+- `missing` (default): no data -> `INSUFFICIENT_DATA`.
+- `notBreaching`: no data counts as within the threshold -> `OK`.
+- `breaching`: no data counts as breaching -> `ALARM`.
+- `ignore`: keep the current state.
+For an event-count metric, "no data" really means "zero findings", so `notBreaching` shows the true state. A real finding still publishes 1, which meets the threshold of 1 and moves the alarm to `ALARM`. (Publishing an explicit 0 each period also works, but costs extra calls.)
+W: Treat missing data as notBreaching: quiet periods display as `OK`, and any real data point of 1 still triggers the alarm, so detection is unchanged.
+X: A=Change the unit to None: the unit is only a label on data points; it does not create data for empty periods, so the alarm stays in `INSUFFICIENT_DATA`.
+B=Delete the alarm: removes automated alerting for high-severity findings and makes detection depend on someone looking at a console.
+C=Raise the threshold to 2: a single high-severity finding would no longer alarm, weakening detection, and empty periods would still show `INSUFFICIENT_DATA`.
+T: For metrics that exist only when something happens, set missing-data handling to notBreaching instead of changing thresholds.
+
+@ Q001780 explain
+G: ## Composite alarms
+A CloudWatch **composite alarm** watches the states of other alarms instead of a metric. Its rule expression combines them with `AND`, `OR` and `NOT`, for example:
+`ALARM("UnauthorizedApiCalls") AND ALARM("RootAccountUsage")`
+## Reducing alert noise
+- Put the paging action (such as an SNS topic) on the composite alarm only.
+- Leave the child alarms without paging actions. They keep evaluating, keep their own state history and remain visible on dashboards.
+- The composite alarm goes to `ALARM` once when both children are in `ALARM`, so on-call gets one page instead of two for the same incident.
+Composite alarms can also suppress actions during a known condition, such as a maintenance window.
+W: Composite alarm with AND logic: it pages once when both alarms are firing together, while each child alarm still records its own history for later review.
+X: B=Merged Logs Insights query: a saved query is for interactive analysis, and merging the filters would remove the two separate alarms whose history the team wants to keep.
+C=Anomaly detection bands: they replace a static threshold with a learned band for one metric; they do not combine two alarms or reduce duplicate pages.
+D=One-minute evaluation periods: shorter periods make each alarm react faster and potentially flap more, which increases paging rather than merging it.
+T: To page once for correlated alarms while keeping each one, use a composite alarm and put actions only on it.
+
+@ Q001781 explain
+G: ## Management events versus data events
+CloudTrail splits API activity into two kinds:
+- **Management events** (control plane): operations that configure resources, such as `PutBucketPolicy`, `CreateBucket` or `RunInstances`. Trails log them by default, and event history keeps the last 90 days.
+- **Data events** (data plane): operations on the data inside a resource, such as S3 `GetObject` and `PutObject` or DynamoDB item reads. They are high volume, are **not** logged by default and are billed separately.
+## Enabling S3 data events
+Add data events to the trail, preferably with **advanced event selectors** to limit cost, for example `resources.type` = `AWS::S3::Object` and `resources.ARN` starting with `arn:aws:s3:::sensitive-bucket/`.
+In this incident, the bucket policy change was a management event (visible) while downloads were data events (never recorded).
+W: Object reads are data events: `GetObject` is only recorded when S3 data events are enabled on the trail, ideally scoped with advanced event selectors.
+X: A=Management events expiring after 24 hours: downloads are data events, not management events, and management events are kept 90 days in event history and as long as you keep them in a trail's bucket.
+B=Logged only with Versioning: S3 Versioning keeps object versions; it has no effect on what CloudTrail records.
+C=CloudTrail never logs S3: CloudTrail logs S3 object operations as data events; VPC Flow Logs show IPs and ports, not who called `GetObject`.
+T: Configuration changes are management events (logged by default); object reads and writes are data events you must enable.
+
+@ Q001782 explain
+G: ## Why data events need scoping
+S3 data events record every object-level call such as `GetObject` and `PutObject`. They are billed per event, so on high-volume buckets they can become expensive quickly.
+## Advanced event selectors
+Advanced event selectors let a trail (or CloudTrail Lake event data store) record only the data events you choose, using fields such as:
+- `eventCategory` = `Data`
+- `resources.type` = `AWS::S3::Object`
+- `resources.ARN` StartsWith `arn:aws:s3:::regulated-bucket-1/` (one entry per bucket)
+- optionally `readOnly` or `eventName` to narrow further.
+Example: with 200 buckets and only 5 regulated, selectors for those 5 capture full forensic detail there while the other 195 buckets generate no data-event charges.
+W: Advanced event selectors for the 5 buckets: they give object-level forensic visibility exactly where it is needed and avoid paying for events from the high-volume, non-sensitive buckets.
+X: A=Management events only: management events do not include `GetObject` or `PutObject`, so the required object-level visibility would be missing.
+B=Data events for all buckets: meets visibility but logs and bills every object call across all 200 high-volume buckets, which is the cost the company wants to avoid.
+D=Data events in one Region: the choice is based on volume, not sensitivity, so regulated buckets in other Regions go unlogged while non-sensitive traffic in that Region is still billed.
+T: Scope S3 data events to the sensitive buckets with advanced event selectors instead of all-or-nothing logging.
+
+@ Q001783 explain
+G: ## Reading the record
+Source `203.0.113.5` port `443` to `10.0.1.20` port `51000` is an HTTPS server answering a connection the instance started: the instance used ephemeral port 51000 for its outbound request. This is **return traffic**.
+## Stateful versus stateless filtering
+- **Security groups** are stateful: if outbound traffic was allowed, the response is allowed automatically, whatever the inbound rules say.
+- **Network ACLs** are stateless: return traffic is evaluated against the subnet's inbound NACL rules like any new packet. If there is no inbound rule allowing TCP `1024-65535` from that source, the response is rejected.
+## What flow logs tell you
+The `action` field is only `ACCEPT` or `REJECT`; it does not say whether a security group or a NACL made the decision. With the security group clearly allowing this traffic, the next check is the subnet's inbound NACL rules for ephemeral ports.
+W: Likely the NACL: return traffic that a stateful security group would allow can still be dropped by a stateless NACL without an inbound ephemeral-port rule, and flow logs do not identify which layer rejected it.
+X: A=Stateless security group: security groups are always stateful and cannot be switched to stateless, so they do not block responses to allowed outbound traffic.
+B=Logging error: a flow log records `REJECT` whenever either layer drops traffic; a security group allowing it does not stop a NACL from rejecting it.
+D=Shield Advanced blocked it: Shield Advanced mitigates DDoS attacks against protected resources; a `REJECT` in a VPC flow log reflects security group or NACL decisions, and a single HTTPS response is not a DDoS event.
+T: REJECT on return traffic with a permissive security group points to a stateless NACL missing an inbound ephemeral-port rule.
+
+@ Q001784 explain
+G: ## What flow logs do not capture
+VPC Flow Logs record IP traffic through network interfaces, but some traffic is always excluded. Examples:
+- Traffic to and from the **Amazon-provided DNS server** (the VPC base CIDR plus two, such as `10.0.0.2`, or `169.254.169.253`).
+- Instance metadata traffic to `169.254.169.254` and Amazon Time Sync traffic.
+- DHCP traffic.
+If an instance uses your own DNS server instead, that traffic is logged like any other.
+## Getting DNS visibility
+**Route 53 Resolver query logging** records DNS queries made from resources in a VPC: the query name, type, response code, answers and the source instance. Logs can go to CloudWatch Logs, S3 or Data Firehose. This is the right source for questions such as "which instance looked up this suspicious domain?".
+W: Flow logs exclude Amazon DNS traffic: queries to the Amazon-provided resolver never appear in flow logs, so DNS investigations use Route 53 Resolver query logging.
+X: A=DNS traffic type: the traffic type setting accepts only `ACCEPT`, `REJECT` or `ALL`; there is no DNS option, and `ALL` already includes everything that flow logs can capture.
+C=UDP missed by the interval: flow logs record UDP flows normally, and the aggregation interval only groups packets into records; it does not drop them.
+D=S3-only delivery: the destination (CloudWatch Logs, S3 or Firehose) changes where records are stored, not which traffic is captured.
+T: Traffic to the Amazon-provided DNS resolver is never in flow logs; use Resolver query logging for DNS visibility.
+
+@ Q001785 explain
+G: ## What each log records
+- **CloudTrail S3 data events** record object-level API calls such as `PutObject`. Each event has a `userIdentity` block (principal type, ARN, access key, and for temporary credentials the `sessionContext` with the role session and `mfaAuthenticated`), plus `sourceIPAddress`, `userAgent`, `eventTime` and request parameters such as the bucket and key.
+- **S3 server access logs** record requests with requester, IP and operation, but no session context or MFA status, and delivery is best effort.
+- **VPC Flow Logs** record IPs, ports and bytes, not API calls or identities.
+- **AWS Config** records configuration of resources such as the bucket itself, not individual object writes.
+Example question: "who uploaded `reports/q3.csv`, from where, with MFA?" -> filter CloudTrail data events on `eventName` = `PutObject` and that key.
+W: CloudTrail S3 data events: they are the only source here that records the principal, the source IP and the session's MFA status for each `PutObject` call.
+X: A=VPC Flow Logs: flow logs capture network metadata only and cannot show which IAM principal made an API call or whether MFA was used.
+C=S3 server access logs: they show requester and IP, but they do not include session context or MFA status, and AWS delivers them on a best-effort basis.
+D=AWS Config history: Config tracks bucket-level configuration such as policies and settings; it does not record individual object uploads.
+T: To answer who wrote an object, from where and with what session, use CloudTrail S3 data events.
+
+@ Q001786 explain
+G: ## Two ways Macie finds sensitive data
+- **Automated sensitive data discovery** samples objects across the account's buckets every day to build a broad picture of where sensitive data might be. It is sampling for coverage, not a guaranteed full scan of chosen buckets.
+- **Sensitive data discovery jobs** analyze the buckets you choose. A job is either **one-time** or **scheduled** (daily, weekly or monthly).
+## Scoping and incremental runs
+A job can select buckets with explicit names or with **bucket criteria** such as a tag, for example `Classification` = `Confidential`. Criteria are re-evaluated on each run, so newly tagged buckets are included automatically.
+A scheduled job analyzes, on each run, only the objects created or changed since the previous run; you can choose whether the first run includes existing objects.
+W: Recurring tag-scoped job: a scheduled job with a tag-based bucket criterion keeps rescanning exactly the confidential buckets and picks up new or changed objects each run.
+X: A=GuardDuty finding filter: GuardDuty S3 Protection looks for suspicious access to S3, and its filters only sort GuardDuty findings; neither inspects object contents for PII.
+B=One-time job: a tag-scoped one-time job scans once and stops, so objects added later are never analyzed without creating new jobs.
+D=Automated discovery: it samples across the account rather than fully rescanning chosen buckets, and buckets can be excluded from it, so the description is inaccurate and it does not give a tag-targeted periodic scan.
+T: Periodic, targeted Macie scans are scheduled jobs scoped by bucket criteria; automated discovery is broad sampling.
+
+@ Q001787 explain
+G: ## What Macie is
+Amazon Macie discovers and classifies sensitive data (such as PII and credentials) in Amazon S3 and reports on bucket security posture. It is a **detection and reporting** service: it reads objects and produces findings; it does not change buckets or objects.
+## Two discovery modes
+- **Automated sensitive data discovery**: once enabled, Macie samples representative objects across buckets daily, with no job to define, and shows sensitivity scores per bucket.
+- **Sensitive data discovery jobs**: one-time or scheduled (daily, weekly, monthly), with bucket scope set by names or by criteria such as tags.
+## Acting on findings
+Macie publishes findings to EventBridge and Security Hub. Remediation, such as enabling Block Public Access, is built separately, for example with an EventBridge rule and a Lambda function.
+W: B=Automated discovery samples account-wide: it runs continuously across the account's buckets without the user defining a job or scope.
+E=Scheduled, scoped jobs: discovery jobs can run on a recurring schedule and target buckets by name or by criteria such as tags.
+X: A=Only objects under 1 KB: Macie analyzes files far larger than 1 KB; its size limits depend on file type and are much larger than that.
+C=Automatic public-bucket remediation: Macie reports that a bucket is public through policy findings but does not apply Block Public Access itself; remediation must be automated separately.
+D=Encrypts objects while scanning: Macie only reads objects (it needs decrypt permission for KMS-encrypted ones); encryption at rest is configured in S3 and KMS, not by Macie.
+T: Macie discovers and classifies sensitive data through sampling or scheduled jobs; it never fixes or encrypts anything itself.
+
+@ Q001788 explain
+G: ## Configuration items and the resource timeline
+When AWS Config records a resource type, it saves a **configuration item** each time the resource changes: the full configuration, relationships and capture time.
+The **resource timeline** in the Config console lists these items in order for one resource, for example security group `sg-0abc...`.
+- Each entry shows what changed compared with the previous item, such as a new inbound rule `22/tcp` from `0.0.0.0/0`.
+- The timeline also shows compliance changes from Config rules.
+- It links to the related **CloudTrail events**, such as `AuthorizeSecurityGroupIngress`, where `userIdentity` shows which principal made the call and when.
+This answers "when", "what was it before" and "who" in one place.
+W: Resource timeline linked to CloudTrail: it shows each configuration change with the previous state and connects it to the CloudTrail event that identifies the caller.
+X: A=Proactive evaluation mode: proactive rules evaluate resource definitions before deployment; they do not show history of an existing resource.
+B=Conformance packs: a conformance pack deploys a collection of rules and remediations as one unit; it reports compliance, not the change history of one security group.
+C=Aggregators: aggregators collect Config data from multiple accounts and Regions into one view; the question is about a single resource's change detail, which the timeline provides.
+T: To see when a resource changed, what it looked like before and who did it, use the Config resource timeline with its CloudTrail links.
+
+@ Q001789 explain
+G: ## Config data is per account and Region
+AWS Config records resources and evaluates rules separately in every account and Region. Viewing 50 accounts x 3 Regions one by one would mean 150 console views.
+## Aggregators
+A Config **aggregator** in a central account collects configuration and compliance data from many source accounts and Regions.
+- With an **Organizations source**, the aggregator automatically includes all accounts in the organization, including new ones, without individual authorizations. It must be created in the management account or a delegated administrator account for Config.
+- It shows rule compliance, conformance pack status and resource inventory, and supports advanced queries across the aggregated data.
+Example: from the security account, list every noncompliant `AWS::EC2::SecurityGroup` across all accounts and Regions.
+W: Config aggregator with an Organizations source: it pulls compliance and configuration data from all member accounts and Regions into one account with no role switching.
+X: A=CloudTrail Lake federated queries: CloudTrail Lake analyzes event data, and federation only makes it queryable from Athena; it is not a built-in Config compliance view across accounts.
+B=Rules in the central account: Config rules evaluate resources only in the account and Region where they run, so they cannot see member accounts' resources.
+C=Security Hub native aggregation: Security Hub shows results of its own controls, which use Config, but it does not replace an aggregator for general Config compliance and resource configuration data.
+T: A multi-account, multi-Region Config view comes from an aggregator, ideally with an Organizations source.
+
+@ Q001790 explain
+G: ## What CloudTrail Insights does
+CloudTrail Insights analyzes the **management events** a trail or event data store records (and, on trails only, data events if you enable data events Insights) and learns a baseline of normal activity. When activity deviates significantly from it, Insights generates an **Insights event**.
+- Types: unusual **API call rate** (for example a burst of `DeleteBucket` or `RunInstances` calls) and unusual **API error rate** (for example a spike of `AccessDenied`).
+- No thresholds to set: Insights learns the baseline itself.
+## Where Insights events go
+On a trail, Insights events are written to the same S3 bucket (under a separate prefix) and to CloudWatch Logs if configured, and they are sent to EventBridge, so a rule can notify or start automation when an anomaly appears.
+Insights is billed per event analyzed. Management events Insights works on its own; data events Insights is an optional addition, so data events are never a prerequisite.
+W: A=Delivered like other trail events: Insights events land in the trail's destinations and are emitted to EventBridge, where rules can react.
+D=Baselines management activity: Insights learns normal API call and error rates for management events (and optionally data events on trails) and flags significant deviations.
+X: B=Analyzes VPC Flow Logs: Insights looks only at CloudTrail API activity; network traffic anomalies are a job for services such as GuardDuty.
+C=Manual numeric thresholds: Insights needs no per-API thresholds because it builds the baseline automatically.
+E=Requires S3 data events: management events Insights runs without any data events; data events Insights is optional and only analyzes data events you choose to log.
+T: CloudTrail Insights automatically baselines API activity (management events, optionally data events) and sends anomalies to the trail's destinations and EventBridge.
+
+@ Q001791 explain
+G: ## Why the bucket policy matters
+CloudTrail writes log files as the service principal `cloudtrail.amazonaws.com`, so the destination bucket's policy must allow it. When the console wizard creates the bucket, it adds this policy automatically; a manually created bucket has none.
+## The required statements
+- `s3:GetBucketAcl` on `arn:aws:s3:::my-trail-bucket`, so CloudTrail can check the bucket.
+- `s3:PutObject` on `arn:aws:s3:::my-trail-bucket/AWSLogs/111122223333/*` (including any prefix), usually with condition `s3:x-amz-acl` = `bucket-owner-full-control`.
+- A condition such as `aws:SourceArn` = the trail ARN is recommended to prevent the confused-deputy problem.
+Without these, CloudTrail reports delivery errors such as Access Denied and no files appear.
+W: Bucket policy missing CloudTrail permissions: a manually created bucket lacks the `GetBucketAcl` and `PutObject` grants for `cloudtrail.amazonaws.com`, which matches the Access Denied errors and empty bucket.
+X: A=Invalid prefix character: CloudTrail validates the prefix when the trail is created, and an invalid prefix is not the typical cause of Access Denied on a manually built bucket.
+C=Disabled KMS key: this only applies if the trail uses SSE-KMS with that key, which the stem does not mention; the clue points to the manually created bucket's policy.
+D=CLI trails cannot use manual buckets: any trail, however created, can deliver to any bucket whose policy grants CloudTrail access.
+T: A trail delivering to a hand-made bucket needs a bucket policy granting CloudTrail GetBucketAcl and PutObject.
+
+@ Q001792 explain
+G: ## How CloudTrail notifications work
+A trail can publish a message to an SNS topic each time it delivers a log file to S3. Publishing is done by the service principal `cloudtrail.amazonaws.com`, so the **topic's access policy** must allow it, for example:
+- `Action`: `SNS:Publish`
+- `Principal`: `{"Service": "cloudtrail.amazonaws.com"}`
+- Condition `aws:SourceArn` = the trail ARN (recommended)
+If someone edits or replaces the topic policy and drops this statement, CloudTrail can no longer publish, while log delivery to S3 is unaffected, which matches the symptom exactly.
+## Related checks
+- If the topic uses SSE with a customer managed KMS key, the key policy must also let CloudTrail use it.
+- Confirm the subscriptions are still confirmed.
+W: Topic policy no longer allows CloudTrail: logs still reach S3, so only the SNS publish step is failing, and a missing `SNS:Publish` permission for CloudTrail is the first thing to check.
+X: A=Bucket encryption change: log files are still being delivered to S3, so the S3 side is working; bucket encryption does not affect SNS publishing.
+B=Multi-Region setting: it controls which Regions' events the trail records, not whether a delivery notification is published.
+D=Insights enabled: Insights adds anomaly detection events; turning it on or off does not stop log file notifications.
+T: When logs arrive but notifications stop, check that the SNS topic policy still lets CloudTrail publish.
+
+@ Q001793 explain
+G: ## Suppression rules
+A GuardDuty **suppression rule** is a saved filter with auto-archive. New findings matching all its criteria are archived automatically: they are not sent to Security Hub, S3 exports, Detective or EventBridge, but they stay viewable as archived findings.
+## Scoping narrowly
+Good criteria combine the finding type with something that identifies the expected source, for example:
+- Finding type = `Recon:EC2/PortProbeUnprotectedPort`
+- plus the scanner's IP addresses or instance IDs or a tag such as `Role=vuln-scanner`.
+Everything else, including the same finding type from other sources, still alerts.
+## Why not IP lists
+GuardDuty IP and entity lists apply only to traffic involving publicly routable addresses and domains, and they affect whole groups of finding types, so they are blunt tools for one internal scanner.
+W: Narrow suppression rule: matching on finding type plus the scanner's identity archives only the known-benign findings and keeps the finding type active for real probes.
+X: A=Disable the finding type: GuardDuty does not let you turn off individual finding types, and even if it did, real port probes from attackers would go undetected.
+C=Threat list: a threat list marks IPs as malicious, so it makes GuardDuty generate more findings for the scanner, the opposite of the goal.
+D=Trusted IP list: IP lists apply only to publicly routable addresses, while the scanner reaches neighbors in the VPC over private addresses, and a trusted entry would silence many finding types for that IP rather than this one.
+T: Quiet known-benign GuardDuty findings with a narrow suppression rule (finding type plus source), not by disabling types or using IP lists.
+
+@ Q001794 explain
+G: ## Two kinds of GuardDuty IP lists
+GuardDuty lets you upload lists from S3 (formats such as plain text or STIX) that change how it evaluates activity involving those entries: legacy IP address lists, or the newer, recommended entity lists that can also hold domains. Lists apply only to publicly routable addresses and domains.
+- **Trusted IP list**: addresses you trust, such as your corporate egress IPs. GuardDuty does not generate findings for activity involving these entries. At most one trusted IP list and one trusted entity list per account per Region.
+- **Threat list**: known malicious addresses, such as from a threat intelligence feed. GuardDuty generates findings when resources communicate with these IPs. Up to six threat lists can be active per account per Region.
+Both are customer-provided, managed in the GuardDuty console or API, and in an organization the administrator account manages them for members.
+Example: add your office NAT IPs to the trusted list, and a partner's malicious-IP feed as a threat list.
+W: Trusted suppresses, threat detects: trusted IP lists stop certain findings for listed addresses, while threat lists cause findings for activity involving listed addresses.
+X: A=Only in Security Hub: IP lists are a GuardDuty feature, configured in GuardDuty; Security Hub has no IP list setting.
+B=Threat lists are AWS-generated: GuardDuty already uses its own internal threat intelligence, but threat lists are customer-supplied lists you upload and change.
+D=Identical and interchangeable: the lists have opposite effects, one reducing findings and one creating them, so swapping them would reverse the behavior.
+T: Trusted IP list = fewer findings for known-good IPs; threat list = findings for known-bad IPs.
+
+@ Q001795 explain
+G: ## How suppression rules match
+A GuardDuty suppression rule archives every new finding that matches **all** of its filter criteria. It does not know your intent: if the only criterion is the subnet ID, then every finding type from that subnet is archived, including high-severity credential exfiltration.
+Archived findings are not sent to Security Hub or EventBridge, so no alert fires, but they are **not deleted**: they remain visible under archived findings for the normal retention period.
+## A correctly scoped rule
+- Finding type, for example `Recon:EC2/PortProbeUnprotectedPort` or other specific Recon types.
+- Severity, such as low only.
+- A specific source, such as instance IDs, a tag or the scanner IPs, not a whole subnet.
+Review suppression rules regularly and periodically review archived findings to catch rules that hide too much.
+W: Rule too broad: criteria like "any finding from this subnet" matched the unrelated high-severity finding; adding finding type, severity and specific source criteria limits it to the intended noise.
+X: A=Must be a trusted IP list: suppression rules are exactly what auto-archives findings, and trusted IP lists apply only to publicly routable addresses, not to internal instances in a subnet.
+B=Permanently deleted: suppressed findings are archived, not deleted, so the team can review them, which is how this was discovered.
+D=Only findings older than 7 days: suppression rules have no age condition; they act on new matching findings as they are generated.
+T: Suppression rules archive everything that matches, so always include finding type and specific source criteria and review archived findings.

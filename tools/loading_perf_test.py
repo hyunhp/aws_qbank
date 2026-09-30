@@ -64,6 +64,10 @@ with sync_playwright() as p:
         worst.append(w)
         check(f"explanation visible {qid}", pg.is_visible(f"#explain-{qid}"))
     check("no long frames on reveal (4x CPU)", max(worst) <= 100, worst)
+    exp_reqs = [u for u in data_reqs if "/data/explanations/" in u]
+    check("explanations fetched once, versioned, only for the open exam",
+          len(exp_reqs) == 1 and exp_reqs[0].endswith("SAA-C03.json?v=" + index["exams"]["SAA-C03"]["e"]), exp_reqs)
+    check("exam file carries no explanations", "explanation" not in json.load(open(pathlib.Path(ROOT, "data", "SAA-C03.json"), encoding="utf-8"))[0])
     b.close()
 srv.shutdown()
 print(f"{ok}/{ok+fail} passed"); sys.exit(1 if fail else 0)

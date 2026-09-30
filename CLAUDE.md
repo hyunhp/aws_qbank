@@ -2,6 +2,8 @@
 
 Static GitHub Pages site (https://hyunhp.github.io/aws_qbank/) with original AWS certification
 practice questions. No build step: `index.html`, `js/*.js`, `data/*.json`, `diagrams/*.json`.
+Explanations live apart from the questions: `data/<EXAM>.json` has none, `data/explanations/<EXAM>.json` is `{id: text}`
+(qgen `load_exam`/`save_exam` merge and split them; the site fetches them on first reveal).
 Open work items are in `TODO.md` — read it at the start of a session.
 
 ## Hard rules

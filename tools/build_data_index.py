@@ -1,7 +1,8 @@
 """Build data/exams-index.json: per-exam question counts, id ranges and a content hash per data file.
 
 The site downloads this small file first, then fetches an exam's questions only when that exam
-is opened, as data/<EXAM>.json?v=<hash>. Because the URL changes whenever the file changes,
+is opened, as data/<EXAM>.json?v=<hash>. Explanations live in data/explanations/<EXAM>.json?v=<e> and are
+fetched on the first reveal. Because the URL changes whenever the file changes,
 browsers can keep the big files in their HTTP cache between visits.
 
 Run after changing anything in data/ (qgen ingest runs it automatically).
@@ -36,6 +37,9 @@ def build():
         raw = path.read_bytes()
         docs = json.loads(raw)
         exams[code] = {"count": len(docs), "v": hashlib.sha1(raw).hexdigest()[:10], "ids": id_ranges(docs)}
+        exp = DATA / "explanations" / f"{code}.json"
+        if exp.exists():
+            exams[code]["e"] = hashlib.sha1(exp.read_bytes()).hexdigest()[:10]
         for d in docs:
             unique[d["id"]] = d
             if len(d.get("examCodes") or []) > 1:

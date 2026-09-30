@@ -511,6 +511,7 @@ function renderResults() {
 
 async function renderReview() {
   const docs = await docsFor(state.exam);
+  if (qb.ensureExplanations) await qb.ensureExplanations(docs);
   const byId = new Map(docs.map(q => [q.id, q]));
   const list = state.ids.map((id, i) => ({ id, i })).filter(({ id }) =>
     reviewFilter === "all" ? true : reviewFilter === "flagged" ? state.flags.includes(id) : !state.results[id]);

@@ -77,7 +77,9 @@ def load_questions():
     for f in (ROOT / "data").glob("*.json"):
         if not re.fullmatch(r"[A-Z]{3}-C\d{2}\.json", f.name):
             continue
-        for q in json.loads(f.read_text()):
+        exp = json.loads((ROOT / "data" / "explanations" / f.name).read_text(encoding="utf-8"))
+        for q in json.loads(f.read_text(encoding="utf-8")):
+            q["explanation"] = exp[q["id"]]
             qs[q["id"]] = q
     return qs
 
@@ -86,7 +88,7 @@ def consistency(ids):
     qs = load_questions()
     errors, implied = [], []
     for qid in ids:
-        spec = json.loads((ROOT / "diagrams" / f"{qid}.json").read_text())
+        spec = json.loads((ROOT / "diagrams" / f"{qid}.json").read_text(encoding="utf-8"))
         q = qs.get(qid)
         if not q:
             errors.append(f"{qid}: question not found in data/")
@@ -135,7 +137,7 @@ def main():
     ap.add_argument("--shots")
     ap.add_argument("--only")
     a = ap.parse_args()
-    ids = a.only.split(",") if a.only else json.loads((ROOT / "diagrams/index.json").read_text())["ids"]
+    ids = a.only.split(",") if a.only else json.loads((ROOT / "diagrams/index.json").read_text(encoding="utf-8"))["ids"]
     errors, implied = consistency(ids)
     lint = layout(ids, a.shots)
     for qid, issues in lint.items():

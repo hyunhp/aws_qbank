@@ -56,11 +56,24 @@ NUM_WORD = {2: "TWO", 3: "THREE"}
 
 
 def load_exam(code):
-    return json.loads((DATA / f"{code}.json").read_text(encoding="utf-8"))
+    """Questions of one exam with their explanations merged back in (stored apart, see save_exam)."""
+    qs = json.loads((DATA / f"{code}.json").read_text(encoding="utf-8"))
+    exp_path = DATA / "explanations" / f"{code}.json"
+    if exp_path.exists():
+        exp = json.loads(exp_path.read_text(encoding="utf-8"))
+        for q in qs:
+            q["explanation"] = exp[q["id"]]
+    return qs
 
 
 def save_exam(code, qs):
-    (DATA / f"{code}.json").write_text(json.dumps(qs, indent=1, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+    """Write data/<EXAM>.json without explanations and data/explanations/<EXAM>.json ({id: text}).
+    The site loads the lean question file first and the explanations only when a question is revealed."""
+    lean = [{k: v for k, v in q.items() if k != "explanation"} for q in qs]
+    (DATA / f"{code}.json").write_text(json.dumps(lean, indent=1, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+    exp = {q["id"]: q["explanation"] for q in sorted(qs, key=lambda x: x["id"])}
+    (DATA / "explanations").mkdir(exist_ok=True)
+    (DATA / "explanations" / f"{code}.json").write_text(json.dumps(exp, indent=1, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
 
 
 def domain_map():

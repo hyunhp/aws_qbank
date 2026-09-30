@@ -3,7 +3,9 @@ Deterministic per question id, so every exam file that shares a question gets th
 Letter references in explanations ("Option B", "(A, D)", "C is wrong", ...) are remapped to the new positions.
 Usage: python3 tools/rebalance_answers.py [--before Q001953]
 """
-import json, glob, random, re, sys, collections
+import json, glob, random, re, sys, collections, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "qgen"))
+import qgen   # load_exam/save_exam keep explanations in data/explanations/
 BEFORE = sys.argv[sys.argv.index("--before")+1] if "--before" in sys.argv else "Q001953"
 EXCL = r"(?:account|accounts|vpc|vpcs|region|regions|connection|connections|site|sites|zone|tier|type|class|plan|grade|team|teams|service|services|server|servers|app|application|bucket|subnet|table|version|model|stage|step|phase|group|user|role|host|node|cluster|database|db|office|branch|partner|company|customer|tenant|department|stack|pipeline|environment|queue|topic|vendor|shard|endpoint|function|job|interface|record|policy|scenario|case|test|sample|variant|dataset|window|domain|ou|workload|project|product|flow|path|line|router|device|link|port|unit)"
 TOK = re.compile(r"(?<![\w\-/.'’])([A-E])(?![\w\-+’'#.:%])")
@@ -30,12 +32,11 @@ def rebalance(q):
     q["explanation"] = remap(q["explanation"], mp)
     return q
 if __name__ == "__main__":
-    files = sorted(glob.glob("data/*-*.json")); done = {}
-    for f in files:
-        for q in json.load(open(f)):
+    exams = qgen.EXAMS; done = {}
+    for e in exams:
+        for q in qgen.load_exam(e):
             if q["id"] < BEFORE and q["id"] not in done: done[q["id"]] = rebalance(dict(q))
-    for f in files:
-        d = [done.get(q["id"], q) for q in json.load(open(f))]
-        json.dump(d, open(f, "w"), ensure_ascii=False)
-    allq = {q["id"]: q for f in files for q in json.load(open(f))}
+    for e in exams:
+        qgen.save_exam(e, [done.get(q["id"], q) for q in qgen.load_exam(e)])
+    allq = {q["id"]: q for e in exams for q in qgen.load_exam(e)}
     print(len(done), "rebalanced;", collections.Counter(k for q in allq.values() for k in q["correctKeys"]))

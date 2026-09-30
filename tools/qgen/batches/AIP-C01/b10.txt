@@ -1,0 +1,285 @@
+@ AIP-C01 D3 T3.3 advanced troubleshooting
+S: A European insurer uses AWS Organizations and attached a service control policy to the workload OU that denies all actions when aws:RequestedRegion is not eu-central-1, with an exemption list for global services. After the change, applications that call Amazon Bedrock through an EU cross-Region inference profile started returning AccessDenied errors, although calls with the single-Region model ID in eu-central-1 still work. The company must keep all inference inside the EU. What should the platform team do?
+A: Extend the SCP allow-list to every EU Region that the inference profile can route requests to, keeping non-EU Regions denied, and keep the profile so that traffic stays inside the EU geography.
+B: Remove the SCP from the workload OU and rely on the IAM permissions boundary of each application role to keep requests inside eu-central-1 only.
+C: Replace the EU inference profile with a global inference profile so that AWS can route to any commercial Region with available capacity and the SCP no longer needs to list Regions.
+D: Add a VPC endpoint policy on the Bedrock runtime endpoint that permits only eu-central-1 requests, because endpoint policies override the Region checks that SCPs perform.
+K: A
+G: ## How cross-Region inference interacts with SCPs
+An inference profile lets Amazon Bedrock route a request to one of several Regions to get more throughput. The caller invokes the profile from its own Region, but the model can actually run in another Region of the profile's geography (for example an `eu.` profile spans EU Regions).
+An SCP that keys on `aws:RequestedRegion` is evaluated for the Regions involved in the request. If the destination Regions are not allowed, the call is denied even though the source Region is allowed.
+## Data residency angle
+A geography-scoped profile keeps inference inside a defined geography, which satisfies an "EU only" rule. A profile that can route worldwide does not.
+W: The SCP is doing its job but is too narrow for the profile: the profile may serve the request from another EU Region that the SCP denies. Allowing exactly the EU Regions the profile uses restores access and still blocks every non-EU Region, so residency is preserved and the guardrail stays central.
+X: B=Permissions boundary only: a boundary is per role, so removing the SCP loses the organization-wide guarantee. Any new role without the boundary could call other Regions, and it does not fix how the profile routes.
+C=Global profile: a global profile can route to Regions outside the EU, which breaks the data-residency requirement the SCP was written to enforce.
+D=Endpoint policy: a VPC endpoint policy is a separate control and cannot override an SCP deny. SCP and endpoint policy are both evaluated, and the SCP deny still wins.
+T: SCPs that restrict Regions must also allow every Region a cross-Region inference profile can route to, and geography-scoped profiles keep inference inside the required boundary.
+V: Amazon Bedrock, AWS Organizations
+
+@ AIP-C01 D3 T3.3 advanced use-case
+S: A payments company must keep Amazon Bedrock prompts and responses as evidence for seven years. Regulators require that neither developers nor account administrators can alter or delete the records during that period, and the security team must be able to query them for investigations. Model invocation logging is enabled. Which design meets the requirement?
+A: Deliver invocation logs to an Amazon S3 bucket with Object Lock in compliance mode and a seven-year default retention, and query the logs with Amazon Athena.
+B: Deliver invocation logs to a CloudWatch Logs log group with retention set to seven years, and allow only the security team to run Logs Insights queries.
+C: Deliver invocation logs to an S3 bucket with versioning and a lifecycle rule that moves objects to S3 Glacier after 30 days, and protect the bucket with a strict bucket policy.
+D: Rely on the AWS CloudTrail management events for Bedrock, which already record every prompt and response and are stored in an organization trail with log file validation.
+K: A
+G: ## Two separate questions: content and immutability
+- **Content**: which service records the prompt and response text? Model invocation logging does. CloudTrail records API calls (who, when, which model) but not the prompt text.
+- **Immutability**: can anyone with admin rights change the record? A retention setting alone does not stop a privileged user from deleting data. A write-once-read-many (WORM) control does.
+S3 Object Lock in compliance mode prevents any user, including the root user, from overwriting or deleting a locked object version until the retention period ends.
+W: Object Lock in compliance mode gives the WORM guarantee for the retention period, invocation logging supplies the prompt and response content, and Athena provides the investigation queries over the stored objects.
+X: B=CloudWatch Logs retention: a retention period expires old events, but a principal with the right IAM permissions can still delete the log group or streams, so it is not tamper-proof.
+C=Versioning and Glacier: versioning and a bucket policy can be changed or bypassed by an administrator, and lifecycle tiering does not stop deletion. Nothing enforces immutability.
+D=CloudTrail only: CloudTrail records that InvokeModel was called and by whom, but not the request and response bodies, so it cannot serve as prompt-level evidence.
+T: Use invocation logging for prompt content and S3 Object Lock in compliance mode when records must be immutable for a fixed retention period.
+V: Amazon Bedrock, Amazon S3, Amazon Athena
+
+@ AIP-C01 D3 T3.3 advanced use-case
+S: A bank trains candidate models in a development account and hosts them in a production account. Policy requires separation of duties: the data scientists who train a model must not be able to approve it, and only models approved by the model risk team may be deployed. All models are versioned in the Amazon SageMaker Model Registry. Which approach enforces the policy?
+A: Restrict permission to change a model package's approval status to the model risk team's role, and deploy from the production pipeline only when the package status changes to Approved.
+B: Let the data scientists set the status to Approved after their own tests pass, and require the risk team to tag each package with a reviewer name for later audits.
+C: Store approvals in a spreadsheet that the risk team maintains, and have the production pipeline read the spreadsheet before every deployment to decide which versions to release.
+D: Give the production account pipeline role permission to approve packages automatically when the training job finishes with an accuracy above a fixed threshold.
+K: A
+G: ## Registry approval status as a control point
+Each model version in the SageMaker Model Registry is a model package with an approval status such as `PendingManualApproval`, `Approved` or `Rejected`. Changing that status is an API action, so IAM can limit who is allowed to do it.
+Deployment automation can watch for the status-change event through Amazon EventBridge and deploy only when a package becomes `Approved`.
+## Separation of duties
+The person who builds a model should not be the person who signs it off. Enforcing this in IAM makes it a technical control that an audit can verify, instead of a convention.
+W: Limiting the approval action to the risk team makes approval an independent step, and gating the production pipeline on the Approved status ties deployment to that decision. The registry also keeps the approval history for the auditors.
+X: B=Self approval with tags: the data scientists would approve their own work, which is exactly the conflict the policy forbids, and a tag is descriptive rather than a control.
+C=Spreadsheet: it sits outside the registry, can be edited by anyone with access, and cannot be enforced by the pipeline in a tamper-evident way.
+D=Automatic approval: a metric threshold is a useful quality gate but it is not the independent model risk review that the policy requires, and it removes the human approver.
+T: Enforce separation of duties by allowing only the approver role to change SageMaker Model Registry approval status and by deploying only on the Approved event.
+V: Amazon SageMaker, Amazon EventBridge, AWS IAM
+
+@ AIP-C01 D3 T3.3 applied comparison
+S: A team uses Amazon Bedrock Prompt Management for a loan-letter generator. A regulator asks the team to show exactly which prompt text produced letters sent last March. Developers currently edit the working draft of the prompt while production applications reference the prompt by its identifier without a version. Which change gives the team the evidence they need going forward?
+A: Publish an immutable numbered prompt version per release, point production at it, and log that version id with each request.
+B: Keep editing the working draft in place and store a screenshot of the prompt in the ticket after each change.
+C: Copy the prompt text into an environment variable of the application and redeploy the application whenever the text changes, keeping the deployment history as the record.
+D: Turn on model invocation logging only, and infer the prompt text from the responses when the regulator asks.
+K: A
+G: ## Draft versus version
+In Bedrock Prompt Management the working draft is mutable: any edit changes what an unversioned reference will use. A version is a numbered snapshot of the prompt that cannot be modified afterwards.
+## Why the version id matters
+For evidence, three facts must line up: which prompt text existed, which version production used, and which request used it. Referencing a numbered version and logging that identifier with each request gives a verifiable chain.
+W: An immutable version freezes the prompt text, pinning production to it removes silent changes, and logging the identifier with each request lets the team map any letter back to its exact prompt.
+X: B=Screenshots: a screenshot is manual, can be missed, and does not prove which text production actually used at runtime.
+C=Environment variable: it does version the text with deployments, but it bypasses the prompt management catalog, offers no review history of the prompt itself, and still needs the identifier logged per request.
+D=Logging only: invocation logging can capture the rendered prompt, but relying on it alone provides no governed prompt catalog and depends on logging being enabled at that time. It also does not identify which approved prompt version was intended.
+T: Reference immutable numbered prompt versions in production and log the version id with each request so any output can be traced to its prompt.
+V: Amazon Bedrock
+
+@ AIP-C01 D3 T3.3 advanced comparison
+S: A healthcare company plans to process protected health information with Amazon Bedrock. Its compliance officer needs (1) proof of the AWS-side compliance status and the ability to accept a business associate agreement, and (2) evidence that the company's own workload is configured as its policies require. Which TWO sources provide this evidence? (Select TWO)
+A: AWS Artifact, for AWS compliance reports and for accepting agreements such as a business associate agreement.
+B: AWS CloudTrail and AWS Config history, which show how the company's accounts and resources were configured and used.
+C: AWS Trusted Advisor, which certifies that the company's workload complies with HIPAA once all checks are green.
+D: The Amazon Bedrock model card, which contains the company's own risk assessment and approval records.
+E: AWS Marketplace, where the business associate agreement is purchased as a subscription for each model.
+K: A,B
+G: ## Shared responsibility for compliance
+AWS is responsible for compliance of the cloud infrastructure and eligible services, and publishes evidence for it. The customer is responsible for how it configures and uses those services, and must produce its own evidence.
+- **AWS Artifact** is the self-service portal for AWS audit reports (for example SOC reports) and for reviewing and accepting agreements such as a business associate agreement.
+- **CloudTrail and AWS Config** record API activity and resource configuration history, which is the customer's evidence of its own controls.
+W: A=AWS Artifact: it answers what AWS attests and lets the company accept the agreement.
+B=CloudTrail and Config: they provide the company's own configuration and activity trail, so together the two cover both halves of the shared responsibility.
+X: C=Trusted Advisor: it gives best-practice recommendations, not a compliance certification, and passing its checks does not make a workload HIPAA compliant.
+D=Model card: a provider's model documentation describes the model, not the customer's own risk assessment and approvals, which the company keeps in its own records such as SageMaker Model Cards.
+E=Marketplace: the business associate agreement is accepted through AWS Artifact, not purchased per model as a subscription.
+T: Use AWS Artifact for AWS attestations and agreements, and CloudTrail plus AWS Config for the customer's own control evidence.
+V: AWS Artifact, AWS CloudTrail, AWS Config
+
+@ AIP-C01 D3 T3.3 advanced troubleshooting
+S: A retailer fine-tuned a foundation model on support transcripts. Weeks later a customer exercises a GDPR erasure right and asks that the personal data be removed. The team deleted the transcripts from Amazon S3, but the privacy officer points out that three fine-tuned model versions were trained on datasets that contained those transcripts, and nobody can say which ones. What should the team implement so this can be answered and handled in the future?
+A: Record lineage from each dataset version to the training jobs and model versions it produced, then retrain the affected models without the records.
+B: Tell the customer that deleting the S3 objects completes the request, because trained model weights are not personal data, and close the ticket.
+C: Edit the model weights directly to subtract the influence of the transcripts, and record the edit in the model card as remediation.
+D: Attach a Bedrock guardrail that masks the customer's name in outputs, and keep serving all three model versions unchanged.
+K: A
+G: ## Data lineage and erasure
+Personal data used for fine-tuning can influence the resulting model. There is no supported way to surgically delete one person's contribution from trained weights, so the practical response is to retrain from a corrected dataset.
+To do that, the team must know which datasets fed which training runs and which model versions came out. That is data lineage, and it must be recorded when training happens, for example through SageMaker lineage tracking, registry metadata or model card training details.
+W: With lineage, the team can list the model versions built from datasets containing the transcripts, retrain them from a filtered dataset and retire the old versions. Without it, the answer is unknowable.
+X: B=Deleting objects only: it leaves the trained models untouched and the claim that weights are never personal data is not something a controller can assume. Regulators may treat memorized data as in scope.
+C=Editing weights: there is no reliable procedure to subtract one record's influence from weights, and documenting an unverifiable edit would not satisfy an audit.
+D=Output masking: guardrails mask text at inference but the data would still be embedded in the models, and masking a name does not answer the erasure request.
+T: Record dataset to training job to model version lineage at training time so erasure and provenance questions can be answered and affected models retrained.
+V: Amazon SageMaker, Amazon S3
+
+@ AIP-C01 D3 T3.3 advanced use-case
+S: A company in the EU screens job applicants with an FM-based summarizer and ranker. Its legal team says this use case is likely a high-risk category under the EU AI Act and asks engineering which measures support the regulation's expectations for such systems. Which TWO measures are appropriate at a conceptual level? (Select TWO)
+A: Keep automatic logs of system operation and technical documentation such as intended purpose, data sources and evaluation results, retained for audit.
+B: Design effective human oversight so that recruiters can review, override and disregard the system's ranking before any decision is taken.
+C: Host every component in an EU Region, because the regulation makes EU hosting mandatory for all high-risk systems.
+D: Accept the AWS shared responsibility model, which transfers the obligations of the deployer to AWS once the workload runs on Bedrock.
+E: Turn off logging of applicant inputs entirely, because the regulation forbids retaining any record of how an AI system was used.
+K: A,B
+G: ## The EU AI Act in one paragraph
+The EU AI Act sorts AI systems by risk. Uses such as employment and worker management are treated as high-risk. Providers and deployers of high-risk systems are expected to have, at a conceptual level, a risk management process, data governance, technical documentation, record-keeping through logs, transparency to users, human oversight and appropriate accuracy and robustness.
+## What it does not say
+It does not require a particular hosting Region, and it does not let a cloud provider take over the deployer's own duties.
+W: A=Logs and documentation: they support traceability and audits, and can be built with invocation logging and SageMaker Model Cards.
+B=Human oversight: it keeps a person able to override the ranking, and can be implemented with services such as Amazon A2I.
+X: C=Mandatory EU hosting: data-protection and residency rules may drive Region choices, but the AI Act does not mandate EU hosting for all high-risk systems.
+D=Transferred obligations: shared responsibility splits security tasks between AWS and the customer. Regulatory duties of a deployer stay with the deployer.
+E=No logging: the opposite is true. Record-keeping is an expectation for high-risk systems, and privacy is handled through minimization and access control rather than by removing all records.
+T: For high-risk AI uses, think logs plus technical documentation and real human oversight, not a mandated Region or a transfer of duties to the cloud provider.
+V: Amazon Bedrock, Amazon SageMaker, Amazon Augmented AI
+
+@ AIP-C01 D3 T3.4 advanced comparison
+S: A bank uses an FM on Amazon Bedrock to draft replies to customers who dispute card transactions. Replies must be reviewed by a trained employee before sending in three cases: the model output triggers a guardrail intervention, the case involves an amount above a threshold, and a random 5 percent of all other cases so that quality can be audited. The employees work in a private workforce. Which solution implements this with the least custom tooling?
+A: Use Amazon A2I with a custom task type and a private workforce, and start a human loop from the application on a match or a random sample.
+B: Use Amazon Mechanical Turk with a public workforce for all reviews, because it scales without any onboarding of employees.
+C: Send every draft to a Slack channel through an AWS Lambda function and ask employees to reply with an emoji when approved.
+D: Enable a Bedrock guardrail with the highest filter strengths so that no human reviews are needed for any case above the amount threshold or for the random sample.
+K: A
+G: ## What Amazon A2I does
+Amazon Augmented AI (A2I) lets you build human review workflows for machine learning predictions. You define a flow definition with a work team (private employees, a vendor, or a public workforce) and a task template. Your application calls `StartHumanLoop` when a condition is met, and A2I collects the reviewer's decision.
+Built-in task types exist for Amazon Textract and Amazon Rekognition, and a custom task type supports any model, including an FM.
+## Triggers
+Conditions such as low confidence or a business rule can start a loop, and a random percentage can be sampled for quality audits.
+W: A2I with a custom task type and a private workforce provides reviewer tasks, decision capture and an auditable record. The application decides when to call it, which covers guardrail, amount and random sampling triggers.
+X: B=Public workforce: customer dispute data is sensitive and the bank wants trained employees, so a public workforce is inappropriate.
+C=Slack emoji: it has no structured task, no controlled workforce and no dependable audit record of who approved what.
+D=Higher guardrail strength: a guardrail is an automated control. It does not replace the human review the policy requires, and a stricter filter cannot judge disputes.
+T: For human review of FM output, use Amazon A2I with a custom task type, a private workforce and application-defined triggers, including random sampling.
+V: Amazon Augmented AI, Amazon Bedrock
+
+@ AIP-C01 D3 T3.4 advanced tradeoff
+S: An insurance company built a Bedrock agent that can cancel policies through an action group. Compliance requires that a licensed back-office employee, not the customer chatting with the agent, approves each cancellation before it is executed. The approver works in a separate back-office system and approvals can take a long and unpredictable time. Which design fits best?
+A: Use return of control so the application creates an approval task for a licensed employee, then resumes the agent with the outcome.
+B: Enable user confirmation on the action so that the customer in the chat confirms the cancellation before it runs.
+C: Add a system prompt instruction that says the agent must never cancel a policy without a licensed employee's permission, and rely on the model to comply with it in every conversation.
+D: Give the action group Lambda function a longer timeout of 15 minutes so that it can wait for the employee inside the invocation.
+K: A
+G: ## Two human-in-the-loop options in Bedrock Agents
+- **User confirmation** asks the end user of the agent to confirm or deny an action before the agent runs it. It suits cases where the person chatting is the right approver.
+- **Return of control** hands the function call details back to the application instead of running a Lambda function. The application decides how to run it, including routing it to other people, then returns the results so that the agent continues.
+## Choosing
+When the approver is a different person and the wait is long, the workflow belongs in the application, which can persist state and wait.
+W: Return of control lets the application run its own approval workflow with the right approver and time budget, then resume the agent with the result, while the agent never executes the cancellation directly.
+X: B=User confirmation: it asks the customer, who is not the licensed approver the policy requires. It is right for end-user consent, not for internal authorization.
+C=Prompt instruction: a prompt is not an enforced control, and the model can be manipulated to ignore it, so cancellation authority would still rest on model behavior.
+D=Longer Lambda timeout: Lambda's maximum duration is 15 minutes, which an approval can easily exceed, and holding a function open for a human is fragile and costly.
+T: Use user confirmation when the chat user should approve, and return of control when another person or process must authorize before the action runs.
+V: Amazon Bedrock Agents, AWS Lambda
+
+@ AIP-C01 D3 T3.4 advanced troubleshooting
+S: A lender uses an FM to explain to applicants why their application was declined. The explanation is generated from the applicant data and the model's own step-by-step reasoning. A regulator questions whether the reasoning shown is the real reason for the decision. Which conclusion and action are most appropriate?
+A: Treat model-written reasoning as a plausible narrative, not proof, and state reasons from the decision factors and evidence actually used.
+B: Keep the model's reasoning text as the official explanation, because a model that writes its reasoning step by step reveals its true internal computation.
+C: Ask the model to rate its own confidence and attach the score, which proves the explanation is faithful to the internal computation.
+D: Replace the FM with a larger FM, because model size guarantees that generated explanations are faithful to the model's internal computation.
+K: A
+G: ## Explainability limits of foundation models
+An FM produces text token by token. When asked to explain itself, it generates a fluent justification, but that text is not a readout of the internal computation. Research shows written reasoning can omit or misstate the real drivers of an output.
+## What to do instead
+For decisions that affect people, keep the decision logic in auditable components (a rules engine or a tabular model with feature attributions from SageMaker Clarify) and use the FM to phrase the verified factors. Provide evidence such as source citations that the reader can check.
+W: The reasoning text cannot be trusted as the true cause. Grounding the explanation in the factors that actually drove the decision makes it verifiable and defensible to the regulator.
+X: B=Reasoning as official: fluent step-by-step text does not guarantee faithfulness, which is precisely the regulator's concern.
+C=Self-rated confidence: a confidence number the model writes is generated text too. It does not measure whether the explanation matches the computation.
+D=Bigger model: larger models write more fluent explanations, but size does not make them faithful.
+T: Model-written explanations are not proof of the real cause. Base regulated explanations on verifiable factors and evidence, with the FM only phrasing them.
+V: Amazon Bedrock, Amazon SageMaker
+
+@ AIP-C01 D3 T3.4 advanced use-case
+S: A media company runs a customer-facing summarization feature on a Bedrock foundation model. The provider announces the end of life of that model version and recommends a newer model. The team wants to migrate without introducing new bias, toxicity or quality regressions for specific languages and customer segments. What is the best approach?
+A: Evaluate both models on a golden dataset and a red-team set, compare per language and segment, then roll out with a canary.
+B: Switch all traffic to the newer model on the announcement date, since the provider states it is better on public benchmarks.
+C: Compare only the average latency and cost of the two models in a load test, because output quality is assumed to be equal within the same model family and provider.
+D: Apply the existing guardrail to the new model and skip evaluation, because guardrails make the behavior of any model identical.
+K: A
+G: ## Model changes are behavior changes
+A new model version changes wording, refusals, tone and failure modes even for the same prompt. Public benchmarks are averages and rarely reflect a company's languages, customers and risk tolerances.
+## Responsible migration
+- Keep a **golden dataset** that represents real traffic, sliced by language and segment, plus a **red-team set** of adversarial cases.
+- Run **Bedrock model evaluation** (automatic metrics, LLM-as-a-judge or human review) on both models and compare per slice.
+- Roll out gradually with a canary and monitor guardrail intervention and feedback signals.
+W: A slice-level comparison on representative and adversarial data catches regressions that averages hide, and the canary limits exposure while production monitoring confirms the result.
+X: B=Trust the announcement: public benchmarks say nothing about this company's languages and segments, so regressions could reach every customer at once.
+C=Latency and cost only: those metrics matter for operations, but they do not measure bias, toxicity or quality, and equal quality across versions is not guaranteed.
+D=Guardrail only: guardrails filter content but do not equalize quality, tone or correctness, and different models trigger them differently.
+T: Treat every model migration as a behavior change: evaluate per slice on golden and red-team data, then canary and monitor.
+V: Amazon Bedrock
+
+@ AIP-C01 D3 T3.4 advanced tradeoff
+S: Before launching a multilingual HR assistant, a team wants to test how it behaves when adversaries try to make it produce harmful or discriminatory answers. The assistant runs in production for years and its prompts, model and guardrails will change often. Which TWO practices build a durable red-teaming program? (Select TWO)
+A: Maintain a versioned adversarial prompt suite, including multi-turn and multilingual attacks, and run it automatically against every change to the model, prompt or guardrail, blocking the release when thresholds fail.
+B: Feed new findings from production feedback and security reviews back into the suite so that it keeps pace with attacks seen in the field.
+C: Run one manual red-team exercise before launch and archive the report, since the model does not change once the assistant is deployed.
+D: Use only the prompts that the guardrail blocked in production as the test set, since they represent all attacks that will ever occur.
+E: Rely on the model provider's published safety benchmark results as the assistant's own red-team evidence.
+K: A,B
+G: ## Red teaming as a continuous process
+Red teaming means probing a system with adversarial input to find failures before real users do. A one-time exercise ages quickly, because prompts, models, guardrails and attack techniques change.
+## Practical shape
+- A versioned suite of test cases, including multi-turn and multilingual cases, run in CI against every change.
+- Release gates with thresholds.
+- A feedback loop so that new real-world incidents become permanent test cases.
+W: A=Automated gated suite: it catches regressions on each change to the model, prompt or guardrail.
+B=Feedback loop: feeding field findings into the suite keeps the tests realistic, so together they turn red teaming into a lasting control.
+X: C=One-time exercise: prompts, models and guardrails change often, so a single report stops being valid soon after launch.
+D=Blocked prompts only: that set contains only attacks the guardrail already stops, so it cannot reveal the ones that get through.
+E=Provider benchmarks: they describe the base model in general, not this application, its prompts and its languages, so they are not evidence for this system.
+T: Make red teaming continuous: a versioned adversarial suite gating every change, fed by production findings.
+V: Amazon Bedrock
+
+@ AIP-C01 D3 T3.4 advanced use-case
+S: A public-sector chatbot on Amazon Bedrock produced an offensive answer that a citizen posted on social media. The agency's leadership wants to be able to contain such incidents in minutes and to learn from them. Which combination best prepares the team?
+A: An escalation runbook with owners, feedback tied to logged request ids, and a feature flag that switches the assistant to a safe fallback.
+B: A quarterly meeting in which the team reviews a random sample of conversations and decides whether policies need updating.
+C: An instruction to citizens to email the agency, with the team investigating by reading all conversation logs manually after each message, without severity tiers.
+D: A larger guardrail denied-topic list that is expanded whenever an incident is reported, with no owners or process for the response.
+K: A
+G: ## Escalation is a design requirement
+Even with guardrails and evaluation, harmful output will sometimes reach users. Responsible AI practice includes being able to respond quickly and consistently.
+## Ingredients
+- **Runbook**: severity tiers, named owners and who decides to disable the feature.
+- **Traceability**: feedback linked to the invocation id in the logs, so the exact prompt, response and versions can be found.
+- **Kill switch**: a feature flag, for example with AWS AppConfig, that moves traffic to a fallback such as a static answer or human agent without a deployment.
+W: The runbook removes hesitation, the request id shortens investigation from hours to minutes, and the flag stops the harm while the root cause is worked out.
+X: B=Quarterly sampling: it is useful for trend review but it is far too slow for containing an incident and does not connect individual reports to the requests.
+C=Email and manual log reading: no severity process, no request linkage, and searching all logs by hand is slow and error-prone.
+D=Expanding denied topics: it can be part of the fix, but without owners, a process and a way to disable the feature quickly, containment still depends on people improvising.
+T: Prepare escalation before launch: a runbook with owners, feedback linked to request ids, and a feature-flag kill switch to a safe fallback.
+V: Amazon Bedrock, AWS AppConfig
+
+@ AIP-C01 D3 T3.4 advanced comparison
+S: A lender runs a tabular loan-approval model on a SageMaker real-time endpoint next to a Bedrock-based assistant that explains outcomes. The risk team must be alerted if the approval rates between demographic groups start to diverge in production over time. Which approach detects this?
+A: Schedule SageMaker Clarify bias drift monitoring on the endpoint's captured data against a baseline, and alarm through CloudWatch.
+B: Rely on the Bedrock guardrail intervention count on the assistant, because a rise in interventions indicates that approval rates are diverging between demographic groups.
+C: Run the SageMaker Clarify pre-training bias report once on the original dataset and reuse it as the ongoing monitor.
+D: Watch the endpoint's CPU utilization and invocation latency, since demographic drift always appears as a resource utilization change.
+K: A
+G: ## Bias can drift after launch
+Bias metrics measured on training data can change once the model sees live traffic whose mix of people or behavior differs. Monitoring must therefore be continuous.
+## The AWS mechanism
+SageMaker Model Monitor with Clarify supports bias drift monitoring: endpoint data capture feeds a scheduled job that recomputes bias metrics for the configured facets and compares them with a baseline, and violations can raise CloudWatch alarms.
+Guardrails filter text content and do not measure statistical fairness of decisions.
+W: Bias drift monitoring recomputes group fairness metrics on live data on a schedule and compares against the baseline, so divergence in approval rates raises an alarm for the risk team.
+X: B=Guardrail interventions: they count blocked content, not group-level outcome rates, and could stay flat while approvals diverge.
+C=One-time pre-training report: it describes the historical dataset and cannot show how live behavior changes after deployment.
+D=CPU and latency: these are operational metrics unrelated to demographic outcome balance.
+T: Use SageMaker Model Monitor with Clarify bias drift monitoring to watch group fairness metrics in production and alarm on divergence.
+V: Amazon SageMaker, Amazon CloudWatch
+
+@ AIP-C01 D3 T3.4 advanced tradeoff
+S: A team evaluating a Bedrock-based customer service assistant for fairness is deciding between the built-in public prompt datasets in Amazon Bedrock model evaluation and a custom dataset. The assistant serves Spanish-speaking and English-speaking customers in the telecom domain, with billing disputes as a sensitive workflow. Which approach gives the most decision-relevant fairness evidence?
+A: Build a custom dataset from de-identified real tickets in both languages, with paired prompts differing only in a demographic attribute, and compare slices.
+B: Use only the built-in toxicity dataset, since a low toxicity score proves the assistant treats all customers equally.
+C: Use a single English benchmark of general knowledge questions, since fairness is the same in every language and domain.
+D: Ask the FM to generate its own test prompts once and grade the answers with the same FM as the only judge, without any human sampling of results.
+K: A
+G: ## What fairness evaluation needs
+Public datasets are useful for a first screening, for example toxicity and stereotyping benchmarks. Fairness for a specific application depends on its users, languages and workflows, so evidence must come from data that represents them.
+## Paired (counterfactual) prompts
+Two prompts that are identical except for a demographic attribute let you check whether the answer quality or tone changes. Comparing scores per language and segment shows gaps that an overall average hides.
+W: A custom, representative dataset with paired prompts and slice-level comparison tests the actual workflow and users. Bedrock model evaluation supports custom prompt datasets with automatic metrics, LLM-as-a-judge and human review.
+X: B=Toxicity only: toxicity is only one aspect. A low score says nothing about differences in helpfulness or outcomes between groups.
+C=English general knowledge: it ignores Spanish speakers and the billing-dispute domain, so it cannot reveal gaps that affect them.
+D=Self-generated tests and self-judging: the same model creates and grades the cases, which can miss its own blind spots, and no human sampling validates the judge.
+T: For fairness evidence, use a representative custom dataset with paired prompts and per-slice comparison, not only generic public benchmarks.
+V: Amazon Bedrock

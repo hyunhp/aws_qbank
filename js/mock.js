@@ -193,6 +193,7 @@ async function ensureData() {
     specs = s; domainMap = m;
   }
 }
+let setupTimed = true;    // timer checkbox survives re-renders of the setup screen
 let setupDomain = null;   // null = whole exam by official weights, else one domain code
 function domainDocs(docs) { return setupDomain ? docs.filter(q => domainOf(q, setupExam, domainMap) === setupDomain) : docs; }
 async function docsFor(exam) { return (await qb.loadExam(exam)) || []; }
@@ -389,7 +390,7 @@ async function renderSetup(extra) {
         <button class="mode${mode === "full" ? " on" : ""}" data-mode="full" type="button"><b>${setupDomain ? "Full section" : "Full exam"}</b><span>${fullN} questions · ${Math.round(timeFor(spec, fullN) / 60)} min</span></button>
         <button class="mode${mode === "short" ? " on" : ""}" data-mode="short" type="button"><b>Short practice</b><span>${shortN} questions · ${Math.round(timeFor(spec, shortN) / 60)} min</span></button>
       </div>
-      <label class="row"><input type="checkbox" id="mkTimed" checked> Timer (auto-submits at 0:00)</label>
+      <label class="row"><input type="checkbox" id="mkTimed"${setupTimed ? " checked" : ""}> Timer (auto-submits at 0:00)</label>
       <div class="meta">Pool: ${pool.length} questions${setupDomain ? " in this section" : ""} · ${unseen} not yet seen in mock exams · official pass mark ${spec.passingScore}/1000${setupDomain ? " (whole exam)" : ""}</div>
       ${unseen < (mode === "short" ? shortN : fullN) ? `<div class="meta" style="color:var(--amber)">Fewer unseen questions than needed, so some repeats will be included.</div>` : ""}
       <div class="btnrow"><button class="btn" data-act="start">Start exam</button>
@@ -402,7 +403,7 @@ async function renderSetup(extra) {
       }).join("")}</table>` : `<div class="meta">No attempts yet.</div>`}
     </div></div>`;
   root.onclick = async (e) => {
-    const t = e.target.closest("[data-act],[data-mode]");
+    const t = e.target.closest("[data-act],.mode[data-mode]");   // not the root itself: it carries data-mode too
     if (!t) return;
     if (t.dataset.mode) { renderSetup({ mode: t.dataset.mode }); return; }
     const act = t.dataset.act;
@@ -410,6 +411,7 @@ async function renderSetup(extra) {
     else if (act === "start") startExam(root.dataset.mode, root.querySelector("#mkTimed").checked);
     else if (act === "resetseen") { const s = loadSeen(); delete s[setupExam]; save(KEY_SEEN, s); renderSetup(); }
   };
+  root.querySelector("#mkTimed").onchange = (e) => { setupTimed = e.target.checked; };
   root.querySelector("#mkExam").onchange = (e) => { setupExam = e.target.value; setupDomain = null; renderSetup(); };
   root.querySelector("#mkDomain").onchange = (e) => { setupDomain = e.target.value || null; renderSetup(); };
 }

@@ -2,7 +2,8 @@
 
 - First visit downloads only data/exams-index.json and the one exam being shown.
 - Exam files are requested with a ?v=<hash> that matches data/exams-index.json.
-- Opening Bookmarks loads the other exams (bookmarks can come from any exam).
+- Opening Bookmarks loads only the exams holding bookmarked ids (id ranges in exams-index.json).
+- Explanations are fetched once per exam (data/explanations/<EXAM>.json?v=<e>), prefetched when idle.
 - Revealing explanations stays smooth on a 4x-throttled CPU (no long frames).
     python3 tools/loading_perf_test.py
 """

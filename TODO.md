@@ -1,11 +1,16 @@
 # TODO
 
-State on 2026-09-30: every question in all 13 exams (4,502 incl. shared) has a detailed explanation; 64 flawed
-questions were fixed in place (`tools/qgen/batches/*/f0*.txt`). Done the same day: bookmarks load only the exams
-holding bookmarked ids (id ranges in `exams-index.json`), explanations split into `data/explanations/<EXAM>.json`
-(exam files ~0.33 MB, explanations fetched on first reveal), `qgen check` refuses old blocks superseded by an
-`I:` rewrite, `.claude/agents` now has explanation-writer, batch-reviewer, question-writer and fix-writer,
-`.explain{contain:layout style}` cut the reveal layout cost by about a quarter.
+State on 2026-09-30: 4,502+ questions in 12 exams, all with detailed explanations (`data/explanations/<EXAM>.json`).
+Done the same day (see git log): bookmarks load only needed exams, explanations split from exam files, section
+(domain/task) filter chips with per-domain accuracy (localStorage only) and "one section only" mock exams,
+`qgen check` guards superseded blocks, `.claude/agents` has explanation-writer / batch-reviewer / question-writer /
+fix-writer. Reinforcement batches (each fact-checked by an independent reviewer before ingest): AIF D4 +30,
+AIP D3 +30, AIB D3 +20, and +20 in the security/governance domain of DEA (D4), SAA (D1), DVA (D2), SOA (D4),
+MLA (D4), SAP (T1.2/T1.4/T2.3/T3.2), DOP (D6), ANS (D4), SCS (D6). Pools are now 356-445 per exam.
+
+## 0. Open idea: answer-position/length stats after the reinforcement
+`python3 tools/qgen/qgen.py report` is clean (no length bias flags over the limit); nothing to do unless new
+batches are added.
 
 ## 1. Keep availability notes current
 Explanations mention services closed to new customers (verified 2026-09-30 against the AWS "service availability

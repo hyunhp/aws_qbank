@@ -38,13 +38,15 @@ with sync_playwright() as p:
     check("chip counts from index", str(index["exams"]["AIF-C01"]["count"]) in pg.inner_text("#chipRow"))
 
     # bookmark something from another exam, then open Bookmarks in a fresh page
-    aif = json.load(open(pathlib.Path(ROOT, "data", "AIF-C01.json")))[0]["id"]
+    aif = json.load(open(pathlib.Path(ROOT, "data", "AIF-C01.json"), encoding="utf-8"))[0]["id"]
     pg.evaluate(f"localStorage.setItem('aws_qbank_bookmarks_v1', JSON.stringify(['{aif}']))")
     pg2 = ctx.new_page(); reqs2 = []
     pg2.on("request", lambda r: reqs2.append(r.url) if "/data/" in r.url else None)
     pg2.goto(BASE + "#bookmarks"); pg2.wait_for_selector(".qcard", timeout=15000)
     check("bookmark from other exam shown", pg2.query_selector(f"#card-{aif}") is not None)
-    check("bookmarks view loads all exams", len([u for u in reqs2 if re.search(r"/data/[A-Z]{3}-C\d{2}\.json", u)]) == len(index["exams"]))
+    loaded = sorted(re.search(r"/data/([A-Z]{3}-C\d{2})\.json", u).group(1) for u in reqs2 if re.search(r"/data/[A-Z]{3}-C\d{2}\.json", u))
+    holders = sorted(c for c, e in index["exams"].items() if any(a <= int(aif[1:]) <= b for a, b in e["ids"]))
+    check("bookmarks view loads only the exams holding bookmarked ids", loaded == holders and len(loaded) < len(index["exams"]), (loaded, holders))
     pg2.close()
 
     # reveal smoothness under CPU throttling

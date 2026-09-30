@@ -1,4 +1,4 @@
-"""Build data/exams-index.json: per-exam question counts plus a content hash per data file.
+"""Build data/exams-index.json: per-exam question counts, id ranges and a content hash per data file.
 
 The site downloads this small file first, then fetches an exam's questions only when that exam
 is opened, as data/<EXAM>.json?v=<hash>. Because the URL changes whenever the file changes,
@@ -13,6 +13,19 @@ DATA = ROOT / "data"
 EXTRA = ["exam-specs.json", "exam-domains.json"]
 
 
+def id_ranges(docs):
+    """Question ids (Q000123 -> 123) of one exam as [first, last] runs, so the bookmarks view can tell
+    which exam files hold a bookmarked id without downloading them all."""
+    nums = sorted(int(d["id"][1:]) for d in docs)
+    runs = []
+    for n in nums:
+        if runs and n == runs[-1][1] + 1:
+            runs[-1][1] = n
+        else:
+            runs.append([n, n])
+    return runs
+
+
 def build():
     specs = json.loads((DATA / "exam-specs.json").read_text(encoding="utf-8"))
     exams, unique, shared = {}, {}, set()
@@ -22,7 +35,7 @@ def build():
             continue
         raw = path.read_bytes()
         docs = json.loads(raw)
-        exams[code] = {"count": len(docs), "v": hashlib.sha1(raw).hexdigest()[:10]}
+        exams[code] = {"count": len(docs), "v": hashlib.sha1(raw).hexdigest()[:10], "ids": id_ranges(docs)}
         for d in docs:
             unique[d["id"]] = d
             if len(d.get("examCodes") or []) > 1:

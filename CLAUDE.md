@@ -2,6 +2,7 @@
 
 Static GitHub Pages site (https://hyunhp.github.io/aws_qbank/) with original AWS certification
 practice questions. No build step: `index.html`, `js/*.js`, `data/*.json`, `diagrams/*.json`.
+Open work items are in `TODO.md` — read it at the start of a session.
 
 ## Hard rules
 - Never create files or folders the site reads whose names start with `_` (GitHub Pages/Jekyll

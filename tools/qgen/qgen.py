@@ -43,6 +43,8 @@ a correct answer that is conspicuously the longest option too often.
 """
 import collections, hashlib, json, pathlib, random, re, sys
 
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # Windows consoles default to cp949
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DATA = ROOT / "data"
 STATE = ROOT / "tools/qgen/ingested.json"          # block hash -> question id

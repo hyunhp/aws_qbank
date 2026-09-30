@@ -128,7 +128,7 @@ def parse_block(lines):
 
 def compile_file(path):
     blocks, cur = [], None
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         if line.startswith("@"):
             cur = [line]; blocks.append(cur)
         elif cur is not None:
@@ -136,7 +136,7 @@ def compile_file(path):
     out = []
     for b in blocks:
         spec = parse_block(b)
-        (OUT / f"{spec['id']}.json").write_text(json.dumps(spec, indent=1, ensure_ascii=False) + "\n")
+        (OUT / f"{spec['id']}.json").write_text(json.dumps(spec, indent=1, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
         out.append(spec["id"])
     return out
 

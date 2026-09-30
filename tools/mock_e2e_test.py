@@ -72,7 +72,7 @@ with sync_playwright() as p:
     pg.click('[data-filter="all"]')
     ok("review all lists 20", pg.locator(".rv").count() == 20)
     # diagram inside review for a drawn question that has one
-    ids = set(json.load(open(ROOT + "/diagrams/index.json"))["ids"])
+    ids = set(json.load(open(ROOT + "/diagrams/index.json", encoding="utf-8"))["ids"])
     with_diag = [q for q in st["ids"] if q in ids]
     if with_diag:
         pg.wait_for_selector(f"#mk-explain-{with_diag[0]} figure.qb-diagram", state="attached", timeout=8000)

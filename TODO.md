@@ -19,17 +19,14 @@ Client, AWS Service Management Connector (mention removed from Q001823). App Run
 carry an availability note in their explanations. Re-check every few months; the original Security Hub is now
 "Security Hub CSPM" (don't state a rename date).
 
-## 2. First diagram reveal: remaining long frame is generic layout
-Profiling (4x CPU) showed the ~100 ms frame is one ~65-80 ms Layout on any reveal, not diagram-specific
-(`injectStyles` is not the cause). Containing `.explain` cut it ~25 %. Further ideas: fewer DOM nodes per card,
-`contain: layout` on `.qcard`. `tools/diagrams/build_assets.py` fails on this Windows PC (source icon set missing),
-so `diagram.js` cannot be re-versioned here. `loading_perf_test.py` "no long frames on reveal" stays borderline
-(100 ms limit) when the company network needs re-authentication.
+## 2. Reveal frame cost (no action needed)
+Profiling (4x CPU) shows the ~100 ms frame is one ~45-70 ms Layout on any reveal, independent of list size and of
+diagrams (`injectStyles` is not the cause); it is the explanation text layout itself. `.explain{contain:layout style}`
+already cut it ~25 %. `loading_perf_test.py` "no long frames on reveal" (100 ms limit) can still flake when the
+company network needs re-authentication.
 
-## 3. tools/diagrams/site_test.py fails (not part of the required suite)
-`#card-Q000193` (AIB-C01, sequential mode, `?fresh=` URL) never becomes "visible" for Playwright within 30 s, also on
-commit 048b041. The card exists (y about 31,500 px); probably needs scrolling into view or `state="attached"`.
-
-## 4. Windows encoding
-Several tools read/print UTF-8 with the default cp949 locale. Fixed in the tests touched today; run the suite with
-`PYTHONUTF8=1` (e.g. `tools/diagrams/check.py` prints an em dash) or fix the remaining spots.
+## Tooling notes
+- `tools/diagrams/build_assets.py` reuses icons already in `assets/aws-icons.svg` when the icon pack is missing, so
+  it works on any PC; only brand-new icons need the pack (path as first argument).
+- Windows cp949: file I/O in tools now passes `encoding="utf-8"`; `qgen.py` and `diagrams/check.py` reconfigure stdout.
+  If a new script prints or reads non-ASCII, do the same.

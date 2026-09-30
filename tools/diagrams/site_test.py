@@ -12,12 +12,12 @@ class Q(http.server.SimpleHTTPRequestHandler):
 srv=http.server.ThreadingHTTPServer(("127.0.0.1",0),functools.partial(Q,directory=ROOT))
 threading.Thread(target=srv.serve_forever,daemon=True).start()
 BASE=f"http://127.0.0.1:{srv.server_address[1]}/"
-ids=set(json.load(open(f"{ROOT}/diagrams/index.json"))["ids"])
+ids=set(json.load(open(f"{ROOT}/diagrams/index.json",encoding="utf-8"))["ids"])
 exams={}
 for f in sorted(g for g in glob.glob(f"{ROOT}/data/*.json") if re.fullmatch(r"[A-Z]{3}-C\d{2}\.json", pathlib.Path(g).name)):
     if f.endswith("_manifest.json"): continue
-    code=f.split("/")[-1][:-5]
-    qs=json.load(open(f))
+    code=pathlib.Path(f).stem
+    qs=json.load(open(f,encoding="utf-8"))
     withd=[q["id"] for q in qs if q["id"] in ids]
     shared=[q["id"] for q in qs if q["id"] in ids and len(q["examCodes"])>1 and q["examCodes"][0]!=code]
     own=[i for i in withd if i not in shared]

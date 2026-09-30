@@ -27,7 +27,7 @@ try:
     link=pg.evaluate("navigator.clipboard.readText()")
     check("link format", "#bm=" in link, link)
     with pg.expect_download() as dl: pg.click("#bmExport")
-    path=dl.value.path(); data=json.load(open(path))
+    path=dl.value.path(); data=json.load(open(path,encoding="utf-8"))
     check("export contents", sorted(data["bookmarks"])==sorted(ids), data)
     # fresh context: restore by link
     ctx2=b.new_context(); pg2=ctx2.new_page(); pg2.on("pageerror", lambda e: errs.append(str(e)))

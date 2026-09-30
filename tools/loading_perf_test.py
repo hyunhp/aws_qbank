@@ -16,8 +16,8 @@ class Q(http.server.SimpleHTTPRequestHandler):
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Q, directory=ROOT))
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 BASE = f"http://127.0.0.1:{srv.server_address[1]}/"
-index = json.load(open(pathlib.Path(ROOT, "data", "exams-index.json")))
-diag_ids = set(json.load(open(pathlib.Path(ROOT, "diagrams", "index.json")))["ids"])
+index = json.load(open(pathlib.Path(ROOT, "data", "exams-index.json"), encoding="utf-8"))
+diag_ids = set(json.load(open(pathlib.Path(ROOT, "diagrams", "index.json"), encoding="utf-8"))["ids"])
 ok = fail = 0
 def check(name, cond, info=""):
     global ok, fail

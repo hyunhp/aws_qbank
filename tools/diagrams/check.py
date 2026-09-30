@@ -12,6 +12,8 @@ Exit code 1 if any consistency or layout error is found.
 """
 import argparse, functools, http.server, json, pathlib, re, sys, threading
 
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # Windows consoles default to cp949
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 # icon -> words that must appear in the question text. None = generic icon, no check.

@@ -360,6 +360,12 @@ def check(path, write=False):
     for i in items:
         if seen_hash[i["hash"]] > 1:
             errors.append(f"{i['where']}: duplicate stem inside batch")
+    # an id claimed by two block hashes was rewritten later with `I: <id>`; the older, unpinned block must not undo it
+    id_hashes = collections.Counter(state.values())
+    for i in items:
+        if not i["pin"] and id_hashes.get(state.get(i["hash"]), 0) > 1:
+            errors.append(f"{i['where']}: superseded - {state[i['hash']]} was rewritten later with an `I:` block; "
+                          f"delete this block (re-ingesting it would revert the fix)")
 
     # near-duplicate check against every existing question of the same exams (excluding own earlier ingest)
     exams = sorted({i["exam"] for i in items} | {e for i in items for e in i["shared"]})

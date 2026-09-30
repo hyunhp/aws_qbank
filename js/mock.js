@@ -7,6 +7,7 @@ const KEY_ACTIVE = "aws_qbank_mock_active_v1";
 const KEY_HISTORY = "aws_qbank_mock_history_v1";
 const KEY_SEEN = "aws_qbank_mock_seen_v1";
 const SHORT_N = 20;
+const SECTION_N = 40;   // "Full section": up to this many questions of one exam domain
 const HISTORY_MAX = 200;
 
 let qb = null;           // helpers passed from index.html
@@ -75,6 +76,14 @@ export function allocate(n, domains, supply) {
     for (const c of cand) { if (left <= 0) break; alloc[c.code]++; left--; c.r -= 1; }
   }
   return alloc;
+}
+
+// Section-only draw: n questions of one domain, unseen first, final order shuffled.
+export function drawFocused(exam, n, docs, domain, map, seenIds) {
+  const seen = new Set(seenIds || []);
+  const pool = docs.filter(q => domainOf(q, exam, map) === domain).map(q => q.id);
+  const fresh = shuffle(pool.filter(id => !seen.has(id))), old = shuffle(pool.filter(id => seen.has(id)));
+  return shuffle(fresh.concat(old).slice(0, n));
 }
 
 // Draw n question ids: stratified by domain, unseen first, then final order shuffled.
@@ -184,6 +193,8 @@ async function ensureData() {
     specs = s; domainMap = m;
   }
 }
+let setupDomain = null;   // null = whole exam by official weights, else one domain code
+function domainDocs(docs) { return setupDomain ? docs.filter(q => domainOf(q, setupExam, domainMap) === setupDomain) : docs; }
 async function docsFor(exam) { return (await qb.loadExam(exam)) || []; }
 
 // ---------- lifecycle ----------
@@ -196,6 +207,7 @@ export async function open(opts) {
     await ensureData();
     const active = await validActive(load(KEY_ACTIVE, null));
     setupExam = (opts.exam && specs[opts.exam]) ? opts.exam : (active && active.exam) || "SAA-C03";
+    setupDomain = opts.domain && specs[setupExam].domains.some(d => d.code === opts.domain) ? opts.domain : null;
     if (active) { state = active; view = "exam"; await startTicking(); }
   } catch (err) {
     showError(specs ? err : new Error("Could not load exam settings. Check your connection and reload. (" + (err && err.message) + ")"));
@@ -246,15 +258,18 @@ function persist() { if (state && !state.submitted) save(KEY_ACTIVE, state); }
 async function startExam(mode, timed) {
   const spec = specs[setupExam];
   const docs = await docsFor(setupExam);
-  const n = mode === "short" ? Math.min(SHORT_N, docs.length) : Math.min(spec.questions, docs.length);
+  const pool = domainDocs(docs);
+  const n = mode === "short" ? Math.min(SHORT_N, pool.length) : Math.min(setupDomain ? SECTION_N : spec.questions, pool.length);
   const seenAll = loadSeen();
-  const ids = draw(setupExam, n, docs, spec, domainMap, seenAll[setupExam]);
+  const ids = setupDomain ? drawFocused(setupExam, n, docs, setupDomain, domainMap, seenAll[setupExam])
+                          : draw(setupExam, n, docs, spec, domainMap, seenAll[setupExam]);
+  if (!ids.length) return;
   const byId = new Map(docs.map(q => [q.id, q]));
   const order = {};
   ids.forEach(id => { order[id] = shuffle((byId.get(id).choices || []).map(c => c.key)); });
   const dur = timeFor(spec, ids.length);
   state = {
-    v: 1, exam: setupExam, mode, ids, order, answers: {}, flags: [], cur: 0,
+    v: 1, exam: setupExam, domain: setupDomain, mode, ids, order, answers: {}, flags: [], cur: 0,
     startedAt: Date.now(), duration: dur, timed: !!timed, deadline: timed ? Date.now() + dur * 1000 : null,
     submitted: false,
   };
@@ -306,7 +321,7 @@ async function submit(auto) {
   state.summary = { correct, total: state.ids.length, dom, used };
   // history + seen
   const hist = loadHistory();
-  hist.push({ exam: state.exam, mode: state.mode, at: Date.now(), correct, total: state.ids.length, dom, used, timed: state.timed, auto: state.auto });
+  hist.push({ exam: state.exam, domain: state.domain || null, mode: state.mode, at: Date.now(), correct, total: state.ids.length, dom, used, timed: state.timed, auto: state.auto });
   save(KEY_HISTORY, hist.slice(-HISTORY_MAX));
   const seen = loadSeen();
   seen[state.exam] = Array.from(new Set((seen[state.exam] || []).concat(state.ids)));
@@ -347,10 +362,17 @@ function showError(err) {
 async function renderSetup(extra) {
   const spec = specs[setupExam];
   const docs = await docsFor(setupExam);
+  if (setupDomain && !spec.domains.some(d => d.code === setupDomain)) setupDomain = null;
   const seen = new Set(loadSeen()[setupExam] || []);
-  const unseen = docs.filter(q => !seen.has(q.id)).length;
-  const fullN = Math.min(spec.questions, docs.length);
-  const shortN = Math.min(SHORT_N, docs.length);
+  const pool = domainDocs(docs);
+  const unseen = pool.filter(q => !seen.has(q.id)).length;
+  const fullN = Math.min(setupDomain ? SECTION_N : spec.questions, pool.length);
+  const shortN = Math.min(SHORT_N, pool.length);
+  const perDomain = {};
+  docs.forEach(q => { const d = domainOf(q, setupExam, domainMap); perDomain[d] = (perDomain[d] || 0) + 1; });
+  const domOpts = `<option value="">All sections · official weights</option>` + spec.domains.filter(d => perDomain[d.code])
+    .map(d => `<option value="${d.code}"${d.code === setupDomain ? " selected" : ""}>${d.code} · ${esc(d.name)} (${perDomain[d.code]})</option>`).join("");
+  const domName = setupDomain ? (spec.domains.find(d => d.code === setupDomain) || {}).name : "";
   const hist = loadHistory().filter(h => h.exam === setupExam).slice(-10).reverse();
   const opts = (qb.EXAMS || []).filter(([c]) => specs[c]).map(([c, n]) => `<option value="${c}"${c === setupExam ? " selected" : ""}>${c} · ${esc(n)}</option>`).join("");
   const mode = (extra && extra.mode) || root.dataset.mode || "full";
@@ -358,15 +380,17 @@ async function renderSetup(extra) {
   root.innerHTML = `<div class="mk">
     <button class="linkbtn" data-act="exit">← Question bank</button>
     <h2>Mock Exam</h2>
-    <p class="sub">Timed, answers hidden until you submit. Questions follow the official domain weights, and ones you haven't seen in earlier mock exams come first.</p>
+    <p class="sub">${setupDomain ? `Timed, answers hidden until you submit. Only questions from ${setupDomain} · ${esc(domName)}; ones you haven't seen in earlier mock exams come first.`
+      : "Timed, answers hidden until you submit. Questions follow the official domain weights, and ones you haven't seen in earlier mock exams come first."}</p>
     <div class="panel">
       <select id="mkExam" aria-label="Certification">${opts}</select>
+      <select id="mkDomain" aria-label="Section">${domOpts}</select>
       <div class="modes">
-        <button class="mode${mode === "full" ? " on" : ""}" data-mode="full" type="button"><b>Full exam</b><span>${fullN} questions · ${Math.round(timeFor(spec, fullN) / 60)} min</span></button>
+        <button class="mode${mode === "full" ? " on" : ""}" data-mode="full" type="button"><b>${setupDomain ? "Full section" : "Full exam"}</b><span>${fullN} questions · ${Math.round(timeFor(spec, fullN) / 60)} min</span></button>
         <button class="mode${mode === "short" ? " on" : ""}" data-mode="short" type="button"><b>Short practice</b><span>${shortN} questions · ${Math.round(timeFor(spec, shortN) / 60)} min</span></button>
       </div>
       <label class="row"><input type="checkbox" id="mkTimed" checked> Timer (auto-submits at 0:00)</label>
-      <div class="meta">Pool: ${docs.length} questions · ${unseen} not yet seen in mock exams · official pass mark ${spec.passingScore}/1000</div>
+      <div class="meta">Pool: ${pool.length} questions${setupDomain ? " in this section" : ""} · ${unseen} not yet seen in mock exams · official pass mark ${spec.passingScore}/1000${setupDomain ? " (whole exam)" : ""}</div>
       ${unseen < (mode === "short" ? shortN : fullN) ? `<div class="meta" style="color:var(--amber)">Fewer unseen questions than needed, so some repeats will be included.</div>` : ""}
       <div class="btnrow"><button class="btn" data-act="start">Start exam</button>
       ${seen.size ? `<button class="linkbtn" data-act="resetseen">Reset seen questions for ${setupExam}</button>` : ""}</div>
@@ -374,7 +398,7 @@ async function renderSetup(extra) {
     <div class="panel"><b>Recent attempts · ${setupExam}</b>
       ${hist.length ? `<table><tr><th>Date</th><th>Mode</th><th>Score</th><th>Result</th></tr>${hist.map(h => {
         const pct = Math.round((h.correct / h.total) * 100); const v = verdictFor(spec.level, pct);
-        return `<tr><td>${new Date(h.at).toLocaleDateString()}</td><td>${h.mode === "short" ? "Short" : "Full"}</td><td>${h.correct}/${h.total} (${pct}%)</td><td class="v-${v.key}">${v.label}</td></tr>`;
+        return `<tr><td>${new Date(h.at).toLocaleDateString()}</td><td>${h.mode === "short" ? "Short" : "Full"}${h.domain ? " · " + esc(h.domain) : ""}</td><td>${h.correct}/${h.total} (${pct}%)</td><td class="v-${v.key}">${v.label}</td></tr>`;
       }).join("")}</table>` : `<div class="meta">No attempts yet.</div>`}
     </div></div>`;
   root.onclick = async (e) => {
@@ -386,7 +410,8 @@ async function renderSetup(extra) {
     else if (act === "start") startExam(root.dataset.mode, root.querySelector("#mkTimed").checked);
     else if (act === "resetseen") { const s = loadSeen(); delete s[setupExam]; save(KEY_SEEN, s); renderSetup(); }
   };
-  root.querySelector("#mkExam").onchange = (e) => { setupExam = e.target.value; renderSetup(); };
+  root.querySelector("#mkExam").onchange = (e) => { setupExam = e.target.value; setupDomain = null; renderSetup(); };
+  root.querySelector("#mkDomain").onchange = (e) => { setupDomain = e.target.value || null; renderSetup(); };
 }
 
 async function renderExam() {

@@ -1,5 +1,5 @@
 // Unit tests for mock exam drawing: node tools/mock_unit_test.mjs
-import { draw, allocate, domainOf } from "../js/mock.js";
+import { draw, drawFocused, allocate, domainOf } from "../js/mock.js";
 import fs from "fs";
 const specs = JSON.parse(fs.readFileSync("data/exam-specs.json"));
 const map = JSON.parse(fs.readFileSync("data/exam-domains.json"));
@@ -40,6 +40,18 @@ for (const exam of Object.keys(specs).filter(k => !k.startsWith("_"))) {
   }
   ok(`${exam} second exam prefers unseen`, overlap === minOverlap, `${overlap} vs min ${minOverlap}`);
   console.log(exam, "pool", docs.length, "full", spec.questions, "overlap on 2nd draw", overlap);
+  // section-only draw: only that domain, unique, capped by the pool, unseen first
+  for (const d of spec.domains) {
+    const pool = docs.filter(q => domainOf(q, exam, map) === d.code);
+    if (!pool.length) continue;
+    const ids = drawFocused(exam, 20, docs, d.code, map, []);
+    ok(`${exam} ${d.code} focused size`, ids.length === Math.min(20, pool.length), ids.length);
+    ok(`${exam} ${d.code} focused only this domain`, ids.every(id => domainOf(byId.get(id), exam, map) === d.code));
+    ok(`${exam} ${d.code} focused unique`, new Set(ids).size === ids.length);
+    const seenIds = pool.slice(0, Math.max(0, pool.length - 5)).map(q => q.id);
+    const next = drawFocused(exam, 5, docs, d.code, map, seenIds);
+    ok(`${exam} ${d.code} focused prefers unseen`, next.every(id => !seenIds.includes(id)) || pool.length <= 5, next.join(","));
+  }
 }
 // allocation edge cases
 const a = allocate(10, [{ code: "D1", weight: 50 }, { code: "D2", weight: 50 }], { D1: 2, D2: 100 });

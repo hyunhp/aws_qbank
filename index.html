@@ -58,6 +58,18 @@ header.top p.sub{margin:0;color:var(--muted);font-size:.92rem}
 .chip.active{background:var(--accent-bg);color:var(--accent-ink);border-color:var(--accent)}
 .chip:not([disabled]):hover{border-color:var(--accent)}
 .chip-sep{width:1px;align-self:stretch;background:var(--line);margin:0 2px}
+.filterrow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 8px}
+.filterrow[hidden]{display:none}
+.fchip{font:inherit;font-size:.76rem;line-height:1.3;border:1px solid var(--line);background:var(--surface);color:var(--muted);border-radius:8px;padding:5px 9px;cursor:pointer;text-align:left}
+.fchip .k{font-family:"IBM Plex Mono",monospace;font-weight:600;margin-right:5px}
+.fchip .cnt,.fchip .pct{font-variant-numeric:tabular-nums;opacity:.8;margin-left:5px}
+.fchip:hover{border-color:var(--accent)}
+.fchip.active{background:var(--accent-bg);color:var(--accent-ink);border-color:var(--accent)}
+.fchip.weak{border-color:var(--amber)}
+.fchip.weak .pct{color:var(--amber);opacity:1;font-weight:600}
+.flink{font:inherit;font-size:.74rem;background:none;border:none;color:var(--muted);text-decoration:underline;cursor:pointer;padding:4px 2px}
+.flink:hover{color:var(--accent)}
+.flabel{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-right:2px}
 .bookmarks-chip{border-color:var(--amber)}
 .bookmarks-chip.active{background:var(--amber-bg);color:var(--amber);border-color:var(--amber)}
 
@@ -182,6 +194,8 @@ header.top p.sub{margin:0;color:var(--muted);font-size:.92rem}
   </header>
 
   <div class="chiprow" id="chipRow"></div>
+  <div class="filterrow" id="domainRow" hidden></div>
+  <div class="filterrow" id="taskRow" hidden></div>
   <div class="exambar" id="examBar" aria-hidden="true"><div class="exambar-inner"><span class="code" id="examBarCode"></span><span class="name" id="examBarName"></span><span class="score" id="examBarScore"></span><button type="button" id="examBarChange" tabindex="-1">Change</button></div></div>
   <button class="totop" id="toTop" type="button" aria-label="Back to top" title="Back to top" tabindex="-1">↑</button>
   <div class="scorepill" id="scorePill"></div>
@@ -228,6 +242,93 @@ const shuffledOrder = {};         // examCode -> array of docs in the order curr
 const ORDER_MODE_KEY = "aws_qbank_order_mode_v1";
 let orderMode = (function(){ try { return localStorage.getItem(ORDER_MODE_KEY) === "sequential" ? "sequential" : "shuffle"; } catch (e) { return "shuffle"; } })();
 function setOrderMode(m){ orderMode = m; try { localStorage.setItem(ORDER_MODE_KEY, m); } catch (e) {} }
+// --- Domain / task filter and per-domain accuracy (this browser only) ---
+const STATS_KEY = "aws_qbank_domain_stats_v1";   // { exam: { D4: [correct, total] } }, never part of the bookmark backup
+const WEAK_MIN = 5, WEAK_PCT = 70;               // a domain is flagged after 5 counted answers below 70 %
+let meta = null;                                 // { specs, map, tasks }: exam-specs / exam-domains / exam-tasks
+const filt = { d: null, t: null };               // active domain / task filter of the selected exam
+let metaLoad = null;
+function loadMeta(){
+  if (!metaLoad) metaLoad = (async () => {
+    const idx = await loadDataIndex();
+    const get = name => { const v = idx && idx.files && idx.files[name]; return fetch(`./data/${name}${v ? "?v=" + v : ""}`, v ? {} : { cache: "no-cache" }).then(r => r.ok ? r.json() : {}); };
+    try { const [specs, map, tasks] = await Promise.all([get("exam-specs.json"), get("exam-domains.json"), get("exam-tasks.json")]); meta = { specs, map, tasks }; }
+    catch (e) { metaLoad = null; console.warn("Domain data unavailable", e); }
+    return meta;
+  })();
+  return metaLoad;
+}
+function docDomain(q, exam){ return (!q.examCodes || q.examCodes[0] === exam) ? q.domainCode : (((meta && meta.map[q.id]) || {})[exam] || q.domainCode); }
+function docTask(q, exam){ return (q.examCodes || [])[0] === exam ? q.taskId : null; }
+function filterDocs(docs){
+  return docs.filter(q => (!filt.d || docDomain(q, selectedExam) === filt.d) && (!filt.t || docTask(q, selectedExam) === filt.t));
+}
+function orderKey(){ return selectedExam === BOOKMARKS_CODE ? BOOKMARKS_CODE : `${selectedExam}|${filt.d || ""}|${filt.t || ""}`; }
+function filterFromLink(){
+  const p = new URLSearchParams((location.hash || "").replace(/^#/, ""));
+  filt.d = /^D\d+$/.test(p.get("d") || "") ? p.get("d") : null;
+  filt.t = filt.d && /^T\d+\.\d+$/.test(p.get("t") || "") ? p.get("t") : null;
+}
+function syncHash(){
+  const h = selectedExam === BOOKMARKS_CODE ? "#bookmarks"
+    : `#exam=${selectedExam}${filt.d ? "&d=" + filt.d : ""}${filt.t ? "&t=" + filt.t : ""}`;
+  history.replaceState(null, "", h);
+}
+function loadStats(){ try { return JSON.parse(localStorage.getItem(STATS_KEY)) || {}; } catch (e) { return {}; } }
+function saveStats(st){ try { localStorage.setItem(STATS_KEY, JSON.stringify(st)); } catch (e) {} }
+function recordStat(q, ok){
+  const exam = selectedExam === BOOKMARKS_CODE ? q._exam : selectedExam;
+  if (!exam || !meta) return;
+  const d = docDomain(q, exam), st = loadStats();
+  const row = (st[exam] = st[exam] || {}), cell = (row[d] = row[d] || [0, 0]);
+  cell[1]++; if (ok) cell[0]++;
+  saveStats(st);
+}
+function renderFilters(docs){
+  const dRow = document.getElementById("domainRow"), tRow = document.getElementById("taskRow");
+  const spec = meta && selectedExam !== BOOKMARKS_CODE ? meta.specs[selectedExam] : null;
+  if (!spec) { dRow.hidden = tRow.hidden = true; return; }
+  const stats = loadStats()[selectedExam] || {};
+  const byD = {}, byT = {};
+  docs.forEach(q => {
+    const d = docDomain(q, selectedExam); byD[d] = (byD[d] || 0) + 1;
+    const t = docTask(q, selectedExam); if (t && d === filt.d) byT[t] = (byT[t] || 0) + 1;
+  });
+  const pctOf = d => { const c = stats[d]; return c && c[1] ? Math.round(c[0] * 100 / c[1]) : null; };
+  const weak = d => { const c = stats[d]; return !!c && c[1] >= WEAK_MIN && pctOf(d) < WEAK_PCT; };
+  let h = `<span class="flabel">Section</span><button class="fchip${!filt.d ? " active" : ""}" data-d="" type="button">All<span class="cnt">${docs.length}</span></button>`;
+  spec.domains.filter(d => byD[d.code]).forEach(d => {
+    const p = pctOf(d.code);
+    h += `<button class="fchip${filt.d === d.code ? " active" : ""}${weak(d.code) ? " weak" : ""}" data-d="${d.code}" type="button" title="${weak(d.code) ? "Below " + WEAK_PCT + "% so far - worth extra practice" : ""}"><span class="k">${d.code}</span>${esc(d.name)}<span class="cnt">${byD[d.code]}</span>${p === null ? "" : `<span class="pct">${p}%</span>`}</button>`;
+  });
+  const tried = spec.domains.filter(d => stats[d.code] && stats[d.code][1] >= 3);
+  if (tried.length) {
+    const worst = tried.slice().sort((a, b) => pctOf(a.code) - pctOf(b.code) || stats[b.code][1] - stats[a.code][1])[0];
+    h += `<button class="flink" data-focus="${worst.code}" type="button">🎯 Focus on weakest (${worst.code})</button><button class="flink" data-resetstats type="button">Reset stats</button>`;
+  }
+  dRow.innerHTML = h; dRow.hidden = false;
+  const tasks = (meta.tasks || {})[selectedExam] || {};
+  const tkeys = filt.d ? Object.keys(tasks).filter(k => k.split(".")[0] === filt.d.slice(1) && byT["T" + k]) : [];
+  if (tkeys.length) {
+    tRow.innerHTML = `<span class="flabel">Task</span><button class="fchip${!filt.t ? " active" : ""}" data-t="" type="button">All in ${filt.d}</button>` +
+      tkeys.map(k => `<button class="fchip${filt.t === "T" + k ? " active" : ""}" data-t="T${k}" type="button"><span class="k">T${k}</span>${esc(tasks[k])}<span class="cnt">${byT["T" + k]}</span></button>`).join("");
+    tRow.hidden = false;
+  } else tRow.hidden = true;
+}
+function onFilterClick(e){
+  const b = e.target.closest("button"); if (!b) return;
+  if (b.hasAttribute("data-resetstats")) {
+    if (!confirm("Reset your per-section accuracy for " + selectedExam + "?")) return;
+    const st = loadStats(); delete st[selectedExam]; saveStats(st);
+  } else if (b.dataset.focus) { filt.d = b.dataset.focus; filt.t = null; }
+  else if (b.hasAttribute("data-d")) { filt.d = b.dataset.d || null; filt.t = null; }
+  else if (b.hasAttribute("data-t")) { filt.t = b.dataset.t || null; }
+  else return;
+  syncHash();
+  renderList({ reshuffle: true });
+}
+document.getElementById("domainRow").addEventListener("click", onFilterClick);
+document.getElementById("taskRow").addEventListener("click", onFilterClick);
 function sequential(arr){ return arr.slice().sort((a, b) => String(a.id).localeCompare(String(b.id), undefined, { numeric: true })); }
 
 // --- Bookmarks (stored locally in this browser only) ---
@@ -465,10 +566,11 @@ function renderChips(){
     const btn = e.target.closest(".chip");
     if (!btn || btn.disabled) return;
     selectedExam = btn.dataset.code;
+    filt.d = filt.t = null;
     renderChips();
     renderList();
     renderScorePill();
-    history.replaceState(null, "", selectedExam === BOOKMARKS_CODE ? "#bookmarks" : `#exam=${selectedExam}`);
+    syncHash();
   };
 }
 
@@ -510,7 +612,7 @@ function resetScore(){
 function renderListControls(){
   renderBookmarkTools();
   const el = document.getElementById("listControls");
-  const docs = shuffledOrder[selectedExam];
+  const docs = shuffledOrder[orderKey()];
   el.style.display = (docs && docs.length > 0) ? "flex" : "none";
   document.getElementById("shuffleBtn").classList.toggle("active", orderMode === "shuffle");
   document.getElementById("sequentialBtn").classList.toggle("active", orderMode === "sequential");
@@ -619,6 +721,7 @@ function revealCard(qid, opts){
     const s = examScore[selectedExam] || (examScore[selectedExam] = { correct: 0, total: 0 });
     s.total++;
     if (isCorrect) s.correct++;
+    recordStat(q, isCorrect);
     renderScorePill();
   }
 }
@@ -679,17 +782,24 @@ async function renderList(opts){
     const need = await examsForBookmarks();
     if (need.some(c => cache[c] === undefined)) { area.innerHTML = '<div class="loading">Loading bookmarked questions…</div>'; await Promise.all(need.map(loadExam)); }
   }
-  const docs = selectedExam === BOOKMARKS_CODE ? getBookmarkedDocs() : await loadExam(selectedExam);
+  const all = selectedExam === BOOKMARKS_CODE ? getBookmarkedDocs() : await loadExam(selectedExam);
+  if (selectedExam !== BOOKMARKS_CODE) await loadMeta();
+  const spec = meta && meta.specs[selectedExam];
+  if (spec && filt.d && !spec.domains.some(d => d.code === filt.d)) filt.d = filt.t = null;   // stale link
+  let docs = selectedExam === BOOKMARKS_CODE ? all : filterDocs(all);
+  if (!docs.length && all.length && selectedExam !== BOOKMARKS_CODE) { filt.d = filt.t = null; docs = all; syncHash(); }
+  renderFilters(all);
   if (!docs.length){
-    shuffledOrder[selectedExam] = [];
+    shuffledOrder[orderKey()] = [];
     area.innerHTML = selectedExam === BOOKMARKS_CODE
       ? '<div class="empty">You haven\'t bookmarked any questions yet. Click the ☆ icon on a question to save it here.</div>'
       : '<div class="empty">No questions have been created for this certification yet.</div>';
     renderScorePill(); renderListControls();
     return;
   }
-  if (reshuffle || !shuffledOrder[selectedExam]) shuffledOrder[selectedExam] = orderMode === "sequential" ? sequential(docs) : shuffle(docs);
-  const displayDocs = shuffledOrder[selectedExam];
+  const okey = orderKey();
+  if (reshuffle || !shuffledOrder[okey]) shuffledOrder[okey] = orderMode === "sequential" ? sequential(docs) : shuffle(docs);
+  const displayDocs = shuffledOrder[okey];
   currentQMap = new Map(displayDocs.map(d => [d.id, d]));
   area.innerHTML = `<div class="qlist">${displayDocs.map(questionCard).join("")}</div>`;
   warmDiagrams(displayDocs);
@@ -834,6 +944,7 @@ async function boot(){
   document.getElementById("statShared").textContent = idx ? idx.sharedUnique : new Set(flat.filter(d => (d.examCodes || []).length > 1).map(d => d.id)).size;
 
   const linked = examFromLink();
+  filterFromLink();
   selectedExam = linked === BOOKMARKS_CODE
     ? BOOKMARKS_CODE
     : ((linked && (counts[linked] || 0) > 0) ? linked : (EXAMS.map(([c]) => c).find(c => (counts[c] || 0) > 0) || null));
@@ -847,11 +958,11 @@ window.addEventListener("hashchange", () => {
   if (restoreFromLink()) { selectedExam = BOOKMARKS_CODE; renderChips(); renderList(); return; }
   const linked = examFromLink();
   if (linked === BOOKMARKS_CODE) { selectedExam = BOOKMARKS_CODE; renderChips(); renderList(); return; }
-  if (linked && (counts[linked] || 0) > 0) { selectedExam = linked; renderChips(); renderList(); }
+  if (linked && (counts[linked] || 0) > 0) { selectedExam = linked; filterFromLink(); renderChips(); renderList(); }
 });
 
 // --- Mock exam mode (js/mock.js, loaded on demand) ---
-const MOCK_VERSION = "eabfa4b49e"; // stamped by tools/stamp_version.py
+const MOCK_VERSION = "362f1157d6"; // stamped by tools/stamp_version.py
 function toggleBookmark(qid){
   const on = !bookmarks.has(qid);
   if (on) { bookmarks.add(qid); requestPersistentStorage(); } else bookmarks.delete(qid);
@@ -868,6 +979,7 @@ function mockFromLink(){
   return EXAMS.some(([c]) => c === code) ? code : "";
 }
 let mockOpening = false;
+let pendingMockDomain = null;   // section filter handed to the next mock exam setup
 async function openMock(code){
   if (mockOpening) return;
   mockOpening = true;
@@ -887,9 +999,13 @@ async function openMockInner(code){
   root.hidden = false;
   document.getElementById("examBar").classList.remove("show");
   const exam = code || (selectedExam && selectedExam !== BOOKMARKS_CODE ? selectedExam : "");
-  if (!location.hash.startsWith("#mock")) history.pushState(null, "", exam ? `#mock=${exam}` : "#mock");
+  const linkedDomain = /^D\d+$/.test(new URLSearchParams((location.hash || "").replace(/^#/, "")).get("d") || "") && location.hash.startsWith("#mock")
+    ? new URLSearchParams(location.hash.replace(/^#/, "")).get("d") : null;
+  const domain = linkedDomain || pendingMockDomain;
+  pendingMockDomain = null;
+  if (!location.hash.startsWith("#mock")) history.pushState(null, "", exam ? `#mock=${exam}${domain ? "&d=" + domain : ""}` : "#mock");
   try {
-    await mockModule.open({ root, exam, qb: window.qb, onExit: closeMock });
+    await mockModule.open({ root, exam, domain, qb: window.qb, onExit: closeMock });
   } catch (e) {
     console.warn("Mock exam failed to open", e);
     root.innerHTML = `<div class="wrap" style="padding-top:40px"><div class="empty">
@@ -909,11 +1025,11 @@ function closeMock(code){
   const root = document.getElementById("mockRoot");
   root.hidden = true; root.innerHTML = ""; root.onclick = null;
   document.querySelector(".wrap").hidden = false;
-  if (code && (counts[code] || 0) > 0 && code !== selectedExam){ selectedExam = code; renderChips(); renderList(); }
-  history.replaceState(null, "", selectedExam === BOOKMARKS_CODE ? "#bookmarks" : `#exam=${selectedExam}`);
+  if (code && (counts[code] || 0) > 0 && code !== selectedExam){ selectedExam = code; filt.d = filt.t = null; renderChips(); renderList(); }
+  syncHash();
   window.scrollTo(0, 0);
 }
-document.getElementById("mockBtn").addEventListener("click", () => openMock(selectedExam !== BOOKMARKS_CODE ? selectedExam : ""));
+document.getElementById("mockBtn").addEventListener("click", () => { pendingMockDomain = selectedExam !== BOOKMARKS_CODE ? filt.d : null; openMock(selectedExam !== BOOKMARKS_CODE ? selectedExam : ""); });
 window.addEventListener("popstate", () => {
   const m = mockFromLink();
   if (m === null && !document.getElementById("mockRoot").hidden) closeMock();

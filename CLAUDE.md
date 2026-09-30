@@ -4,6 +4,9 @@ Static GitHub Pages site (https://hyunhp.github.io/aws_qbank/) with original AWS
 practice questions. No build step: `index.html`, `js/*.js`, `data/*.json`, `diagrams/*.json`.
 Explanations live apart from the questions: `data/<EXAM>.json` has none, `data/explanations/<EXAM>.json` is `{id: text}`
 (qgen `load_exam`/`save_exam` merge and split them; the site fetches them on first reveal).
+Section filter chips (domain/task, `#exam=X&d=D4&t=T4.1`), per-domain accuracy (localStorage only, not in the bookmark
+backup) and the mock exam "one section only" option read `data/exam-specs.json`, `exam-domains.json` and
+`exam-tasks.json` (English task names; keep it in step with `tools/qgen/tasks.json`).
 Open work items are in `TODO.md` — read it at the start of a session.
 
 ## Hard rules
@@ -43,4 +46,4 @@ answer), stem length. `python3 tools/qgen/length_bias.py <batch>` lists the ques
 - Plan gaps: `python3 tools/qgen/qgen.py plan <EXAM>`; status: `python3 tools/qgen/qgen.py report`
 - Validate: `python3 tools/qgen/qgen.py check <batch>`; write: `... ingest <batch>`
 - Tests (all must pass before commit):
-  `node tools/mock_unit_test.mjs && python3 tools/mock_e2e_test.py && python3 tools/mock_link_test.py && python3 tools/bookmark_backup_test.py && python3 tools/loading_perf_test.py && python3 tools/diagrams/scroll_ui_test.py && python3 tools/diagrams/check.py && python3 tools/diagrams/site_test.py`
+  `node tools/mock_unit_test.mjs && python3 tools/mock_e2e_test.py && python3 tools/mock_link_test.py && python3 tools/bookmark_backup_test.py && python3 tools/loading_perf_test.py && python3 tools/domain_filter_test.py && python3 tools/diagrams/scroll_ui_test.py && python3 tools/diagrams/check.py && python3 tools/diagrams/site_test.py`

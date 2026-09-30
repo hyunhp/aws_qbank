@@ -11,7 +11,7 @@ import hashlib, json, pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
-EXTRA = ["exam-specs.json", "exam-domains.json"]
+EXTRA = ["exam-specs.json", "exam-domains.json", "exam-tasks.json"]
 
 
 def id_ranges(docs):

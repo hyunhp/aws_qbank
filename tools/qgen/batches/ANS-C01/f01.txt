@@ -1,0 +1,236 @@
+# ANS-C01 fixes for flawed published questions (full blocks, pinned with I:)
+
+@ ANS-C01 D1 T1.1 applied troubleshooting
+S: A CloudFront distribution has two cache behaviors above the default (*) behavior, in this order: precedence 0 uses the path pattern *.jpg with a short TTL and a cache key that includes several request headers, and precedence 1 uses the path pattern /images/* with a long TTL tuned for static images. JPEG files under /images/ are being served with the short TTL and a low cache hit ratio instead of the image-optimized behavior. What is the root cause and fix?
+A: CloudFront should choose the most specific pattern on its own, so the distribution must be recreated
+B: Path patterns must begin without a slash, so /images/* never matches and requests fall to *.jpg
+C: Behaviors are evaluated in precedence order and *.jpg matches first; move /images/* above *.jpg
+D: The /images/* behavior needs an explicit priority number set in a separate cache policy field
+K: C
+G: ## How CloudFront picks a cache behavior
+A distribution has an ordered list of cache behaviors, each with a path pattern such as `/images/*` or `*.jpg`, plus the **default (*) behavior**.
+- For every request CloudFront checks the behaviors in **precedence order** (0, 1, 2, ...) and uses the **first pattern that matches**. It does not look for the longest or most specific match.
+- The default (*) behavior is always evaluated last and cannot be moved; it catches whatever no other behavior matched.
+- Patterns are case-sensitive, and a leading slash is optional (`images/*` and `/images/*` are equivalent).
+## Why the images get the wrong settings
+A request for `/images/logo.jpg` matches both `*.jpg` and `/images/*`. Because `*.jpg` has precedence 0, it wins, so the file gets the short TTL and is cached separately for each combination of those request headers, which fragments the cache and lowers the hit ratio.
+Example fix: give `/images/*` precedence 0 and `*.jpg` precedence 1. Now `/images/logo.jpg` uses the image behavior, while `/blog/photo.jpg` still uses the `*.jpg` behavior.
+W: First match in precedence order: CloudFront stops at the first matching path pattern, and the broader `*.jpg` pattern is listed first, so it captures every JPEG under `/images/`. Reordering so `/images/*` comes before `*.jpg` sends those requests to the long-TTL behavior.
+X: A=Automatic specificity: CloudFront never re-sorts behaviors by specificity; list order is the rule. Reordering is an in-place edit of the distribution, so nothing needs to be recreated.
+B=Leading slash invalid: a leading slash is optional in path patterns, so `/images/*` is valid and matches `/images/logo.jpg`. The problem is that another pattern is evaluated before it.
+D=Separate priority field: there is no priority field in cache policies. The position of a behavior in the list is its precedence, and cache policies only control TTLs and the cache key.
+T: CloudFront uses the first matching cache behavior in precedence order, with the default (*) always last; put narrow patterns such as /images/* above broad ones such as *.jpg.
+V: Amazon CloudFront
+I: Q001593
+
+@ ANS-C01 D3 T3.2 applied definition
+S: A network operations team wants continuous, active measurement of latency and packet loss along the specific paths between their on-premises data centers and their AWS VPCs over both Direct Connect and VPN, using probes that AWS manages with no agents to install, independent of whether the BGP session itself reports a failure, to catch brownout conditions like partial packet loss that do not take BGP down. Which AWS capability is designed for this?
+A: VPC Reachability Analyzer
+B: Amazon CloudWatch Network Monitor
+C: The AWS Direct Connect ConnectionBpsEgress CloudWatch metric alone
+D: Amazon CloudWatch Internet Monitor
+K: B
+G: ## Brownouts and why BGP misses them
+A **brownout** (gray failure) is partial degradation: 2% packet loss or rising latency. BGP keepalives are tiny and infrequent, so a session stays Established even while applications suffer.
+## Amazon CloudWatch Network Monitor
+Network Monitor measures hybrid paths actively and continuously:
+- You create a monitor with probes from a VPC subnet to on-premises IP addresses, over Direct Connect or VPN, using ICMP or TCP.
+- The probes are AWS-managed, so there is no agent to install on your instances or on-premises hosts.
+- It publishes round-trip time and packet loss to CloudWatch, so you can alarm on thresholds such as loss above 1%, and it shows whether degradation is inside the AWS network.
+## Example
+A monitor probes `192.168.10.5` from a subnet in the production VPC, and routing carries the probes over Direct Connect. A 3% loss spike on that path with BGP still up is visible within minutes.
+W: CloudWatch Network Monitor: it continuously measures latency and packet loss on specific hybrid paths over Direct Connect and VPN with AWS-managed probes, which catches brownouts that never take BGP down.
+X: A=Reachability Analyzer: it analyzes configuration statically and sends no packets, so it cannot measure loss or latency on a live path.
+C=ConnectionBpsEgress alone: this metric reports throughput leaving the AWS side of the connection. A link can carry normal volume while dropping a few percent of packets, so it does not reveal loss or latency.
+D=CloudWatch Internet Monitor: Internet Monitor measures performance between your applications and end users across the public internet by location and provider, not private hybrid paths.
+T: For latency and loss on specific Direct Connect or VPN paths, use Network Monitor's AWS-managed probes; configuration analysis and throughput metrics cannot see brownouts.
+V: CloudWatch Network Monitor, Direct Connect, Site-to-Site VPN
+I: Q001710
+
+@ ANS-C01 D1 T1.5 advanced troubleshooting
+S: A company relies on Direct Connect with jumbo frames (8500-byte MTU, the maximum for a transit VIF and a Transit Gateway) enabled end to end for a data replication workload that depends on high throughput. As a resiliency improvement, they add a Site-to-Site VPN as a BGP-advertised backup path to the same Transit Gateway. During a scheduled Direct Connect maintenance window, traffic fails over to the VPN and replication throughput drops sharply with intermittent errors related to oversized packets. What is the most likely explanation?
+A: The VPN must be re-established manually after each DX maintenance, so no traffic flowed
+B: BGP can't fail over between DX and VPN
+C: VPN tunnels don't support jumbo frames, so large packets fail
+D: TGW VPN attachments don't support BGP, forcing static routing that drops large packets
+K: C
+G: ## MTU on different paths
+The **MTU** is the largest packet a path can carry without fragmentation.
+- Direct Connect private VIFs support jumbo frames up to 9001 bytes, and transit VIFs up to 8500 bytes.
+- A transit gateway carries up to 8500 bytes for VPC and Direct Connect attachments, but only 1500 bytes for VPN attachments.
+- Inside the IPsec tunnel the usable size is smaller still, because encryption headers take space (the VPN tunnel MTU is 1446 bytes).
+## What happens on failover
+When traffic moves from Direct Connect to the VPN, hosts keep sending large packets. Packets bigger than the tunnel MTU are dropped or must be fragmented, and throughput collapses. The fix is to clamp TCP MSS on the routers or set a host MTU that works on both paths.
+Example: an 8500-byte replication packet that fit on Direct Connect cannot fit in a tunnel that carries about 1400 bytes of payload.
+W: VPN does not support jumbo frames: the VPN path has a much smaller MTU, so the 8500-byte packets the replication workload sends fail or fragment after failover.
+X: A=Manual VPN re-establishment: VPN tunnels with BGP stay up and take routes automatically. The stem says traffic did fail over and throughput dropped, so traffic was flowing.
+B=BGP cannot fail over between DX and VPN: BGP failover between Direct Connect and VPN is a standard, supported design, and the stem shows the failover happened.
+D=TGW VPN lacks BGP: transit gateway VPN attachments support dynamic BGP routing, and static routes would not cause oversize-packet errors anyway.
+T: Direct Connect through a transit gateway supports jumbo frames up to 8500 bytes but VPN does not; plan MTU or MSS for the smallest path before relying on a VPN backup.
+V: AWS Direct Connect, AWS Site-to-Site VPN, AWS Transit Gateway
+I: Q001634
+
+@ ANS-C01 D1 T1.4 advanced troubleshooting
+S: A network engineer suspects that traffic is not reaching its intended destination because of a missing or blackholed route somewhere along a multi-hop path through two peered Transit Gateways in different Regions, each with several route tables, all registered in an AWS Network Manager global network. Rather than manually inspecting every route table, which tool can trace the path through the transit gateway route tables and identify the specific route table with the configuration issue?
+A: AWS Trusted Advisor network reachability checks
+B: CloudWatch Logs Insights queries against VPC Flow Logs
+C: Amazon VPC IPAM resource discovery and CIDR monitoring
+D: AWS Network Manager Route Analyzer
+K: D
+G: ## Transit gateway route tables in a chain
+A packet crossing a transit gateway is routed by the TGW route table associated with the attachment it entered from. With several route tables and peered transit gateways in other Regions, a path can break in many places: a missing route, a `blackhole` route, or an association to the wrong table.
+## Route Analyzer
+**Route Analyzer** is part of AWS Network Manager. You choose a source and a destination (a transit gateway attachment and an IP address) and it walks the TGW route tables along the path, including across peered transit gateways registered in the global network.
+- It reports each hop and the route used.
+- It flags where the path breaks, such as "no route" or a blackhole route in a specific route table.
+- It can check the return path as well.
+Example: analyzing `10.1.0.25` to `10.2.5.10` shows that the route table for the peering attachment in the second Region has `10.2.0.0/16` as a blackhole.
+W: Route Analyzer: it analyzes transit gateway route tables along the whole path, across the peered transit gateways in the global network, and points to the exact missing or blackhole route, which is what the engineer is asking for.
+X: A=Trusted Advisor: Trusted Advisor checks best practices such as security group openness and service limits. It does not trace routes through transit gateway route tables.
+B=Logs Insights on flow logs: flow logs show traffic that was observed. They can show that packets stopped, but not which route table entry is missing or blackholed.
+C=VPC IPAM: IPAM plans and tracks IP address allocations and can flag overlapping or unmanaged CIDRs, but it does not read transit gateway route tables or follow a packet's path hop by hop.
+T: For "which TGW route table is missing or blackholing my route" across a Network Manager global network, use Route Analyzer; flow logs show symptoms and IPAM shows address usage, not the broken route.
+V: AWS Network Manager
+I: Q001622
+
+@ ANS-C01 D2 T2.1 advanced troubleshooting
+S: After enabling MACsec with the must_encrypt encryption mode on a two-member Direct Connect LAG, traffic across one member connection drops to zero while the other member continues to pass traffic normally, and the BGP session on the private virtual interface that runs over the LAG stays up. What is the most likely cause?
+A: MACsec runs on the LAG as a whole, so one member cannot fail on its own
+B: The LAG minimum links threshold was not met
+C: The other member draws all traffic because of BGP local preference
+D: The router's CKN/CAK doesn't match AWS, so must-secure blocks traffic
+K: D
+G: ## MACsec encryption modes
+A MACsec-capable Direct Connect connection or LAG has an encryption mode:
+- **must_encrypt**: traffic is allowed only after a MACsec session is established. If MKA cannot agree, the link passes nothing.
+- **should_encrypt**: MACsec is preferred, but traffic flows unencrypted if the session fails.
+- **no_encrypt**: MACsec is not used.
+## Where BGP runs on a LAG
+BGP runs on the virtual interface, which sits on the LAG as a whole, not on each member. As long as enough members stay up to meet the minimum-links setting, the LAG and the VIF's BGP session stay up even if one member passes nothing.
+## What makes MKA fail
+Both ends must hold the same **CKN** and **CAK**, plus compatible MACsec settings such as the cipher suite. A typo in the CAK on the router, a key rotated on one side only, or a CKN that does not match the one associated in AWS all stop the session from forming.
+Example: AWS has CKN `aa11...` associated with the LAG, but the router port for the second member uses `aa12...`. In must_encrypt mode that member drops all frames, while the other member keeps passing traffic.
+W: CKN/CAK mismatch with must_encrypt: the member's MACsec session cannot form, and must_encrypt blocks all traffic on it rather than falling back to cleartext, which matches one member at zero while the other member keeps the LAG and its BGP session up.
+X: A=LAG as a whole: MACsec runs per physical link, with a separate MKA session on each member connection, so one member's session can fail while the other member's session works.
+B=Minimum links threshold: the minimum-links setting controls whether the whole LAG stays up. If it were not met, the entire LAG and the BGP session on its VIF would go down, not one member while the other passes traffic.
+C=BGP local preference: BGP sessions run on virtual interfaces over the LAG as a whole. Local preference chooses between routes, it cannot steer traffic to one physical member of a LAG, which LACP hashing handles.
+T: must_encrypt plus zero traffic on one link → the MACsec keys on that link do not match; should_encrypt would have fallen back instead of blocking.
+V: Direct Connect
+I: Q001646
+
+@ ANS-C01 D3 T3.3 advanced use-case
+S: An application uses an AWS Global Accelerator standard accelerator whose listener has two endpoint groups: one in us-east-1 containing the existing Application Load Balancer, and one in a newly added Region containing a new ALB. Both endpoints are healthy. Operations wants the new Region to receive only a small percentage of the traffic that would normally be routed to it, and then to raise that share step by step while validating performance, without a hard cutover. Which Global Accelerator setting should be adjusted?
+A: Set the new Region endpoint group's traffic dial to a low percentage, then raise it in steps
+B: Change the health check protocol from HTTP to TCP so traffic shifts to the new Region slowly
+C: Give the new Region's ALB a lower endpoint weight than the ALB in the us-east-1 endpoint group
+D: Switch client affinity from None to Source IP so new connections move over gradually
+K: A
+G: ## Two traffic controls in Global Accelerator
+A standard accelerator has listeners, each with one **endpoint group per Region**, and each endpoint group contains endpoints such as ALBs, NLBs, EC2 instances or Elastic IP addresses.
+- The **traffic dial** is set per endpoint group (0-100%, default 100%). It controls what percentage of the traffic that would normally go to that Region is actually sent there; the rest goes to the other endpoint groups.
+- **Endpoint weights** split traffic among the endpoints inside one endpoint group. They have no effect across Regions.
+Global Accelerator normally sends each user to the closest healthy endpoint group, then applies the dial and the weights.
+## Ramping up a new Region
+Set the new endpoint group's dial to, for example, 10%. Users near the new Region send 10% of their traffic to it and the remaining 90% to us-east-1. After checking latency and errors, raise the dial to 25%, 50% and finally 100%. Setting the dial back to 0% removes the Region from service without deleting anything.
+W: Traffic dial on the new endpoint group: the dial is the per-Region control for exactly this pattern, sending a chosen percentage of the new Region's traffic there and letting operations raise it step by step without a hard cutover.
+X: B=Health check protocol: the health check protocol decides how endpoint health is tested. Healthy endpoints receive traffic the same way whether checks use HTTP or TCP, so it gives no gradual shift.
+C=Endpoint weight: weights only divide traffic among endpoints in the same endpoint group. Each Region here is its own endpoint group with a single ALB, so a lower weight on the new ALB changes nothing between Regions.
+D=Source IP client affinity: affinity only keeps a given client on the same endpoint once one is chosen. It does not set what share of traffic a Region receives.
+T: Shift traffic between Regions gradually → endpoint group traffic dial; split traffic among endpoints inside one Region → endpoint weights.
+V: Global Accelerator
+I: Q001720
+
+@ ANS-C01 D2 T2.4 advanced troubleshooting
+S: A transit gateway's attachment to a Direct Connect gateway shows the state available in the Amazon VPC console, yet on-premises users cannot reach VPC workloads over Direct Connect. The engineer suspects that the BGP session on the transit virtual interface is down. Where can the engineer check the BGP status of that session?
+A: The Direct Connect console or DescribeVirtualInterfaces output, which reports the transit VIF's BGP peer status
+B: The transit gateway attachment state, because an available attachment state confirms BGP is established
+C: AWS Network Manager Route Analyzer, which reports the BGP peer state of each Direct Connect connection it finds
+D: VPC Flow Logs on the attachment subnets, which record the BGP keepalives exchanged with the on-premises router
+K: A
+G: ## What each view shows
+A transit gateway connects to Direct Connect through an attachment to a Direct Connect gateway, which is associated with one or more transit virtual interfaces.
+- A transit gateway **attachment state** such as `available` is a lifecycle state: the attachment is provisioned. It says nothing about whether routes are being exchanged.
+- The BGP session for Direct Connect runs between the on-premises router and AWS on the **virtual interface** (here a transit VIF). Its state is a property of the VIF.
+## Where the BGP state lives
+The Direct Connect console shows each virtual interface with its BGP peers and their **BGP status** (up or down). The same data is returned by the `DescribeVirtualInterfaces` API as `bgpPeers[].bgpStatus`.
+Example: the attachment is `available`, but the transit VIF shows BGP status `down` because the on-premises router has the wrong ASN or MD5 key. Fixing the router brings BGP up and the Direct Connect gateway starts propagating on-premises prefixes to the transit gateway route table.
+W: Direct Connect VIF BGP status: the BGP session belongs to the transit virtual interface, and the Direct Connect console and DescribeVirtualInterfaces report each BGP peer's status directly, so this is the place to confirm whether the session is down.
+X: B=Attachment state: `available` only means the transit gateway attachment to the Direct Connect gateway exists. It stays available while the BGP session on the VIF is down.
+C=Route Analyzer: Route Analyzer walks transit gateway route tables between a source and a destination. It does not report BGP session state for Direct Connect connections or virtual interfaces.
+D=VPC Flow Logs: the BGP session runs between the on-premises router and the Direct Connect endpoint, not through ENIs in a VPC subnet, so flow logs never contain these keepalives.
+T: An available transit gateway attachment is not proof of routing; check the BGP status of the virtual interface itself in Direct Connect.
+V: AWS Direct Connect, AWS Transit Gateway
+I: Q001685
+
+@ ANS-C01 D4 T4.2 advanced definition
+S: GuardDuty reports UnauthorizedAccess:EC2/MaliciousIPCaller.Custom for an instance. What does it indicate, and what is a sound first response?
+A: An IAM user signed in from a Tor exit node using stolen credentials
+B: AWS WAF blocked a malicious HTTP request sent to the instance
+C: Its security group was changed by an unauthorized IAM principal
+D: It talks to an IP on your custom threat list; isolate and investigate
+K: D
+G: ## Reading GuardDuty finding names
+A finding type follows `ThreatPurpose:ResourceType/ThreatFamily.DetectionMechanism`:
+- **UnauthorizedAccess**: the purpose, activity that may indicate unauthorized access.
+- **EC2**: the affected resource is an EC2 instance.
+- **MaliciousIPCaller.Custom**: the instance is communicating with an IP address that appears on a **custom threat list** you uploaded to GuardDuty (a threat intel set). Matches against AWS's built-in threat intelligence appear under other types, such as `Backdoor:EC2/C&CActivity.B`.
+Either way, the instance itself is talking to a known-bad address, which may mean it is compromised.
+## A sound first response
+- **Contain**: move the instance to an isolation security group with no rules or tightly restricted ones, or restrict it with a NACL.
+- **Preserve evidence**: snapshot EBS volumes and keep logs before terminating anything.
+- **Investigate**: use Amazon Detective or flow logs and CloudTrail to learn what it contacted and how it got there.
+W: Talking to an IP on your custom threat list: the finding means the instance communicated with an address from your own uploaded threat list, so contain it, preserve evidence and investigate before deciding on cleanup.
+X: A=IAM user from Tor: sign-ins or API calls from Tor exit nodes produce IAM-related findings such as `UnauthorizedAccess:IAMUser/TorIPCaller`, not an EC2 finding.
+B=WAF blocked a request: WAF blocks are recorded in WAF logs and metrics; GuardDuty does not report WAF actions as this finding.
+C=Security group changed: an unauthorized configuration change is visible in CloudTrail and Config. This finding type describes the instance's network communication, not a change to its security group.
+T: Read the finding type (purpose, resource, family): MaliciousIPCaller.Custom on EC2 means the instance talked to an IP on your custom threat list; contain, preserve evidence, investigate.
+V: Amazon GuardDuty
+I: Q001754
+
+@ ANS-C01 D2 T2.3 advanced use-case
+S: An on-premises DNS server forwards queries for a private hosted zone to a Route 53 Resolver inbound endpoint over Direct Connect. Other traffic between the data center and the endpoint's subnets flows normally, but the DNS queries fail. Which TWO checks are most relevant? (Select TWO)
+A: A Resolver forwarding rule for the zone's domain is associated with the endpoint's VPC
+B: The inbound endpoint's subnets have a route to an internet gateway for sending DNS replies
+C: The private hosted zone is associated with the VPC containing the inbound endpoint
+D: The private hosted zone is converted to a public hosted zone for on-premises use
+E: Security groups on the inbound endpoint allow DNS traffic from on-premises
+K: C,E
+G: ## How an inbound endpoint answers on-premises queries
+A Route 53 Resolver **inbound endpoint** is a set of ENIs in your VPC subnets. On-premises DNS servers forward queries to those ENI IP addresses, and the endpoint hands them to the Route 53 Resolver of that VPC.
+- The Resolver answers from the private hosted zones **associated with the endpoint's VPC**. If the zone is not associated, the name is looked up publicly and the query returns NXDOMAIN or the wrong answer.
+- The endpoint ENIs use a **security group**, which must allow UDP and TCP port 53 from the on-premises DNS servers. Without it, queries are dropped and time out.
+## What an inbound endpoint does not need
+- **Forwarding rules** apply to outbound endpoints, which send queries from the VPC to other resolvers. An inbound endpoint needs none.
+- Replies travel back over the same private path (Direct Connect or VPN). Because other traffic to the endpoint subnets already works, routing is not the problem, and no internet gateway is involved.
+Example: add the VPC to the zone `corp.internal`, and allow UDP/TCP 53 from `10.50.0.0/24` on the endpoint security group.
+W: C=Zone associated with the endpoint VPC: the inbound endpoint resolves through its own VPC's Resolver, which only sees private hosted zones associated with that VPC, so a missing association makes every query for the zone fail.
+E=Endpoint security group allows DNS: the endpoint ENIs are protected by their security group, and if it does not allow UDP and TCP port 53 from the on-premises DNS servers, the forwarded queries are dropped.
+X: A=Forwarding rule for the zone: forwarding rules are used by outbound endpoints to send queries out of the VPC. An inbound endpoint needs none, and a rule forwarding this domain to on-premises would send the queries away from the private hosted zone.
+B=Internet gateway route: DNS replies to on-premises return over the same Direct Connect path as the queries, and the stem says traffic to the endpoint subnets already works, so an internet gateway route plays no part.
+D=Convert to a public zone: making the zone public would expose internal names on the internet and is not required; inbound endpoints exist so on-premises clients can resolve private zones privately.
+T: Inbound endpoint queries fail with working routing → check the private hosted zone's VPC association and the endpoint security group (UDP/TCP 53 from on-premises).
+V: Amazon Route 53 Resolver
+I: Q003864
+
+@ ANS-C01 D1 T1.2 advanced use-case
+S: Security wants to block VPC workloads from resolving known malicious domains, such as malware and botnet command-and-control domains, and to log every blocked query, across 50 accounts. Which solution fits BEST?
+A: Route 53 public hosted zones created for each malicious domain.
+B: Network ACLs that block the IP addresses of malicious domains.
+C: DNS Firewall managed lists via Firewall Manager, with logging.
+D: Security group outbound rules that restrict port 53.
+K: C
+G: ## Route 53 Resolver DNS Firewall
+DNS Firewall filters DNS queries that VPC resources send to the Route 53 Resolver (the VPC's `.2` address).
+- A **rule group** contains rules that match a **domain list** and take an action: `ALLOW`, `BLOCK` (for example return `NXDOMAIN`) or `ALERT`.
+- **AWS managed domain lists** (Malware, Botnet/Command and Control, Aggregate Threat List, Amazon GuardDuty Threat List) are maintained and updated by AWS, so security teams do not have to track known-bad domains themselves. Custom domain lists can be added to the same rule group for anything else.
+- Blocked queries can be recorded with **Resolver query logging** to CloudWatch Logs, S3 or Firehose.
+## Rolling it out to 50 accounts
+**AWS Firewall Manager** can apply a DNS Firewall policy across an AWS Organization: it associates the rule groups with every in-scope VPC, including new accounts and VPCs, so no team has to configure it manually.
+Example: a rule `BLOCK` for the managed malware list with priority 100, deployed by Firewall Manager, plus query logging to a central S3 bucket.
+W: DNS Firewall managed lists via Firewall Manager with logging: it blocks resolution of known malware and botnet domains centrally using lists AWS keeps current, applies consistently across all 50 accounts, and logs each blocked query.
+X: A=Public hosted zones per malicious domain: creating public zones does not stop VPC resolution of those names (you would not be the authoritative delegation), cannot keep up with constantly changing threat lists, and provides no blocking logs.
+B=Network ACLs blocking IPs: malicious domains change IP addresses often and can share IPs with legitimate sites, NACLs have small rule limits, and they act on IPs, not on the DNS query itself.
+D=Security groups restricting port 53: security groups cannot inspect which domain is being queried. Restricting port 53 either breaks all DNS or allows all of it, and it produces no log of blocked domains.
+T: Block malicious domain lookups organization-wide with logs -> Route 53 Resolver DNS Firewall managed lists deployed by Firewall Manager, not IP-based filters.
+V: Route 53 Resolver DNS Firewall
+I: Q002077

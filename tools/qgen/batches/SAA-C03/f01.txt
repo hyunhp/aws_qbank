@@ -1,0 +1,112 @@
+# SAA-C03 fixes for flawed published questions (full rewrites pinned with I:)
+
+@ SAA-C03 D2 T2.1 applied use-case
+S: A serverless API is called by several partner applications, and each partner already sends its own API key with every request. Traffic bursts occasionally exceed the backend Lambda function's concurrency, causing downstream throttling. The architect wants API Gateway to cap each partner's request rate and burst so that excess requests are rejected at the API instead of reaching Lambda. Which configuration should be used?
+A: Move the API behind an S3 static website endpoint
+B: A usage plan with rate and burst throttling
+C: Enable API Gateway response caching for all methods
+D: Set the Lambda function's reserved concurrency to unlimited
+K: B
+G: ## Throttling in API Gateway
+API Gateway limits request rates with a token bucket: a **rate** (steady requests per second) and a **burst** (how many requests can arrive at once). Requests over the limit are rejected with HTTP `429 Too Many Requests`; they are not queued, so the backend never sees them. Clients are expected to retry with backoff, which AWS SDKs do automatically.
+Throttling can be set at several levels:
+- account-level limits per Region;
+- stage and method throttling settings, which apply to every caller alike;
+- **usage plans**, which apply rate, burst and optional quotas per API key for chosen stages and methods.
+## Why a usage plan fits here
+The partners already send API keys, so a usage plan can give each partner its own limit without any client change. Example: the backend comfortably handles about 200 requests per second; three partners each get rate 50 and burst 60, so their combined traffic stays below that level.
+W: Usage plan with rate and burst throttling: API Gateway enforces a per-key rate and burst at the front door, so each partner's spikes are cut off with a 429 response before they invoke Lambda or reach the downstream systems that are already throttling.
+X: A=S3 static website endpoint: an S3 website serves static files only. It cannot invoke Lambda, run API logic or apply per-client request limits, so the API would simply stop working.
+C=Response caching for all methods: caching helps only repeated cacheable reads. Writes and unique requests still pass through at full burst, no per-partner limit is applied, and caching every method can return stale or wrong data.
+D=Unlimited reserved concurrency: there is no unlimited setting, since concurrency is bounded by the account quota, and more concurrency would push even more load onto the downstream systems that are already throttling.
+T: To cap each API client's bursts before they reach the backend, throttle at API Gateway with a usage plan (per API key); stage or method throttling applies one limit to everyone.
+V: API Gateway, Lambda
+I: Q000480
+
+@ SAA-C03 D3 T3.4 advanced troubleshooting
+S: Users report intermittent slow response times from a web application behind an Application Load Balancer spanning three Availability Zones. The targets are registered by an Auto Scaling group. CloudWatch shows one AZ has significantly fewer registered targets than the other two, and that AZ's targets show higher average latency and CPU utilization. What is the MOST likely cause and correct fix?
+A: Uneven AZ distribution; enable cross-zone load balancing and balance the group
+B: The application needs a Network Load Balancer instead of an Application Load Balancer
+C: The ALB's idle timeout is too high and should be reduced to free connections
+D: The health check interval is too long and should be increased further
+K: A
+G: ## How a load balancer splits traffic across AZs
+An Application Load Balancer has a node in each enabled Availability Zone, and DNS spreads client connections roughly evenly across those nodes. What each node does next depends on **cross-zone load balancing**:
+- **On** (the ALB default at the load balancer level): each node spreads requests across all healthy targets in every AZ, so every target gets about the same share.
+- **Off** (possible per target group since 2022): each node sends requests only to targets in its own AZ. Each AZ still receives about one third of the traffic, whatever its target count.
+## Example
+Three AZs with 6, 6 and 2 targets and cross-zone off: each AZ gets about 33% of requests. In the first two AZs each target carries about 5.5%; in the third each carries about 16.7%, three times the load. Those targets run hot, their latency rises, and users hit by that AZ see slow responses.
+## The fix
+Turn cross-zone load balancing back on for the target group, and let the Auto Scaling group rebalance so each AZ has a similar number of targets.
+W: Uneven AZ distribution with cross-zone load balancing off: the AZ with fewer targets still receives about a third of the traffic, so each of its targets carries more load. Enabling cross-zone load balancing spreads requests across all targets, and rebalancing the group removes the capacity gap.
+X: B=Switch to a Network Load Balancer: an NLB also routes per AZ (its cross-zone setting is off by default), so the same imbalance would persist, and nothing in the symptoms needs layer 4 load balancing.
+C=Reduce the idle timeout: the idle timeout only closes inactive connections. It does not change how requests are divided between AZs, so the overloaded targets in the small AZ stay overloaded.
+D=Lengthen the health check interval: a longer interval only makes the load balancer slower to detect failing targets. It does not add capacity or rebalance traffic, so it can make the slowdown worse.
+T: With cross-zone load balancing off, each AZ gets an equal share of traffic regardless of its target count, so the AZ with the fewest targets overloads; enable cross-zone and balance targets across AZs.
+V: Elastic Load Balancing, Amazon EC2 Auto Scaling, Amazon CloudWatch
+I: Q000542
+
+@ SAA-C03 D4 T4.1 applied tradeoff
+S: A company uses AWS Backup to protect Amazon EBS volumes and Amazon EFS file systems and wants to minimize long-term backup storage costs while retaining backups for 7 years for compliance. What should the solutions architect configure?
+A: AWS Backup lifecycle rules to cold storage
+B: Scripts that copy backups to S3 Glacier on a schedule
+C: Disable backups after 90 days to reduce cost
+D: Keep all backups in warm storage indefinitely
+K: A
+G: ## Warm and cold storage in AWS Backup
+A backup plan in AWS Backup has rules that define the schedule, the target vault and a **lifecycle**:
+- **Transition to cold storage** after N days moves recovery points to a much cheaper tier intended for long retention.
+- **Expire** after N days deletes them automatically. A recovery point must stay in cold storage for at least 90 days, so the expiry must be at least 90 days after the transition.
+Cold storage is available only for resource types that support it, such as EBS snapshots, EFS, DynamoDB with advanced features and Timestream. Amazon RDS snapshots, for example, do not support it, so check the feature availability table by resource type.
+## Example
+Rule: daily backup, transition to cold after 30 days, expire after 2,555 days (about 7 years). Recent restores come from warm storage; old compliance copies sit in cold storage at a fraction of the price. AWS Backup Vault Lock can also make the retention tamper-proof.
+W: Lifecycle rules to cold storage: the backup plan itself moves older EBS and EFS recovery points to the low-cost cold tier and deletes them after 7 years, with no custom code and with retention enforced by the service.
+X: B=Scripts copying to S3 Glacier: AWS Backup recovery points are not objects you can copy into a Glacier storage class yourself, and a homegrown script adds failure points and breaks the managed restore path.
+C=Disable backups after 90 days: this deletes the data the company must keep for 7 years, so it directly violates the compliance requirement instead of reducing its cost.
+D=Warm storage indefinitely: it meets the retention requirement but pays warm-tier prices for years of rarely restored data, which is exactly the cost the company wants to avoid.
+T: Long compliance retention in AWS Backup = lifecycle rule to cold storage plus an expiry, for resource types that support cold storage; not scripts and not warm storage forever.
+V: AWS Backup, Amazon EBS, Amazon EFS
+I: Q000558
+
+@ SAA-C03 D3 T3.1 applied comparison
+S: A big data analytics workload running on hundreds of EC2 instances reads and writes a shared Amazon EFS file system with spiky, highly parallel access. It needs the highest aggregate throughput and operations per second that EFS offers, and the team wants to follow current AWS recommendations. Which EFS configuration should be selected?
+A: General Purpose performance mode with Elastic throughput
+B: Max I/O performance mode with Provisioned throughput
+C: Max I/O performance mode with Bursting throughput
+D: General Purpose performance mode with Bursting throughput
+K: A
+G: ## Two separate EFS settings
+Amazon EFS has two independent choices that are easy to confuse:
+- **Performance mode**: `General Purpose` or `Max I/O`, chosen at creation time.
+- **Throughput mode**: `Elastic`, `Provisioned` or `Bursting`, which controls how much throughput the file system can drive and can be changed later.
+## Why Max I/O is no longer the answer for scale
+Max I/O was designed for highly parallel workloads that accept higher per-operation latency. Today, General Purpose with Elastic throughput scales further: it has the highest documented EFS limits (up to 2.5 million read IOPS per file system after a quota increase) with the lowest per-operation latency. Max I/O is a previous-generation mode that is not supported with Elastic throughput or One Zone file systems, and AWS recommends General Purpose for all file systems.
+## Elastic throughput
+Elastic throughput scales up and down automatically with the workload and bills for what is used, which suits spiky access without capacity planning.
+W: General Purpose with Elastic throughput: this combination gives EFS's highest aggregate IOPS and throughput with the lowest per-operation latency, scales automatically with spiky demand, and matches AWS's current recommendation for all file systems.
+X: B=Max I/O with Provisioned throughput: Max I/O is a previous-generation mode with higher per-operation latency that AWS no longer recommends, and Provisioned throughput fixes a MiB/s level that must be sized for the spikes.
+C=Max I/O with Bursting throughput: Max I/O adds latency without beating General Purpose with Elastic, and Bursting ties throughput to stored data and burst credits, which spiky heavy access can exhaust.
+D=General Purpose with Bursting throughput: the performance mode is right, but Bursting throughput scales with the amount of data stored and runs on credits, and it has much lower IOPS limits than Elastic.
+T: For maximum EFS scale today, use General Purpose performance mode with Elastic throughput; Max I/O is a legacy choice that AWS no longer recommends.
+V: Amazon EFS
+I: Q000523
+
+@ SAA-C03 D4 T4.3 advanced tradeoff
+S: A new Amazon RDS for PostgreSQL database needs 8,000 IOPS steadily and can tolerate occasional latency variation. Cost matters. Which storage option fits BEST?
+A: io1 storage with 8,000 provisioned IOPS, since production databases require Provisioned IOPS
+B: io2 Block Express storage with 8,000 provisioned IOPS for the lowest possible latency
+C: gp3 storage of 100 GiB with 8,000 IOPS provisioned on top of the included baseline
+D: gp3 storage of 400 GiB or more, whose included 12,000 IOPS baseline covers the need
+K: D
+G: ## RDS storage types
+- **General Purpose SSD (gp3)**: for MySQL, MariaDB and PostgreSQL, volumes under 400 GiB get a fixed 3,000 IOPS and 125 MiB/s that cannot be changed. At 400 GiB and above the included baseline rises to 12,000 IOPS and 500 MiB/s, and more can be provisioned at a low per-IOPS price. (Oracle's threshold is 200 GiB; SQL Server lets you provision IOPS at any size.) Latency is good but less consistent than Provisioned IOPS.
+- **Provisioned IOPS SSD (io1, io2 Block Express)**: the highest and most consistent performance, with sub-millisecond latency for io2, at a higher price because every provisioned IOPS is billed. Nothing requires production databases to use it.
+## Example
+A 400 GiB PostgreSQL volume on gp3 includes 12,000 IOPS in the storage price, which covers the steady 8,000 IOPS. Buying 8,000 IOPS on io1 or io2 adds a per-IOPS monthly charge for latency consistency the team said it does not need.
+W: gp3 of 400 GiB or more: at this size RDS for PostgreSQL gp3 includes a 12,000 IOPS baseline at no extra IOPS charge, so it meets the steady 8,000 IOPS need at the lowest cost, and the workload explicitly tolerates occasional latency variation.
+X: A=io1 because production requires it: there is no such rule. io1 bills every provisioned IOPS each month, and its benefit, consistent latency, is not required here, so it costs more for nothing the team needs.
+B=io2 Block Express for lowest latency: it buys the lowest, most consistent latency, which the workload does not need, and bills for each provisioned IOPS, so it costs more than gp3.
+C=gp3 of 100 GiB with extra IOPS: for PostgreSQL, gp3 volumes under 400 GiB have a fixed 3,000 IOPS baseline and IOPS cannot be provisioned, so this configuration cannot deliver 8,000 IOPS.
+T: On RDS gp3 (MySQL, MariaDB, PostgreSQL), IOPS scale with size thresholds: under 400 GiB is fixed at 3,000; 400 GiB and above includes 12,000. Pay for io1 or io2 only when consistent low latency is required.
+V: Amazon RDS, Amazon EBS
+I: Q000578

@@ -1,0 +1,95 @@
+# DEA-C01 fixes to published questions (pinned with I:)
+
+@ DEA-C01 D1 T1.3 applied troubleshooting
+S: An EventBridge rule invokes a Lambda function as part of a pipeline. EventBridge delivers every event successfully, but the function code occasionally throws an error, and after Lambda's asynchronous retries are exhausted those events are lost with no record. Which configuration should be added to preserve the failed events for later inspection and reprocessing?
+A: Enable S3 Versioning on the pipeline's output bucket so earlier object versions are kept
+B: An SQS dead-letter queue attached to the EventBridge rule target for the function
+C: An SQS on-failure destination in the function's asynchronous invocation settings
+D: Increase the Lambda function's timeout to 15 minutes so every event can finish processing
+K: C
+G: ## Two separate retry stages
+When an EventBridge rule targets a Lambda function, the event passes through two hand-offs, and each has its own failure handling:
+- **EventBridge to Lambda (delivery).** EventBridge invokes the function asynchronously. If the invoke call itself fails, for example because of missing permissions or a deleted function, EventBridge retries under the target's retry policy and then sends the event to the **rule target's dead-letter queue**, if one is set.
+- **Inside Lambda (execution).** Once Lambda accepts the asynchronous invocation, delivery has succeeded from EventBridge's point of view. If the function code throws an error, Lambda retries it (up to 2 more times by default) and then discards the event unless the function has an **on-failure destination** (SQS, SNS, Lambda, EventBridge or S3) or a function-level DLQ.
+## Example
+`aws lambda put-function-event-invoke-config --function-name transform --destination-config '{"OnFailure":{"Destination":"arn:aws:sqs:us-east-1:111122223333:transform-failed"}}'`
+The destination record includes the original event plus the error details, so the event can be inspected and replayed.
+W: On-failure destination on the function: the events fail inside the function code after Lambda's own asynchronous retries, and that is exactly what an on-failure destination captures. The SQS message holds the original event and the error, so it can be inspected and redriven.
+X: A=S3 Versioning: versioning keeps older versions of objects that were already written; it records nothing about events whose processing failed before any output was produced.
+B=Rule target DLQ: the target DLQ only receives events EventBridge could not deliver. Here delivery succeeds and the failure happens later inside the function, so nothing ever reaches that queue.
+D=15-minute timeout: a longer timeout only helps when events time out; code errors still fail, and after the retries those events are still discarded with no record.
+T: A rule target DLQ catches EventBridge delivery failures; errors thrown by the function code need a Lambda on-failure destination (or function DLQ).
+V: Amazon EventBridge, AWS Lambda, Amazon SQS
+I: Q000296
+
+@ DEA-C01 D3 T3.4 applied comparison
+S: A data engineer profiles a 500 GB dataset with AWS Glue DataBrew and must keep each profiling run far cheaper than a full scan. The profile must proportionally represent every category of a highly imbalanced customer_segment column, but DataBrew's built-in samples only take first, last or random N rows. Which approach is most appropriate?
+A: Build a stratified sample by customer_segment in a Glue Spark job, then profile that
+B: Sample only the most recent 24 hours of data, regardless of the category distribution
+C: Profile the entire 500 GB dataset with no sampling at all on every profiling run
+D: Use DataBrew's sequential sample of the first 500 rows in the file's original order
+K: A
+G: ## Why the way you sample matters
+Profiling a sample is much cheaper than profiling 500 GB, but the sample must look like the full dataset.
+- **First N rows** reflect however the file happens to be ordered, often by date or source, so some categories may be missing entirely.
+- **Random sampling** is unbiased on average, but with a rare category (say 0.5% of rows) a small random sample may contain only a handful of its rows, or none.
+- **Stratified sampling** first splits data by a column (the strata, here `customer_segment`) and then samples within each group in proportion to its share, so every segment appears at its true ratio.
+## What DataBrew offers
+DataBrew's sample options are row-based: a project samples the first, last or random N rows (500 first rows by default), and a profile job runs on the full dataset or a custom number of rows. There is no stratified option, so a stratified sample is prepared upstream, for example with Spark's `df.sampleBy("customer_segment", fractions, seed=42)` in a Glue job writing to S3, and that output is registered as the DataBrew dataset to profile.
+W: Stratified sample built upstream: sampling within each `customer_segment` in proportion to its size keeps the imbalanced category proportions intact, and profiling that smaller output keeps each run cheap. Because DataBrew has no stratified sampler, the Glue job does this step.
+X: B=Last 24 hours only: a time slice reflects only recent activity and ignores the category mix; segments that were quiet that day would be missing or under-represented.
+C=Full dataset every run: profiling all 500 GB each time is accurate but slow and costly, which breaks the stated requirement to keep each run far cheaper than a full scan.
+D=First 500 rows: sequential sampling depends on file order, and 500 rows from the top may come from a single segment, badly misrepresenting an imbalanced column.
+T: When groups are imbalanced, stratified sampling preserves their proportions; DataBrew only samples by rows, so build the stratified sample upstream (for example with Spark sampleBy) and profile it.
+V: AWS Glue DataBrew
+I: Q000393
+
+@ DEA-C01 D2 T2.3 advanced definition
+S: A daily job must export a Redshift query result to S3 as Parquet, partitioned by date, in parallel. Which command fits?
+A: INSERT INTO a local Redshift table sorted by date
+B: A SELECT run from the query editor with results downloaded
+C: UNLOAD with FORMAT PARQUET and PARTITION BY
+D: COPY with FORMAT PARQUET from the S3 prefix
+K: C
+G: ## COPY loads, UNLOAD exports
+In Amazon Redshift:
+- `COPY` reads files from S3 (or other sources) **into** a table
+- `UNLOAD` runs a query and writes the result **out** to S3
+By default UNLOAD writes in parallel, each slice producing its own files. It supports `FORMAT PARQUET` or CSV and `PARTITION BY` to write Hive-style folders.
+Example:
+- `UNLOAD ('SELECT * FROM sales WHERE sale_date = CURRENT_DATE - 1')`
+- `TO 's3://exports/sales/'`
+- `IAM_ROLE 'arn:aws:iam::111122223333:role/RedshiftUnload'`
+- `FORMAT PARQUET PARTITION BY (sale_date);`
+This produces folders such as `s3://exports/sales/sale_date=2026-09-28/` with Parquet files ready for Athena or Spark.
+## Local tables versus S3
+A local (internal) Redshift table stores its rows in Redshift managed storage, not as files you control in S3. Sort keys only order rows inside the cluster; they never produce Parquet files or date folders in a bucket.
+W: UNLOAD with FORMAT PARQUET and PARTITION BY: it is the Redshift command made for exporting query results to S3, writing Parquet in parallel and splitting output into date partitions in one statement.
+X: A=INSERT into a local table: the rows stay inside Redshift managed storage. A date sort key orders them within the cluster but writes no Parquet files and no partition folders to S3.
+B=Query editor download: downloading results through the browser is manual, limited in size, not parallel and cannot write partitioned Parquet to S3 on a schedule.
+D=COPY with Parquet: COPY moves data into Redshift. It reads Parquet from an S3 prefix but never writes files out.
+T: Into Redshift is COPY; out of Redshift to S3 is UNLOAD, which can write partitioned Parquet in parallel.
+V: Amazon Redshift
+I: Q000339
+
+@ DEA-C01 D4 T4.4 applied use-case
+S: An organization trail already delivers CloudTrail events from every account and Region to a central S3 bucket, where they are kept for several years. A security team wants ad hoc SQL queries over those events with no servers or clusters to run and no need to add new partitions as each day's logs arrive. Which approach best fits?
+A: An Athena table over the trail's S3 prefix that uses partition projection
+B: Stream the trail into CloudWatch Logs and query the log group with Logs Insights
+C: Load the events into an Amazon OpenSearch Service domain and query them with SQL
+D: Create an AWS Config aggregator and run advanced queries across all accounts
+K: A
+G: ## CloudTrail logs in S3
+A trail writes compressed JSON log files to S3 under a predictable path: `AWSLogs/<org-id>/<account-id>/CloudTrail/<region>/<yyyy>/<MM>/<dd>/`. Amazon Athena can query those files in place with standard SQL, charging per data scanned, with no servers to manage.
+## Partition projection
+A table partitioned by account, Region and date lets queries read only the folders they need. Normally each new partition must be added (`ALTER TABLE ADD PARTITION` or a crawler). With **partition projection**, table properties describe the partition values and the path template, for example `projection.date.type=date` and `storage.location.template=s3://trail-bucket/AWSLogs/o-abc123/${account}/CloudTrail/${region}/${date}`, and Athena computes partitions at query time, so new days are queryable immediately.
+Example: `SELECT eventname, useridentity.arn FROM cloudtrail_logs WHERE date >= '2026/09/01' AND eventsource = 'iam.amazonaws.com'`.
+## Availability note
+AWS CloudTrail Lake, the managed event data store, has been closed to new customers since May 31, 2026, so S3 plus Athena is the standard pattern for new SQL analysis of CloudTrail history.
+W: Athena with partition projection: Athena queries the trail files where they already sit in S3 with SQL and no infrastructure, multi-year retention is just S3 storage, and partition projection means no partition maintenance as new daily logs arrive.
+X: B=CloudWatch Logs Insights: the trail would only send new events to a log group, so years of history already in S3 stay out of reach, and long retention is paid again as CloudWatch log storage.
+C=OpenSearch Service: you would have to provision a domain or collection, build ingestion from S3, and manage index size and retention, which is the cluster the team wants to avoid.
+D=AWS Config aggregator: it aggregates resource configuration and compliance data from accounts and Regions, not the CloudTrail API event history.
+T: CloudTrail events already in S3 are queried with Athena; partition projection removes partition maintenance for date-based log paths.
+V: AWS CloudTrail
+I: Q000418

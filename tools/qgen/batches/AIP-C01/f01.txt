@@ -1,0 +1,93 @@
+# AIP-C01 fixes of published questions (full blocks pinned with I:)
+
+@ AIP-C01 D2 T2.2 advanced troubleshooting
+S: For cost reasons, a team wants to serve a 2 GB embeddings model from AWS Lambda. The .zip deployment package with a layer is rejected for exceeding the 250 MB unzipped limit, and a container-image version deploys but shows cold starts of 45 seconds or more. What change best addresses this model-deployment challenge?
+A: Increase the Lambda timeout to 15 minutes
+B: Host the model on SageMaker Serverless or real-time inference (or ECS/Fargate) instead of Lambda
+C: Compress the model file with gzip and decompress it at runtime inside the handler to stay under the package size limit
+D: Place the model inside a Lambda layer, since layers are stored separately from the function's own deployment package
+K: B
+G: ## Lambda limits for model hosting
+AWS Lambda is great for short, lightweight functions, but model hosting pushes several limits:
+- A .zip package, including all its layers, can be at most 250 MB unzipped. A container image can be up to 10 GB, so the 2 GB model fits there.
+- Memory tops out at 10,240 MB, with no GPU.
+- Every cold start initializes a new execution environment and loads the model into memory, so a multi-gigabyte model adds many seconds of startup. Moving to a container image solves packaging but not this cold-start cost.
+## Model-serving platforms
+- **SageMaker Serverless Inference**: scales with requests and to zero; it still has cold starts, but it is built for model containers.
+- **SageMaker real-time endpoints**: always-warm instances for low, steady latency.
+- **Amazon ECS on Fargate**: long-running containers that load the model once and keep it in memory.
+Example: a real-time endpoint loads the 2 GB model at instance start, and every later request reuses it.
+W: SageMaker or ECS/Fargate hosting: these platforms load the 2 GB model once per instance or container and keep it in memory, avoiding both the .zip size limit and Lambda's repeated heavy cold starts.
+X: A=15-minute timeout: the timeout limits how long one invocation may run; it neither shrinks the package nor makes loading the model during a cold start any faster.
+C=gzip plus runtime decompression: model weights compress poorly, so the package likely still exceeds 250 MB, and decompressing gigabytes on every cold start makes cold starts even longer.
+D=Model in a Lambda layer: layers count toward the same 250 MB unzipped limit as the function code, which is exactly the limit the team already hit, so a 2 GB model still does not fit.
+T: When a model is too big for Lambda's package and cold-start profile, host it on a model-serving platform such as SageMaker or ECS instead of squeezing it into Lambda.
+V: AWS Lambda, Amazon SageMaker
+I: Q001442
+
+@ AIP-C01 D2 T2.2 applied use-case
+S: A company fine-tuned a custom model using Amazon Bedrock's model customization capability and now needs to use it for production inference. Which statement describes how this custom model is served, compared with invoking a Bedrock base model on demand?
+A: It stays in Bedrock but must first get a custom model deployment or Provisioned Throughput, invoked by that ARN
+B: It must first be containerized and deployed to ECS Fargate, because Bedrock hosts only the base foundation models
+C: It must be hosted on AWS Lambda using the model artifacts exported from the customization job's output bucket
+D: It must be exported to Amazon S3 and queried through Amazon Athena using a user-defined function for inference
+K: A
+G: ## Serving a Bedrock custom model
+Amazon Bedrock model customization (fine-tuning, continued pre-training, distillation) produces a **custom model** that lives inside Bedrock; you never manage its weights or servers.
+- A base model can be invoked on demand right away by its model ID, paid per token.
+- A custom model cannot be invoked just because it exists. You first give it serving capacity, in one of two ways:
+- **On-demand custom model deployment**: for supported base models, you create a deployment and pay per token, with no purchased capacity.
+- **Provisioned Throughput**: you purchase model units for the custom model, which gives dedicated, reserved capacity and is the long-standing option for serving custom models.
+Either way you call the returned deployment or provisioned model ARN with the same `InvokeModel` or `Converse` APIs.
+Example: after a fine-tuning job creates `my-claims-model`, the team creates a custom model deployment for it and points the application at that deployment ARN.
+W: Deployment or Provisioned Throughput inside Bedrock: Bedrock keeps and serves the custom model itself, but it must be given capacity through an on-demand custom model deployment or Provisioned Throughput, and callers use that ARN instead of a base model ID.
+X: B=Containerize for ECS Fargate: Bedrock hosts custom models itself; you never export them into your own containers to serve them, and Bedrock does not hand over the weights.
+C=Host on Lambda from exported artifacts: Bedrock does not give out the customized weights for self-hosting, and Lambda has no GPUs for serving a foundation model anyway.
+D=Query through Athena: Athena runs SQL over data in S3; it is not a model serving layer, and the custom model is never exported as a file that could be queried.
+T: Bedrock custom models are served inside Bedrock through a custom model deployment or Provisioned Throughput and invoked by that ARN, not by exporting them to other compute.
+V: Amazon Bedrock
+I: Q001440
+
+@ AIP-C01 D3 T3.3 applied use-case
+S: A financial services company fine-tunes a foundation model using data that passes through several AWS Glue ETL jobs before landing in the training bucket. Auditors need to trace exactly which raw source tables and transformations contributed to the final training dataset. Which capability supports this?
+A: Data lineage captured from the Glue jobs in Amazon SageMaker Catalog
+B: CloudWatch Logs Insights queries over the Glue job run logs
+C: Bedrock Guardrails contextual grounding checks on the model output
+D: SageMaker Model Cards training data section for the model
+K: A
+G: ## What data lineage is
+Data lineage is a graph of where data came from and what changed it: source tables, the jobs that read and wrote them, and the output datasets. For a training set, lineage answers "which raw tables and which transformations produced this file?"
+## Lineage for Glue pipelines
+When raw tables are cataloged in the AWS Glue Data Catalog and processed by Glue ETL jobs, the jobs can emit lineage as OpenLineage-compatible events. Amazon SageMaker Catalog (in SageMaker Unified Studio, built on Amazon DataZone) captures these events automatically and shows them as a graph like:
+- `raw.transactions` + `raw.customers` -> Glue job `join_clean` -> `curated.features` -> Glue job `export_training` -> `s3://train-bucket/v7/`
+Auditors can start from the training dataset and walk back through each job and its run history to the original sources.
+W: SageMaker Catalog lineage: lineage events captured from the Glue jobs and Data Catalog tables record how data flowed and was transformed, which is exactly the source-to-training-set trace the auditors need.
+X: B=Logs Insights on job logs: job logs show run details and errors, not a structured record of which input tables fed which outputs; rebuilding lineage from them is manual and unreliable.
+C=Contextual grounding: grounding checks whether a model's response is supported by provided source text at inference time; it has nothing to do with how training data was produced.
+D=Model Card training section: it describes the training data in prose for governance, but it does not capture or trace the transformations between source tables and the dataset.
+T: To trace a training dataset back through ETL steps, use data lineage in SageMaker Catalog; logs, grounding checks and model cards do not record data flow.
+V: AWS Glue, Amazon SageMaker
+I: Q001507
+
+@ AIP-C01 D3 T3.2 applied use-case
+S: Before fine-tuning a foundation model on a large S3 data lake of customer documents stored as text, CSV, PDF and Word files, a data science team wants to identify which objects contain sensitive information like credit card numbers or national ID numbers so those objects can be excluded or remediated. Which service is purpose-built for this discovery task at the S3 object level?
+A: AWS Glue crawlers
+B: Amazon Macie
+C: Amazon Comprehend Custom Classification
+D: Amazon Bedrock Guardrails
+K: B
+G: ## Sensitive data discovery in S3
+Amazon Macie is a managed service that scans objects in S3 and reports where sensitive data is stored. It uses:
+- **Managed data identifiers** for common types such as credit card numbers, bank account numbers, passport and national ID numbers.
+- **Custom data identifiers** (regex plus keywords) for organization-specific formats.
+- **Automated sensitive data discovery** that samples buckets continuously, plus one-time or scheduled discovery jobs for full scans.
+Each finding names the bucket, the object key, the data types found and where in the object they occur, so the team can exclude or remediate those objects.
+## Supported formats
+Macie analyzes text and CSV, big data (Avro, Parquet), document (PDF, Word, Excel), email and archive formats. It does not analyze images, so scanned pages stored only as images would need text extraction first, for example with Amazon Textract.
+W: Amazon Macie: it is purpose-built to discover sensitive data such as card and national ID numbers across S3 objects at scale and to report exactly which objects contain it.
+X: A=Glue crawlers: crawlers infer schemas and partitions to populate the Data Catalog; they do not inspect values to flag card or national ID numbers.
+C=Comprehend custom classification: it assigns labels you train to documents you send it; it does not inventory buckets or come with detectors for card or ID numbers across an S3 estate.
+D=Bedrock Guardrails: guardrails filter prompts and model responses at inference time; they do not scan training data stored in S3 buckets.
+T: To find which S3 objects hold sensitive data before training, use Macie; guardrails filter model traffic and Comprehend analyzes only the text you submit to it.
+V: Amazon Macie
+I: Q001499

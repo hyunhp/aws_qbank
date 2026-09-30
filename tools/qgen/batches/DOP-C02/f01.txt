@@ -1,0 +1,130 @@
+# DOP-C02 fixes to published questions (pinned with I:)
+
+@ DOP-C02 D1 T1.3 advanced troubleshooting
+S: A team's CodeArtifact repository used to have the public npm store repository (with an external connection to npmjs) as its upstream. The platform team replaced that upstream with a new internal CodeArtifact repository that has no upstreams or external connection of its own. Now npm install in CodeBuild still resolves packages the team used before, but fails for public packages and versions never fetched before. What is the most likely cause?
+A: CodeBuild has a hardcoded allowlist of package registries that excludes CodeArtifact endpoints.
+B: npm is not supported by CodeArtifact, so only pip and Maven packages can resolve through it.
+C: No repository in the chain now has an external connection, so new public packages can't be fetched.
+D: Changing the upstream configuration purged every package version cached from the old upstream.
+K: C
+G: ## How CodeArtifact reaches public registries
+Only a repository with an **external connection** (for example `public:npmjs`) can fetch packages from the public registry. Other repositories reach it through **upstream repositories**: when a package is requested and not found locally, CodeArtifact searches the upstreams in their listed order, including their upstreams, until one returns it.
+- When a package version is fetched through an upstream, it is **retained** in the downstream repository, so later installs keep working even if the upstream changes.
+- Removing the only path to the repository with the external connection means new packages and new versions can no longer be pulled from npmjs.
+## Example of a working chain
+`team-repo` -> upstreams `internal-repo`, then `npm-store` (external connection `public:npmjs`). Order matters only for which repository answers first; a package missing from `internal-repo` is then looked up in `npm-store`.
+W: No external connection in the chain: the new internal upstream has no path to npmjs, so only package versions already retained in the team repository resolve. Adding the internal repository alongside (not instead of) the public store repository, or giving it an upstream that has the external connection, restores resolution.
+X: A=Hardcoded registry allowlist: CodeBuild has no such allowlist; builds reach CodeArtifact endpoints with an authorization token like any npm client, and previously used packages still install.
+B=npm not supported: CodeArtifact supports npm as well as pip, Maven, NuGet, Swift, Ruby, Cargo and generic packages, and the team's earlier npm installs worked through it.
+D=Cache purged: package versions fetched through an upstream are retained in the downstream repository; the stem even shows previously used packages still installing, which rules out a purge.
+T: Public packages reach CodeArtifact only through a repository with an external connection; keep that repository somewhere in every upstream chain.
+V: CodeArtifact, CodeBuild
+I: Q001251
+
+@ DOP-C02 D2 T2.2 advanced use-case
+S: A company wants to ensure that an S3 bucket used for centralized log storage can only be accessed by IAM principals belonging to their own AWS Organization, even if the bucket policy is later misconfigured to allow a broader principal, and wants this enforced consistently for every resource-based policy across the organization rather than editing each policy individually. Which control best achieves this?
+A: Enable account-level S3 Block Public Access, which limits access to organization members.
+B: A root-level resource control policy denying S3 access when aws:PrincipalOrgID isn't the org ID.
+C: A root-level SCP denying S3 actions when aws:PrincipalOrgID isn't the organization's ID.
+D: Use AWS Config to detect and delete overly permissive bucket policies after they are created.
+K: B
+G: ## SCPs and RCPs limit different sides of a request
+AWS Organizations has two kinds of authorization policy, and both only set maximum permissions:
+- A **service control policy (SCP)** limits what **principals in member accounts** can do. It never applies to a principal from outside the organization, even when that principal calls a resource inside it.
+- A **resource control policy (RCP)** limits what can be done **to resources in member accounts**, whoever the caller is. It is evaluated on every request to a supported service, such as Amazon S3, AWS STS, AWS KMS, Amazon SQS and AWS Secrets Manager.
+## Data perimeter example
+An RCP attached to the root with `"Effect": "Deny"`, `"Action": "s3:*"`, `"Resource": "*"` and the conditions `StringNotEqualsIfExists` `aws:PrincipalOrgID` = `o-abc123` plus `BoolIfExists` `aws:PrincipalIsAWSService` = `false` denies S3 access to any principal outside the organization while still letting AWS services such as CloudTrail deliver logs. A bucket policy that later grants a broader principal cannot override this deny. RCPs do not apply to the management account's own resources.
+W: Resource control policy: an RCP is evaluated on requests to S3 resources in every member account, including requests from principals outside the organization, so one deny with `aws:PrincipalOrgID` blocks them regardless of any individual bucket policy.
+X: A=Block Public Access: it blocks public ACLs and policies, but a bucket policy granting a specific outside account is not "public" and is still allowed, so it does not limit access to the organization.
+C=Root-level SCP: SCPs only restrict principals inside the organization's member accounts. A principal from another account is never subject to the company's SCPs, so a misconfigured bucket policy would still let it in.
+D=Config detect and delete: remediation happens after the policy exists, leaving a window of access, and it does not enforce anything at request time.
+T: SCPs limit your own principals; RCPs limit access to your resources by anyone, which is how to enforce an organization-wide data perimeter.
+V: AWS Organizations, Amazon S3, AWS IAM
+I: Q001284
+
+@ DOP-C02 D1 T1.2 applied use-case
+S: A team is setting up a new CodeCommit repository and wants every pull request to be automatically scanned for code quality and security issues, with merges blocked while critical findings remain. The team has never used Amazon CodeGuru Reviewer. How should this be integrated?
+A: Copy the changed code into the CodeGuru console by hand and review the report before every pull request.
+B: Associate the new repository with CodeGuru Reviewer, which blocks merges on critical findings itself.
+C: Use CodeGuru Profiler to analyze each pull request's code changes for quality and security issues.
+D: Run a static analysis CodeBuild job on pull request events, gated by an approval rule that it approves.
+K: D
+G: ## Availability of CodeGuru Reviewer
+Since November 7, 2025, Amazon CodeGuru Reviewer no longer accepts new repository associations; only repositories associated before that date keep getting reviews. For new CodeCommit repositories, a pull request quality gate has to be built from other tools.
+## A pull request gate for CodeCommit
+A durable pattern works with any scanner:
+- CodeCommit emits `CodeCommit Pull Request State Change` events to Amazon EventBridge when a PR is created or updated.
+- An EventBridge rule starts a CodeBuild project on the PR's source commit. The buildspec runs a static analysis (SAST) and linting tool and fails when critical findings exist.
+- An **approval rule** on the repository requires one approval from the CodeBuild service role. On success the build calls `aws codecommit update-pull-request-approval-state --approval-state APPROVE` and posts results as a PR comment; on failure it revokes approval, so the PR cannot be merged.
+W: CodeBuild scan plus approval rule: EventBridge runs the scan automatically on every PR update, and because the approval rule requires the build role's approval, a PR with critical findings cannot be merged.
+X: A=Manual console copy: it is manual work before every pull request, not tied to the PR workflow, so nothing is automatic and nothing can block a merge.
+B=Associate with CodeGuru Reviewer: new repository associations stopped on November 7, 2025, and even for existing associations Reviewer only posts comments; it never blocks a merge on its own.
+C=CodeGuru Profiler: Profiler analyses the runtime performance of running applications, such as CPU and latency hotspots; it does not review pull request source code.
+T: Gate CodeCommit pull requests with an EventBridge-triggered CodeBuild scan plus an approval rule; CodeGuru Reviewer takes no new repository associations.
+V: CodeGuru Reviewer, CodeCommit, CodeBuild
+I: Q001239
+
+@ DOP-C02 D5 T5.1 advanced troubleshooting
+S: A company enabled an AWS Organizations CloudTrail trail in the management account and created an EventBridge rule on the management account's default event bus to detect root user console sign-ins across all accounts, targeting a Lambda function for alerting. During a security drill, a root sign-in occurred in a member account but no alert fired, and the trail is confirmed to be logging correctly across all accounts. What is the most likely cause?
+A: Organization trails never generate events for member accounts, only for the management account.
+B: Root user activity is never logged by CloudTrail, so root sign-ins cannot produce any event at all.
+C: The member's sign-in event goes to that account's own event bus; the trail doesn't forward it.
+D: EventBridge rules cannot be created in the management account of an AWS Organization at all.
+K: C
+G: ## Where CloudTrail events reach EventBridge
+CloudTrail events are sent to the **default event bus of the account and Region where they occur**. An organization trail collects member-account events into one S3 bucket (and optionally a CloudWatch Logs log group), but it does not send them to the management account's EventBridge.
+- A rule on the management account's bus therefore only sees the management account's own events.
+- Console sign-in events have source `aws.signin` and detail-type `AWS Console Sign In via CloudTrail`; root sign-ins are usually recorded in `us-east-1`.
+## Centralizing the alert
+Deploy a rule in each member account (for example with CloudFormation StackSets) that matches `{"source":["aws.signin"],"detail":{"userIdentity":{"type":["Root"]}}}` and forwards to a central event bus in the security account, whose resource policy allows `events:PutEvents` from the organization. The central bus rule then invokes the alerting Lambda function.
+W: Events stay in the member account: the root sign-in event was published only to the member account's default event bus, so the management account rule never saw it. Forward events from each member account to a central bus to alert centrally.
+X: A=Org trails skip members: an organization trail logs events for every member account; that is its purpose, and the stem confirms logging works across all accounts.
+B=Root activity not logged: CloudTrail records root user actions, including console sign-ins, which is why root sign-in alerts are a standard control.
+D=No rules in management account: the management account can create EventBridge rules like any other account; the rule simply only receives that account's events.
+T: EventBridge receives CloudTrail events only in the account where they happen; forward member-account events to a central bus to alert centrally.
+V: CloudTrail, EventBridge, AWS Organizations, IAM
+I: Q001364
+
+@ DOP-C02 D2 T2.2 advanced troubleshooting
+S: An automation pipeline running in Account A uses long-term IAM user credentials to assume a cross-account role in Account B and run a long CloudFormation deployment that regularly takes 90 minutes. The pipeline fails partway through with The security token included in the request is expired. The role's trust policy is correctly configured, and the pipeline uses AssumeRole once at the start. What is the most likely fix?
+A: Raise the role's MaxSessionDuration (up to 12 hours) and request a longer DurationSeconds.
+B: Add an sts:ExternalId condition to the trust policy, which extends the session duration.
+C: Call AssumeRole every 15 minutes, since STS sessions cannot exceed 15 minutes.
+D: Switch from AssumeRole to GetFederationToken, whose credentials never expire.
+K: A
+G: ## How long AssumeRole credentials last
+`AssumeRole` returns temporary credentials that expire after `DurationSeconds`, which defaults to 3,600 seconds (1 hour). The maximum you can request is the role's `MaxSessionDuration`, which you can set between 1 and 12 hours.
+## Example
+- Set the role's maximum: `aws iam update-role --role-name DeployRole --max-session-duration 14400` (4 hours).
+- Request it: `aws sts assume-role --role-arn arn:aws:iam::222233334444:role/DeployRole --role-session-name deploy --duration-seconds 10800`.
+A 90-minute job with default 1-hour credentials fails partway with an expired token.
+## Why the IAM user detail matters
+Here the caller uses IAM user credentials, so the longer duration applies. If the pipeline were itself running under role credentials and then assumed another role, that would be role chaining, and the session would be capped at 1 hour regardless of `MaxSessionDuration`; the job would then have to refresh credentials instead.
+W: Raise MaxSessionDuration and request a longer DurationSeconds: the single AssumeRole call from IAM user credentials currently gives about an hour; allowing and requesting a longer session covers the 90-minute deployment.
+X: B=ExternalId extends sessions: `sts:ExternalId` only controls who may assume the role; it has no effect on how long the credentials last.
+C=15-minute maximum: 15 minutes is the minimum `DurationSeconds`, not the maximum; sessions can last up to the role's configured maximum of up to 12 hours.
+D=GetFederationToken never expires: all STS credentials expire. GetFederationToken is for federated users from IAM user credentials and does not give credentials for a role in another account.
+T: Long jobs need a longer role session (MaxSessionDuration up to 12 hours plus DurationSeconds); role chaining is still limited to 1 hour.
+V: AWS STS, AWS IAM
+I: Q001287
+
+@ DOP-C02 D1 T1.4 advanced use-case
+S: A company deploys to EC2 behind an ALB and wants each new version to go to a fresh set of instances, with traffic moved to them one instance at a time instead of all at once and automatic rollback if CloudWatch alarms fire. Which approach fits?
+A: In-place deployment to all instances at once during a maintenance window
+B: CodeDeploy blue/green with OneAtATime rerouting and alarm-based rollback
+C: Manual replacement of one instance per day with new code copied by SSH
+D: DNS weighted routing changed by hand when the team has time to monitor
+K: B
+G: ## CodeDeploy blue/green on EC2
+In a CodeDeploy **blue/green** deployment for EC2 behind a load balancer, CodeDeploy provisions a replacement (green) fleet, installs the new revision, registers the green instances with the target group, and deregisters the original (blue) instances. The deployment configuration controls how many instances are handled at a time: with `CodeDeployDefault.OneAtATime`, traffic is rerouted to one replacement instance at a time. You can wait before rerouting and keep blue instances for a while for fast rollback.
+## Automatic rollback
+A deployment group can list **CloudWatch alarms**, such as ALB 5xx count or target response time. If an alarm goes to `ALARM` during the deployment, CodeDeploy stops it and, with automatic rollback enabled, rolls back, sending traffic back to the original instances while they still exist.
+## Note on percentages
+Percentage-based canary and linear configurations (such as `CodeDeployDefault.ECSCanary10Percent5Minutes`) exist only for Lambda and ECS. For EC2, CodeDeploy moves traffic in instance batches, not exact traffic percentages.
+W: CodeDeploy blue/green with OneAtATime and alarm rollback: new instances receive traffic one at a time, and CloudWatch alarms trigger an automatic rollback, which is the only option that is both gradual and automatic.
+X: A=In-place to all instances at once: every user gets the new version immediately on the existing instances, there is no fresh fleet or gradual shift, and rollback means redeploying.
+C=Manual SSH replacement per day: it is slow, error-prone, bypasses deployment tooling, and has no automatic rollback.
+D=Hand-edited DNS weights: DNS caching makes the split imprecise and slow to reverse, and it relies on people watching instead of alarms rolling back automatically.
+T: For gradual EC2 releases, CodeDeploy blue/green shifts traffic in instance batches with alarm-based automatic rollback; percentage canaries are for Lambda and ECS.
+V: AWS CodeDeploy
+I: Q003439
